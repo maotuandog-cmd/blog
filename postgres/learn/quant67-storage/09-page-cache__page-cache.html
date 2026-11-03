@@ -1,0 +1,2056 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】Page Cache 深度解析 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="page-cache, linux, writeback, readahead, dirty-pages, memory-management, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/09-page-cache/page-cache.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】Page Cache 深度解析" />
+    <meta property="og:description" content="应用程序每一次 read() 或 write() 系统调用，感觉像是直接在操作磁盘上的文件，但实际上，内核在中间插入了一层透明的缓存——页缓存（Page Cache）。这层缓存用物理内存保存最近访问过的文件数据，使得绝大多数读操作不需要触发磁盘 I/O，而写操作可以先落到内存，再由后台线程异步刷回存储设备。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/09-page-cache/page-cache.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="page-cache" />
+    <meta property="article:tag" content="linux" />
+    <meta property="article:tag" content="writeback" />
+    <meta property="article:tag" content="readahead" />
+    <meta property="article:tag" content="dirty-pages" />
+    <meta property="article:tag" content="memory-management" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】Page Cache 深度解析" />
+    <meta name="twitter:description" content="应用程序每一次 read() 或 write() 系统调用，感觉像是直接在操作磁盘上的文件，但实际上，内核在中间插入了一层透明的缓存——页缓存（Page Cache）。这层缓存用物理内存保存最近访问过的文件数据，使得绝大多数读操作不需要触发磁盘 I/O，而写操作可以先落到内存，再由后台线程异步刷回存储设备。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】Page Cache 深度解析", "description": "应用程序每一次 read() 或 write() 系统调用，感觉像是直接在操作磁盘上的文件，但实际上，内核在中间插入了一层透明的缓存——页缓存（Page Cache）。这层缓存用物理内存保存最近访问过的文件数据，使得绝大多数读操作不需要触发磁盘 I/O，而写操作可以先落到内存，再由后台线程异步刷回存储设备。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/09-page-cache/page-cache.html"}, "datePublished": "2025-08-18T00:00:00+00:00", "dateModified": "2026-04-15T10:43:36+00:00", "keywords": ["page-cache", "linux", "writeback", "readahead", "dirty-pages", "memory-management"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】Page Cache 深度解析</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-18</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#page-cache</span> <span>#linux</span> <span>#writeback</span> <span>#readahead</span> <span>#dirty-pages</span> <span>#memory-management</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/08-block-device-layer/block-device-layer.html">上一篇：【存储工程】块设备层：bio、request 与 I/O 调度器</a><a class="post-series-nav__link" href="/post/storage/10-direct-io/direct-io.html">下一篇：【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/page-cache.html">#page-cache</a><a class="chip-link" href="/tags/linux-ba324c.html">#linux</a><a class="chip-link" href="/tags/writeback.html">#writeback</a><a class="chip-link" href="/tags/readahead.html">#readahead</a><a class="chip-link" href="/tags/dirty-pages.html">#dirty-pages</a><a class="chip-link" href="/tags/memory-management-00a412.html">#memory-management</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#page-cache-深度解析"
+                id="toc-page-cache-深度解析">Page Cache 深度解析</a>
+                <ul>
+                <li><a href="#一page-cache-的角色与原理"
+                id="toc-一page-cache-的角色与原理">一、Page Cache
+                的角色与原理</a>
+                <ul>
+                <li><a href="#什么是-page-cache"
+                id="toc-什么是-page-cache">1.1 什么是 Page
+                Cache</a></li>
+                <li><a href="#为什么需要-page-cache"
+                id="toc-为什么需要-page-cache">1.2 为什么需要 Page
+                Cache</a></li>
+                <li><a href="#读路径" id="toc-读路径">1.3
+                读路径</a></li>
+                <li><a href="#写路径" id="toc-写路径">1.4
+                写路径</a></li>
+                <li><a href="#缓存淘汰lru-列表"
+                id="toc-缓存淘汰lru-列表">1.5 缓存淘汰：LRU
+                列表</a></li>
+                </ul></li>
+                <li><a href="#二page-cache-数据结构"
+                id="toc-二page-cache-数据结构">二、Page Cache
+                数据结构</a>
+                <ul>
+                <li><a href="#struct-address_space"
+                id="toc-struct-address_space">2.1 struct
+                address_space</a></li>
+                <li><a href="#从基数树到-xarray"
+                id="toc-从基数树到-xarray">2.2 从基数树到
+                XArray</a></li>
+                <li><a href="#页面标志" id="toc-页面标志">2.3
+                页面标志</a></li>
+                <li><a href="#folio多页复合单元"
+                id="toc-folio多页复合单元">2.4
+                folio：多页复合单元</a></li>
+                <li><a href="#页面索引机制" id="toc-页面索引机制">2.5
+                页面索引机制</a></li>
+                </ul></li>
+                <li><a href="#三读预取readahead"
+                id="toc-三读预取readahead">三、读预取（Readahead）</a>
+                <ul>
+                <li><a href="#顺序检测与预读窗口"
+                id="toc-顺序检测与预读窗口">3.1
+                顺序检测与预读窗口</a></li>
+                <li><a href="#初始预读大小与最大预读"
+                id="toc-初始预读大小与最大预读">3.2
+                初始预读大小与最大预读</a></li>
+                <li><a href="#同步预读与异步预读"
+                id="toc-同步预读与异步预读">3.3
+                同步预读与异步预读</a></li>
+                <li><a href="#read_ahead_kb-调优"
+                id="toc-read_ahead_kb-调优">3.4 read_ahead_kb
+                调优</a></li>
+                <li><a href="#对顺序读性能的影响"
+                id="toc-对顺序读性能的影响">3.5
+                对顺序读性能的影响</a></li>
+                <li><a href="#预读的负面影响随机-io-工作负载"
+                id="toc-预读的负面影响随机-io-工作负载">3.6
+                预读的负面影响：随机 I/O 工作负载</a></li>
+                <li><a href="#posix_fadvise-与-madvise"
+                id="toc-posix_fadvise-与-madvise">3.7 posix_fadvise 与
+                madvise</a></li>
+                </ul></li>
+                <li><a href="#四脏页与回写writeback"
+                id="toc-四脏页与回写writeback">四、脏页与回写（Writeback）</a>
+                <ul>
+                <li><a href="#脏页参数详解" id="toc-脏页参数详解">4.1
+                脏页参数详解</a></li>
+                <li><a href="#回写线程" id="toc-回写线程">4.2
+                回写线程</a></li>
+                <li><a href="#回写触发条件" id="toc-回写触发条件">4.3
+                回写触发条件</a></li>
+                <li><a href="#wbt回写节流" id="toc-wbt回写节流">4.4
+                WBT：回写节流</a></li>
+                <li><a href="#数据库场景的脏页调优"
+                id="toc-数据库场景的脏页调优">4.5
+                数据库场景的脏页调优</a></li>
+                </ul></li>
+                <li><a href="#五内存压力下的-page-cache-行为"
+                id="toc-五内存压力下的-page-cache-行为">五、内存压力下的
+                Page Cache 行为</a>
+                <ul>
+                <li><a href="#内存回收kswapd-与直接回收"
+                id="toc-内存回收kswapd-与直接回收">5.1 内存回收：kswapd
+                与直接回收</a></li>
+                <li><a href="#页缓存淘汰与交换"
+                id="toc-页缓存淘汰与交换">5.2 页缓存淘汰与交换</a></li>
+                <li><a href="#swappiness-参数"
+                id="toc-swappiness-参数">5.3 swappiness 参数</a></li>
+                <li><a href="#oom-killer-与页缓存"
+                id="toc-oom-killer-与页缓存">5.4 OOM Killer
+                与页缓存</a></li>
+                <li><a href="#vm.min_free_kbytes-与水位线"
+                id="toc-vm.min_free_kbytes-与水位线">5.5
+                vm.min_free_kbytes 与水位线</a></li>
+                <li><a href="#抖动检测psi-内存压力"
+                id="toc-抖动检测psi-内存压力">5.6 抖动检测：PSI
+                内存压力</a></li>
+                </ul></li>
+                <li><a href="#六page-cache-监控"
+                id="toc-六page-cache-监控">六、Page Cache 监控</a>
+                <ul>
+                <li><a href="#free-命令" id="toc-free-命令">6.1 free
+                命令</a></li>
+                <li><a href="#procmeminfo" id="toc-procmeminfo">6.2
+                /proc/meminfo</a></li>
+                <li><a href="#vmstat" id="toc-vmstat">6.3
+                vmstat</a></li>
+                <li><a href="#procvmstat" id="toc-procvmstat">6.4
+                /proc/vmstat</a></li>
+                <li><a href="#sar-历史数据" id="toc-sar-历史数据">6.5
+                sar 历史数据</a></li>
+                <li><a href="#bcc-工具cachestat-与-cachetop"
+                id="toc-bcc-工具cachestat-与-cachetop">6.6 BCC
+                工具：cachestat 与 cachetop</a></li>
+                <li><a href="#fincore检查文件缓存状态"
+                id="toc-fincore检查文件缓存状态">6.7
+                fincore：检查文件缓存状态</a></li>
+                <li><a href="#综合监控脚本" id="toc-综合监控脚本">6.8
+                综合监控脚本</a></li>
+                </ul></li>
+                <li><a href="#七page-cache-与数据库"
+                id="toc-七page-cache-与数据库">七、Page Cache
+                与数据库</a>
+                <ul>
+                <li><a href="#双重缓冲问题" id="toc-双重缓冲问题">7.1
+                双重缓冲问题</a></li>
+                <li><a href="#o_direct-绕过页缓存"
+                id="toc-o_direct-绕过页缓存">7.2 O_DIRECT
+                绕过页缓存</a></li>
+                <li><a href="#postgresql-与操作系统缓存的交互"
+                id="toc-postgresql-与操作系统缓存的交互">7.3 PostgreSQL
+                与操作系统缓存的交互</a></li>
+                <li><a href="#依赖页缓存还是应用缓冲池"
+                id="toc-依赖页缓存还是应用缓冲池">7.4
+                依赖页缓存还是应用缓冲池</a></li>
+                <li><a href="#数据库服务器调优策略"
+                id="toc-数据库服务器调优策略">7.5
+                数据库服务器调优策略</a></li>
+                </ul></li>
+                <li><a href="#八page-cache-高级操作"
+                id="toc-八page-cache-高级操作">八、Page Cache
+                高级操作</a>
+                <ul>
+                <li><a href="#清除页缓存" id="toc-清除页缓存">8.1
+                清除页缓存</a></li>
+                <li><a href="#posix_fadvise-缓存控制"
+                id="toc-posix_fadvise-缓存控制">8.2 posix_fadvise
+                缓存控制</a></li>
+                <li><a href="#madvise-控制-mmap-区域"
+                id="toc-madvise-控制-mmap-区域">8.3 madvise 控制 mmap
+                区域</a></li>
+                <li><a href="#sync_file_range-精细回写控制"
+                id="toc-sync_file_range-精细回写控制">8.4
+                sync_file_range 精细回写控制</a></li>
+                <li><a href="#文件锁与页缓存一致性"
+                id="toc-文件锁与页缓存一致性">8.5
+                文件锁与页缓存一致性</a></li>
+                </ul></li>
+                <li><a href="#九page-cache-调优实战"
+                id="toc-九page-cache-调优实战">九、Page Cache
+                调优实战</a>
+                <ul>
+                <li><a href="#面向工作负载的调优方案"
+                id="toc-面向工作负载的调优方案">9.1
+                面向工作负载的调优方案</a></li>
+                <li><a href="#高吞吐流式处理"
+                id="toc-高吞吐流式处理">9.2 高吞吐流式处理</a></li>
+                <li><a href="#低延迟数据库" id="toc-低延迟数据库">9.3
+                低延迟数据库</a></li>
+                <li><a href="#日志聚合防止缓存污染"
+                id="toc-日志聚合防止缓存污染">9.4
+                日志聚合：防止缓存污染</a></li>
+                <li><a href="#综合调优清单" id="toc-综合调优清单">9.5
+                综合调优清单</a></li>
+                </ul></li>
+                <li><a href="#参考文献"
+                id="toc-参考文献">参考文献</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="page-cache-深度解析">Page Cache 深度解析</h1>
+            <p>应用程序每一次 <code>read()</code> 或
+            <code>write()</code>
+            系统调用，感觉像是直接在操作磁盘上的文件，但实际上，内核在中间插入了一层透明的缓存——页缓存（Page
+            Cache）。这层缓存用物理内存保存最近访问过的文件数据，使得绝大多数读操作不需要触发磁盘
+            I/O，而写操作可以先落到内存，再由后台线程异步刷回存储设备。</p>
+            <p>页缓存是 Linux
+            存储栈中最关键的性能组件之一。理解它的工作原理、数据结构、调优参数和监控手段，对于数据库管理员、存储工程师和系统性能分析师来说都是必修课。一个配置不当的页缓存策略，轻则造成不必要的
+            I/O 放大，重则触发直接内存回收（Direct
+            Reclaim）导致应用延迟飙升，甚至在极端情况下引发 OOM（Out Of
+            Memory）杀死关键进程。</p>
+            <p>本文将从页缓存的基本原理出发，逐步深入到内核数据结构、读预取算法、脏页回写机制、内存压力下的行为、监控方法、与数据库的交互，最终落到实际的调优实战。</p>
+            <hr />
+            <h2 id="一page-cache-的角色与原理">一、Page Cache
+            的角色与原理</h2>
+            <h3 id="什么是-page-cache">1.1 什么是 Page Cache</h3>
+            <p>页缓存（Page Cache）是 Linux
+            内核在物理内存中维护的一个文件数据缓存层。当进程通过
+            <code>read()</code>
+            系统调用读取文件时，内核不会每次都去访问底层的块设备（Block
+            Device），而是先检查该文件对应的数据页是否已经在内存中。如果在，直接从内存返回数据；如果不在，才从磁盘读取数据，同时将数据缓存到页缓存中，以便后续访问。</p>
+            <p>从本质上讲，页缓存是一个以内存页（通常
+            4KB）为粒度的、全局共享的文件数据缓存。它由内核自动管理，对应用程序完全透明——应用程序不需要做任何特殊处理就能享受到缓存带来的性能提升。</p>
+            <h3 id="为什么需要-page-cache">1.2 为什么需要 Page
+            Cache</h3>
+            <p>页缓存存在的根本原因是存储介质与内存之间巨大的速度差距：</p>
+            <pre class="text"><code>存储层次                 典型延迟            相对速度
+─────────────────────────────────────────────────
+L1 Cache                 1 ns               1x
+L2 Cache                 4 ns               4x
+L3 Cache                 12 ns              12x
+DRAM                     80 ns              80x
+Intel Optane PMem        300 ns             300x
+NVMe SSD（随机读）       100 us             100,000x
+SATA SSD（随机读）       200 us             200,000x
+HDD（随机读）            8 ms               8,000,000x</code></pre>
+            <p>即使是最快的 NVMe 固态硬盘（Solid State
+            Drive，SSD），其随机读延迟也比内存慢三个数量级。对于传统的机械硬盘（Hard
+            Disk
+            Drive，HDD），差距更是达到了五个数量级。页缓存的作用就是用有限的内存资源，尽可能多地缓存”热”数据，将大量的磁盘
+            I/O 转化为内存访问，从而大幅降低应用程序的 I/O 延迟。</p>
+            <h3 id="读路径">1.3 读路径</h3>
+            <p>当应用程序调用 <code>read()</code>
+            读取文件数据时，内核的处理路径如下：</p>
+            <pre class="text"><code>应用程序调用 read(fd, buf, len)
+        |
+        v
+VFS 层：确定文件的 inode 和偏移量
+        |
+        v
+检查 Page Cache：该偏移量对应的页是否在缓存中？
+        |
+       / \
+      /   \
+   命中    未命中
+    |        |
+    v        v
+ 从内存    向块设备发起 I/O 请求
+ 复制到      |
+ 用户空间    v
+    |      数据从磁盘读入内核缓冲区
+    |        |
+    |        v
+    |      将数据页加入 Page Cache
+    |        |
+    |        v
+    |      从内存复制到用户空间
+    |        |
+    v        v
+  返回数据给应用程序</code></pre>
+            <p>这个路径揭示了页缓存最重要的性能特征：<strong>缓存命中时，I/O
+            操作完全不涉及磁盘，延迟从毫秒级降到微秒级</strong>。在典型的生产服务器上，页缓存的命中率（Hit
+            Ratio）通常在 90% 以上——也就是说，10 次读操作中只有 1
+            次需要真正访问磁盘。</p>
+            <h3 id="写路径">1.4 写路径</h3>
+            <p>写操作的路径与读操作有本质区别。Linux
+            默认采用回写（Write-Back）策略，而不是直写（Write-Through）策略：</p>
+            <pre class="text"><code>应用程序调用 write(fd, buf, len)
+        |
+        v
+VFS 层：确定文件的 inode 和偏移量
+        |
+        v
+检查 Page Cache：该偏移量对应的页是否在缓存中？
+        |
+       / \
+      /   \
+   命中    未命中
+    |        |
+    v        v
+ 更新缓存  分配新页，将数据写入
+ 中的数据    |
+    |        v
+    v      将新页加入 Page Cache
+    |        |
+    v        v
+  标记该页为&quot;脏页&quot;（Dirty Page）
+        |
+        v
+  write() 系统调用返回（此时数据尚未到达磁盘）
+        |
+        v
+  后台回写线程（Flusher Thread）异步将脏页刷到磁盘</code></pre>
+            <p>这种设计的好处是显而易见的：<code>write()</code>
+            调用几乎立即返回，应用程序不需要等待慢速的磁盘写入完成。代价是在脏页被刷回磁盘之前，如果系统崩溃或断电，这些尚未持久化的数据会丢失。这也是为什么需要
+            <code>fsync()</code> 或 <code>fdatasync()</code>
+            来确保数据持久化的原因。</p>
+            <h3 id="缓存淘汰lru-列表">1.5 缓存淘汰：LRU 列表</h3>
+            <p>内存是有限的资源，页缓存不可能无限增长。当系统内存紧张时，内核需要回收一部分页缓存页面来满足新的内存分配请求。Linux
+            使用改良的最近最少使用（Least Recently
+            Used，LRU）算法来决定淘汰哪些页面。</p>
+            <p>内核维护两个 LRU 列表：</p>
+            <pre class="text"><code>活跃列表（Active List）
+    |
+    |  页面被再次访问时提升
+    |  列表尾部的页面降级到非活跃列表
+    |
+    v
+非活跃列表（Inactive List）
+    |
+    |  新读入的页面先进入此列表
+    |  被再次访问时提升到活跃列表
+    |  列表尾部的页面被淘汰
+    |
+    v
+  回收（Reclaim）</code></pre>
+            <p>这种双列表设计被称为”二次机会”（Second
+            Chance）算法。它比简单的 LRU 更能抵抗缓存扫描（Cache
+            Scan）——当一次性读取大量文件时（例如全量备份），这些只访问一次的页面会停留在非活跃列表中，不会将真正的热数据从活跃列表中挤出去。</p>
+            <p>内核还区分文件页（File-backed Pages）和匿名页（Anonymous
+            Pages），分别维护独立的 LRU
+            列表。文件页就是页缓存中的页面，而匿名页是没有文件背景的内存页面（如堆、栈分配的内存）。当需要回收内存时，内核可以直接丢弃干净的文件页（因为数据可以从磁盘重新读取），但匿名页必须先写入交换空间（Swap
+            Space）才能回收。</p>
+            <hr />
+            <h2 id="二page-cache-数据结构">二、Page Cache 数据结构</h2>
+            <h3 id="struct-address_space">2.1 struct address_space</h3>
+            <p>页缓存的核心数据结构是
+            <code>address_space</code>，每个文件的索引节点（inode）都关联一个
+            <code>address_space</code>
+            对象。这个结构体管理着该文件所有被缓存的页面：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 简化版 address_space 结构，基于 Linux 6.x 内核 */</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> address_space <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode        <span class="op">*</span>host<span class="op">;</span>          <span class="co">/* 关联的 inode */</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> xarray       i_pages<span class="op">;</span>       <span class="co">/* 页面索引结构 */</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    atomic_t            i_mmap_writable<span class="op">;</span> <span class="co">/* mmap 可写映射计数 */</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> rb_root_cached i_mmap<span class="op">;</span>      <span class="co">/* mmap 映射的区间树 */</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span>       nrpages<span class="op">;</span>       <span class="co">/* 缓存的页面总数 */</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    pgoff_t             writeback_index<span class="op">;</span> <span class="co">/* 回写起始位置 */</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> address_space_operations <span class="op">*</span>a_ops<span class="op">;</span> <span class="co">/* 操作函数表 */</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span>       flags<span class="op">;</span>         <span class="co">/* 标志位 */</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    spinlock_t          i_lock<span class="op">;</span>        <span class="co">/* 保护成员的自旋锁 */</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    gfp_t               gfp_mask<span class="op">;</span>     <span class="co">/* 内存分配标志 */</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> list_head    i_private_list<span class="op">;</span> <span class="co">/* 私有列表 */</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><code>a_ops</code>
+            是一个操作函数表，包含了具体文件系统（如
+            ext4、XFS）实现的读写函数。当页缓存需要从磁盘读取数据或将脏页写回磁盘时，就会调用这些函数：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> address_space_operations <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>writepage<span class="op">)(</span><span class="kw">struct</span> page <span class="op">*</span>page<span class="op">,</span> <span class="kw">struct</span> writeback_control <span class="op">*</span>wbc<span class="op">);</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>read_folio<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*,</span> <span class="kw">struct</span> folio <span class="op">*);</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>writepages<span class="op">)(</span><span class="kw">struct</span> address_space <span class="op">*,</span> <span class="kw">struct</span> writeback_control <span class="op">*);</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="op">(*</span>dirty_folio<span class="op">)(</span><span class="kw">struct</span> address_space <span class="op">*,</span> <span class="kw">struct</span> folio <span class="op">*);</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>readahead<span class="op">)(</span><span class="kw">struct</span> readahead_control <span class="op">*);</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>write_begin<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*,</span> <span class="kw">struct</span> address_space <span class="op">*,</span> loff_t<span class="op">,</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>                       <span class="dt">unsigned</span><span class="op">,</span> <span class="kw">struct</span> page <span class="op">**,</span> <span class="dt">void</span> <span class="op">**);</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>write_end<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*,</span> <span class="kw">struct</span> address_space <span class="op">*,</span> loff_t<span class="op">,</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>                     <span class="dt">unsigned</span><span class="op">,</span> <span class="dt">unsigned</span><span class="op">,</span> <span class="kw">struct</span> page <span class="op">*,</span> <span class="dt">void</span> <span class="op">*);</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>direct_IO<span class="op">)(</span><span class="kw">struct</span> kiocb <span class="op">*,</span> <span class="kw">struct</span> iov_iter <span class="op">*);</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... 更多操作 ... */</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <h3 id="从基数树到-xarray">2.2 从基数树到 XArray</h3>
+            <p>在早期的 Linux 内核中，<code>address_space</code>
+            使用基数树（Radix
+            Tree）来索引页面。基数树以文件偏移量（以页为单位）作为键，可以在
+            O(log n) 时间内查找、插入和删除页面。</p>
+            <p>从 Linux 4.20
+            开始，内核引入了扩展数组（XArray）来替代基数树。XArray 在
+            API 层面更简洁，并且在底层做了多项优化：</p>
+            <pre class="text"><code>XArray 相比 Radix Tree 的改进：
+─────────────────────────────────
+1. 统一的锁机制（内置自旋锁，减少外部锁的使用）
+2. 更好的多序项（Multi-order Entry）支持
+3. 标记（Mark）系统替代了旧的标签（Tag）系统
+4. 更直观的迭代器 API
+5. 支持原子操作（xa_cmpxchg 等）</code></pre>
+            <p>在页缓存的上下文中，XArray
+            的标记系统特别重要。内核使用标记来快速找到具有特定属性的页面，例如脏页或正在回写的页面：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* XArray 标记定义 */</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PAGECACHE_TAG_DIRTY     XA_MARK_0   </span><span class="co">/* 脏页标记 */</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PAGECACHE_TAG_WRITEBACK XA_MARK_1   </span><span class="co">/* 回写中标记 */</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PAGECACHE_TAG_TOWRITE   XA_MARK_2   </span><span class="co">/* 待写标记 */</span></span></code></pre></div>
+            <p>通过这些标记，内核可以快速遍历某个文件的所有脏页，而不需要扫描整个
+            XArray。</p>
+            <h3 id="页面标志">2.3 页面标志</h3>
+            <p>每个物理内存页都有一组标志位（Page Flags），存储在
+            <code>struct page</code> 的 <code>flags</code>
+            字段中。与页缓存相关的关键标志包括：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 页缓存相关的页面标志 */</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>PG_locked       <span class="co">/* 页面被锁定，I/O 进行中 */</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>PG_uptodate     <span class="co">/* 页面内容与磁盘一致（或已被正确填充） */</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>PG_dirty        <span class="co">/* 页面已被修改，尚未写回磁盘 */</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>PG_writeback    <span class="co">/* 页面正在被写回磁盘 */</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>PG_lru          <span class="co">/* 页面在 LRU 列表中 */</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>PG_active       <span class="co">/* 页面在活跃 LRU 列表中 */</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>PG_referenced   <span class="co">/* 页面最近被访问过 */</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>PG_private      <span class="co">/* 页面有文件系统的私有数据（如 buffer_head） */</span></span></code></pre></div>
+            <p>这些标志的状态转换反映了页面在页缓存中的生命周期：</p>
+            <pre class="text"><code>新分配的页面
+    |
+    v
+PG_locked（从磁盘读取数据中）
+    |
+    v
+PG_uptodate + PG_lru（数据读取完成，加入 LRU）
+    |
+   / \
+  /   \
+被读取  被修改
+  |       |
+  v       v
+PG_referenced  PG_dirty（标记为脏页）
+  |               |
+  v               v
+PG_active      后台回写触发
+（提升到活跃列表）  |
+                   v
+              PG_writeback（写回进行中）
+                   |
+                   v
+              清除 PG_dirty 和 PG_writeback（写回完成）</code></pre>
+            <h3 id="folio多页复合单元">2.4 folio：多页复合单元</h3>
+            <p>传统上，页缓存以单个 4KB 页面为操作单位。但随着存储设备的
+            I/O 粒度越来越大（NVMe SSD 的内部页大小通常是 16KB），以 4KB
+            为单位管理缓存变得低效——元数据开销大、TLB（Translation
+            Lookaside Buffer）压力高。</p>
+            <p>从 Linux 5.16 开始，内核引入了 folio 的概念。一个 folio
+            是一组物理连续的页面，可以作为一个整体进行操作：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* folio 结构（简化） */</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> folio <span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 内部包含 struct page */</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> flags<span class="op">;</span>       <span class="co">/* 页面标志 */</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> address_space <span class="op">*</span>mapping<span class="op">;</span> <span class="co">/* 所属的 address_space */</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    pgoff_t index<span class="op">;</span>             <span class="co">/* 文件偏移（以页为单位） */</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> order<span class="op">;</span>        <span class="co">/* 2^order 个页面 */</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    atomic_t _mapcount<span class="op">;</span>        <span class="co">/* 映射计数 */</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    atomic_t _refcount<span class="op">;</span>        <span class="co">/* 引用计数 */</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>folio 的关键特性：</p>
+            <pre class="text"><code>folio 相比传统 page 的优势：
+──────────────────────────────
+1. 减少元数据开销（一个 folio 管理多个页面）
+2. 提高大 I/O 效率（一次操作处理更多数据）
+3. 减少 TLB 压力（使用大页/透明大页）
+4. 简化代码（消除了 compound page 的复杂性）
+5. 与文件系统块大小更好地对齐</code></pre>
+            <h3 id="页面索引机制">2.5 页面索引机制</h3>
+            <p>页缓存通过文件偏移量来索引页面。给定一个文件偏移量
+            <code>offset</code>，对应的页面索引（Page
+            Index）计算方式如下：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 将字节偏移转换为页面索引 */</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>pgoff_t index <span class="op">=</span> offset <span class="op">&gt;&gt;</span> PAGE_SHIFT<span class="op">;</span>  <span class="co">/* PAGE_SHIFT = 12，即除以 4096 */</span></span></code></pre></div>
+            <p>查找页面的典型流程：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 在页缓存中查找页面（简化版） */</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> folio <span class="op">*</span>filemap_get_folio<span class="op">(</span><span class="kw">struct</span> address_space <span class="op">*</span>mapping<span class="op">,</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>                                pgoff_t index<span class="op">)</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> folio <span class="op">*</span>folio<span class="op">;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 在 XArray 中查找 */</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    folio <span class="op">=</span> xa_load<span class="op">(&amp;</span>mapping<span class="op">-&gt;</span>i_pages<span class="op">,</span> index<span class="op">);</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>folio <span class="op">&amp;&amp;</span> <span class="op">!</span>folio_try_get<span class="op">(</span>folio<span class="op">))</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>        folio <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> folio<span class="op">;</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>当查找未命中时，内核会分配新的 folio
+            并从磁盘读取数据：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 缓存未命中时的处理（简化版） */</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> folio <span class="op">*</span>filemap_get_folio_or_read<span class="op">(</span><span class="kw">struct</span> address_space <span class="op">*</span>mapping<span class="op">,</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>                                        pgoff_t index<span class="op">,</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>                                        <span class="kw">struct</span> file <span class="op">*</span>file<span class="op">)</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> folio <span class="op">*</span>folio<span class="op">;</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    folio <span class="op">=</span> filemap_get_folio<span class="op">(</span>mapping<span class="op">,</span> index<span class="op">);</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>folio<span class="op">)</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> folio<span class="op">;</span>  <span class="co">/* 命中 */</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 未命中：分配新 folio */</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    folio <span class="op">=</span> filemap_alloc_folio<span class="op">(</span>mapping<span class="op">-&gt;</span>gfp_mask<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>folio<span class="op">)</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ERR_PTR<span class="op">(-</span>ENOMEM<span class="op">);</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 将 folio 加入 XArray */</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>    xa_store<span class="op">(&amp;</span>mapping<span class="op">-&gt;</span>i_pages<span class="op">,</span> index<span class="op">,</span> folio<span class="op">,</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 从磁盘读取数据 */</span></span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a>    mapping<span class="op">-&gt;</span>a_ops<span class="op">-&gt;</span>read_folio<span class="op">(</span>file<span class="op">,</span> folio<span class="op">);</span></span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> folio<span class="op">;</span></span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <hr />
+            <h2 id="三读预取readahead">三、读预取（Readahead）</h2>
+            <h3 id="顺序检测与预读窗口">3.1 顺序检测与预读窗口</h3>
+            <p>读预取（Readahead）是页缓存最重要的性能优化之一。其核心思想是：如果内核检测到应用程序正在顺序读取文件，就提前将后续的数据页读入缓存，使得应用程序的下一次
+            <code>read()</code> 调用能够直接命中缓存。</p>
+            <p>内核在每个打开文件的 <code>struct file</code>
+            中维护一个预读状态结构：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> file_ra_state <span class="op">{</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>    pgoff_t start<span class="op">;</span>          <span class="co">/* 当前预读窗口的起始位置 */</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> size<span class="op">;</span>      <span class="co">/* 当前预读窗口的大小（页数） */</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> async_size<span class="op">;</span> <span class="co">/* 异步预读部分的大小 */</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> ra_pages<span class="op">;</span>  <span class="co">/* 最大预读大小（页数） */</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> mmap_miss<span class="op">;</span> <span class="co">/* mmap 顺序性计数器 */</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    loff_t prev_pos<span class="op">;</span>        <span class="co">/* 上一次读取的位置 */</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>顺序检测的基本逻辑是：如果当前读取的位置紧接上一次读取的结束位置，就判定为顺序读取，并启动或扩大预读窗口。</p>
+            <h3 id="初始预读大小与最大预读">3.2
+            初始预读大小与最大预读</h3>
+            <p>当内核首次检测到顺序读取模式时，会设置一个初始预读大小。这个大小取决于多个因素：</p>
+            <pre class="text"><code>初始预读大小的确定：
+────────────────────
+1. 首次读取：通常为请求大小的 2-4 倍，但不超过 ra_pages
+2. 后续读取：预读窗口逐步翻倍增长
+3. 最大限制：受 ra_pages 约束（默认 128 页 = 512KB）</code></pre>
+            <p>最大预读大小由以下参数控制：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前预读大小（单位：KB）</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 典型默认值：128（即 128KB = 32 页）</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看系统级默认值</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.readahead_pages</span></code></pre></div>
+            <p>预读窗口的增长过程：</p>
+            <pre class="text"><code>时间 ──────────────────────────────────────────&gt;
+
+第 1 次读取：请求 4KB
+预读窗口：[page 0 ~ page 3]（16KB，初始大小）
+
+第 2 次读取：命中缓存
+预读窗口：[page 4 ~ page 11]（32KB，翻倍）
+
+第 3 次读取：命中缓存
+预读窗口：[page 12 ~ page 27]（64KB，翻倍）
+
+第 4 次读取：命中缓存
+预读窗口：[page 28 ~ page 59]（128KB，翻倍）
+
+第 5 次读取：命中缓存
+预读窗口：[page 60 ~ page 123]（256KB，翻倍）
+
+... 直到达到 read_ahead_kb 设定的最大值</code></pre>
+            <h3 id="同步预读与异步预读">3.3 同步预读与异步预读</h3>
+            <p>预读分为同步预读（Synchronous
+            Readahead）和异步预读（Asynchronous
+            Readahead）两种模式：</p>
+            <pre class="text"><code>预读窗口布局：
+┌──────────────────────────────┬───────────────────┐
+│       同步预读区域            │   异步预读区域     │
+│  （必须等待 I/O 完成）        │（提前触发预读）     │
+└──────────────────────────────┴───────────────────┘
+^                              ^                   ^
+start                    async boundary          start + size</code></pre>
+            <ul>
+            <li><p><strong>同步预读</strong>：当应用程序读取的页面不在缓存中时触发。内核必须等待
+            I/O
+            完成，将数据页读入缓存后才能返回给应用程序。这是冷启动时的必经之路。</p></li>
+            <li><p><strong>异步预读</strong>：当应用程序读取到预读窗口中的”异步标记”位置时触发。此时当前请求的数据已经在缓存中（可以立即返回），但内核同时发起一个后台
+            I/O
+            请求，提前将下一批数据读入缓存。这样应用程序的下一次读取仍然能命中缓存。</p></li>
+            </ul>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 异步预读触发条件（简化版） */</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> page_cache_async_readahead<span class="op">(</span><span class="kw">struct</span> address_space <span class="op">*</span>mapping<span class="op">,</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>                                 <span class="kw">struct</span> file_ra_state <span class="op">*</span>ra<span class="op">,</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>                                 <span class="kw">struct</span> file <span class="op">*</span>file<span class="op">,</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>                                 pgoff_t index<span class="op">)</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 如果读取位置到达异步标记，触发下一轮预读 */</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>index <span class="op">==</span> ra<span class="op">-&gt;</span>start <span class="op">+</span> ra<span class="op">-&gt;</span>size <span class="op">-</span> ra<span class="op">-&gt;</span>async_size<span class="op">)</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>        ondemand_readahead<span class="op">(</span>mapping<span class="op">,</span> ra<span class="op">,</span> file<span class="op">,</span> <span class="kw">true</span><span class="op">,</span> index<span class="op">);</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="read_ahead_kb-调优">3.4 read_ahead_kb 调优</h3>
+            <p><code>read_ahead_kb</code> 是预读调优中最重要的参数：</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看所有块设备的预读大小</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> dev <span class="kw">in</span> /sys/block/<span class="pp">*</span>/queue/read_ahead_kb<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">dirname</span> <span class="va">$(</span><span class="fu">dirname</span> <span class="va">$dev)</span> <span class="kw">|</span> <span class="fu">xargs</span> basename<span class="va">)</span><span class="st">: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$dev)</span><span class="st"> KB&quot;</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置特定设备的预读大小</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 256 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 blockdev 命令设置（单位：512 字节扇区）</span></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a><span class="ex">blockdev</span> <span class="at">--setra</span> 512 /dev/sda   <span class="co"># 设置为 256KB（512 * 512B）</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a><span class="ex">blockdev</span> <span class="at">--getra</span> /dev/sda       <span class="co"># 查看当前设置</span></span></code></pre></div>
+            <p>不同场景下的推荐值：</p>
+            <pre class="text"><code>工作负载类型              推荐 read_ahead_kb    原因
+──────────────────────────────────────────────────────────
+顺序读密集型（视频流）    1024-4096             最大化吞吐
+数据库（OLTP）            64-128                减少无用预读
+数据库（OLAP/分析）       256-1024              大范围扫描受益
+随机读密集型              32-64                 预读几乎无用，减少浪费
+NVMe SSD                 128-256               延迟低，中等预读即可
+HDD                      256-1024              弥补高延迟
+RAID 阵列                与条带大小对齐         避免跨条带读取</code></pre>
+            <h3 id="对顺序读性能的影响">3.5 对顺序读性能的影响</h3>
+            <p>预读对顺序读的性能提升是巨大的。以下是一个简单的基准测试（Benchmark）示例：</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 清除页缓存以获得冷启动数据</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> 3 <span class="op">&gt;</span> /proc/sys/vm/drop_caches</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 测试不同预读大小下的顺序读吞吐（使用 dd）</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> ra <span class="kw">in</span> 32 128 512 2048<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="va">$ra</span> <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sync</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> 3 <span class="op">&gt;</span> /proc/sys/vm/drop_caches</span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;read_ahead_kb = </span><span class="va">$ra</span><span class="st">&quot;</span></span>
+<span id="cb24-9"><a href="#cb24-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">dd</span> if=/data/testfile of=/dev/null bs=1M count=1024 <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;copied|bytes&#39;</span></span>
+<span id="cb24-10"><a href="#cb24-10" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;---&quot;</span></span>
+<span id="cb24-11"><a href="#cb24-11" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+            <p>典型的性能对比（HDD，顺序读 1GB 文件）：</p>
+            <pre class="text"><code>read_ahead_kb    吞吐量        说明
+────────────────────────────────────────
+32               80 MB/s      预读窗口太小，频繁触发同步 I/O
+128              150 MB/s     默认值，合理的平衡点
+512              180 MB/s     更大的 I/O 合并，接近磁盘极限
+2048             185 MB/s     收益递减，额外内存消耗</code></pre>
+            <h3 id="预读的负面影响随机-io-工作负载">3.6
+            预读的负面影响：随机 I/O 工作负载</h3>
+            <p>预读并非总是有益的。对于随机 I/O（Random
+            I/O）工作负载，预读不仅没有帮助，反而会造成性能损失：</p>
+            <pre class="text"><code>随机读场景下预读的负面影响：
+──────────────────────────────
+1. 带宽浪费：预读的数据不会被后续访问使用
+2. 内存浪费：无用的预读数据占据了页缓存空间
+3. I/O 放大：实际的磁盘 I/O 量是应用请求量的数倍
+4. 缓存污染：热数据被无用的预读数据挤出缓存</code></pre>
+            <p>对于数据库这类混合工作负载的应用，可以通过
+            <code>posix_fadvise()</code>
+            系统调用对不同的文件或文件区域设置不同的预读策略。</p>
+            <h3 id="posix_fadvise-与-madvise">3.7 posix_fadvise 与
+            madvise</h3>
+            <p>应用程序可以通过 <code>posix_fadvise()</code> 和
+            <code>madvise()</code> 主动告知内核自己的访问模式：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/sequential_file&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：将顺序访问这个文件 */</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_SEQUENTIAL<span class="op">);</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a><span class="co">/* 效果：预读窗口大小翻倍 */</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：将随机访问这个文件 */</span></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_RANDOM<span class="op">);</span></span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a><span class="co">/* 效果：禁用预读 */</span></span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-13"><a href="#cb27-13" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：即将访问某个区域 */</span></span>
+<span id="cb27-14"><a href="#cb27-14" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span> POSIX_FADV_WILLNEED<span class="op">);</span></span>
+<span id="cb27-15"><a href="#cb27-15" aria-hidden="true" tabindex="-1"></a><span class="co">/* 效果：立即将指定区域预读到缓存 */</span></span>
+<span id="cb27-16"><a href="#cb27-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-17"><a href="#cb27-17" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：不再需要某个区域的缓存 */</span></span>
+<span id="cb27-18"><a href="#cb27-18" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span> POSIX_FADV_DONTNEED<span class="op">);</span></span>
+<span id="cb27-19"><a href="#cb27-19" aria-hidden="true" tabindex="-1"></a><span class="co">/* 效果：将指定区域的页面从缓存中淘汰 */</span></span></code></pre></div>
+            <p>对于使用 <code>mmap()</code> 映射的文件区域，使用
+            <code>madvise()</code> 代替：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/mman.h&gt;</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>addr <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> size<span class="op">,</span> PROT_READ<span class="op">,</span> MAP_SHARED<span class="op">,</span> fd<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：将顺序访问这片内存区域 */</span></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr<span class="op">,</span> size<span class="op">,</span> MADV_SEQUENTIAL<span class="op">);</span></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：将随机访问这片内存区域 */</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr<span class="op">,</span> size<span class="op">,</span> MADV_RANDOM<span class="op">);</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：即将访问某个区域 */</span></span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr <span class="op">+</span> offset<span class="op">,</span> length<span class="op">,</span> MADV_WILLNEED<span class="op">);</span></span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a><span class="co">/* 告知内核：不再需要某个区域 */</span></span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr <span class="op">+</span> offset<span class="op">,</span> length<span class="op">,</span> MADV_DONTNEED<span class="op">);</span></span></code></pre></div>
+            <hr />
+            <h2
+            id="四脏页与回写writeback">四、脏页与回写（Writeback）</h2>
+            <h3 id="脏页参数详解">4.1 脏页参数详解</h3>
+            <p>脏页（Dirty
+            Page）管理是页缓存中最复杂也最关键的部分。内核通过一组
+            sysctl 参数来控制脏页的行为：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看所有脏页相关参数</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-a</span> <span class="kw">|</span> <span class="fu">grep</span> dirty</span></code></pre></div>
+            <p><strong>dirty_ratio / dirty_bytes</strong></p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 脏页占可用内存的最大比例（百分比）</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_ratio</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：20（即 20%）</span></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者以字节数指定绝对上限</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_bytes</span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：0（表示使用 dirty_ratio）</span></span></code></pre></div>
+            <p>当脏页总量达到 <code>dirty_ratio</code>
+            时，<strong>执行写操作的进程会被阻塞</strong>，直到有足够的脏页被刷回磁盘。这是一个硬限制，确保脏页不会无限增长：</p>
+            <pre class="text"><code>dirty_ratio 的行为：
+────────────────────
+                  正常写入        写入被阻塞
+脏页比例：0% ═══════════════════╪══════════&gt; 100%
+                              dirty_ratio
+                              （默认 20%）</code></pre>
+            <p><strong>dirty_background_ratio /
+            dirty_background_bytes</strong></p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 触发后台回写的脏页比例（百分比）</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_background_ratio</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：10（即 10%）</span></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者以字节数指定</span></span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_background_bytes</span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：0（表示使用 dirty_background_ratio）</span></span></code></pre></div>
+            <p>当脏页总量达到 <code>dirty_background_ratio</code>
+            时，内核<strong>唤醒后台回写线程</strong>开始将脏页刷回磁盘，但写操作的进程不会被阻塞：</p>
+            <pre class="text"><code>脏页参数的完整行为：
+──────────────────────
+         后台回写             节流          写入阻塞
+          未启动               区域            区域
+ 0% ═════════╪═══════════════════╪═════════════&gt; 100%
+      dirty_background_ratio  dirty_ratio
+           （默认 10%）       （默认 20%）
+
+- 脏页 &lt; 10%：不触发回写，脏页正常累积
+- 10% &lt;= 脏页 &lt; 20%：后台线程开始回写，写进程逐步被节流
+- 脏页 &gt;= 20%：写进程被完全阻塞，等待脏页下降</code></pre>
+            <p><strong>dirty_expire_centisecs</strong></p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 脏页的过期时间（单位：百分之一秒）</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_expire_centisecs</span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：3000（即 30 秒）</span></span></code></pre></div>
+            <p>超过这个时间的脏页会被回写线程优先刷回磁盘，即使脏页总量没有达到阈值。这确保了数据不会在内存中停留太久。</p>
+            <p><strong>dirty_writeback_centisecs</strong></p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 回写线程的唤醒间隔（单位：百分之一秒）</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_writeback_centisecs</span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：500（即 5 秒）</span></span></code></pre></div>
+            <p>回写线程每隔这个时间就会被唤醒一次，检查是否有过期的脏页需要刷回磁盘。</p>
+            <h3 id="回写线程">4.2 回写线程</h3>
+            <p>Linux
+            内核使用专用的内核线程来执行脏页回写。在现代内核中，每个后端设备接口（Backing
+            Device Info，BDI）都有自己的回写线程：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看系统中的回写线程</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> aux <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;flush|writeback&#39;</span></span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 典型输出：</span></span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a><span class="co"># root  [kworker/u8:0-flush-253:0]  # 设备 253:0 的回写线程</span></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a><span class="co"># root  [kworker/u8:1-flush-8:0]    # 设备 8:0 的回写线程</span></span></code></pre></div>
+            <p>回写线程的工作流程：</p>
+            <pre class="text"><code>回写线程唤醒
+    |
+    v
+检查是否有过期脏页（age &gt; dirty_expire_centisecs）
+    |
+   / \
+  是   否
+  |     |
+  v     v
+回写   检查脏页总量是否超过 dirty_background_ratio
+过期     |
+脏页    / \
+  |   是   否
+  |    |    |
+  |    v    v
+  |  回写   继续睡眠
+  |  脏页   dirty_writeback_centisecs
+  |    |
+  v    v
+继续回写直到脏页降到安全水位
+    |
+    v
+  睡眠</code></pre>
+            <h3 id="回写触发条件">4.3 回写触发条件</h3>
+            <p>脏页回写可以由三种方式触发：</p>
+            <pre class="text"><code>触发方式          条件                         行为
+─────────────────────────────────────────────────────────
+定时器触发        每隔 dirty_writeback_centisecs  回写过期脏页
+阈值触发          脏页达到 dirty_background_ratio  后台回写开始
+同步触发          应用调用 sync/fsync/fdatasync    同步回写所有/指定脏页</code></pre>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动触发全局同步回写</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 对单个文件进行同步</span></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="co"># fsync - 同步数据和元数据</span></span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a><span class="st">import os</span></span>
+<span id="cb39-8"><a href="#cb39-8" aria-hidden="true" tabindex="-1"></a><span class="st">fd = os.open(&#39;/data/file&#39;, os.O_WRONLY)</span></span>
+<span id="cb39-9"><a href="#cb39-9" aria-hidden="true" tabindex="-1"></a><span class="st">os.fsync(fd)</span></span>
+<span id="cb39-10"><a href="#cb39-10" aria-hidden="true" tabindex="-1"></a><span class="st">os.close(fd)</span></span>
+<span id="cb39-11"><a href="#cb39-11" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span>
+<span id="cb39-12"><a href="#cb39-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-13"><a href="#cb39-13" aria-hidden="true" tabindex="-1"></a><span class="co"># fdatasync - 仅同步数据（不含不影响读取的元数据）</span></span>
+<span id="cb39-14"><a href="#cb39-14" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb39-15"><a href="#cb39-15" aria-hidden="true" tabindex="-1"></a><span class="st">import os</span></span>
+<span id="cb39-16"><a href="#cb39-16" aria-hidden="true" tabindex="-1"></a><span class="st">fd = os.open(&#39;/data/file&#39;, os.O_WRONLY)</span></span>
+<span id="cb39-17"><a href="#cb39-17" aria-hidden="true" tabindex="-1"></a><span class="st">os.fdatasync(fd)</span></span>
+<span id="cb39-18"><a href="#cb39-18" aria-hidden="true" tabindex="-1"></a><span class="st">os.close(fd)</span></span>
+<span id="cb39-19"><a href="#cb39-19" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="wbt回写节流">4.4 WBT：回写节流</h3>
+            <p>回写节流（Writeback Throttling，WBT）是 Linux 4.10
+            引入的一项机制，专门用于
+            blk-mq（多队列块设备层）。它通过监控写操作的延迟来自动调节脏页回写的速率，防止回写风暴导致读延迟飙升：</p>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 WBT 状态</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/wbt_lat_usec</span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：75000（75ms）——目标延迟</span></span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用 WBT</span></span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/block/sda/queue/wbt_lat_usec</span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置目标延迟（微秒）</span></span>
+<span id="cb40-9"><a href="#cb40-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 50000 <span class="op">&gt;</span> /sys/block/sda/queue/wbt_lat_usec</span></code></pre></div>
+            <p>WBT 的工作原理：</p>
+            <pre class="text"><code>1. 监控写请求的完成延迟
+2. 如果延迟超过目标值（wbt_lat_usec），减少允许的在途写请求数
+3. 如果延迟低于目标值，逐步增加允许的在途写请求数
+4. 通过这种反馈机制，在吞吐和延迟之间找到平衡</code></pre>
+            <h3 id="数据库场景的脏页调优">4.5 数据库场景的脏页调优</h3>
+            <p>数据库服务器对脏页参数非常敏感。配置不当会导致周期性的性能抖动（Performance
+            Jitter）——即”回写风暴”（Writeback Storm）。</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据库服务器推荐的脏页参数</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 降低后台回写阈值，让回写更频繁、更平滑</span></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=3</span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者使用绝对值（适用于大内存服务器）</span></span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a><span class="co"># sysctl -w vm.dirty_background_bytes=268435456  # 256MB</span></span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 降低硬限制，减少突发回写的数据量</span></span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=10</span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者使用绝对值</span></span>
+<span id="cb42-11"><a href="#cb42-11" aria-hidden="true" tabindex="-1"></a><span class="co"># sysctl -w vm.dirty_bytes=1073741824  # 1GB</span></span>
+<span id="cb42-12"><a href="#cb42-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-13"><a href="#cb42-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 缩短脏页过期时间</span></span>
+<span id="cb42-14"><a href="#cb42-14" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=1000  <span class="co"># 10 秒</span></span>
+<span id="cb42-15"><a href="#cb42-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-16"><a href="#cb42-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 缩短回写线程唤醒间隔</span></span>
+<span id="cb42-17"><a href="#cb42-17" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_writeback_centisecs=300  <span class="co"># 3 秒</span></span></code></pre></div>
+            <p>这些调优的核心思路是”少量多次”——让回写线程更频繁地工作，每次刷回少量脏页，而不是等脏页积累到很大量时一次性刷回。后者会导致
+            I/O 带宽被回写操作独占，前台的读请求延迟飙升。</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 持久化 sysctl 配置</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;&gt;</span> /etc/sysctl.d/90-dirty-pages.conf <span class="op">&lt;&lt; &#39;EOF&#39;</span></span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a><span class="st">vm.dirty_background_ratio = 3</span></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="st">vm.dirty_ratio = 10</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="st">vm.dirty_expire_centisecs = 1000</span></span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a><span class="st">vm.dirty_writeback_centisecs = 300</span></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">--system</span></span></code></pre></div>
+            <hr />
+            <h2 id="五内存压力下的-page-cache-行为">五、内存压力下的
+            Page Cache 行为</h2>
+            <h3 id="内存回收kswapd-与直接回收">5.1 内存回收：kswapd
+            与直接回收</h3>
+            <p>当系统可用内存低于特定水位线（Watermark）时，内核会启动内存回收机制。回收的主要目标之一就是页缓存中的页面。</p>
+            <p>内核定义了三个水位线：</p>
+            <pre class="text"><code>内存水位线：
+──────────────────────────────────────────
+high    ─── kswapd 停止回收
+          |
+          |  kswapd 在此区间内工作
+          |
+low     ─── kswapd 被唤醒，开始后台回收
+          |
+          |  如果 kswapd 来不及回收
+          |
+min     ─── 触发直接回收（Direct Reclaim）
+          |
+          |  紧急保留区域
+          |
+  0     ─── 内存完全耗尽，触发 OOM Killer</code></pre>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前水位线（单位：页）</span></span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/zoneinfo <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Node|pages free|min|low|high&#39;</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-20</span></span></code></pre></div>
+            <p><strong>kswapd</strong>
+            是一个后台内核线程，当可用内存降到 <code>low</code>
+            水位线以下时被唤醒，它在后台异步回收内存页面，直到可用内存恢复到
+            <code>high</code>
+            水位线以上。这个过程对应用程序是透明的。</p>
+            <p><strong>直接回收</strong>（Direct
+            Reclaim）发生在可用内存降到 <code>min</code> 水位线以下，且
+            kswapd
+            来不及回收足够内存时。此时，执行内存分配的进程（即触发
+            <code>page fault</code> 或 <code>malloc</code>
+            的进程）被迫自己执行内存回收，<strong>进程会被阻塞</strong>直到回收到足够的内存。这是导致应用延迟飙升的主要原因之一。</p>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看直接回收的发生次数</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;pgsteal_direct|allocstall&#39;</span> /proc/vmstat</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="co"># allocstall_normal    12345   # 直接回收触发次数</span></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="co"># pgsteal_direct       98765   # 直接回收回收的页面数</span></span></code></pre></div>
+            <h3 id="页缓存淘汰与交换">5.2 页缓存淘汰与交换</h3>
+            <p>在内存回收过程中，内核面临一个关键选择：淘汰页缓存页面（文件页），还是将匿名页换出到交换空间？</p>
+            <pre class="text"><code>回收页面的类型与代价：
+──────────────────────────────────────────────
+类型        干净的文件页    脏的文件页    匿名页
+──────────────────────────────────────────────
+回收动作    直接丢弃       先回写再丢弃   写入 Swap
+I/O 代价    无             一次写 I/O     一次写 I/O
+恢复方式    从磁盘重读     从磁盘重读     从 Swap 重读
+适用场景    优先回收       次优先         尽量避免</code></pre>
+            <p>干净的文件页是最理想的回收对象——它们可以直接被丢弃，不需要任何
+            I/O 操作，因为数据可以随时从磁盘文件重新读取。</p>
+            <h3 id="swappiness-参数">5.3 swappiness 参数</h3>
+            <p><code>swappiness</code>
+            参数控制内核在回收内存时，倾向于回收文件页还是匿名页：</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前 swappiness 值</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.swappiness</span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值：60</span></span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置 swappiness</span></span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.swappiness=10</span></code></pre></div>
+            <pre class="text"><code>swappiness 值的含义：
+──────────────────────────────────
+0     极度偏好回收文件页，几乎不使用 swap
+      （但并非完全禁用 swap，极端内存压力下仍会换出）
+10    强烈偏好回收文件页
+60    默认值，在文件页和匿名页之间取得平衡
+100   同等对待文件页和匿名页
+200   极度偏好换出匿名页（Linux 5.8+ cgroup v2）</code></pre>
+            <p>对于数据库服务器，通常建议将 <code>swappiness</code>
+            设为较低值（如 1 或
+            10）。原因是数据库通常有自己的缓冲池（Buffer Pool），比如
+            InnoDB 的 Buffer Pool 或 PostgreSQL 的 Shared
+            Buffers，这些内存被分配为匿名页。如果
+            <code>swappiness</code>
+            太高，内核可能会把数据库缓冲池中的热数据换出到磁盘，导致灾难性的性能下降。</p>
+            <h3 id="oom-killer-与页缓存">5.4 OOM Killer 与页缓存</h3>
+            <p>当内存回收（包括页缓存淘汰和交换）都无法释放足够的内存时，内核会触发
+            OOM Killer（Out Of Memory
+            Killer）来杀死一个或多个进程以释放内存。</p>
+            <p>一个常见的误解是”系统还有很多缓存内存，不应该
+            OOM”。事实上，OOM Killer
+            在判断是否触发时，已经考虑了可回收的页缓存：</p>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 OOM 相关信息</span></span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> <span class="st">&quot;oom\|out of memory&quot;</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-10</span></span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看进程的 oom_score（值越高越可能被杀）</span></span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/oom_score</span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整进程的 OOM 优先级（-1000 到 1000）</span></span>
+<span id="cb50-8"><a href="#cb50-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="at">-500</span> <span class="op">&gt;</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/oom_score_adj    <span class="co"># 降低被杀概率</span></span>
+<span id="cb50-9"><a href="#cb50-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="at">-1000</span> <span class="op">&gt;</span> /proc/<span class="op">&lt;</span>pid<span class="op">&gt;</span>/oom_score_adj   <span class="co"># 完全豁免（谨慎使用）</span></span></code></pre></div>
+            <h3 id="vm.min_free_kbytes-与水位线">5.5 vm.min_free_kbytes
+            与水位线</h3>
+            <p><code>vm.min_free_kbytes</code>
+            参数直接影响内存水位线的计算：</p>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前值</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.min_free_kbytes</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值取决于物理内存大小，通常为几十 MB</span></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置更大的值以留出更多安全裕量</span></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.min_free_kbytes=262144  <span class="co"># 256MB</span></span></code></pre></div>
+            <pre class="text"><code>水位线计算（近似）：
+──────────────────────
+min = vm.min_free_kbytes 对应的页数
+low = min + min / 4
+high = min + min / 2</code></pre>
+            <p>增大 <code>vm.min_free_kbytes</code>
+            的效果是提高所有水位线，让 kswapd
+            更早开始工作，减少直接回收的概率。但设置过大会白白浪费内存（这些内存被保留不用）。</p>
+            <p>对于大内存服务器（如 256GB+），推荐将
+            <code>vm.min_free_kbytes</code> 设为
+            1-2GB，以确保在突发大量内存分配时有足够的缓冲空间，避免直接回收。</p>
+            <h3 id="抖动检测psi-内存压力">5.6 抖动检测：PSI
+            内存压力</h3>
+            <p>压力失速信息（Pressure Stall Information，PSI）是 Linux
+            4.20 引入的一项功能，可以量化系统因内存（以及
+            CPU、I/O）不足而导致的性能损失：</p>
+            <div class="sourceCode" id="cb53"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看内存压力</span></span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/memory</span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a><span class="co"># some avg10=0.50 avg60=0.25 avg300=0.10 total=123456</span></span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a><span class="co"># full avg10=0.10 avg60=0.05 avg300=0.02 total=23456</span></span></code></pre></div>
+            <pre class="text"><code>PSI 内存指标说明：
+──────────────────
+some：至少有一个任务因内存压力而被延迟的时间比例
+full：所有任务都因内存压力而被延迟的时间比例
+
+avg10/avg60/avg300：过去 10 秒/60 秒/300 秒的移动平均值
+total：自系统启动以来的总延迟时间（微秒）</code></pre>
+            <p>可以设置 PSI 触发器来在内存压力超过阈值时接收通知：</p>
+            <div class="sourceCode" id="cb55"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb55-1"><a href="#cb55-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 当 10 秒内 some 指标超过 25% 时触发</span></span>
+<span id="cb55-2"><a href="#cb55-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;some 250000 1000000&quot;</span> <span class="op">&gt;</span> /proc/pressure/memory</span>
+<span id="cb55-3"><a href="#cb55-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 含义：在 1 秒窗口内，如果等待时间超过 250ms（25%），触发通知</span></span></code></pre></div>
+            <p>PSI
+            是比单纯监控可用内存更好的内存压力指标。一个系统可能只有 2%
+            的可用内存，但如果工作集完全在页缓存中且没有新的大量分配需求，PSI
+            内存压力为 0——系统运行良好。</p>
+            <hr />
+            <h2 id="六page-cache-监控">六、Page Cache 监控</h2>
+            <h3 id="free-命令">6.1 free 命令</h3>
+            <p><code>free</code>
+            是最常用的内存查看命令，但很多人误读了它的输出：</p>
+            <div class="sourceCode" id="cb56"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb56-1"><a href="#cb56-1" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span></code></pre></div>
+            <pre class="text"><code>              total        used        free      shared  buff/cache   available
+Mem:           62Gi        8.5Gi       1.2Gi       256Mi       52.3Gi      53.0Gi
+Swap:          8.0Gi       0.5Gi       7.5Gi</code></pre>
+            <p>关键字段解读：</p>
+            <pre class="text"><code>字段          含义
+──────────────────────────────────────────────────────────
+total         物理内存总量
+used          已使用的内存（不含 buff/cache）
+free          完全空闲的内存（未被任何东西使用）
+shared        tmpfs 等共享内存使用量
+buff/cache    缓冲区（Buffer）和页缓存（Page Cache）的总和
+available     应用程序实际可用的内存（free + 可回收的 cache）</code></pre>
+            <p><strong>常见误解</strong>：看到 <code>free</code> 只有
+            1.2GB 就以为系统快没内存了。实际上 <code>available</code>
+            才是判断内存是否充足的正确指标。在上面的例子中，尽管
+            <code>free</code> 只有 1.2GB，但 <code>available</code> 有
+            53GB——因为页缓存中的大部分页面都可以被回收。</p>
+            <h3 id="procmeminfo">6.2 /proc/meminfo</h3>
+            <p><code>/proc/meminfo</code> 提供了最详细的内存信息：</p>
+            <div class="sourceCode" id="cb59"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb59-1"><a href="#cb59-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看页缓存相关的关键指标</span></span>
+<span id="cb59-2"><a href="#cb59-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Cached|Dirty|Writeback|AnonPages|Buffers|Active\(file\)|Inactive\(file\)&#39;</span> /proc/meminfo</span></code></pre></div>
+            <pre class="text"><code>字段              含义
+──────────────────────────────────────────────────────────
+Cached            页缓存大小（不含 tmpfs 使用的内存）
+Buffers           块设备缓冲区大小（元数据缓存）
+Dirty             当前脏页总量
+Writeback         正在回写的页面总量
+AnonPages         匿名页总量（堆、栈等）
+Active(file)      活跃的文件页（页缓存中经常访问的页面）
+Inactive(file)    非活跃的文件页（页缓存中不常访问的页面）</code></pre>
+            <p>监控脚本示例：</p>
+            <div class="sourceCode" id="cb61"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb61-1"><a href="#cb61-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb61-2"><a href="#cb61-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 每秒输出页缓存关键指标</span></span>
+<span id="cb61-3"><a href="#cb61-3" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="fu">true</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb61-4"><a href="#cb61-4" aria-hidden="true" tabindex="-1"></a>    <span class="va">timestamp</span><span class="op">=</span><span class="va">$(</span><span class="fu">date</span> <span class="st">&#39;+%Y-%m-%d %H:%M:%S&#39;</span><span class="va">)</span></span>
+<span id="cb61-5"><a href="#cb61-5" aria-hidden="true" tabindex="-1"></a>    <span class="va">cached</span><span class="op">=</span><span class="va">$(</span><span class="fu">grep</span> <span class="st">&#39;^Cached:&#39;</span> /proc/meminfo <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{print $2}&#39;</span><span class="va">)</span></span>
+<span id="cb61-6"><a href="#cb61-6" aria-hidden="true" tabindex="-1"></a>    <span class="va">dirty</span><span class="op">=</span><span class="va">$(</span><span class="fu">grep</span> <span class="st">&#39;^Dirty:&#39;</span> /proc/meminfo <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{print $2}&#39;</span><span class="va">)</span></span>
+<span id="cb61-7"><a href="#cb61-7" aria-hidden="true" tabindex="-1"></a>    <span class="va">writeback</span><span class="op">=</span><span class="va">$(</span><span class="fu">grep</span> <span class="st">&#39;^Writeback:&#39;</span> /proc/meminfo <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{print $2}&#39;</span><span class="va">)</span></span>
+<span id="cb61-8"><a href="#cb61-8" aria-hidden="true" tabindex="-1"></a>    <span class="va">active_file</span><span class="op">=</span><span class="va">$(</span><span class="fu">grep</span> <span class="st">&#39;^Active(file):&#39;</span> /proc/meminfo <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{print $2}&#39;</span><span class="va">)</span></span>
+<span id="cb61-9"><a href="#cb61-9" aria-hidden="true" tabindex="-1"></a>    <span class="va">inactive_file</span><span class="op">=</span><span class="va">$(</span><span class="fu">grep</span> <span class="st">&#39;^Inactive(file):&#39;</span> /proc/meminfo <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{print $2}&#39;</span><span class="va">)</span></span>
+<span id="cb61-10"><a href="#cb61-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-11"><a href="#cb61-11" aria-hidden="true" tabindex="-1"></a>    <span class="bu">printf</span> <span class="st">&quot;%s  Cached: %8s kB  Dirty: %8s kB  WB: %6s kB  Act: %8s kB  Inact: %8s kB\n&quot;</span> <span class="dt">\</span></span>
+<span id="cb61-12"><a href="#cb61-12" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;</span><span class="va">$timestamp</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$cached</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$dirty</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$writeback</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$active_file</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$inactive_file</span><span class="st">&quot;</span></span>
+<span id="cb61-13"><a href="#cb61-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-14"><a href="#cb61-14" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sleep</span> 1</span>
+<span id="cb61-15"><a href="#cb61-15" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+            <h3 id="vmstat">6.3 vmstat</h3>
+            <p><code>vmstat</code> 提供了系统级的 I/O 和内存统计：</p>
+            <div class="sourceCode" id="cb62"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb62-1"><a href="#cb62-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 每秒输出一次 vmstat</span></span>
+<span id="cb62-2"><a href="#cb62-2" aria-hidden="true" tabindex="-1"></a><span class="fu">vmstat</span> 1 5</span></code></pre></div>
+            <pre class="text"><code>procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0  51200 125000  84000 5400000    0    0   120  2400  800 1200  5  3 90  2  0
+ 1  0  51200 124000  84000 5401000    0    0    80  1600  750 1100  4  2 92  2  0</code></pre>
+            <p>与页缓存相关的列：</p>
+            <pre class="text"><code>列名    含义                                    关注点
+────────────────────────────────────────────────────────────
+cache   页缓存大小                              持续下降可能表示内存压力
+si      从 swap 读入的数据量（KB/s）            非零表示正在使用 swap
+so      写入 swap 的数据量（KB/s）              非零表示内存不足
+bi      从块设备读入的数据量（KB/s）            包含缓存未命中导致的磁盘读
+bo      写入块设备的数据量（KB/s）              包含脏页回写
+wa      CPU 等待 I/O 的时间比例                 高值表示 I/O 瓶颈</code></pre>
+            <h3 id="procvmstat">6.4 /proc/vmstat</h3>
+            <p><code>/proc/vmstat</code>
+            包含了大量内核虚拟内存子系统的计数器：</p>
+            <div class="sourceCode" id="cb65"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb65-1"><a href="#cb65-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 页缓存命中和未命中（如果内核版本支持）</span></span>
+<span id="cb65-2"><a href="#cb65-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;pgpgin|pgpgout|pswpin|pswpout|pgfault|pgmajfault&#39;</span> /proc/vmstat</span></code></pre></div>
+            <pre class="text"><code>关键计数器：
+──────────────────────────────────────────────────
+pgpgin          从磁盘读入的页面数（含页缓存填充）
+pgpgout         写入磁盘的页面数（含脏页回写）
+pswpin          从 swap 读入的页面数
+pswpout         写入 swap 的页面数
+pgfault         缺页异常总数（含 minor fault）
+pgmajfault      主缺页异常数（需要磁盘 I/O 的缺页）</code></pre>
+            <p>主缺页异常（Major Page
+            Fault）意味着请求的页面不在页缓存中，必须从磁盘读取。监控
+            <code>pgmajfault</code>
+            的增长率可以直观地反映页缓存的未命中情况：</p>
+            <div class="sourceCode" id="cb67"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb67-1"><a href="#cb67-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 监控主缺页异常率</span></span>
+<span id="cb67-2"><a href="#cb67-2" aria-hidden="true" tabindex="-1"></a><span class="ex">watch</span> <span class="at">-n</span> 1 <span class="st">&#39;grep pgmajfault /proc/vmstat&#39;</span></span></code></pre></div>
+            <h3 id="sar-历史数据">6.5 sar 历史数据</h3>
+            <p><code>sar</code> 命令（来自 sysstat
+            包）可以收集和查看历史性能数据：</p>
+            <div class="sourceCode" id="cb68"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb68-1"><a href="#cb68-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 内存使用历史（含页缓存）</span></span>
+<span id="cb68-2"><a href="#cb68-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sar</span> <span class="at">-r</span> 1 5</span>
+<span id="cb68-3"><a href="#cb68-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出：kbmemfree kbavail kbbuffers kbcached kbcommit %commit kbactive kbinact kbdirty</span></span>
+<span id="cb68-4"><a href="#cb68-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb68-5"><a href="#cb68-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 分页活动历史</span></span>
+<span id="cb68-6"><a href="#cb68-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sar</span> <span class="at">-B</span> 1 5</span>
+<span id="cb68-7"><a href="#cb68-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出：pgpgin/s pgpgout/s fault/s majflt/s pgfree/s pgscank/s pgscand/s pgsteal/s</span></span>
+<span id="cb68-8"><a href="#cb68-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb68-9"><a href="#cb68-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看历史数据（指定日期）</span></span>
+<span id="cb68-10"><a href="#cb68-10" aria-hidden="true" tabindex="-1"></a><span class="ex">sar</span> <span class="at">-r</span> <span class="at">-f</span> /var/log/sysstat/sa18   <span class="co"># 查看 18 号的数据</span></span></code></pre></div>
+            <p><code>sar -B</code> 中的关键指标：</p>
+            <pre class="text"><code>指标        含义                              告警阈值
+────────────────────────────────────────────────────
+pgscank/s   kswapd 每秒扫描的页面数           持续 &gt; 0 表示内存压力
+pgscand/s   直接回收每秒扫描的页面数          &gt; 0 表示严重内存压力
+pgsteal/s   每秒成功回收的页面数              应接近 pgscank/s + pgscand/s
+majflt/s    每秒主缺页异常数                  持续高值表示缓存不足</code></pre>
+            <h3 id="bcc-工具cachestat-与-cachetop">6.6 BCC
+            工具：cachestat 与 cachetop</h3>
+            <p>BCC（BPF Compiler Collection）提供了基于 eBPF（Extended
+            Berkeley Packet Filter）的高级页缓存监控工具：</p>
+            <div class="sourceCode" id="cb70"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb70-1"><a href="#cb70-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 安装 bcc-tools（Ubuntu/Debian）</span></span>
+<span id="cb70-2"><a href="#cb70-2" aria-hidden="true" tabindex="-1"></a><span class="ex">apt</span> install bcc-tools</span>
+<span id="cb70-3"><a href="#cb70-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb70-4"><a href="#cb70-4" aria-hidden="true" tabindex="-1"></a><span class="co"># cachestat：全局页缓存命中率统计（每秒）</span></span>
+<span id="cb70-5"><a href="#cb70-5" aria-hidden="true" tabindex="-1"></a><span class="ex">cachestat</span> 1</span></code></pre></div>
+            <pre class="text"><code># cachestat 输出示例：
+    HITS   MISSES  DIRTIES HITRATIO   BUFFERS_MB  CACHED_MB
+   15382      234      180   98.50%          82      5273
+   14890      156      220   98.96%          82      5275
+   16001       89       95   99.45%          82      5276</code></pre>
+            <div class="sourceCode" id="cb72"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb72-1"><a href="#cb72-1" aria-hidden="true" tabindex="-1"></a><span class="co"># cachetop：按进程显示页缓存命中率</span></span>
+<span id="cb72-2"><a href="#cb72-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cachetop</span> 5</span></code></pre></div>
+            <pre class="text"><code># cachetop 输出示例：
+PID      UID      CMD              HITS     MISSES   DIRTIES  READ_HIT%  WRITE_HIT%
+18234    postgres postgres         12345    89       234      99.28%     100.00%
+18240    mysql    mysqld           8901     456      567      95.12%     100.00%
+1024     root     rsync            2345     3456     0        40.42%     -</code></pre>
+            <p><code>cachetop</code>
+            特别有用——它能精确地告诉你哪个进程的页缓存命中率低，从而定位需要优化的应用。</p>
+            <h3 id="fincore检查文件缓存状态">6.7
+            fincore：检查文件缓存状态</h3>
+            <p><code>fincore</code> 命令（来自 util-linux
+            包）可以查看特定文件有多少数据在页缓存中：</p>
+            <div class="sourceCode" id="cb74"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb74-1"><a href="#cb74-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件的缓存状态</span></span>
+<span id="cb74-2"><a href="#cb74-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fincore</span> /var/lib/postgresql/14/main/base/16384/16385</span>
+<span id="cb74-3"><a href="#cb74-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb74-4"><a href="#cb74-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb74-5"><a href="#cb74-5" aria-hidden="true" tabindex="-1"></a><span class="co"># RES  PAGES  SIZE FILE</span></span>
+<span id="cb74-6"><a href="#cb74-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 12M   3072  120M /var/lib/postgresql/14/main/base/16384/16385</span></span>
+<span id="cb74-7"><a href="#cb74-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 说明：120MB 的文件中有 12MB（3072 页）在页缓存中</span></span></code></pre></div>
+            <div class="sourceCode" id="cb75"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb75-1"><a href="#cb75-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 批量查看目录下所有文件的缓存状态</span></span>
+<span id="cb75-2"><a href="#cb75-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fincore</span> /var/lib/postgresql/14/main/base/16384/<span class="pp">*</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-k1</span> <span class="at">-h</span> <span class="at">-r</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-20</span></span></code></pre></div>
+            <p>也可以使用 <code>vmtouch</code>
+            工具获取更详细的信息：</p>
+            <div class="sourceCode" id="cb76"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb76-1"><a href="#cb76-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 安装 vmtouch</span></span>
+<span id="cb76-2"><a href="#cb76-2" aria-hidden="true" tabindex="-1"></a><span class="ex">apt</span> install vmtouch</span>
+<span id="cb76-3"><a href="#cb76-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb76-4"><a href="#cb76-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件的缓存状态</span></span>
+<span id="cb76-5"><a href="#cb76-5" aria-hidden="true" tabindex="-1"></a><span class="ex">vmtouch</span> /var/lib/postgresql/14/main/base/16384/16385</span>
+<span id="cb76-6"><a href="#cb76-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb76-7"><a href="#cb76-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb76-8"><a href="#cb76-8" aria-hidden="true" tabindex="-1"></a><span class="co">#            Files: 1</span></span>
+<span id="cb76-9"><a href="#cb76-9" aria-hidden="true" tabindex="-1"></a><span class="co">#      Directories: 0</span></span>
+<span id="cb76-10"><a href="#cb76-10" aria-hidden="true" tabindex="-1"></a><span class="co">#   Resident Pages: 3072/30720  12M/120M  10.0%</span></span>
+<span id="cb76-11"><a href="#cb76-11" aria-hidden="true" tabindex="-1"></a><span class="co">#          Elapsed: 0.005 seconds</span></span></code></pre></div>
+            <h3 id="综合监控脚本">6.8 综合监控脚本</h3>
+            <p>以下是一个综合监控页缓存状态的脚本：</p>
+            <div class="sourceCode" id="cb77"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb77-1"><a href="#cb77-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb77-2"><a href="#cb77-2" aria-hidden="true" tabindex="-1"></a><span class="co"># page_cache_monitor.sh - 页缓存综合监控脚本</span></span>
+<span id="cb77-3"><a href="#cb77-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-4"><a href="#cb77-4" aria-hidden="true" tabindex="-1"></a><span class="va">INTERVAL</span><span class="op">=</span><span class="va">${1</span><span class="op">:-</span>5<span class="va">}</span></span>
+<span id="cb77-5"><a href="#cb77-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-6"><a href="#cb77-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== Page Cache Monitor (interval: </span><span class="va">${INTERVAL}</span><span class="st">s) ===&quot;</span></span>
+<span id="cb77-7"><a href="#cb77-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb77-8"><a href="#cb77-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-9"><a href="#cb77-9" aria-hidden="true" tabindex="-1"></a><span class="va">prev_pgpgin</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgpgin / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-10"><a href="#cb77-10" aria-hidden="true" tabindex="-1"></a><span class="va">prev_pgpgout</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgpgout / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-11"><a href="#cb77-11" aria-hidden="true" tabindex="-1"></a><span class="va">prev_pgmajfault</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgmajfault / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-12"><a href="#cb77-12" aria-hidden="true" tabindex="-1"></a><span class="va">prev_pgsteal_direct</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgsteal_direct / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-13"><a href="#cb77-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-14"><a href="#cb77-14" aria-hidden="true" tabindex="-1"></a><span class="bu">printf</span> <span class="st">&quot;%-20s %10s %10s %10s %10s %10s %10s %10s\n&quot;</span> <span class="dt">\</span></span>
+<span id="cb77-15"><a href="#cb77-15" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;Timestamp&quot;</span> <span class="st">&quot;Cached_MB&quot;</span> <span class="st">&quot;Dirty_MB&quot;</span> <span class="st">&quot;WB_MB&quot;</span> <span class="st">&quot;PgIn/s&quot;</span> <span class="st">&quot;PgOut/s&quot;</span> <span class="st">&quot;MajFlt/s&quot;</span> <span class="st">&quot;DRecl/s&quot;</span></span>
+<span id="cb77-16"><a href="#cb77-16" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;─────────────────────────────────────────────────────────────────────────────────────────────&quot;</span></span>
+<span id="cb77-17"><a href="#cb77-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-18"><a href="#cb77-18" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="fu">true</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb77-19"><a href="#cb77-19" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sleep</span> <span class="st">&quot;</span><span class="va">$INTERVAL</span><span class="st">&quot;</span></span>
+<span id="cb77-20"><a href="#cb77-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-21"><a href="#cb77-21" aria-hidden="true" tabindex="-1"></a>    <span class="va">timestamp</span><span class="op">=</span><span class="va">$(</span><span class="fu">date</span> <span class="st">&#39;+%H:%M:%S&#39;</span><span class="va">)</span></span>
+<span id="cb77-22"><a href="#cb77-22" aria-hidden="true" tabindex="-1"></a>    <span class="va">cached</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^Cached:/ {printf &quot;%.0f&quot;, $2/1024}&#39;</span> /proc/meminfo<span class="va">)</span></span>
+<span id="cb77-23"><a href="#cb77-23" aria-hidden="true" tabindex="-1"></a>    <span class="va">dirty</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^Dirty:/ {printf &quot;%.0f&quot;, $2/1024}&#39;</span> /proc/meminfo<span class="va">)</span></span>
+<span id="cb77-24"><a href="#cb77-24" aria-hidden="true" tabindex="-1"></a>    <span class="va">writeback</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^Writeback:/ {printf &quot;%.0f&quot;, $2/1024}&#39;</span> /proc/meminfo<span class="va">)</span></span>
+<span id="cb77-25"><a href="#cb77-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-26"><a href="#cb77-26" aria-hidden="true" tabindex="-1"></a>    <span class="va">curr_pgpgin</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgpgin / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-27"><a href="#cb77-27" aria-hidden="true" tabindex="-1"></a>    <span class="va">curr_pgpgout</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgpgout / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-28"><a href="#cb77-28" aria-hidden="true" tabindex="-1"></a>    <span class="va">curr_pgmajfault</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgmajfault / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-29"><a href="#cb77-29" aria-hidden="true" tabindex="-1"></a>    <span class="va">curr_pgsteal_direct</span><span class="op">=</span><span class="va">$(</span><span class="fu">awk</span> <span class="st">&#39;/^pgsteal_direct / {print $2}&#39;</span> /proc/vmstat<span class="va">)</span></span>
+<span id="cb77-30"><a href="#cb77-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-31"><a href="#cb77-31" aria-hidden="true" tabindex="-1"></a>    <span class="va">pgin_rate</span><span class="op">=</span><span class="va">$((</span> (<span class="va">curr_pgpgin</span> <span class="op">-</span> <span class="va">prev_pgpgin</span>) <span class="op">/</span> <span class="va">INTERVAL</span> <span class="va">))</span></span>
+<span id="cb77-32"><a href="#cb77-32" aria-hidden="true" tabindex="-1"></a>    <span class="va">pgout_rate</span><span class="op">=</span><span class="va">$((</span> (<span class="va">curr_pgpgout</span> <span class="op">-</span> <span class="va">prev_pgpgout</span>) <span class="op">/</span> <span class="va">INTERVAL</span> <span class="va">))</span></span>
+<span id="cb77-33"><a href="#cb77-33" aria-hidden="true" tabindex="-1"></a>    <span class="va">majfault_rate</span><span class="op">=</span><span class="va">$((</span> (<span class="va">curr_pgmajfault</span> <span class="op">-</span> <span class="va">prev_pgmajfault</span>) <span class="op">/</span> <span class="va">INTERVAL</span> <span class="va">))</span></span>
+<span id="cb77-34"><a href="#cb77-34" aria-hidden="true" tabindex="-1"></a>    <span class="va">drecl_rate</span><span class="op">=</span><span class="va">$((</span> (<span class="va">curr_pgsteal_direct</span> <span class="op">-</span> <span class="va">prev_pgsteal_direct</span>) <span class="op">/</span> <span class="va">INTERVAL</span> <span class="va">))</span></span>
+<span id="cb77-35"><a href="#cb77-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-36"><a href="#cb77-36" aria-hidden="true" tabindex="-1"></a>    <span class="bu">printf</span> <span class="st">&quot;%-20s %10s %10s %10s %10s %10s %10s %10s\n&quot;</span> <span class="dt">\</span></span>
+<span id="cb77-37"><a href="#cb77-37" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;</span><span class="va">$timestamp</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$cached</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$dirty</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$writeback</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$pgin_rate</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$pgout_rate</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb77-38"><a href="#cb77-38" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;</span><span class="va">$majfault_rate</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$drecl_rate</span><span class="st">&quot;</span></span>
+<span id="cb77-39"><a href="#cb77-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-40"><a href="#cb77-40" aria-hidden="true" tabindex="-1"></a>    <span class="va">prev_pgpgin</span><span class="op">=</span><span class="va">$curr_pgpgin</span></span>
+<span id="cb77-41"><a href="#cb77-41" aria-hidden="true" tabindex="-1"></a>    <span class="va">prev_pgpgout</span><span class="op">=</span><span class="va">$curr_pgpgout</span></span>
+<span id="cb77-42"><a href="#cb77-42" aria-hidden="true" tabindex="-1"></a>    <span class="va">prev_pgmajfault</span><span class="op">=</span><span class="va">$curr_pgmajfault</span></span>
+<span id="cb77-43"><a href="#cb77-43" aria-hidden="true" tabindex="-1"></a>    <span class="va">prev_pgsteal_direct</span><span class="op">=</span><span class="va">$curr_pgsteal_direct</span></span>
+<span id="cb77-44"><a href="#cb77-44" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+            <hr />
+            <h2 id="七page-cache-与数据库">七、Page Cache 与数据库</h2>
+            <h3 id="双重缓冲问题">7.1 双重缓冲问题</h3>
+            <p>大多数数据库都有自己的缓冲池（Buffer
+            Pool），这就导致了”双重缓冲”（Double
+            Buffering）问题——同一份数据同时存在于数据库的缓冲池和操作系统的页缓存中，浪费了宝贵的内存资源。</p>
+            <pre class="text"><code>双重缓冲的数据路径：
+──────────────────────────────────────────
+
+读取路径：
+磁盘 ──&gt; Page Cache ──&gt; 数据库 Buffer Pool ──&gt; 应用程序
+         （内核管理）     （数据库管理）
+
+写入路径：
+应用程序 ──&gt; 数据库 Buffer Pool ──&gt; Page Cache ──&gt; 磁盘
+              （数据库管理）        （内核管理）
+
+问题：同一份 16KB 的 InnoDB 页面，在内存中可能存在两份拷贝</code></pre>
+            <p>不同数据库对这个问题的处理策略不同：</p>
+            <pre class="text"><code>数据库          缓冲池             页缓存策略         说明
+─────────────────────────────────────────────────────────────
+MySQL/InnoDB    Buffer Pool       O_DIRECT           绕过页缓存，避免双重缓冲
+PostgreSQL      Shared Buffers    依赖页缓存          共享缓冲区通常设为内存的 25%
+Oracle          SGA               O_DIRECT           绕过页缓存
+MongoDB/WiredTiger 内部缓存       依赖页缓存          默认使用 50% 可用内存
+RocksDB         Block Cache       O_DIRECT（可选）    默认绕过页缓存</code></pre>
+            <h3 id="o_direct-绕过页缓存">7.2 O_DIRECT 绕过页缓存</h3>
+            <p>直接 I/O（Direct I/O）通过在 <code>open()</code> 时指定
+            <code>O_DIRECT</code>
+            标志，绕过页缓存，直接在用户空间缓冲区和块设备之间传输数据：</p>
+            <div class="sourceCode" id="cb80"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb80-1"><a href="#cb80-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb80-2"><a href="#cb80-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb80-3"><a href="#cb80-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb80-4"><a href="#cb80-4" aria-hidden="true" tabindex="-1"></a><span class="co">/* 打开文件时指定 O_DIRECT */</span></span>
+<span id="cb80-5"><a href="#cb80-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/db/tablespace&quot;</span><span class="op">,</span> O_RDWR <span class="op">|</span> O_DIRECT<span class="op">);</span></span>
+<span id="cb80-6"><a href="#cb80-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb80-7"><a href="#cb80-7" aria-hidden="true" tabindex="-1"></a><span class="co">/* O_DIRECT 的对齐要求：</span></span>
+<span id="cb80-8"><a href="#cb80-8" aria-hidden="true" tabindex="-1"></a><span class="co"> * 1. 用户缓冲区地址必须按 512 字节（或文件系统块大小）对齐</span></span>
+<span id="cb80-9"><a href="#cb80-9" aria-hidden="true" tabindex="-1"></a><span class="co"> * 2. I/O 大小必须是 512 字节（或文件系统块大小）的倍数</span></span>
+<span id="cb80-10"><a href="#cb80-10" aria-hidden="true" tabindex="-1"></a><span class="co"> * 3. 文件偏移量必须是 512 字节（或文件系统块大小）的倍数</span></span>
+<span id="cb80-11"><a href="#cb80-11" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb80-12"><a href="#cb80-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb80-13"><a href="#cb80-13" aria-hidden="true" tabindex="-1"></a><span class="co">/* 分配对齐的缓冲区 */</span></span>
+<span id="cb80-14"><a href="#cb80-14" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>buf<span class="op">;</span></span>
+<span id="cb80-15"><a href="#cb80-15" aria-hidden="true" tabindex="-1"></a>posix_memalign<span class="op">(&amp;</span>buf<span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> <span class="dv">16384</span><span class="op">);</span>  <span class="co">/* 4KB 对齐，16KB 大小 */</span></span>
+<span id="cb80-16"><a href="#cb80-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb80-17"><a href="#cb80-17" aria-hidden="true" tabindex="-1"></a><span class="co">/* 直接读写 */</span></span>
+<span id="cb80-18"><a href="#cb80-18" aria-hidden="true" tabindex="-1"></a>pread<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> <span class="dv">16384</span><span class="op">,</span> offset<span class="op">);</span></span>
+<span id="cb80-19"><a href="#cb80-19" aria-hidden="true" tabindex="-1"></a>pwrite<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> <span class="dv">16384</span><span class="op">,</span> offset<span class="op">);</span></span></code></pre></div>
+            <p>InnoDB 的 <code>innodb_flush_method</code>
+            参数控制是否使用 O_DIRECT：</p>
+            <pre class="text"><code>innodb_flush_method 选项：
+──────────────────────────────────────────────
+fsync           默认值，使用 fsync() 刷新，不用 O_DIRECT
+O_DIRECT        数据文件使用 O_DIRECT，日志文件使用 fsync()
+O_DIRECT_NO_FSYNC  数据文件使用 O_DIRECT，假设元数据无需 fsync
+O_DSYNC         日志文件使用 O_DSYNC</code></pre>
+            <h3 id="postgresql-与操作系统缓存的交互">7.3 PostgreSQL
+            与操作系统缓存的交互</h3>
+            <p>PostgreSQL 的设计哲学与 InnoDB
+            不同——它<strong>依赖</strong>操作系统的页缓存，而不是绕过它。这有几个重要的工程含义：</p>
+            <pre class="text"><code>PostgreSQL 的内存架构：
+──────────────────────────────────────
+Shared Buffers（通常为总内存的 25%）
+    |
+    | PostgreSQL 管理的缓存层
+    | 使用时钟扫描（Clock Sweep）算法淘汰
+    |
+    v
+操作系统 Page Cache（占据大部分剩余内存）
+    |
+    | 内核管理的缓存层
+    | 使用 LRU 算法淘汰
+    |
+    v
+磁盘</code></pre>
+            <div class="sourceCode" id="cb83"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb83-1"><a href="#cb83-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL 推荐配置示例（64GB 内存服务器）</span></span>
+<span id="cb83-2"><a href="#cb83-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-3"><a href="#cb83-3" aria-hidden="true" tabindex="-1"></a><span class="co"># shared_buffers = 16GB（总内存的 25%）</span></span>
+<span id="cb83-4"><a href="#cb83-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 不宜设置过大，因为操作系统还需要页缓存空间</span></span>
+<span id="cb83-5"><a href="#cb83-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-6"><a href="#cb83-6" aria-hidden="true" tabindex="-1"></a><span class="co"># effective_cache_size = 48GB（shared_buffers + 预期的页缓存大小）</span></span>
+<span id="cb83-7"><a href="#cb83-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 这不是内存分配参数，而是查询优化器的提示</span></span>
+<span id="cb83-8"><a href="#cb83-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 告诉优化器&quot;大约有这么多数据可以从缓存中获取&quot;</span></span>
+<span id="cb83-9"><a href="#cb83-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-10"><a href="#cb83-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 操作系统参数</span></span>
+<span id="cb83-11"><a href="#cb83-11" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.swappiness=1          <span class="co"># 尽量不换出匿名页</span></span>
+<span id="cb83-12"><a href="#cb83-12" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=2  <span class="co"># 尽早开始回写</span></span>
+<span id="cb83-13"><a href="#cb83-13" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=5            <span class="co"># 降低硬限制</span></span></code></pre></div>
+            <p><code>shared_buffers</code> 不宜设置过大的原因是
+            PostgreSQL
+            在做检查点（Checkpoint）时需要刷出共享缓冲区中的脏页。如果共享缓冲区太大，检查点期间会产生大量的集中写入，导致
+            I/O 风暴。</p>
+            <h3 id="依赖页缓存还是应用缓冲池">7.4
+            依赖页缓存还是应用缓冲池</h3>
+            <p>选择依赖页缓存还是应用自建缓冲池，取决于具体的工作负载特征：</p>
+            <pre class="text"><code>选择页缓存的场景：
+──────────────────
+- 应用不需要精细控制缓存淘汰策略
+- 多个进程/应用需要共享同一份缓存数据
+- 应用开发复杂度敏感，不想自己管理缓存
+- 文件访问模式以顺序读为主
+
+选择应用缓冲池的场景：
+──────────────────────
+- 需要精确控制哪些数据留在缓存中
+- 需要自定义淘汰策略（如 LRU-K、ARC）
+- 数据页大小与操作系统页大小不一致
+- 需要做页面级别的锁管理
+- 高性能数据库等对延迟极度敏感的场景</code></pre>
+            <h3 id="数据库服务器调优策略">7.5 数据库服务器调优策略</h3>
+            <p>针对数据库服务器的页缓存调优策略汇总：</p>
+            <div class="sourceCode" id="cb85"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb85-1"><a href="#cb85-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb85-2"><a href="#cb85-2" aria-hidden="true" tabindex="-1"></a><span class="co"># db_server_tuning.sh - 数据库服务器页缓存相关调优</span></span>
+<span id="cb85-3"><a href="#cb85-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb85-4"><a href="#cb85-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 减少 swap 使用倾向</span></span>
+<span id="cb85-5"><a href="#cb85-5" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.swappiness=1</span>
+<span id="cb85-6"><a href="#cb85-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb85-7"><a href="#cb85-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 保守的脏页参数</span></span>
+<span id="cb85-8"><a href="#cb85-8" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=3</span>
+<span id="cb85-9"><a href="#cb85-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=10</span>
+<span id="cb85-10"><a href="#cb85-10" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=1000</span>
+<span id="cb85-11"><a href="#cb85-11" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_writeback_centisecs=300</span>
+<span id="cb85-12"><a href="#cb85-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb85-13"><a href="#cb85-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 增大最小空闲内存保留</span></span>
+<span id="cb85-14"><a href="#cb85-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 对于 64GB 内存的服务器</span></span>
+<span id="cb85-15"><a href="#cb85-15" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.min_free_kbytes=524288  <span class="co"># 512MB</span></span>
+<span id="cb85-16"><a href="#cb85-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb85-17"><a href="#cb85-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 禁用透明大页（对数据库通常有害）</span></span>
+<span id="cb85-18"><a href="#cb85-18" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> never <span class="op">&gt;</span> /sys/kernel/mm/transparent_hugepage/enabled</span>
+<span id="cb85-19"><a href="#cb85-19" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> never <span class="op">&gt;</span> /sys/kernel/mm/transparent_hugepage/defrag</span>
+<span id="cb85-20"><a href="#cb85-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb85-21"><a href="#cb85-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. 调整 NUMA 策略（如果是多 NUMA 节点服务器）</span></span>
+<span id="cb85-22"><a href="#cb85-22" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.zone_reclaim_mode=0  <span class="co"># 允许跨 NUMA 节点分配</span></span>
+<span id="cb85-23"><a href="#cb85-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb85-24"><a href="#cb85-24" aria-hidden="true" tabindex="-1"></a><span class="co"># 6. 对于使用 O_DIRECT 的数据库（如 MySQL），减小预读</span></span>
+<span id="cb85-25"><a href="#cb85-25" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 64 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span></code></pre></div>
+            <hr />
+            <h2 id="八page-cache-高级操作">八、Page Cache 高级操作</h2>
+            <h3 id="清除页缓存">8.1 清除页缓存</h3>
+            <p>Linux 提供了一个接口来手动清除各种缓存：</p>
+            <div class="sourceCode" id="cb86"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb86-1"><a href="#cb86-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 清除页缓存</span></span>
+<span id="cb86-2"><a href="#cb86-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> 1 <span class="op">&gt;</span> /proc/sys/vm/drop_caches</span>
+<span id="cb86-3"><a href="#cb86-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb86-4"><a href="#cb86-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 清除 dentries 和 inodes 缓存</span></span>
+<span id="cb86-5"><a href="#cb86-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> 2 <span class="op">&gt;</span> /proc/sys/vm/drop_caches</span>
+<span id="cb86-6"><a href="#cb86-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb86-7"><a href="#cb86-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 清除页缓存、dentries 和 inodes 缓存</span></span>
+<span id="cb86-8"><a href="#cb86-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> 3 <span class="op">&gt;</span> /proc/sys/vm/drop_caches</span></code></pre></div>
+            <p><strong>注意</strong>：<code>sync</code> 必须在
+            <code>drop_caches</code>
+            之前执行，否则脏页不会被清除（<code>drop_caches</code>
+            只清除干净的缓存页面，不会丢弃脏页）。</p>
+            <pre class="text"><code>drop_caches 的使用场景：
+──────────────────────────
+适用：
+- 基准测试前清除缓存，获得冷启动数据
+- 调试页缓存相关问题
+- 观察没有缓存时的真实 I/O 模式
+
+不适用（生产环境慎用）：
+- 试图&quot;释放内存&quot;——页缓存本身就是有效利用内存
+- 定期清除缓存——会导致性能急剧下降
+- 作为 OOM 的应对手段——应该排查真正的内存泄漏</code></pre>
+            <h3 id="posix_fadvise-缓存控制">8.2 posix_fadvise
+            缓存控制</h3>
+            <p><code>posix_fadvise()</code>
+            是应用程序控制页缓存行为的主要接口：</p>
+            <div class="sourceCode" id="cb88"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb88-1"><a href="#cb88-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb88-2"><a href="#cb88-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb88-3"><a href="#cb88-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;datafile&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb88-4"><a href="#cb88-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb88-5"><a href="#cb88-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* FADV_DONTNEED：从缓存中淘汰指定区域 */</span></span>
+<span id="cb88-6"><a href="#cb88-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* 适用于日志处理：读完即丢，避免缓存污染 */</span></span>
+<span id="cb88-7"><a href="#cb88-7" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_DONTNEED<span class="op">);</span></span>
+<span id="cb88-8"><a href="#cb88-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb88-9"><a href="#cb88-9" aria-hidden="true" tabindex="-1"></a><span class="co">/* FADV_WILLNEED：将指定区域预读到缓存 */</span></span>
+<span id="cb88-10"><a href="#cb88-10" aria-hidden="true" tabindex="-1"></a><span class="co">/* 适用于已知即将访问的数据 */</span></span>
+<span id="cb88-11"><a href="#cb88-11" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span> POSIX_FADV_WILLNEED<span class="op">);</span></span>
+<span id="cb88-12"><a href="#cb88-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb88-13"><a href="#cb88-13" aria-hidden="true" tabindex="-1"></a><span class="co">/* FADV_NOREUSE：提示数据只会被访问一次 */</span></span>
+<span id="cb88-14"><a href="#cb88-14" aria-hidden="true" tabindex="-1"></a><span class="co">/* 注意：在许多 Linux 版本中这个提示被忽略 */</span></span>
+<span id="cb88-15"><a href="#cb88-15" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_NOREUSE<span class="op">);</span></span></code></pre></div>
+            <p><code>FADV_DONTNEED</code>
+            的一个经典用例是日志聚合系统。当 rsync
+            或日志收集器顺序读取大量日志文件时，这些数据只需要读取一次就会被发送到远端，不需要留在缓存中：</p>
+            <div class="sourceCode" id="cb89"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb89-1"><a href="#cb89-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 dd 读取文件后立即丢弃缓存</span></span>
+<span id="cb89-2"><a href="#cb89-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/var/log/syslog of=/dev/null bs=1M</span>
+<span id="cb89-3"><a href="#cb89-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 文件数据现在占据了页缓存</span></span>
+<span id="cb89-4"><a href="#cb89-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb89-5"><a href="#cb89-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 用 python 调用 posix_fadvise 清除</span></span>
+<span id="cb89-6"><a href="#cb89-6" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb89-7"><a href="#cb89-7" aria-hidden="true" tabindex="-1"></a><span class="st">import os</span></span>
+<span id="cb89-8"><a href="#cb89-8" aria-hidden="true" tabindex="-1"></a><span class="st">fd = os.open(&#39;/var/log/syslog&#39;, os.O_RDONLY)</span></span>
+<span id="cb89-9"><a href="#cb89-9" aria-hidden="true" tabindex="-1"></a><span class="st">os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)</span></span>
+<span id="cb89-10"><a href="#cb89-10" aria-hidden="true" tabindex="-1"></a><span class="st">os.close(fd)</span></span>
+<span id="cb89-11"><a href="#cb89-11" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="madvise-控制-mmap-区域">8.3 madvise 控制 mmap
+            区域</h3>
+            <p>对于使用 <code>mmap()</code> 映射的文件区域，使用
+            <code>madvise()</code> 来提供访问模式提示：</p>
+            <div class="sourceCode" id="cb90"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb90-1"><a href="#cb90-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/mman.h&gt;</span></span>
+<span id="cb90-2"><a href="#cb90-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb90-3"><a href="#cb90-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb90-4"><a href="#cb90-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;datafile&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb90-5"><a href="#cb90-5" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> size <span class="op">=</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">/* 1GB */</span></span>
+<span id="cb90-6"><a href="#cb90-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>addr <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> size<span class="op">,</span> PROT_READ<span class="op">,</span> MAP_SHARED<span class="op">,</span> fd<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb90-7"><a href="#cb90-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb90-8"><a href="#cb90-8" aria-hidden="true" tabindex="-1"></a><span class="co">/* MADV_SEQUENTIAL：顺序访问，增大预读 */</span></span>
+<span id="cb90-9"><a href="#cb90-9" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr<span class="op">,</span> size<span class="op">,</span> MADV_SEQUENTIAL<span class="op">);</span></span>
+<span id="cb90-10"><a href="#cb90-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb90-11"><a href="#cb90-11" aria-hidden="true" tabindex="-1"></a><span class="co">/* MADV_RANDOM：随机访问，禁用预读 */</span></span>
+<span id="cb90-12"><a href="#cb90-12" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr<span class="op">,</span> size<span class="op">,</span> MADV_RANDOM<span class="op">);</span></span>
+<span id="cb90-13"><a href="#cb90-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb90-14"><a href="#cb90-14" aria-hidden="true" tabindex="-1"></a><span class="co">/* MADV_WILLNEED：即将访问，预读到缓存 */</span></span>
+<span id="cb90-15"><a href="#cb90-15" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr <span class="op">+</span> offset<span class="op">,</span> length<span class="op">,</span> MADV_WILLNEED<span class="op">);</span></span>
+<span id="cb90-16"><a href="#cb90-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb90-17"><a href="#cb90-17" aria-hidden="true" tabindex="-1"></a><span class="co">/* MADV_DONTNEED：不再需要，可以淘汰 */</span></span>
+<span id="cb90-18"><a href="#cb90-18" aria-hidden="true" tabindex="-1"></a><span class="co">/* 注意：对于 MAP_PRIVATE 映射，这会丢弃修改 */</span></span>
+<span id="cb90-19"><a href="#cb90-19" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr <span class="op">+</span> offset<span class="op">,</span> length<span class="op">,</span> MADV_DONTNEED<span class="op">);</span></span>
+<span id="cb90-20"><a href="#cb90-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb90-21"><a href="#cb90-21" aria-hidden="true" tabindex="-1"></a><span class="co">/* MADV_FREE：页面可以被延迟回收（Linux 4.5+） */</span></span>
+<span id="cb90-22"><a href="#cb90-22" aria-hidden="true" tabindex="-1"></a><span class="co">/* 比 MADV_DONTNEED 更高效：只在内存压力时才回收 */</span></span>
+<span id="cb90-23"><a href="#cb90-23" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr <span class="op">+</span> offset<span class="op">,</span> length<span class="op">,</span> MADV_FREE<span class="op">);</span></span></code></pre></div>
+            <h3 id="sync_file_range-精细回写控制">8.4 sync_file_range
+            精细回写控制</h3>
+            <p><code>sync_file_range()</code> 提供了比
+            <code>fsync()</code>
+            更精细的回写控制，允许应用程序控制文件特定区域的回写行为：</p>
+            <div class="sourceCode" id="cb91"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb91-1"><a href="#cb91-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb91-2"><a href="#cb91-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb91-3"><a href="#cb91-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;datafile&quot;</span><span class="op">,</span> O_WRONLY<span class="op">);</span></span>
+<span id="cb91-4"><a href="#cb91-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb91-5"><a href="#cb91-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* 将指定范围的脏页提交到回写队列，但不等待完成 */</span></span>
+<span id="cb91-6"><a href="#cb91-6" aria-hidden="true" tabindex="-1"></a>sync_file_range<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span></span>
+<span id="cb91-7"><a href="#cb91-7" aria-hidden="true" tabindex="-1"></a>                SYNC_FILE_RANGE_WRITE<span class="op">);</span></span>
+<span id="cb91-8"><a href="#cb91-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb91-9"><a href="#cb91-9" aria-hidden="true" tabindex="-1"></a><span class="co">/* 等待之前提交的回写完成 */</span></span>
+<span id="cb91-10"><a href="#cb91-10" aria-hidden="true" tabindex="-1"></a>sync_file_range<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span></span>
+<span id="cb91-11"><a href="#cb91-11" aria-hidden="true" tabindex="-1"></a>                SYNC_FILE_RANGE_WAIT_BEFORE <span class="op">|</span> SYNC_FILE_RANGE_WRITE <span class="op">|</span></span>
+<span id="cb91-12"><a href="#cb91-12" aria-hidden="true" tabindex="-1"></a>                SYNC_FILE_RANGE_WAIT_AFTER<span class="op">);</span></span></code></pre></div>
+            <pre class="text"><code>sync_file_range 的标志位：
+──────────────────────────────────────────────────
+SYNC_FILE_RANGE_WAIT_BEFORE   等待已提交的回写完成
+SYNC_FILE_RANGE_WRITE         将脏页提交到回写队列
+SYNC_FILE_RANGE_WAIT_AFTER    等待本次提交的回写完成
+
+组合使用：
+- 仅 WRITE：异步提交回写，不等待（最常用）
+- WAIT_BEFORE | WRITE | WAIT_AFTER：等价于对范围做 fdatasync
+- WAIT_BEFORE | WRITE：确保之前的回写完成后再提交新的</code></pre>
+            <p><strong>注意</strong>：<code>sync_file_range()</code>
+            <strong>不保证数据持久化</strong>，因为它不会刷新文件元数据，也不会确保底层存储设备的写缓存被刷新。如果需要数据持久化保证，仍然需要使用
+            <code>fsync()</code> 或 <code>fdatasync()</code>。</p>
+            <h3 id="文件锁与页缓存一致性">8.5 文件锁与页缓存一致性</h3>
+            <p>页缓存保证同一台机器上多个进程通过
+            <code>read()</code>/<code>write()</code>
+            访问同一文件时的数据一致性——因为所有进程共享同一个页缓存。但在以下场景中需要额外注意：</p>
+            <pre class="text"><code>页缓存一致性边界：
+──────────────────────────────────────
+一致的场景：
+- 同一台机器上的多个进程通过 read/write 访问同一文件
+- 同一台机器上的 mmap 和 read/write 混合使用（内核保证一致）
+
+不一致的场景：
+- 网络文件系统（NFS/CIFS）：不同客户端的页缓存相互独立
+- O_DIRECT 和 buffered I/O 混合使用同一文件
+- 使用 mmap(MAP_PRIVATE) 后修改的数据不会写回文件</code></pre>
+            <p>在网络文件系统上使用文件锁（<code>flock()</code> 或
+            <code>fcntl()</code>
+            锁）时，需要特别注意页缓存一致性问题：</p>
+            <div class="sourceCode" id="cb94"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb94-1"><a href="#cb94-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/file.h&gt;</span></span>
+<span id="cb94-2"><a href="#cb94-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb94-3"><a href="#cb94-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb94-4"><a href="#cb94-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/nfs/shared/data&quot;</span><span class="op">,</span> O_RDWR<span class="op">);</span></span>
+<span id="cb94-5"><a href="#cb94-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb94-6"><a href="#cb94-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* 获取排他锁 */</span></span>
+<span id="cb94-7"><a href="#cb94-7" aria-hidden="true" tabindex="-1"></a>flock<span class="op">(</span>fd<span class="op">,</span> LOCK_EX<span class="op">);</span></span>
+<span id="cb94-8"><a href="#cb94-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb94-9"><a href="#cb94-9" aria-hidden="true" tabindex="-1"></a><span class="co">/* 在 NFS 上，获取锁后必须使缓存失效才能看到最新数据 */</span></span>
+<span id="cb94-10"><a href="#cb94-10" aria-hidden="true" tabindex="-1"></a><span class="co">/* 可以通过关闭并重新打开文件，或使用 O_DIRECT 来实现 */</span></span>
+<span id="cb94-11"><a href="#cb94-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb94-12"><a href="#cb94-12" aria-hidden="true" tabindex="-1"></a><span class="co">/* ... 读写操作 ... */</span></span>
+<span id="cb94-13"><a href="#cb94-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb94-14"><a href="#cb94-14" aria-hidden="true" tabindex="-1"></a><span class="co">/* 释放锁前确保数据持久化 */</span></span>
+<span id="cb94-15"><a href="#cb94-15" aria-hidden="true" tabindex="-1"></a>fsync<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb94-16"><a href="#cb94-16" aria-hidden="true" tabindex="-1"></a>flock<span class="op">(</span>fd<span class="op">,</span> LOCK_UN<span class="op">);</span></span></code></pre></div>
+            <hr />
+            <h2 id="九page-cache-调优实战">九、Page Cache 调优实战</h2>
+            <h3 id="面向工作负载的调优方案">9.1
+            面向工作负载的调优方案</h3>
+            <p>页缓存调优没有万能的参数配置。正确的方法是分析工作负载特征，然后针对性地调整参数。</p>
+            <pre class="text"><code>工作负载分析维度：
+──────────────────────────────────────
+1. 读写比例：读密集 vs 写密集 vs 混合
+2. 访问模式：顺序 vs 随机 vs 混合
+3. 工作集大小：是否能放入内存
+4. 延迟敏感度：在线服务 vs 批处理
+5. 数据一致性要求：允许丢失 vs 严格持久化</code></pre>
+            <h3 id="高吞吐流式处理">9.2 高吞吐流式处理</h3>
+            <p>视频流、日志收集、数据管道等场景的特征是大量顺序读写，对吞吐量要求高，对延迟不敏感：</p>
+            <div class="sourceCode" id="cb96"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb96-1"><a href="#cb96-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb96-2"><a href="#cb96-2" aria-hidden="true" tabindex="-1"></a><span class="co"># streaming_tuning.sh - 高吞吐流式处理调优</span></span>
+<span id="cb96-3"><a href="#cb96-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb96-4"><a href="#cb96-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 增大预读窗口，最大化顺序读吞吐</span></span>
+<span id="cb96-5"><a href="#cb96-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2048 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb96-6"><a href="#cb96-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb96-7"><a href="#cb96-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 允许更多脏页积累，减少回写频率，提高写合并机会</span></span>
+<span id="cb96-8"><a href="#cb96-8" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=10</span>
+<span id="cb96-9"><a href="#cb96-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=40</span>
+<span id="cb96-10"><a href="#cb96-10" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=6000   <span class="co"># 60 秒</span></span>
+<span id="cb96-11"><a href="#cb96-11" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_writeback_centisecs=1000  <span class="co"># 10 秒</span></span>
+<span id="cb96-12"><a href="#cb96-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb96-13"><a href="#cb96-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 增加 I/O 调度器队列深度（NVMe 设备）</span></span>
+<span id="cb96-14"><a href="#cb96-14" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1024 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/nr_requests</span>
+<span id="cb96-15"><a href="#cb96-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb96-16"><a href="#cb96-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 对于单次读取的大文件，建议应用使用 FADV_SEQUENTIAL</span></span>
+<span id="cb96-17"><a href="#cb96-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 以下是 Python 示例：</span></span>
+<span id="cb96-18"><a href="#cb96-18" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb96-19"><a href="#cb96-19" aria-hidden="true" tabindex="-1"></a><span class="st">import os</span></span>
+<span id="cb96-20"><a href="#cb96-20" aria-hidden="true" tabindex="-1"></a><span class="st">fd = os.open(&#39;/data/video/large_file.mp4&#39;, os.O_RDONLY)</span></span>
+<span id="cb96-21"><a href="#cb96-21" aria-hidden="true" tabindex="-1"></a><span class="st">os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)</span></span>
+<span id="cb96-22"><a href="#cb96-22" aria-hidden="true" tabindex="-1"></a><span class="st"># ... 流式读取 ...</span></span>
+<span id="cb96-23"><a href="#cb96-23" aria-hidden="true" tabindex="-1"></a><span class="st">os.close(fd)</span></span>
+<span id="cb96-24"><a href="#cb96-24" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="低延迟数据库">9.3 低延迟数据库</h3>
+            <p>在线事务处理（Online Transaction
+            Processing，OLTP）数据库的特征是随机读写、延迟敏感、数据一致性要求高：</p>
+            <div class="sourceCode" id="cb97"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb97-1"><a href="#cb97-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb97-2"><a href="#cb97-2" aria-hidden="true" tabindex="-1"></a><span class="co"># oltp_tuning.sh - 低延迟数据库调优</span></span>
+<span id="cb97-3"><a href="#cb97-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb97-4"><a href="#cb97-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 保守的脏页参数：减少回写风暴</span></span>
+<span id="cb97-5"><a href="#cb97-5" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=3</span>
+<span id="cb97-6"><a href="#cb97-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=10</span>
+<span id="cb97-7"><a href="#cb97-7" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=500    <span class="co"># 5 秒</span></span>
+<span id="cb97-8"><a href="#cb97-8" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_writeback_centisecs=100  <span class="co"># 1 秒</span></span>
+<span id="cb97-9"><a href="#cb97-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb97-10"><a href="#cb97-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 几乎不使用 swap</span></span>
+<span id="cb97-11"><a href="#cb97-11" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.swappiness=1</span>
+<span id="cb97-12"><a href="#cb97-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb97-13"><a href="#cb97-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 增大安全裕量，避免直接回收</span></span>
+<span id="cb97-14"><a href="#cb97-14" aria-hidden="true" tabindex="-1"></a><span class="va">TOTAL_MEM_KB</span><span class="op">=</span><span class="va">$(</span><span class="fu">grep</span> MemTotal /proc/meminfo <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{print $2}&#39;</span><span class="va">)</span></span>
+<span id="cb97-15"><a href="#cb97-15" aria-hidden="true" tabindex="-1"></a><span class="va">MIN_FREE</span><span class="op">=</span><span class="va">$((TOTAL_MEM_KB</span> <span class="op">/</span> <span class="dv">128</span><span class="va">))</span>  <span class="co"># 约 0.78% 的总内存</span></span>
+<span id="cb97-16"><a href="#cb97-16" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="va">$MIN_FREE</span> <span class="ot">-lt</span> 524288 <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb97-17"><a href="#cb97-17" aria-hidden="true" tabindex="-1"></a>    <span class="va">MIN_FREE</span><span class="op">=</span>524288  <span class="co"># 至少 512MB</span></span>
+<span id="cb97-18"><a href="#cb97-18" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb97-19"><a href="#cb97-19" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.min_free_kbytes=<span class="va">$MIN_FREE</span></span>
+<span id="cb97-20"><a href="#cb97-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb97-21"><a href="#cb97-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 减小预读（数据库多为随机 I/O）</span></span>
+<span id="cb97-22"><a href="#cb97-22" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 64 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb97-23"><a href="#cb97-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb97-24"><a href="#cb97-24" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用透明大页</span></span>
+<span id="cb97-25"><a href="#cb97-25" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> never <span class="op">&gt;</span> /sys/kernel/mm/transparent_hugepage/enabled</span>
+<span id="cb97-26"><a href="#cb97-26" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> never <span class="op">&gt;</span> /sys/kernel/mm/transparent_hugepage/defrag</span>
+<span id="cb97-27"><a href="#cb97-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb97-28"><a href="#cb97-28" aria-hidden="true" tabindex="-1"></a><span class="co"># NUMA 优化</span></span>
+<span id="cb97-29"><a href="#cb97-29" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.zone_reclaim_mode=0</span>
+<span id="cb97-30"><a href="#cb97-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb97-31"><a href="#cb97-31" aria-hidden="true" tabindex="-1"></a><span class="co"># 对于使用 O_DIRECT 的 MySQL/InnoDB：</span></span>
+<span id="cb97-32"><a href="#cb97-32" aria-hidden="true" tabindex="-1"></a><span class="co"># innodb_flush_method = O_DIRECT</span></span>
+<span id="cb97-33"><a href="#cb97-33" aria-hidden="true" tabindex="-1"></a><span class="co"># innodb_buffer_pool_size = 总内存的 70-80%</span></span></code></pre></div>
+            <h3 id="日志聚合防止缓存污染">9.4
+            日志聚合：防止缓存污染</h3>
+            <p>日志聚合系统（如
+            Fluentd、Logstash、rsync）的特征是顺序读取大量文件，每个文件只读一次：</p>
+            <div class="sourceCode" id="cb98"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb98-1"><a href="#cb98-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb98-2"><a href="#cb98-2" aria-hidden="true" tabindex="-1"></a><span class="co"># log_aggregation_tuning.sh - 日志聚合调优</span></span>
+<span id="cb98-3"><a href="#cb98-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb98-4"><a href="#cb98-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 中等预读（日志是顺序读，但每个文件只读一次）</span></span>
+<span id="cb98-5"><a href="#cb98-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 256 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb98-6"><a href="#cb98-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb98-7"><a href="#cb98-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 适中的脏页参数</span></span>
+<span id="cb98-8"><a href="#cb98-8" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=5</span>
+<span id="cb98-9"><a href="#cb98-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=15</span></code></pre></div>
+            <p>在应用层面防止缓存污染的最佳实践：</p>
+            <div class="sourceCode" id="cb99"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb99-1"><a href="#cb99-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* log_reader.c - 读取日志文件后释放缓存 */</span></span>
+<span id="cb99-2"><a href="#cb99-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb99-3"><a href="#cb99-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb99-4"><a href="#cb99-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb99-5"><a href="#cb99-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb99-6"><a href="#cb99-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> process_log_file<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>path<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb99-7"><a href="#cb99-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span>path<span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb99-8"><a href="#cb99-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb99-9"><a href="#cb99-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb99-10"><a href="#cb99-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 提示内核：顺序访问 */</span></span>
+<span id="cb99-11"><a href="#cb99-11" aria-hidden="true" tabindex="-1"></a>    posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_SEQUENTIAL<span class="op">);</span></span>
+<span id="cb99-12"><a href="#cb99-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb99-13"><a href="#cb99-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">65536</span><span class="op">];</span></span>
+<span id="cb99-14"><a href="#cb99-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n<span class="op">;</span></span>
+<span id="cb99-15"><a href="#cb99-15" aria-hidden="true" tabindex="-1"></a>    off_t offset <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb99-16"><a href="#cb99-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb99-17"><a href="#cb99-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">((</span>n <span class="op">=</span> read<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">)))</span> <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb99-18"><a href="#cb99-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* 处理日志数据 */</span></span>
+<span id="cb99-19"><a href="#cb99-19" aria-hidden="true" tabindex="-1"></a>        process_data<span class="op">(</span>buf<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb99-20"><a href="#cb99-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb99-21"><a href="#cb99-21" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* 已读过的区域不再需要，从缓存淘汰 */</span></span>
+<span id="cb99-22"><a href="#cb99-22" aria-hidden="true" tabindex="-1"></a>        posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> offset<span class="op">,</span> POSIX_FADV_DONTNEED<span class="op">);</span></span>
+<span id="cb99-23"><a href="#cb99-23" aria-hidden="true" tabindex="-1"></a>        offset <span class="op">+=</span> n<span class="op">;</span></span>
+<span id="cb99-24"><a href="#cb99-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb99-25"><a href="#cb99-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb99-26"><a href="#cb99-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 最后一段也淘汰 */</span></span>
+<span id="cb99-27"><a href="#cb99-27" aria-hidden="true" tabindex="-1"></a>    posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_DONTNEED<span class="op">);</span></span>
+<span id="cb99-28"><a href="#cb99-28" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb99-29"><a href="#cb99-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="综合调优清单">9.5 综合调优清单</h3>
+            <p>以下是页缓存调优的完整参数清单：</p>
+            <pre class="text"><code>┌──────────────────────────────────────────────────────────────────────────────┐
+│                        Page Cache 调优清单                                   │
+├──────────────────────────────────┬───────────────────────────────────────────┤
+│ 参数                             │ 说明与建议                                │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ vm.dirty_background_ratio        │ 后台回写启动阈值                          │
+│                                  │ 数据库：3-5%  流式：10-20%               │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ vm.dirty_ratio                   │ 写阻塞阈值                                │
+│                                  │ 数据库：10-15%  流式：30-40%             │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ vm.dirty_expire_centisecs        │ 脏页过期时间                              │
+│                                  │ 数据库：500-1000  流式：3000-6000        │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ vm.dirty_writeback_centisecs     │ 回写线程唤醒间隔                          │
+│                                  │ 数据库：100-300  流式：500-1000          │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ vm.swappiness                    │ 交换倾向                                  │
+│                                  │ 数据库：1-10  通用：30-60                │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ vm.min_free_kbytes               │ 最小空闲内存保留                          │
+│                                  │ 根据总内存设置，通常 512MB-2GB           │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ vm.vfs_cache_pressure            │ VFS 缓存回收压力                          │
+│                                  │ 默认 100，增大则更积极回收 dentry/inode  │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ read_ahead_kb                    │ 预读大小                                  │
+│                                  │ 随机 I/O：32-64  顺序 I/O：256-4096     │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ wbt_lat_usec                     │ 回写节流目标延迟                          │
+│                                  │ SSD：50000-75000  HDD：禁用（0）         │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ transparent_hugepage             │ 透明大页                                  │
+│                                  │ 数据库：never  通用：madvise             │
+├──────────────────────────────────┼───────────────────────────────────────────┤
+│ zone_reclaim_mode                │ NUMA 区域回收                             │
+│                                  │ 数据库：0  NUMA 敏感应用：1              │
+└──────────────────────────────────┴───────────────────────────────────────────┘</code></pre>
+            <p>调优验证步骤：</p>
+            <div class="sourceCode" id="cb101"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb101-1"><a href="#cb101-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb101-2"><a href="#cb101-2" aria-hidden="true" tabindex="-1"></a><span class="co"># verify_tuning.sh - 验证页缓存调优效果</span></span>
+<span id="cb101-3"><a href="#cb101-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb101-4"><a href="#cb101-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 当前内核参数 ===&quot;</span></span>
+<span id="cb101-5"><a href="#cb101-5" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_background_ratio <span class="dt">\</span></span>
+<span id="cb101-6"><a href="#cb101-6" aria-hidden="true" tabindex="-1"></a>       vm.dirty_ratio <span class="dt">\</span></span>
+<span id="cb101-7"><a href="#cb101-7" aria-hidden="true" tabindex="-1"></a>       vm.dirty_expire_centisecs <span class="dt">\</span></span>
+<span id="cb101-8"><a href="#cb101-8" aria-hidden="true" tabindex="-1"></a>       vm.dirty_writeback_centisecs <span class="dt">\</span></span>
+<span id="cb101-9"><a href="#cb101-9" aria-hidden="true" tabindex="-1"></a>       vm.swappiness <span class="dt">\</span></span>
+<span id="cb101-10"><a href="#cb101-10" aria-hidden="true" tabindex="-1"></a>       vm.min_free_kbytes <span class="dt">\</span></span>
+<span id="cb101-11"><a href="#cb101-11" aria-hidden="true" tabindex="-1"></a>       vm.vfs_cache_pressure</span>
+<span id="cb101-12"><a href="#cb101-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb101-13"><a href="#cb101-13" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb101-14"><a href="#cb101-14" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 块设备参数 ===&quot;</span></span>
+<span id="cb101-15"><a href="#cb101-15" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> dev <span class="kw">in</span> /sys/block/sd<span class="pp">*</span> /sys/block/nvme<span class="pp">*</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb101-16"><a href="#cb101-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">[</span> <span class="ot">-d</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">&quot;</span> <span class="bu">]</span> <span class="kw">||</span> <span class="cf">continue</span></span>
+<span id="cb101-17"><a href="#cb101-17" aria-hidden="true" tabindex="-1"></a>    <span class="va">name</span><span class="op">=</span><span class="va">$(</span><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb101-18"><a href="#cb101-18" aria-hidden="true" tabindex="-1"></a>    <span class="va">ra</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">/queue/read_ahead_kb&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="va">)</span></span>
+<span id="cb101-19"><a href="#cb101-19" aria-hidden="true" tabindex="-1"></a>    <span class="va">wbt</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">/queue/wbt_lat_usec&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="va">)</span></span>
+<span id="cb101-20"><a href="#cb101-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$name</span><span class="st">: read_ahead_kb=</span><span class="va">$ra</span><span class="st">  wbt_lat_usec=</span><span class="va">$wbt</span><span class="st">&quot;</span></span>
+<span id="cb101-21"><a href="#cb101-21" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb101-22"><a href="#cb101-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb101-23"><a href="#cb101-23" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb101-24"><a href="#cb101-24" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 当前内存状态 ===&quot;</span></span>
+<span id="cb101-25"><a href="#cb101-25" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb101-26"><a href="#cb101-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb101-27"><a href="#cb101-27" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb101-28"><a href="#cb101-28" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 脏页状态 ===&quot;</span></span>
+<span id="cb101-29"><a href="#cb101-29" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Dirty|Writeback&#39;</span> /proc/meminfo</span>
+<span id="cb101-30"><a href="#cb101-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb101-31"><a href="#cb101-31" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb101-32"><a href="#cb101-32" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 内存压力 ===&quot;</span></span>
+<span id="cb101-33"><a href="#cb101-33" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/memory <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="bu">echo</span> <span class="st">&quot;PSI not available&quot;</span></span>
+<span id="cb101-34"><a href="#cb101-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb101-35"><a href="#cb101-35" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb101-36"><a href="#cb101-36" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 透明大页状态 ===&quot;</span></span>
+<span id="cb101-37"><a href="#cb101-37" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/mm/transparent_hugepage/enabled <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb101-38"><a href="#cb101-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb101-39"><a href="#cb101-39" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb101-40"><a href="#cb101-40" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 直接回收统计 ===&quot;</span></span>
+<span id="cb101-41"><a href="#cb101-41" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;allocstall|pgsteal_direct&#39;</span> /proc/vmstat</span></code></pre></div>
+            <hr />
+            <h2 id="参考文献">参考文献</h2>
+            <ol type="1">
+            <li>Mel Gorman. <em>Understanding the Linux Virtual Memory
+            Manager</em>. Prentice Hall, 2004.</li>
+            <li>Robert Love. <em>Linux Kernel Development</em>, 3rd
+            Edition. Addison-Wesley, 2010.</li>
+            <li>Linux 内核文档：Documentation/admin-guide/sysctl/vm.rst.
+            <a
+            href="https://www.kernel.org/doc/Documentation/admin-guide/sysctl/vm.rst"
+            class="uri">https://www.kernel.org/doc/Documentation/admin-guide/sysctl/vm.rst</a></li>
+            <li>Linux 内核文档：Documentation/filesystems/vfs.rst. <a
+            href="https://www.kernel.org/doc/Documentation/filesystems/vfs.rst"
+            class="uri">https://www.kernel.org/doc/Documentation/filesystems/vfs.rst</a></li>
+            <li>Matthew Wilcox. “XArray: A New Data Structure for the
+            Linux Kernel.” LWN.net, 2018. <a
+            href="https://lwn.net/Articles/745073/"
+            class="uri">https://lwn.net/Articles/745073/</a></li>
+            <li>Matthew Wilcox. “Folios.” LWN.net, 2021. <a
+            href="https://lwn.net/Articles/849538/"
+            class="uri">https://lwn.net/Articles/849538/</a></li>
+            <li>Jens Axboe. “Writeback Throttling.” LWN.net, 2016. <a
+            href="https://lwn.net/Articles/682582/"
+            class="uri">https://lwn.net/Articles/682582/</a></li>
+            <li>Brendan Gregg. <em>Systems Performance: Enterprise and
+            the Cloud</em>, 2nd Edition. Addison-Wesley, 2020.</li>
+            <li>PostgreSQL 文档：Resource Consumption - Memory. <a
+            href="https://www.postgresql.org/docs/current/runtime-config-resource.html"
+            class="uri">https://www.postgresql.org/docs/current/runtime-config-resource.html</a></li>
+            <li>MySQL 文档：InnoDB Disk I/O and File Space Management.
+            <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-disk-io.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/innodb-disk-io.html</a></li>
+            <li>Linux
+            内核文档：Documentation/admin-guide/mm/concepts.rst. <a
+            href="https://www.kernel.org/doc/Documentation/admin-guide/mm/concepts.rst"
+            class="uri">https://www.kernel.org/doc/Documentation/admin-guide/mm/concepts.rst</a></li>
+            <li>Jonathan Corbet. “Toward better readahead.” LWN.net,
+            2020. <a href="https://lwn.net/Articles/835757/"
+            class="uri">https://lwn.net/Articles/835757/</a></li>
+            <li>Facebook Engineering. “Pressure Stall Information for
+            CPU, Memory, and IO.” 2018. <a
+            href="https://facebookmicrosites.github.io/psi/"
+            class="uri">https://facebookmicrosites.github.io/psi/</a></li>
+            <li>Brendan Gregg. <em>BPF Performance Tools</em>.
+            Addison-Wesley, 2019.</li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../08-block-device-layer/block-device-layer.html">块设备层：bio、request
+            与 I/O 调度器</a> <strong>下一篇</strong>: <a
+            href="../10-direct-io/direct-io.html">Direct I/O 与
+            O_DIRECT：绕过缓存的得与失</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-28 · linux / storage</p>
+                    <h3><a href="/post/linux/fsync-error-truth/fsync-error-truth.html">fsync 失败的真相：当它返回错误，你的数据可能已经没了</a></h3>
+                    <p>fsync() 返回 EIO 后再调一次为什么会成功？为什么这反而是灾难？从 2018 fsyncgate 到 Linux errseq_t，再到本机内核 6.6 上用 dm-error 单块故障注入的实测，讲清 writeback 失败时脏页被标记 clean、数据静默丢失的真相，以及 PostgreSQL 为什么选择 PANIC。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-19 · storage</p>
+                    <h3><a href="/post/storage/10-direct-io/direct-io.html">【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</a></h3>
+                    <p>在 Linux 的传统 I/O 路径中，应用程序通过 read() 和 write() 系统调用与文件交互时，数据并不会直接在用户空间缓冲区（User Buffer）和磁盘之间传输。内核会在两者之间插入一层页缓存（Page Cache），作为磁盘数据在内存中的缓存副本。一次典型的写入流程如下：</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/77-file-locking-pitfalls/file-locking-pitfalls.html">【存储工程】POSIX 文件锁：flock、fcntl 与 NFS 锁的工程陷阱</a></h3>
+                    <p>拆解 POSIX 文件锁三大 API 的语义差异，深入 close-any-fd 释放陷阱、OFD 锁机制、F_GETLK 竞态和 NFS 锁恢复的工程真相，给出每种场景的正确选择。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-14 · storage</p>
+                    <h3><a href="/post/storage/66-cache-engineering/cache-engineering.html">【存储工程】缓存工程：从 Page Cache 到应用层缓存</a></h3>
+                    <p>深入分析存储多级缓存架构——Page Cache、Buffer Pool、应用缓存的协同设计，缓存淘汰算法对比，缓存穿透/击穿/雪崩的防护策略</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,2244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】RocksDB 工程实践 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="从 Column Family、Write
+Buffer、Block Cache、Compaction、Rate Limiter 到 Direct I/O
+和监控，系统拆解 RocksDB 在生产环境中的关键配置与故障模式，并给出 SSD
+场景下的配置模板和 db_bench 基准测试方法。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="rocksdb, column-family, compaction, write-buffer, block-cache, rate-limiter, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/32-rocksdb-practice/rocksdb-practice.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】RocksDB 工程实践" />
+    <meta property="og:description" content="从 Column Family、Write Buffer、Block Cache、Compaction、Rate Limiter 到 Direct I/O 和监控，系统拆解 RocksDB 在生产环境中的关键配置与故障模式，并给出 SSD 场景下的配置模板和 db_bench 基准测试方法。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/32-rocksdb-practice/rocksdb-practice.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="rocksdb" />
+    <meta property="article:tag" content="column-family" />
+    <meta property="article:tag" content="compaction" />
+    <meta property="article:tag" content="write-buffer" />
+    <meta property="article:tag" content="block-cache" />
+    <meta property="article:tag" content="rate-limiter" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】RocksDB 工程实践" />
+    <meta name="twitter:description" content="从 Column Family、Write Buffer、Block Cache、Compaction、Rate Limiter 到 Direct I/O 和监控，系统拆解 RocksDB 在生产环境中的关键配置与故障模式，并给出 SSD 场景下的配置模板和 db_bench 基准测试方法。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】RocksDB 工程实践", "description": "从 Column Family、Write Buffer、Block Cache、Compaction、Rate Limiter 到 Direct I/O 和监控，系统拆解 RocksDB 在生产环境中的关键配置与故障模式，并给出 SSD 场景下的配置模板和 db_bench 基准测试方法。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/32-rocksdb-practice/rocksdb-practice.html"}, "datePublished": "2025-09-10T00:00:00+00:00", "dateModified": "2026-04-15T11:33:47+00:00", "keywords": ["rocksdb", "column-family", "compaction", "write-buffer", "block-cache", "rate-limiter"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】RocksDB 工程实践</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-10</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#rocksdb</span> <span>#column-family</span> <span>#compaction</span> <span>#write-buffer</span> <span>#block-cache</span> <span>#rate-limiter</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/31-lsm-tree-tuning/lsm-tree-tuning.html">上一篇：【存储工程】LSM-Tree 工程调优：三种放大的权衡</a><a class="post-series-nav__link" href="/post/storage/33-lmdb-mmap/lmdb-mmap.html">下一篇：【存储工程】LMDB 与内存映射存储</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/rocksdb.html">#rocksdb</a><a class="chip-link" href="/tags/column-family.html">#column-family</a><a class="chip-link" href="/tags/compaction.html">#compaction</a><a class="chip-link" href="/tags/write-buffer.html">#write-buffer</a><a class="chip-link" href="/tags/block-cache.html">#block-cache</a><a class="chip-link" href="/tags/rate-limiter.html">#rate-limiter</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一rocksdb-架构概览"
+                id="toc-一rocksdb-架构概览">一、RocksDB 架构概览</a>
+                <ul>
+                <li><a href="#从-leveldb-到-rocksdb"
+                id="toc-从-leveldb-到-rocksdb">1.1 从 LevelDB 到
+                RocksDB</a></li>
+                <li><a href="#整体架构" id="toc-整体架构">1.2
+                整体架构</a></li>
+                <li><a href="#设计目标与取舍"
+                id="toc-设计目标与取舍">1.3 设计目标与取舍</a></li>
+                </ul></li>
+                <li><a href="#二column-family-设计"
+                id="toc-二column-family-设计">二、Column Family 设计</a>
+                <ul>
+                <li><a href="#column-family-的本质"
+                id="toc-column-family-的本质">2.1 Column Family
+                的本质</a></li>
+                <li><a href="#默认-column-family"
+                id="toc-默认-column-family">2.2 默认 Column
+                Family</a></li>
+                <li><a href="#多-column-family-的创建与使用"
+                id="toc-多-column-family-的创建与使用">2.3 多 Column
+                Family 的创建与使用</a></li>
+                <li><a href="#配置独立性" id="toc-配置独立性">2.4
+                配置独立性</a></li>
+                <li><a href="#column-family-的使用建议"
+                id="toc-column-family-的使用建议">2.5 Column Family
+                的使用建议</a></li>
+                </ul></li>
+                <li><a href="#三write-buffer-与-memtable"
+                id="toc-三write-buffer-与-memtable">三、Write Buffer 与
+                MemTable</a>
+                <ul>
+                <li><a href="#写缓冲区的角色"
+                id="toc-写缓冲区的角色">3.1 写缓冲区的角色</a></li>
+                <li><a href="#核心参数" id="toc-核心参数">3.2
+                核心参数</a></li>
+                <li><a href="#memtable-数据结构选择"
+                id="toc-memtable-数据结构选择">3.3 MemTable
+                数据结构选择</a></li>
+                <li><a href="#memtable-内存与全局控制"
+                id="toc-memtable-内存与全局控制">3.4 MemTable
+                内存与全局控制</a></li>
+                <li><a href="#memtable-参数调优思路"
+                id="toc-memtable-参数调优思路">3.5 MemTable
+                参数调优思路</a></li>
+                </ul></li>
+                <li><a href="#四block-cache-配置"
+                id="toc-四block-cache-配置">四、Block Cache 配置</a>
+                <ul>
+                <li><a href="#block-cache-的作用"
+                id="toc-block-cache-的作用">4.1 Block Cache
+                的作用</a></li>
+                <li><a href="#缓存类型" id="toc-缓存类型">4.2
+                缓存类型</a></li>
+                <li><a href="#缓存内容控制" id="toc-缓存内容控制">4.3
+                缓存内容控制</a></li>
+                <li><a href="#压缩缓存secondary-cache"
+                id="toc-压缩缓存secondary-cache">4.4 压缩缓存（Secondary
+                Cache）</a></li>
+                <li><a href="#block-cache-大小的确定"
+                id="toc-block-cache-大小的确定">4.5 Block Cache
+                大小的确定</a></li>
+                <li><a href="#block-size-的选择"
+                id="toc-block-size-的选择">4.6 Block Size
+                的选择</a></li>
+                </ul></li>
+                <li><a href="#五compaction-策略选择"
+                id="toc-五compaction-策略选择">五、Compaction
+                策略选择</a>
+                <ul>
+                <li><a href="#为什么-compaction-是核心问题"
+                id="toc-为什么-compaction-是核心问题">5.1 为什么
+                Compaction 是核心问题</a></li>
+                <li><a href="#leveled-compaction默认"
+                id="toc-leveled-compaction默认">5.2 Leveled
+                Compaction（默认）</a></li>
+                <li><a href="#universal-compaction"
+                id="toc-universal-compaction">5.3 Universal
+                Compaction</a></li>
+                <li><a href="#fifo-compaction"
+                id="toc-fifo-compaction">5.4 FIFO Compaction</a></li>
+                <li><a href="#三种策略对比" id="toc-三种策略对比">5.5
+                三种策略对比</a></li>
+                <li><a href="#compaction-的并发配置"
+                id="toc-compaction-的并发配置">5.6 Compaction
+                的并发配置</a></li>
+                <li><a href="#compaction-优先级与子压缩"
+                id="toc-compaction-优先级与子压缩">5.7 Compaction
+                优先级与子压缩</a></li>
+                <li><a href="#各层压缩算法" id="toc-各层压缩算法">5.8
+                各层压缩算法</a></li>
+                </ul></li>
+                <li><a href="#六rate-limiter-与写控制"
+                id="toc-六rate-limiter-与写控制">六、Rate Limiter
+                与写控制</a>
+                <ul>
+                <li><a href="#为什么需要限速"
+                id="toc-为什么需要限速">6.1 为什么需要限速</a></li>
+                <li><a href="#rate-limiter-配置"
+                id="toc-rate-limiter-配置">6.2 Rate Limiter
+                配置</a></li>
+                <li><a href="#写停顿write-stall"
+                id="toc-写停顿write-stall">6.3 写停顿（Write
+                Stall）</a></li>
+                <li><a href="#诊断写停顿" id="toc-诊断写停顿">6.4
+                诊断写停顿</a></li>
+                <li><a href="#写停顿的系统性解决思路"
+                id="toc-写停顿的系统性解决思路">6.5
+                写停顿的系统性解决思路</a></li>
+                </ul></li>
+                <li><a href="#七direct-io-与操作系统交互"
+                id="toc-七direct-io-与操作系统交互">七、Direct I/O
+                与操作系统交互</a>
+                <ul>
+                <li><a href="#page-cache-的双缓存问题"
+                id="toc-page-cache-的双缓存问题">7.1 Page Cache
+                的双缓存问题</a></li>
+                <li><a href="#direct-io-配置"
+                id="toc-direct-io-配置">7.2 Direct I/O 配置</a></li>
+                <li><a href="#direct-io-的要求与限制"
+                id="toc-direct-io-的要求与限制">7.3 Direct I/O
+                的要求与限制</a></li>
+                <li><a href="#什么时候使用-direct-io"
+                id="toc-什么时候使用-direct-io">7.4 什么时候使用 Direct
+                I/O</a></li>
+                <li><a href="#io-调度与操作系统调优"
+                id="toc-io-调度与操作系统调优">7.5 I/O
+                调度与操作系统调优</a></li>
+                </ul></li>
+                <li><a href="#八statistics-与-perf-context-监控"
+                id="toc-八statistics-与-perf-context-监控">八、Statistics
+                与 Perf Context 监控</a>
+                <ul>
+                <li><a href="#统计信息statistics"
+                id="toc-统计信息statistics">8.1
+                统计信息（Statistics）</a></li>
+                <li><a href="#关键统计指标" id="toc-关键统计指标">8.2
+                关键统计指标</a></li>
+                <li><a href="#perf-context-与-io-stats-context"
+                id="toc-perf-context-与-io-stats-context">8.3 Perf
+                Context 与 I/O Stats Context</a></li>
+                <li><a href="#db-properties" id="toc-db-properties">8.4
+                DB Properties</a></li>
+                <li><a href="#构建监控仪表盘"
+                id="toc-构建监控仪表盘">8.5 构建监控仪表盘</a></li>
+                </ul></li>
+                <li><a href="#九常见故障模式"
+                id="toc-九常见故障模式">九、常见故障模式</a>
+                <ul>
+                <li><a href="#写停顿write-stall-1"
+                id="toc-写停顿write-stall-1">9.1 写停顿（Write
+                Stall）</a></li>
+                <li><a href="#空间放大爆炸" id="toc-空间放大爆炸">9.2
+                空间放大爆炸</a></li>
+                <li><a href="#内存膨胀" id="toc-内存膨胀">9.3
+                内存膨胀</a></li>
+                <li><a href="#compaction-债务"
+                id="toc-compaction-债务">9.4 Compaction 债务</a></li>
+                </ul></li>
+                <li><a href="#十生产配置模板与-db_bench"
+                id="toc-十生产配置模板与-db_bench">十、生产配置模板与
+                db_bench</a>
+                <ul>
+                <li><a href="#ssd-生产配置模板"
+                id="toc-ssd-生产配置模板">10.1 SSD 生产配置模板</a></li>
+                <li><a href="#内存分配验证" id="toc-内存分配验证">10.2
+                内存分配验证</a></li>
+                <li><a href="#配置参数优先级"
+                id="toc-配置参数优先级">10.3 配置参数优先级</a></li>
+                <li><a href="#db_bench-基准测试"
+                id="toc-db_bench-基准测试">10.4 db_bench
+                基准测试</a></li>
+                <li><a href="#db_bench-结果解读"
+                id="toc-db_bench-结果解读">10.5 db_bench
+                结果解读</a></li>
+                <li><a href="#从-db_bench-到生产"
+                id="toc-从-db_bench-到生产">10.6 从 db_bench
+                到生产</a></li>
+                </ul></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#官方文档与-wiki"
+                id="toc-官方文档与-wiki">官方文档与 Wiki</a></li>
+                <li><a href="#源码" id="toc-源码">源码</a></li>
+                <li><a href="#论文与设计文档"
+                id="toc-论文与设计文档">论文与设计文档</a></li>
+                <li><a href="#工具" id="toc-工具">工具</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>RocksDB 是一个嵌入式键值存储引擎（Embedded Key-Value
+            Store），由 Facebook 在 LevelDB 的基础上 fork
+            并深度改造而来。它的底层数据结构是日志结构合并树（Log-Structured
+            Merge-Tree,
+            LSM-Tree），通过将随机写转化为顺序写来获得高写入吞吐量。自
+            2012 年开源以来，RocksDB
+            已经成为众多分布式系统的存储基座——TiKV、CockroachDB、YugabyteDB、Flink
+            的状态后端、Kafka Streams
+            的本地状态存储，都直接或间接依赖它。</p>
+            <p>但 RocksDB
+            的默认配置面向通用场景，不可能直接满足生产需求。一个典型的
+            RocksDB 实例有超过 200
+            个可调参数，涵盖内存管理、压缩策略（Compaction）、I/O
+            控制、缓存策略等多个维度。配置不当的后果是真实的：写停顿（Write
+            Stall）会让上层服务超时，空间放大（Space
+            Amplification）会撑爆磁盘，内存膨胀（Memory Bloat）会触发
+            OOM。</p>
+            <p>本文不重复 LSM-Tree 的基础理论——那些内容在 <a
+            href="../31-lsm-tree-tuning/lsm-tree-tuning.html">上一篇</a>
+            已经覆盖。这里直接从 RocksDB 的工程视角切入，逐一拆解 Column
+            Family 设计、Write Buffer 配置、Block Cache 调优、Compaction
+            策略选择、Rate Limiter 写控制、Direct I/O
+            交互、监控指标体系、常见故障模式，最终给出一份面向 SSD
+            的生产配置模板和 <code>db_bench</code> 基准测试方法。</p>
+            <blockquote>
+            <p><strong>版本说明</strong> 本文基于 RocksDB
+            9.x（2024-2025），部分 API 和行为在 6.x/7.x/8.x
+            中略有差异，涉及版本差异的地方会单独标注。源码引用以
+            <code>facebook/rocksdb</code> GitHub 仓库主分支为准。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一rocksdb-架构概览">一、RocksDB 架构概览</h2>
+            <h3 id="从-leveldb-到-rocksdb">1.1 从 LevelDB 到
+            RocksDB</h3>
+            <p>LevelDB 是 Google 的 Jeff Dean 和 Sanjay Ghemawat 在 2011
+            年开源的单线程 LSM-Tree
+            引擎。它实现精巧但功能有限：单线程压缩（Compaction）、不支持列族（Column
+            Family）、没有限速器（Rate
+            Limiter）、不支持备份和快照导出。Facebook 在 2012 年 fork 了
+            LevelDB，目标是让它能跑在 SSD
+            上、支持多线程、承受社交网络的写入强度。这个 fork 就是
+            RocksDB。</p>
+            <p>RocksDB 相对 LevelDB 的核心改进包括：</p>
+            <ul>
+            <li>多线程压缩（Concurrent
+            Compaction）：可以同时执行多个压缩任务，充分利用 SSD 的并行
+            I/O 能力；</li>
+            <li>列族（Column
+            Family）：在同一个数据库实例中支持多个独立的
+            LSM-Tree，共享写前日志（Write-Ahead Log, WAL）；</li>
+            <li>可插拔的压缩策略：除了 LevelDB 的分层压缩（Leveled
+            Compaction），还支持通用压缩（Universal
+            Compaction）和先进先出压缩（FIFO Compaction）；</li>
+            <li>Rate Limiter：限制压缩和刷盘（Flush）的 I/O
+            带宽，避免后台任务抢占前台读写的 I/O 资源；</li>
+            <li>Direct I/O 支持：绕过操作系统页缓存（Page Cache），由
+            RocksDB 自己管理缓存；</li>
+            <li>内置统计与性能上下文（Perf
+            Context）：提供几百个运行时指标，方便诊断性能问题。</li>
+            </ul>
+            <h3 id="整体架构">1.2 整体架构</h3>
+            <p>RocksDB 的数据路径可以分为写路径（Write
+            Path）和读路径（Read Path）两条主线。</p>
+            <p>写路径的流程：</p>
+            <ol type="1">
+            <li>客户端调用 <code>Put(key, value)</code> 或
+            <code>WriteBatch</code>；</li>
+            <li>数据先写入写前日志（WAL），保证持久性（Durability）；</li>
+            <li>数据同时写入活跃内存表（Active MemTable）；</li>
+            <li>当 MemTable 大小达到 <code>write_buffer_size</code>
+            时，它变为不可变内存表（Immutable MemTable），一个新的
+            Active MemTable 被创建；</li>
+            <li>后台刷盘线程（Flush Thread）将 Immutable MemTable
+            刷到磁盘，生成一个 L0 层的有序字符串表（Sorted String Table,
+            SST）文件；</li>
+            <li>后台压缩线程（Compaction Thread）将 SST
+            文件从低层合并到高层，消除重复键和已删除的键。</li>
+            </ol>
+            <p>读路径的流程：</p>
+            <ol type="1">
+            <li>先查活跃 MemTable；</li>
+            <li>再查所有 Immutable MemTable（从新到旧）；</li>
+            <li>再查 L0 层的所有 SST 文件（L0
+            的文件键范围可能重叠，必须全部检查）；</li>
+            <li>最后按层查 L1、L2、……Ln 层的 SST
+            文件（每层内部键范围不重叠，可以用二分查找定位文件）。</li>
+            </ol>
+            <p>每个 SST 文件内部通过布隆过滤器（Bloom
+            Filter）和索引块（Index
+            Block）加速查找。如果布隆过滤器判定目标键不在该文件中，就可以跳过这个文件，避免一次磁盘
+            I/O。</p>
+            <pre class="text"><code>写路径：
+
+  Client Put/Delete
+        │
+        ▼
+  ┌──────────┐
+  │   WAL    │  ← 顺序追加写，保证持久性
+  └──────────┘
+        │
+        ▼
+  ┌───────────────┐
+  │ Active        │
+  │ MemTable      │  ← 内存中的有序结构（默认 SkipList）
+  └───────────────┘
+        │  达到 write_buffer_size
+        ▼
+  ┌───────────────┐
+  │ Immutable     │
+  │ MemTable      │  ← 等待刷盘
+  └───────────────┘
+        │  Flush
+        ▼
+  ┌───────────────┐
+  │ L0 SST Files  │  ← 键范围可能重叠
+  └───────────────┘
+        │  Compaction
+        ▼
+  ┌───────────────┐
+  │ L1 SST Files  │  ← 每层内部键范围不重叠
+  ├───────────────┤
+  │ L2 SST Files  │
+  ├───────────────┤
+  │ ...           │
+  └───────────────┘</code></pre>
+            <h3 id="设计目标与取舍">1.3 设计目标与取舍</h3>
+            <p>RocksDB 的设计目标可以概括为三个”优先”：</p>
+            <ol type="1">
+            <li><strong>写吞吐量优先</strong>：LSM-Tree
+            将随机写转为顺序写，适合写多读少的工作负载；</li>
+            <li><strong>空间效率优先</strong>：通过压缩（Compression，注意与
+            Compaction
+            的区别——前者是数据压缩，后者是合并操作）和压缩操作（Compaction）减少磁盘占用；</li>
+            <li><strong>可调性优先</strong>：几乎每一个行为都暴露了配置参数，允许用户根据工作负载精细调整。</li>
+            </ol>
+            <p>代价也很明确：</p>
+            <ul>
+            <li>读放大（Read
+            Amplification）：一次点查可能需要查多层，最坏情况下查 L0
+            的所有文件加上每层一个文件；</li>
+            <li>写放大（Write
+            Amplification）：一条数据在生命周期内会被多次 Compaction
+            重写，写放大系数通常在 10 到 30 之间；</li>
+            <li>空间放大（Space Amplification）：Compaction
+            过程中需要临时空间存放新旧文件，同一键的多个版本也会同时存在于不同层。</li>
+            </ul>
+            <p>这三个放大系数之间存在根本性的权衡——不可能同时把三个都做到最优。这是后面选择
+            Compaction 策略的核心依据。</p>
+            <hr />
+            <h2 id="二column-family-设计">二、Column Family 设计</h2>
+            <h3 id="column-family-的本质">2.1 Column Family 的本质</h3>
+            <p>列族（Column Family）是 RocksDB
+            中一个核心的逻辑隔离机制。每个 Column Family 拥有独立的
+            LSM-Tree：独立的 MemTable、独立的 SST 文件、独立的
+            Compaction 流程。但同一个数据库实例中的所有 Column Family
+            共享同一份 WAL。</p>
+            <p>这种设计的动机来自两个实际需求：</p>
+            <ol type="1">
+            <li><strong>不同数据类型需要不同的配置</strong>：比如元数据（Metadata）需要快速点查，可以用较大的布隆过滤器和较小的
+            Block Size；而用户数据（User
+            Data）可能偏重范围扫描，适合较大的 Block Size
+            和不同的压缩算法。</li>
+            <li><strong>跨数据类型的原子写</strong>：如果把不同数据类型放到不同的
+            RocksDB 实例，就无法在一个 <code>WriteBatch</code>
+            中原子地更新多种数据。Column Family
+            让原子跨族写成为可能，因为它们共享 WAL。</li>
+            </ol>
+            <h3 id="默认-column-family">2.2 默认 Column Family</h3>
+            <p>每个 RocksDB 数据库至少有一个 Column Family，名为
+            <code>"default"</code>。如果调用 <code>DB::Open()</code>
+            时没有指定 Column Family，所有操作都落在
+            <code>"default"</code> 上。</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 打开一个只使用 default Column Family 的数据库</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>DB<span class="op">*</span> db<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>create_if_missing <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Status s <span class="op">=</span> rocksdb<span class="op">::</span>DB<span class="op">::</span>Open<span class="op">(</span>options<span class="op">,</span> <span class="st">&quot;/data/mydb&quot;</span><span class="op">,</span> <span class="op">&amp;</span>db<span class="op">);</span></span></code></pre></div>
+            <h3 id="多-column-family-的创建与使用">2.3 多 Column Family
+            的创建与使用</h3>
+            <p>创建和使用多个 Column Family 需要在
+            <code>DB::Open()</code> 时声明所有 Column Family
+            的描述符（Column Family Descriptor）：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 多 Column Family 的打开方式</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>vector<span class="op">&lt;</span>rocksdb<span class="op">::</span>ColumnFamilyDescriptor<span class="op">&gt;</span> cf_descs<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// default 列族</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>ColumnFamilyOptions default_opts<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>cf_descs<span class="op">.</span>emplace_back<span class="op">(</span>rocksdb<span class="op">::</span>kDefaultColumnFamilyName<span class="op">,</span> default_opts<span class="op">);</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co">// metadata 列族：小 Block Size，高 Bloom Filter 位数</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>ColumnFamilyOptions meta_opts<span class="op">;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>meta_opts<span class="op">.</span>write_buffer_size <span class="op">=</span> <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 16MB</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions meta_table_opts<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>meta_table_opts<span class="op">.</span>block_size <span class="op">=</span> <span class="dv">4</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 4KB</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>meta_table_opts<span class="op">.</span>filter_policy<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewBloomFilterPolicy<span class="op">(</span><span class="dv">15</span><span class="op">,</span> <span class="kw">false</span><span class="op">));</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>meta_opts<span class="op">.</span>table_factory<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewBlockBasedTableFactory<span class="op">(</span>meta_table_opts<span class="op">));</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>cf_descs<span class="op">.</span>emplace_back<span class="op">(</span><span class="st">&quot;metadata&quot;</span><span class="op">,</span> meta_opts<span class="op">);</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="co">// data 列族：大 Block Size，适合范围扫描</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>ColumnFamilyOptions data_opts<span class="op">;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>data_opts<span class="op">.</span>write_buffer_size <span class="op">=</span> <span class="dv">64</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 64MB</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions data_table_opts<span class="op">;</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>data_table_opts<span class="op">.</span>block_size <span class="op">=</span> <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 16KB</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>data_opts<span class="op">.</span>table_factory<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewBlockBasedTableFactory<span class="op">(</span>data_table_opts<span class="op">));</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>cf_descs<span class="op">.</span>emplace_back<span class="op">(</span><span class="st">&quot;data&quot;</span><span class="op">,</span> data_opts<span class="op">);</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>vector<span class="op">&lt;</span>rocksdb<span class="op">::</span>ColumnFamilyHandle<span class="op">*&gt;</span> handles<span class="op">;</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>DB<span class="op">*</span> db<span class="op">;</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>DBOptions db_options<span class="op">;</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>create_if_missing <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>create_missing_column_families <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Status s <span class="op">=</span> rocksdb<span class="op">::</span>DB<span class="op">::</span>Open<span class="op">(</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    db_options<span class="op">,</span> <span class="st">&quot;/data/mydb&quot;</span><span class="op">,</span> cf_descs<span class="op">,</span> <span class="op">&amp;</span>handles<span class="op">,</span> <span class="op">&amp;</span>db<span class="op">);</span></span></code></pre></div>
+            <p>打开之后，通过 <code>ColumnFamilyHandle</code>
+            指定操作的目标列族：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 写入不同列族</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>Put<span class="op">(</span>rocksdb<span class="op">::</span>WriteOptions<span class="op">(),</span> handles<span class="op">[</span><span class="dv">1</span><span class="op">],</span>  <span class="co">// metadata</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;user:1001:name&quot;</span><span class="op">,</span> <span class="st">&quot;Alice&quot;</span><span class="op">);</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>Put<span class="op">(</span>rocksdb<span class="op">::</span>WriteOptions<span class="op">(),</span> handles<span class="op">[</span><span class="dv">2</span><span class="op">],</span>  <span class="co">// data</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;user:1001:avatar&quot;</span><span class="op">,</span> large_blob<span class="op">);</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 跨列族原子写</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>WriteBatch batch<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>batch<span class="op">.</span>Put<span class="op">(</span>handles<span class="op">[</span><span class="dv">1</span><span class="op">],</span> <span class="st">&quot;user:1001:status&quot;</span><span class="op">,</span> <span class="st">&quot;active&quot;</span><span class="op">);</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>batch<span class="op">.</span>Put<span class="op">(</span>handles<span class="op">[</span><span class="dv">2</span><span class="op">],</span> <span class="st">&quot;user:1001:profile&quot;</span><span class="op">,</span> profile_data<span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>Write<span class="op">(</span>rocksdb<span class="op">::</span>WriteOptions<span class="op">(),</span> <span class="op">&amp;</span>batch<span class="op">);</span></span></code></pre></div>
+            <h3 id="配置独立性">2.4 配置独立性</h3>
+            <p>每个 Column Family 可以独立配置以下参数：</p>
+            <table>
+            <colgroup>
+            <col style="width: 37%" />
+            <col style="width: 37%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>参数类别</th>
+            <th>示例参数</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>MemTable</td>
+            <td><code>write_buffer_size</code>、<code>max_write_buffer_number</code></td>
+            <td>写缓冲区大小和数量</td>
+            </tr>
+            <tr>
+            <td>Compaction</td>
+            <td><code>compaction_style</code>、<code>level0_file_num_compaction_trigger</code></td>
+            <td>压缩策略和触发条件</td>
+            </tr>
+            <tr>
+            <td>压缩算法</td>
+            <td><code>compression</code>、<code>bottommost_compression</code></td>
+            <td>各层的数据压缩算法</td>
+            </tr>
+            <tr>
+            <td>布隆过滤器</td>
+            <td><code>filter_policy</code></td>
+            <td>过滤器类型和位数</td>
+            </tr>
+            <tr>
+            <td>Block Size</td>
+            <td><code>block_size</code></td>
+            <td>SST 文件内数据块的大小</td>
+            </tr>
+            <tr>
+            <td>合并操作符</td>
+            <td><code>merge_operator</code></td>
+            <td>自定义 Merge 语义</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>但以下参数是 DB 级别的，所有 Column Family 共享：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>参数</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>max_background_jobs</code></td>
+            <td>后台刷盘和压缩的总线程数</td>
+            </tr>
+            <tr>
+            <td><code>max_background_flushes</code></td>
+            <td>后台刷盘线程数上限</td>
+            </tr>
+            <tr>
+            <td><code>db_paths</code></td>
+            <td>数据库文件的存储路径</td>
+            </tr>
+            <tr>
+            <td><code>wal_dir</code></td>
+            <td>WAL 文件的存储路径</td>
+            </tr>
+            <tr>
+            <td><code>rate_limiter</code></td>
+            <td>I/O 限速器</td>
+            </tr>
+            <tr>
+            <td><code>statistics</code></td>
+            <td>统计信息收集器</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="column-family-的使用建议">2.5 Column Family
+            的使用建议</h3>
+            <p><strong>适合用 Column Family 的场景</strong>：</p>
+            <ul>
+            <li>同一数据库中有明确不同的数据类型（元数据 vs 用户数据 vs
+            索引数据），需要不同的 Compaction 策略或压缩算法；</li>
+            <li>需要跨数据类型的原子写保证；</li>
+            <li>需要对不同数据类型独立监控和调优。</li>
+            </ul>
+            <p><strong>不适合用 Column Family 的场景</strong>：</p>
+            <ul>
+            <li>数据之间没有原子写需求，且各自的访问模式差异不大——直接用独立的
+            RocksDB 实例更简单，也能隔离故障；</li>
+            <li>Column Family 数量过多（超过几十个）——每个 Column Family
+            都会消耗 MemTable 内存，而且 WAL 的生命周期由最慢的 Column
+            Family 决定，可能导致 WAL 文件堆积。</li>
+            </ul>
+            <p>关于 WAL 的生命周期问题：WAL 只有在所有 Column Family 都
+            flush 掉对应的 MemTable 之后才能被删除。如果某个 Column
+            Family 的写入量很小，它的 MemTable 可能很久才会填满并触发
+            flush，这会导致 WAL
+            文件长时间无法回收，占用大量磁盘空间。解决方案是为写入量小的
+            Column Family 设置较小的
+            <code>write_buffer_size</code>，或者定期手动调用
+            <code>FlushWAL()</code> 和 <code>Flush()</code>。</p>
+            <hr />
+            <h2 id="三write-buffer-与-memtable">三、Write Buffer 与
+            MemTable</h2>
+            <h3 id="写缓冲区的角色">3.1 写缓冲区的角色</h3>
+            <p>写缓冲区（Write Buffer）是 RocksDB
+            写路径中的内存缓冲层。每次 <code>Put</code> 或
+            <code>Delete</code> 操作，数据先写入
+            WAL，然后插入到当前活跃的 MemTable 中。MemTable
+            是一个内存中的有序数据结构，它的角色就是把大量的随机写攒成一批，再一次性刷到磁盘上变成有序的
+            SST 文件。</p>
+            <p>MemTable 的大小和数量直接影响三个指标：</p>
+            <ol type="1">
+            <li><strong>写入延迟</strong>：如果 MemTable 太大，每次
+            flush 的数据量大，flush
+            时间长，可能阻塞后续写入；如果太小，flush
+            过于频繁，也会消耗过多的 I/O 带宽。</li>
+            <li><strong>内存占用</strong>：活跃 MemTable + 所有不可变
+            MemTable 的总大小是 RocksDB 内存开销的重要组成部分。</li>
+            <li><strong>L0 文件数量</strong>：每次 flush 生成一个 L0
+            文件，flush 越频繁，L0 文件堆积越快，可能触发 L0
+            写停顿。</li>
+            </ol>
+            <h3 id="核心参数">3.2 核心参数</h3>
+            <h4 id="write_buffer_size">write_buffer_size</h4>
+            <p>单个 MemTable 的大小上限，默认 64MB。当活跃 MemTable
+            的数据量达到这个阈值时，它会被切换为不可变
+            MemTable，一个新的活跃 MemTable 被创建。</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>write_buffer_size <span class="op">=</span> <span class="dv">128</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 128MB</span></span></code></pre></div>
+            <p>增大 <code>write_buffer_size</code> 的效果：</p>
+            <ul>
+            <li>flush 频率降低，L0 文件堆积速度减慢；</li>
+            <li>每个 SST 文件更大，有利于减少文件数量和元数据开销；</li>
+            <li>内存占用增加。</li>
+            </ul>
+            <p>通常建议根据写入吞吐量和可用内存来调整。对于写入密集型场景，128MB
+            到 256MB 是常见的配置。</p>
+            <h4
+            id="max_write_buffer_number">max_write_buffer_number</h4>
+            <p>允许同时存在的 MemTable
+            数量上限（包括活跃和不可变的），默认为 2。当不可变 MemTable
+            的数量达到 <code>max_write_buffer_number - 1</code>
+            时，新的写入会被阻塞（Write Stall），直到至少一个不可变
+            MemTable 被 flush 完成。</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_write_buffer_number <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span></code></pre></div>
+            <p>增大这个参数可以容忍更多的 flush 延迟——即使 flush
+            线程暂时忙不过来，写入仍然可以继续往新的 MemTable
+            里写。但代价是更多的内存占用。一个 Column Family 的 MemTable
+            内存上限约为：</p>
+            <pre class="text"><code>MemTable 内存上限 ≈ write_buffer_size × max_write_buffer_number</code></pre>
+            <h4
+            id="min_write_buffer_number_to_merge">min_write_buffer_number_to_merge</h4>
+            <p>flush 之前会合并（Merge）的不可变 MemTable
+            的最小数量，默认为 1。设为 2 意味着至少攒够 2 个不可变
+            MemTable 才会 flush，这样可以在 flush
+            之前把重复键合并掉，减少写入磁盘的数据量。</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>min_write_buffer_number_to_merge <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span></code></pre></div>
+            <p>适用场景：写入负载中有大量对同一键的重复更新（比如计数器场景），合并后可以显著减少
+            SST 文件大小。不适合的场景：键很少重复，合并没有收益但增加了
+            flush 延迟。</p>
+            <h3 id="memtable-数据结构选择">3.3 MemTable
+            数据结构选择</h3>
+            <p>RocksDB 支持多种 MemTable 实现，通过
+            <code>memtable_factory</code> 参数配置。</p>
+            <h4 id="skiplist默认">SkipList（默认）</h4>
+            <p>跳表（SkipList）是默认的 MemTable
+            实现。它支持高效的有序插入（O(log
+            n)）和有序遍历，对点查和范围扫描都友好。并发写入通过内部的无锁跳表（Lock-Free
+            SkipList）实现。</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>memtable_factory<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">new</span> rocksdb<span class="op">::</span>SkipListFactory<span class="op">());</span></span></code></pre></div>
+            <p>优势：通用性好，读写性能平衡，并发安全。绝大多数场景应该使用跳表。</p>
+            <h4 id="hashskiplist">HashSkipList</h4>
+            <p>哈希跳表（HashSkipList）在跳表外面套了一层哈希表。写入时先用键的前缀做哈希定位到一个桶（Bucket），桶内部仍然是一个跳表。</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>memtable_factory<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewHashSkipListRepFactory<span class="op">(</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>        <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>  <span class="co">// bucket_count</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">));</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>prefix_extractor<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewFixedPrefixTransform<span class="op">(</span><span class="dv">8</span><span class="op">));</span></span></code></pre></div>
+            <p>适用场景：前缀查询（Prefix
+            Seek）占主导的工作负载——比如键的前 8 个字节是用户
+            ID，查询模式是”给定用户
+            ID，遍历该用户的所有数据”。这种情况下，哈希前缀可以跳过不相关的桶，加速前缀扫描。</p>
+            <p>限制：全序遍历（<code>SeekToFirst</code> +
+            <code>Next</code>）的效率不如纯跳表；必须配合
+            <code>prefix_extractor</code> 使用。</p>
+            <h4 id="vector">Vector</h4>
+            <p>向量（Vector）MemTable
+            把写入的键值对按插入顺序追加到一个动态数组中，flush
+            前再做一次排序。</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>memtable_factory<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">new</span> rocksdb<span class="op">::</span>VectorRepFactory<span class="op">());</span></span></code></pre></div>
+            <p>适用场景：批量导入（Bulk
+            Load）——所有数据先大量写入，再一次性
+            flush。此时不需要插入过程中的有序性，追加写比跳表的插入更快。</p>
+            <p>限制：不支持并发写入；点查需要线性扫描，不适合读写混合的场景。只建议在
+            bulk load 阶段临时使用。</p>
+            <h3 id="memtable-内存与全局控制">3.4 MemTable
+            内存与全局控制</h3>
+            <p>当一个 RocksDB 实例有多个 Column Family 时，每个 Column
+            Family 独立管理自己的 MemTable。如果不加控制，所有 Column
+            Family 的 MemTable 内存总和可能远超预期。</p>
+            <p>RocksDB 提供了 <code>WriteBufferManager</code>
+            来做全局内存控制：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 限制所有 Column Family 的 MemTable 总内存为 2GB</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>shared_ptr<span class="op">&lt;</span>rocksdb<span class="op">::</span>WriteBufferManager<span class="op">&gt;</span> wbm<span class="op">(</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">new</span> rocksdb<span class="op">::</span>WriteBufferManager<span class="op">(</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>        <span class="dv">2</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>  <span class="co">// 2GB</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">));</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>write_buffer_manager <span class="op">=</span> wbm<span class="op">;</span></span></code></pre></div>
+            <p>当总 MemTable
+            内存接近限制时，<code>WriteBufferManager</code> 会触发最老的
+            MemTable 进行 flush，即使单个 Column Family 的 MemTable
+            还没满。这对于 Column Family 数量较多的场景尤其重要。</p>
+            <h3 id="memtable-参数调优思路">3.5 MemTable
+            参数调优思路</h3>
+            <p>调优的核心原则是平衡内存、写入延迟和 L0
+            文件堆积三个维度。</p>
+            <ol type="1">
+            <li><strong>先估算可用内存</strong>：<code>MemTable 总内存 = write_buffer_size × max_write_buffer_number × Column Family 数量</code>，这个值不能超过系统可用内存的一个合理比例（通常不超过
+            25% 到 30%）。</li>
+            <li><strong>再看写入吞吐量</strong>：如果写入速率是
+            100MB/s，<code>write_buffer_size</code> 设为
+            64MB，那么大约每 0.64 秒就会 flush 一次。每秒近 2 个 L0
+            文件的产生速率可能导致 L0 快速堆积。增大
+            <code>write_buffer_size</code> 到 256MB 可以把 flush
+            间隔拉长到约 2.5 秒。</li>
+            <li><strong>最后看 flush 延迟容忍度</strong>：如果 SSD
+            的顺序写速率是 500MB/s，flush 一个 256MB 的 MemTable 需要约
+            0.5 秒。在这 0.5 秒内需要有足够的可用 MemTable（由
+            <code>max_write_buffer_number</code>
+            控制）来继续接收写入。</li>
+            </ol>
+            <hr />
+            <h2 id="四block-cache-配置">四、Block Cache 配置</h2>
+            <h3 id="block-cache-的作用">4.1 Block Cache 的作用</h3>
+            <p>块缓存（Block Cache）是 RocksDB 在内存中缓存 SST
+            文件数据块（Data Block）和索引块（Index
+            Block）的组件。它的作用是减少磁盘读取次数，加速读路径。</p>
+            <p>每个 SST 文件由多个固定大小的数据块组成（默认
+            4KB），每个数据块内部存储连续的键值对。当 RocksDB
+            需要读取某个键时，它先通过索引块定位到对应的数据块，然后从
+            Block Cache
+            中查找该数据块。如果命中，直接从内存读取；如果未命中，从磁盘读取数据块并放入
+            Block Cache。</p>
+            <p>Block Cache 是 RocksDB
+            内存消耗的另一个大头。在读密集型场景中，Block Cache 通常占据
+            RocksDB 总内存的 50% 到 70%。</p>
+            <h3 id="缓存类型">4.2 缓存类型</h3>
+            <h4 id="lrucache默认">LRUCache（默认）</h4>
+            <p>最近最少使用（Least Recently Used, LRU）缓存是默认的
+            Block Cache 实现。它按最近访问时间淘汰数据块。</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions table_options<span class="op">;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_cache <span class="op">=</span> rocksdb<span class="op">::</span>NewLRUCache<span class="op">(</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="dv">4</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>  <span class="co">// 4GB 容量</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="dv">6</span><span class="op">,</span>                           <span class="co">// num_shard_bits, 2^6 = 64 个分片</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">false</span><span class="op">,</span>                       <span class="co">// strict_capacity_limit</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="fl">0.75</span>                         <span class="co">// high_pri_pool_ratio</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span></code></pre></div>
+            <p>参数说明：</p>
+            <ul>
+            <li><strong>容量</strong>：Block Cache
+            的总大小，根据可用内存设定；</li>
+            <li><strong>num_shard_bits</strong>：将 Cache 分成 2^n
+            个分片（Shard），每个分片有独立的锁，减少并发争用。经验值：16GB
+            以下用 6（64 个分片），16GB 以上用 8（256 个分片）；</li>
+            <li><strong>strict_capacity_limit</strong>：设为
+            <code>true</code> 时严格限制容量，插入新块可能失败；设为
+            <code>false</code>（默认）时允许短暂超出容量；</li>
+            <li><strong>high_pri_pool_ratio</strong>：高优先级池（High
+            Priority
+            Pool）的比例。索引块和过滤器块可以被标记为高优先级，不容易被普通数据块淘汰。</li>
+            </ul>
+            <h4 id="hyperclockcache">HyperClockCache</h4>
+            <p>从 RocksDB 8.x 开始，<code>HyperClockCache</code> 成为
+            <code>ClockCache</code> 的替代。它基于时钟算法（Clock
+            Algorithm）实现近似 LRU 的淘汰策略，锁争用比 LRU Cache
+            更少，在高并发读场景下吞吐量更高。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>HyperClockCacheOptions hcc_opts<span class="op">(</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>    <span class="dv">4</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>  <span class="co">// capacity</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span>                    <span class="co">// estimated_entry_charge（估计的平均块大小）</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_cache <span class="op">=</span> hcc_opts<span class="op">.</span>MakeSharedCache<span class="op">();</span></span></code></pre></div>
+            <p>HyperClockCache 的适用场景：读并发非常高（数万 QPS
+            以上），且 LRU Cache 的锁争用成为瓶颈。对于大多数场景，LRU
+            Cache 已经足够，不需要切换。</p>
+            <h3 id="缓存内容控制">4.3 缓存内容控制</h3>
+            <p>Block Cache 默认缓存数据块。但索引块（Index
+            Block）和布隆过滤器块（Filter Block）也可以放入 Block
+            Cache，通过以下参数控制：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>cache_index_and_filter_blocks <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>cache_index_and_filter_blocks_with_high_priority <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>pin_l0_filter_and_index_blocks_in_cache <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span></code></pre></div>
+            <ul>
+            <li><code>cache_index_and_filter_blocks</code>：将索引块和过滤器块也放入
+            Block Cache，而不是独立占用内存。这样可以让 Block Cache
+            统一管理内存，避免内存使用量不可预测。</li>
+            <li><code>cache_index_and_filter_blocks_with_high_priority</code>：将索引和过滤器块标记为高优先级，减少被数据块淘汰的概率。</li>
+            <li><code>pin_l0_filter_and_index_blocks_in_cache</code>：将
+            L0 层文件的索引和过滤器块钉（Pin）在缓存中不淘汰。L0
+            是读路径上必须检查的层，钉住它们可以避免反复从磁盘加载。</li>
+            </ul>
+            <p>在生产环境中，强烈建议打开这三个选项。如果不把索引和过滤器放入
+            Block Cache，它们会在 SST 文件打开时加载到堆内存中，随着 SST
+            文件数量增长，内存使用量不可控。</p>
+            <h3 id="压缩缓存secondary-cache">4.4 压缩缓存（Secondary
+            Cache）</h3>
+            <p>从 RocksDB 7.x 开始，引入了二级缓存（Secondary
+            Cache）的概念。当数据块从 Block
+            Cache（一级缓存）中被淘汰时，可以先压缩后放入二级缓存，而不是直接丢弃。后续访问时先解压再放回一级缓存。</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>CompressedSecondaryCacheOptions sec_opts<span class="op">;</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>sec_opts<span class="op">.</span>capacity <span class="op">=</span> <span class="dv">8</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 8GB</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>sec_opts<span class="op">.</span><span class="dt">compression_type</span> <span class="op">=</span> rocksdb<span class="op">::</span>kLZ4Compression<span class="op">;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> secondary_cache <span class="op">=</span> rocksdb<span class="op">::</span>NewCompressedSecondaryCache<span class="op">(</span>sec_opts<span class="op">);</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>LRUCacheOptions primary_opts<span class="op">;</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>primary_opts<span class="op">.</span>capacity <span class="op">=</span> <span class="dv">4</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 4GB</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>primary_opts<span class="op">.</span>secondary_cache <span class="op">=</span> secondary_cache<span class="op">;</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_cache <span class="op">=</span> primary_opts<span class="op">.</span>MakeSharedCache<span class="op">();</span></span></code></pre></div>
+            <p>这种两级缓存架构的优势：用同样的内存量，缓存更多的数据。假设压缩比为
+            2:1，4GB 一级缓存 + 8GB 二级缓存 = 12GB
+            内存，实际可缓存的数据量约为 4 + 16 =
+            20GB（二级缓存存储的是压缩数据）。代价是二级缓存命中时有一次解压开销。</p>
+            <h3 id="block-cache-大小的确定">4.5 Block Cache
+            大小的确定</h3>
+            <p>Block Cache 的大小没有万能公式。以下是一些经验准则：</p>
+            <ol type="1">
+            <li><strong>估算工作集大小</strong>：如果 SST 文件总大小是
+            500GB，但热点数据只有 50GB，那么 Block Cache 设为 50GB
+            左右可以覆盖大部分热点读取。</li>
+            <li><strong>与 MemTable
+            和操作系统的关系</strong>：<code>Block Cache + MemTable 总量 + 操作系统保留 ≤ 物理内存</code>。典型的分配比例是：Block
+            Cache 占 40% 到 50%，MemTable 占 15% 到
+            25%，其余留给操作系统和 RocksDB 其他组件。</li>
+            <li><strong>监控缓存命中率</strong>：通过
+            <code>rocksdb.block.cache.hit</code> 和
+            <code>rocksdb.block.cache.miss</code>
+            统计指标计算命中率。如果命中率长期低于
+            85%，且内存还有余量，可以考虑增大 Block Cache。</li>
+            </ol>
+            <h3 id="block-size-的选择">4.6 Block Size 的选择</h3>
+            <p>SST 文件中数据块的大小由 <code>block_size</code>
+            参数控制，默认 4KB。</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_size <span class="op">=</span> <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 16KB</span></span></code></pre></div>
+            <p>Block Size 的权衡：</p>
+            <table>
+            <colgroup>
+            <col style="width: 47%" />
+            <col style="width: 26%" />
+            <col style="width: 26%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>Block Size</th>
+            <th>优势</th>
+            <th>劣势</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>小（4KB）</td>
+            <td>点查精度高，缓存粒度细</td>
+            <td>索引块更大，SST 文件元数据开销更高</td>
+            </tr>
+            <tr>
+            <td>大（16-64KB）</td>
+            <td>范围扫描效率高，索引块更小</td>
+            <td>点查可能读入不需要的数据，缓存利用率下降</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>经验选择：点查为主的场景用 4KB 到
+            8KB，范围扫描为主的场景用 16KB 到 32KB。</p>
+            <hr />
+            <h2 id="五compaction-策略选择">五、Compaction 策略选择</h2>
+            <h3 id="为什么-compaction-是核心问题">5.1 为什么 Compaction
+            是核心问题</h3>
+            <p>Compaction 是 LSM-Tree 引擎的心脏。它负责合并和清理 SST
+            文件：消除已删除的键、合并同一键的多个版本、维护各层的有序性。Compaction
+            做得好不好，直接决定了读放大、写放大和空间放大这三个核心指标。</p>
+            <p>RocksDB 提供三种 Compaction
+            策略，适用于不同的工作负载。选错了策略，要么写放大飙升导致
+            SSD
+            寿命缩短，要么空间放大爆炸导致磁盘写满，要么读放大过高导致尾延迟不可控。</p>
+            <h3 id="leveled-compaction默认">5.2 Leveled
+            Compaction（默认）</h3>
+            <p>分层压缩（Leveled Compaction）是 RocksDB
+            的默认策略，也是最常用的策略。它把 SST
+            文件组织成多个层（Level），L0
+            以下的每一层内部的文件键范围不重叠。</p>
+            <p>工作流程：</p>
+            <ol type="1">
+            <li>MemTable flush 生成 L0 文件，L0
+            文件之间键范围可能重叠；</li>
+            <li>当 L0 文件数量达到
+            <code>level0_file_num_compaction_trigger</code>（默认
+            4）时，触发 L0 到 L1 的 Compaction；</li>
+            <li>L1 到 Ln 的 Compaction
+            按比例触发：当某一层的总大小超过该层的大小上限时，选择该层中一个文件与下一层有键范围重叠的文件进行合并。</li>
+            </ol>
+            <p>关键参数：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_style <span class="op">=</span> rocksdb<span class="op">::</span>kCompactionStyleLevel<span class="op">;</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>level0_file_num_compaction_trigger <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_bytes_for_level_base <span class="op">=</span> <span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>       <span class="co">// L1 的大小上限，256MB</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_bytes_for_level_multiplier <span class="op">=</span> <span class="dv">10</span><span class="op">;</span>                 <span class="co">// 每层大小是上一层的 10 倍</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>target_file_size_base <span class="op">=</span> <span class="dv">64</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>           <span class="co">// 单个 SST 文件的目标大小，64MB</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>num_levels <span class="op">=</span> <span class="dv">7</span><span class="op">;</span>                                      <span class="co">// 总层数</span></span></code></pre></div>
+            <p>大小模型：</p>
+            <pre class="text"><code>L1: 256MB
+L2: 2.56GB     （256MB × 10）
+L3: 25.6GB     （2.56GB × 10）
+L4: 256GB      （25.6GB × 10）
+L5: 2.56TB     （256GB × 10）
+L6: 25.6TB     （2.56TB × 10）</code></pre>
+            <p>特性：</p>
+            <ul>
+            <li><strong>写放大</strong>：较高，约 10 到 30
+            倍。一条数据在从 L0
+            到最底层的过程中，每一层都可能被重写一次。层间大小比越大，每次
+            Compaction 涉及的重叠文件越多。</li>
+            <li><strong>空间放大</strong>：较低，约 1.1 到 1.3
+            倍。因为每层内部键范围不重叠，同一键最多在相邻两层各存一份。</li>
+            <li><strong>读放大</strong>：较低。每层最多检查一个文件（通过二分查找），加上
+            L0 的所有文件。</li>
+            </ul>
+            <p>适用场景：读写混合、空间敏感、长期运行的通用负载。这是大多数生产环境的默认选择。</p>
+            <h3 id="universal-compaction">5.3 Universal Compaction</h3>
+            <p>通用压缩（Universal
+            Compaction）又称大小分层压缩（Size-Tiered
+            Compaction），其策略是按文件的大小和数量来触发
+            Compaction。所有 SST
+            文件按时间排序，选择相邻的一批文件合并成更大的文件。</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_style <span class="op">=</span> rocksdb<span class="op">::</span>kCompactionStyleUniversal<span class="op">;</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>CompactionOptionsUniversal universal_opts<span class="op">;</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>universal_opts<span class="op">.</span>size_ratio <span class="op">=</span> <span class="dv">1</span><span class="op">;</span>                          <span class="co">// 触发 Compaction 的大小比</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>universal_opts<span class="op">.</span>min_merge_width <span class="op">=</span> <span class="dv">2</span><span class="op">;</span>                     <span class="co">// 最少合并文件数</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>universal_opts<span class="op">.</span>max_merge_width <span class="op">=</span> UINT_MAX<span class="op">;</span>              <span class="co">// 最多合并文件数</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>universal_opts<span class="op">.</span>max_size_amplification_percent <span class="op">=</span> <span class="dv">200</span><span class="op">;</span>    <span class="co">// 空间放大上限</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>universal_opts<span class="op">.</span>compression_size_percent <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span>           <span class="co">// 按比例压缩</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_options_universal <span class="op">=</span> universal_opts<span class="op">;</span></span></code></pre></div>
+            <p>特性：</p>
+            <ul>
+            <li><strong>写放大</strong>：较低，约 2 到 10 倍。Compaction
+            的频率更低，每次合并的范围更大但总次数少。</li>
+            <li><strong>空间放大</strong>：较高，可能达到 2
+            倍甚至更高。因为同一键可能同时存在于多个未合并的文件中。</li>
+            <li><strong>读放大</strong>：可能较高。需要检查多个未合并的文件。</li>
+            </ul>
+            <p>适用场景：</p>
+            <ul>
+            <li>写入密集型、对写放大敏感的工作负载（比如 SSD
+            寿命敏感的场景）；</li>
+            <li>时间序列数据（Time-Series
+            Data），数据按时间顺序写入，旧数据很少被更新；</li>
+            <li>能容忍较高空间放大的环境。</li>
+            </ul>
+            <h3 id="fifo-compaction">5.4 FIFO Compaction</h3>
+            <p>先进先出压缩（FIFO
+            Compaction）是最简单的策略：不做真正的合并，只是按文件的创建时间删除最老的文件。当
+            SST 文件的总大小超过 <code>max_table_files_size</code>
+            时，最老的文件被直接删除。</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_style <span class="op">=</span> rocksdb<span class="op">::</span>kCompactionStyleFIFO<span class="op">;</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>CompactionOptionsFIFO fifo_opts<span class="op">;</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>fifo_opts<span class="op">.</span>max_table_files_size <span class="op">=</span> <span class="dv">100</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 100GB</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_options_fifo <span class="op">=</span> fifo_opts<span class="op">;</span></span></code></pre></div>
+            <p>特性：</p>
+            <ul>
+            <li><strong>写放大</strong>：接近 1——数据写一次就不再被
+            Compaction 重写；</li>
+            <li><strong>空间放大</strong>：取决于 TTL 和数据量；</li>
+            <li><strong>读放大</strong>：可能很高，因为没有合并操作，同一键可能分散在多个文件中。</li>
+            </ul>
+            <p>适用场景：</p>
+            <ul>
+            <li>纯时间序列、日志类数据，数据只追加不更新，有明确的
+            TTL（生存时间）；</li>
+            <li>作为缓存层使用，数据过期后直接丢弃。</li>
+            </ul>
+            <p>不适合有更新或删除操作的场景，因为 FIFO
+            不会合并旧版本的键。</p>
+            <h3 id="三种策略对比">5.5 三种策略对比</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>Leveled</th>
+            <th>Universal</th>
+            <th>FIFO</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>写放大</td>
+            <td>高（10-30x）</td>
+            <td>低（2-10x）</td>
+            <td>极低（约 1x）</td>
+            </tr>
+            <tr>
+            <td>空间放大</td>
+            <td>低（1.1-1.3x）</td>
+            <td>中高（可达 2x+）</td>
+            <td>取决于 TTL</td>
+            </tr>
+            <tr>
+            <td>读放大</td>
+            <td>低</td>
+            <td>中</td>
+            <td>高</td>
+            </tr>
+            <tr>
+            <td>适用场景</td>
+            <td>通用负载</td>
+            <td>写密集型</td>
+            <td>日志/缓存</td>
+            </tr>
+            <tr>
+            <td>实现复杂度</td>
+            <td>中</td>
+            <td>高</td>
+            <td>低</td>
+            </tr>
+            <tr>
+            <td>SSD 友好度</td>
+            <td>一般</td>
+            <td>好</td>
+            <td>极好</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="compaction-的并发配置">5.6 Compaction
+            的并发配置</h3>
+            <p>Compaction 是 CPU 和 I/O 密集型操作。RocksDB
+            支持多线程并发 Compaction：</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>max_background_jobs <span class="op">=</span> <span class="dv">8</span><span class="op">;</span>       <span class="co">// 后台任务总线程数（含 flush 和 compaction）</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>max_background_flushes <span class="op">=</span> <span class="dv">2</span><span class="op">;</span>    <span class="co">// 其中 flush 线程数上限</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="co">// compaction 线程数 ≈ max_background_jobs - max_background_flushes</span></span></code></pre></div>
+            <p>在 SSD 上，I/O 并行能力强，可以适当增大
+            <code>max_background_jobs</code>（8 到 16）。在 HDD 上，磁盘
+            I/O 是瓶颈，过多的并发 Compaction 反而会加剧随机
+            I/O，通常设为 2 到 4。</p>
+            <h3 id="compaction-优先级与子压缩">5.7 Compaction
+            优先级与子压缩</h3>
+            <p>RocksDB 支持 Compaction
+            优先级设置，控制先合并哪些文件：</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_pri <span class="op">=</span> rocksdb<span class="op">::</span>kMinOverlappingRatio<span class="op">;</span></span></code></pre></div>
+            <p>可选值：</p>
+            <ul>
+            <li><code>kByCompensatedSize</code>：优先选择”补偿大小”（包含删除标记权重）最大的文件，有利于快速回收空间；</li>
+            <li><code>kOldestLargestSeqFirst</code>：优先选择序列号最老的文件，有利于减少旧数据的读放大；</li>
+            <li><code>kOldestSmallestSeqFirst</code>：优先选择序列号最老且最小的文件；</li>
+            <li><code>kMinOverlappingRatio</code>：优先选择与下一层重叠比最小的文件，可以最小化每次
+            Compaction 的写入量。</li>
+            </ul>
+            <p><code>kMinOverlappingRatio</code>
+            在大多数场景下表现最好，因为它每次 Compaction
+            写入的数据量最少，降低了写放大。</p>
+            <p>子压缩（Sub-Compaction）允许一次 Compaction
+            任务在内部并行处理：</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>max_subcompactions <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span></code></pre></div>
+            <p>对于大文件的 Compaction（比如 L0 到 L1
+            的全量合并），子压缩可以显著加速。代价是更高的 CPU
+            和内存消耗。</p>
+            <h3 id="各层压缩算法">5.8 各层压缩算法</h3>
+            <p>SST
+            文件的数据可以用不同的压缩算法，不同层可以配置不同的算法：</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compression_per_level <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kNoCompression<span class="op">,</span>       <span class="co">// L0: 不压缩，减少 flush 延迟</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kNoCompression<span class="op">,</span>       <span class="co">// L1: 不压缩</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>      <span class="co">// L2: LZ4，速度快</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>      <span class="co">// L3: LZ4</span></span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>      <span class="co">// L4: LZ4</span></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD<span class="op">,</span>                <span class="co">// L5: ZSTD，压缩比高</span></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD                 <span class="co">// L6: ZSTD</span></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>bottommost_compression <span class="op">=</span> rocksdb<span class="op">::</span>kZSTD<span class="op">;</span></span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>bottommost_compression_opts<span class="op">.</span>level <span class="op">=</span> <span class="dv">3</span><span class="op">;</span>  <span class="co">// ZSTD 压缩级别</span></span></code></pre></div>
+            <p>设计思路：上层（L0、L1）的数据生命周期短、被读取和
+            Compaction 的频率高，使用无压缩或轻量压缩减少 CPU
+            开销；底层（L5、L6）数据量大、被读取频率低，使用高压缩比算法节省磁盘空间。</p>
+            <hr />
+            <h2 id="六rate-limiter-与写控制">六、Rate Limiter
+            与写控制</h2>
+            <h3 id="为什么需要限速">6.1 为什么需要限速</h3>
+            <p>RocksDB 的后台操作——flush 和 Compaction——会产生大量的磁盘
+            I/O。如果不加控制，后台 I/O
+            会和前台的读写请求争抢磁盘带宽，导致前台请求的延迟飙升。这在
+            SSD 上尤其明显：虽然 SSD
+            的总带宽很高，但写入操作会触发内部的垃圾回收（Garbage
+            Collection, GC），当 SSD 内部 GC 和 RocksDB Compaction
+            同时发生时，前台读延迟可能从微秒级飙到毫秒级。</p>
+            <p>Rate Limiter 的作用就是限制后台 I/O
+            的总带宽，给前台请求留出足够的 I/O 余量。</p>
+            <h3 id="rate-limiter-配置">6.2 Rate Limiter 配置</h3>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>rate_limiter<span class="op">.</span>reset<span class="op">(</span>rocksdb<span class="op">::</span>NewGenericRateLimiter<span class="op">(</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a>    <span class="dv">200</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>           <span class="co">// rate_bytes_per_sec: 200MB/s</span></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a>    <span class="dv">100</span> <span class="op">*</span> <span class="dv">1000</span><span class="op">,</span>                  <span class="co">// refill_period_us: 100ms 周期</span></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a>    <span class="dv">10</span><span class="op">,</span>                          <span class="co">// fairness: 高优先级请求的公平性因子</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>RateLimiter<span class="op">::</span>Mode<span class="op">::</span>kWritesOnly<span class="op">,</span>  <span class="co">// 只限制写</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">true</span>                         <span class="co">// auto_tuned: 自动调整速率</span></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a><span class="op">));</span></span></code></pre></div>
+            <p>参数说明：</p>
+            <ul>
+            <li><strong>rate_bytes_per_sec</strong>：后台 I/O
+            的总带宽上限。设定这个值需要了解磁盘的总带宽——如果 SSD
+            的持续写带宽是 500MB/s，可以把 Rate Limiter 设为 200MB/s 到
+            300MB/s，留 200MB/s 到 300MB/s 给前台操作。</li>
+            <li><strong>refill_period_us</strong>：令牌桶（Token
+            Bucket）的补充周期，默认 100ms。更短的周期意味着更平滑的 I/O
+            分配，但 CPU 开销略高。</li>
+            <li><strong>fairness</strong>：控制高优先级请求（flush）和低优先级请求（Compaction）之间的带宽分配。默认值
+            10 意味着大约每 10 次带宽分配中，有 1
+            次无条件给高优先级请求。</li>
+            <li><strong>auto_tuned</strong>：设为 <code>true</code>
+            时，RocksDB 会根据当前的写入负载和 Compaction
+            压力自动调整限速上限。当 Compaction
+            跟不上写入速度、面临写停顿风险时，会自动提高限速；当压力减小时，恢复到设定值。</li>
+            </ul>
+            <h3 id="写停顿write-stall">6.3 写停顿（Write Stall）</h3>
+            <p>写停顿是 RocksDB
+            中最常见、对上层应用影响最大的性能问题。当后台的 flush 和
+            Compaction 跟不上前台的写入速度时，RocksDB
+            会主动降低甚至完全停止接受写入请求，以避免内存和磁盘空间耗尽。</p>
+            <p>写停顿分为两个阶段：减速（Slowdown）和停止（Stop）。</p>
+            <h4 id="l0-文件堆积引发的写停顿">L0
+            文件堆积引发的写停顿</h4>
+            <p>L0 层的文件数量是触发写停顿的最常见原因。</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>level0_slowdown_writes_trigger <span class="op">=</span> <span class="dv">20</span><span class="op">;</span>   <span class="co">// L0 文件达到 20 个时开始减速</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>level0_stop_writes_trigger <span class="op">=</span> <span class="dv">36</span><span class="op">;</span>       <span class="co">// L0 文件达到 36 个时完全停止写入</span></span></code></pre></div>
+            <p>L0 文件堆积的原因通常是 Compaction 速度跟不上 flush
+            速度。解决方案包括：</p>
+            <ul>
+            <li>增大 <code>write_buffer_size</code>，减少 flush
+            频率；</li>
+            <li>增大 <code>max_background_jobs</code>，增加 Compaction
+            并发度；</li>
+            <li>调整 Rate Limiter，给 Compaction 更多的 I/O 带宽；</li>
+            <li>增大
+            <code>level0_file_num_compaction_trigger</code>，但这会增加读放大。</li>
+            </ul>
+            <h4 id="memtable-堆积引发的写停顿">MemTable
+            堆积引发的写停顿</h4>
+            <p>当不可变 MemTable 的数量达到
+            <code>max_write_buffer_number</code>
+            时，新的写入被阻塞：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_write_buffer_number <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span></code></pre></div>
+            <p>这意味着最多允许 3 个不可变 MemTable 等待 flush（第 4
+            个是活跃的）。如果 flush 线程繁忙或被 Rate Limiter
+            限制，就会出现 MemTable 堆积。</p>
+            <h4 id="pending-compaction-bytes-引发的写停顿">Pending
+            Compaction Bytes 引发的写停顿</h4>
+            <p>当等待 Compaction 的数据量（Pending Compaction
+            Bytes）超过阈值时，也会触发写停顿：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>soft_pending_compaction_bytes_limit <span class="op">=</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a>    <span class="dv">64</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 64GB 时开始减速</span></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>hard_pending_compaction_bytes_limit <span class="op">=</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a>    <span class="dv">256</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span> <span class="co">// 256GB 时完全停止</span></span></code></pre></div>
+            <h3 id="诊断写停顿">6.4 诊断写停顿</h3>
+            <p>RocksDB 提供了多个途径来诊断写停顿：</p>
+            <p><strong>日志文件</strong>：写停顿发生时，RocksDB
+            会在日志中输出告警，包括停顿原因和持续时间。</p>
+            <p><strong>统计指标</strong>：</p>
+            <pre class="text"><code>rocksdb.stall.micros                    # 写停顿的总微秒数
+rocksdb.l0.slowdown.micros              # L0 减速的总微秒数
+rocksdb.memtable.compaction.micros      # MemTable 堆积导致的停顿微秒数
+rocksdb.l0.num.files.stall.micros       # L0 文件数达到 stop trigger 的停顿微秒数
+rocksdb.pending.compaction.bytes        # 等待 Compaction 的数据量</code></pre>
+            <p><strong>DB Properties</strong>：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string value<span class="op">;</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.is-write-stopped&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>   <span class="co">// 是否正在写停止</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.actual-delayed-write-rate&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>  <span class="co">// 当前的减速写入速率</span></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.num-running-compactions&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>    <span class="co">// 正在运行的 Compaction 数量</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.num-running-flushes&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>        <span class="co">// 正在运行的 Flush 数量</span></span></code></pre></div>
+            <h3 id="写停顿的系统性解决思路">6.5
+            写停顿的系统性解决思路</h3>
+            <p>写停顿本质上是一个生产-消费不平衡问题：前台的写入速度（生产者）超过了后台的
+            flush 和 Compaction 速度（消费者）。解决思路有三条：</p>
+            <ol type="1">
+            <li><strong>降低生产速率</strong>：在应用层做写入限速或批量合并，减少写入
+            RocksDB 的数据量；</li>
+            <li><strong>提高消费能力</strong>：增加 Compaction
+            线程数、提高 Rate Limiter 限速、使用更快的存储介质；</li>
+            <li><strong>扩大缓冲区</strong>：增大
+            <code>write_buffer_size</code> 和
+            <code>max_write_buffer_number</code>，增大
+            <code>level0_slowdown_writes_trigger</code> 和
+            <code>level0_stop_writes_trigger</code>——但这只是延缓问题，如果生产-消费速率长期不匹配，缓冲区再大也会被填满。</li>
+            </ol>
+            <hr />
+            <h2 id="七direct-io-与操作系统交互">七、Direct I/O
+            与操作系统交互</h2>
+            <h3 id="page-cache-的双缓存问题">7.1 Page Cache
+            的双缓存问题</h3>
+            <p>默认情况下，RocksDB 的读写操作经过操作系统的页缓存（Page
+            Cache）。这意味着数据在内存中存了两份：一份在 RocksDB 的
+            Block Cache 里，一份在操作系统的 Page Cache
+            里。这种双缓存（Double Buffering）浪费内存，而且 Page Cache
+            的 LRU 策略对 RocksDB 的访问模式不友好——Compaction
+            读取的大量冷数据会污染 Page
+            Cache，把真正的热点数据挤出去。</p>
+            <h3 id="direct-io-配置">7.2 Direct I/O 配置</h3>
+            <p>Direct I/O 绕过操作系统的 Page Cache，让 RocksDB
+            直接与块设备交互。数据只缓存在 Block Cache
+            中，消除了双缓存问题。</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 读取使用 Direct I/O</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>use_direct_reads <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="co">// flush 和 Compaction 的写入使用 Direct I/O</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>use_direct_io_for_flush_and_compaction <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span></code></pre></div>
+            <p>两个参数可以独立控制：</p>
+            <ul>
+            <li><code>use_direct_reads</code>：对 SST 文件的读取使用
+            Direct I/O。打开后，所有 SST 文件的读取不经过 Page
+            Cache，完全依赖 Block Cache。</li>
+            <li><code>use_direct_io_for_flush_and_compaction</code>：flush
+            和 Compaction 写入 SST 文件时使用 Direct
+            I/O。打开后，新写入的 SST 文件不会进入 Page Cache。</li>
+            </ul>
+            <h3 id="direct-io-的要求与限制">7.3 Direct I/O
+            的要求与限制</h3>
+            <p>使用 Direct I/O 有以下前提条件：</p>
+            <ol type="1">
+            <li><strong>文件系统支持</strong>：ext4、XFS 支持 Direct
+            I/O；tmpfs 不支持。</li>
+            <li><strong>对齐要求</strong>：Direct I/O
+            要求读写的偏移量和缓冲区大小必须对齐到文件系统的块大小（通常
+            512 字节或 4KB）。RocksDB 内部会处理对齐，但需要确保
+            <code>sst_file_manager</code> 配置正确。</li>
+            <li><strong>Block Cache 必须足够大</strong>：关闭 Page Cache
+            意味着所有的缓存都依赖 Block Cache。如果 Block Cache
+            太小，缓存命中率会大幅下降，读性能退化严重。</li>
+            <li><strong>WAL 不受影响</strong>：Direct I/O 的配置只影响
+            SST 文件的读写，WAL 仍然通过普通 I/O 写入，仍然经过 Page
+            Cache。</li>
+            </ol>
+            <h3 id="什么时候使用-direct-io">7.4 什么时候使用 Direct
+            I/O</h3>
+            <p><strong>适合使用的场景</strong>：</p>
+            <ul>
+            <li>内存紧张，不想让 Page Cache 和 Block Cache
+            重复缓存同一份数据；</li>
+            <li>SST 文件总大小远大于内存，Page Cache
+            命中率本来就很低；</li>
+            <li>Compaction 的 I/O 模式是顺序读写大文件，Page Cache
+            的随机淘汰策略没有优势。</li>
+            </ul>
+            <p><strong>不适合使用的场景</strong>：</p>
+            <ul>
+            <li>Block Cache 不够大，无法覆盖热点数据——这时候关闭 Page
+            Cache 等于自废一臂；</li>
+            <li>使用的文件系统不支持 Direct I/O；</li>
+            <li>其他进程也需要读取 RocksDB 的 SST
+            文件（比如备份工具），Direct I/O 会导致这些进程也无法利用
+            Page Cache。</li>
+            </ul>
+            <h3 id="io-调度与操作系统调优">7.5 I/O
+            调度与操作系统调优</h3>
+            <p>除了 Direct I/O，以下操作系统级别的配置也会影响 RocksDB
+            的 I/O 性能：</p>
+            <p><strong>I/O 调度器</strong>：对于 SSD，推荐使用
+            <code>none</code>（也叫 <code>noop</code>）或
+            <code>mq-deadline</code> 调度器，避免不必要的 I/O
+            合并和排序。</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> none <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span></code></pre></div>
+            <p><strong>预读（Readahead）</strong>：Direct I/O
+            模式下，操作系统的预读机制不生效。RocksDB
+            有自己的预读控制参数：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_readahead_size <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// Compaction 读取预读 2MB</span></span></code></pre></div>
+            <p>这个参数在 Direct I/O 模式下尤其重要——没有 Page Cache
+            的预读，Compaction 的顺序读会退化为大量小块随机读。设为 2MB
+            可以让 RocksDB 在 Compaction 时一次性读取 2MB 数据，充分利用
+            SSD 的顺序读带宽。</p>
+            <p><strong>文件系统挂载选项</strong>：对于 ext4，建议使用
+            <code>noatime</code>
+            选项挂载，避免每次读取都更新文件的访问时间元数据。</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime /dev/nvme0n1p1 /data</span></code></pre></div>
+            <hr />
+            <h2 id="八statistics-与-perf-context-监控">八、Statistics 与
+            Perf Context 监控</h2>
+            <h3 id="统计信息statistics">8.1 统计信息（Statistics）</h3>
+            <p>RocksDB
+            内置了一套统计信息收集机制，可以记录几百个运行时指标。开启方式：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>statistics <span class="op">=</span> rocksdb<span class="op">::</span>CreateDBStatistics<span class="op">();</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>statistics<span class="op">-&gt;</span>set_stats_level<span class="op">(</span></span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>StatsLevel<span class="op">::</span>kExceptDetailedTimers<span class="op">);</span></span></code></pre></div>
+            <p><code>StatsLevel</code> 有四个级别：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>级别</th>
+            <th>说明</th>
+            <th>开销</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>kDisableAll</code></td>
+            <td>关闭所有统计</td>
+            <td>无</td>
+            </tr>
+            <tr>
+            <td><code>kExceptTimers</code></td>
+            <td>收集计数器，不收集计时器</td>
+            <td>极低</td>
+            </tr>
+            <tr>
+            <td><code>kExceptDetailedTimers</code></td>
+            <td>收集计数器和基本计时器</td>
+            <td>低</td>
+            </tr>
+            <tr>
+            <td><code>kAll</code></td>
+            <td>收集所有指标</td>
+            <td>中等</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>生产环境建议使用
+            <code>kExceptDetailedTimers</code>——它能覆盖绝大多数诊断需求，同时性能开销可以忽略不计。</p>
+            <h3 id="关键统计指标">8.2 关键统计指标</h3>
+            <p>以下是生产环境中必须监控的核心指标：</p>
+            <h4 id="写路径指标">写路径指标</h4>
+            <pre class="text"><code>rocksdb.db.write.micros          # 写入操作的延迟分布（直方图）
+rocksdb.db.write.stall           # 写停顿次数
+rocksdb.stall.micros             # 写停顿总时间
+rocksdb.bytes.written            # 写入的字节总数
+rocksdb.compact.write.bytes      # Compaction 写入的字节数
+rocksdb.flush.write.bytes        # Flush 写入的字节数</code></pre>
+            <p>写放大的计算方式：</p>
+            <pre class="text"><code>写放大 = (rocksdb.compact.write.bytes + rocksdb.flush.write.bytes) / rocksdb.bytes.written</code></pre>
+            <h4 id="读路径指标">读路径指标</h4>
+            <pre class="text"><code>rocksdb.db.get.micros            # Get 操作的延迟分布
+rocksdb.bloom.filter.useful      # 布隆过滤器成功过滤的次数
+rocksdb.bloom.filter.full.positive  # 布隆过滤器误判（假阳性）次数
+rocksdb.block.cache.hit          # Block Cache 命中次数
+rocksdb.block.cache.miss         # Block Cache 未命中次数
+rocksdb.memtable.hit             # MemTable 命中次数</code></pre>
+            <p>缓存命中率的计算：</p>
+            <pre class="text"><code>Block Cache 命中率 = hit / (hit + miss)</code></pre>
+            <p>如果 Block Cache 命中率低于
+            85%，需要考虑增大缓存或检查是否有大范围扫描在污染缓存。</p>
+            <h4 id="compaction-指标">Compaction 指标</h4>
+            <pre class="text"><code>rocksdb.compaction.times.micros       # Compaction 总时间
+rocksdb.compaction.cpu.micros         # Compaction 的 CPU 时间
+rocksdb.num.running.compactions       # 正在运行的 Compaction 数量
+rocksdb.pending.compaction.bytes      # 等待 Compaction 的数据量
+rocksdb.num.files.at.level{N}         # 各层的 SST 文件数量</code></pre>
+            <p><code>pending.compaction.bytes</code> 是最重要的
+            Compaction 健康指标。如果这个值持续增长，说明 Compaction
+            跟不上写入速度，最终会触发写停顿。</p>
+            <h3 id="perf-context-与-io-stats-context">8.3 Perf Context
+            与 I/O Stats Context</h3>
+            <p><code>PerfContext</code> 和 <code>IOStatsContext</code>
+            是线程局部（Thread-Local）的性能计数器，可以精确到单次操作的级别，用于诊断具体的慢查询。</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 启用 Perf Context</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>SetPerfLevel<span class="op">(</span>rocksdb<span class="op">::</span>PerfLevel<span class="op">::</span>kEnableTimeExceptForMutex<span class="op">);</span></span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>get_perf_context<span class="op">()-&gt;</span>Reset<span class="op">();</span></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>get_iostats_context<span class="op">()-&gt;</span>Reset<span class="op">();</span></span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 执行操作</span></span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string value<span class="op">;</span></span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Status s <span class="op">=</span> db<span class="op">-&gt;</span>Get<span class="op">(</span>rocksdb<span class="op">::</span>ReadOptions<span class="op">(),</span> <span class="st">&quot;mykey&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span></span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a><span class="co">// 读取 Perf Context</span></span>
+<span id="cb42-11"><a href="#cb42-11" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>PerfContext<span class="op">*</span> perf <span class="op">=</span> rocksdb<span class="op">::</span>get_perf_context<span class="op">();</span></span>
+<span id="cb42-12"><a href="#cb42-12" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> block_read_time <span class="op">=</span> perf<span class="op">-&gt;</span>block_read_time<span class="op">;</span></span>
+<span id="cb42-13"><a href="#cb42-13" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> block_read_count <span class="op">=</span> perf<span class="op">-&gt;</span>block_read_count<span class="op">;</span></span>
+<span id="cb42-14"><a href="#cb42-14" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> get_from_memtable_time <span class="op">=</span> perf<span class="op">-&gt;</span>get_from_memtable_time<span class="op">;</span></span>
+<span id="cb42-15"><a href="#cb42-15" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> seek_on_memtable_time <span class="op">=</span> perf<span class="op">-&gt;</span>seek_on_memtable_time<span class="op">;</span></span>
+<span id="cb42-16"><a href="#cb42-16" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> bloom_filter_useful <span class="op">=</span> perf<span class="op">-&gt;</span>bloom_sst_hit_count<span class="op">;</span></span>
+<span id="cb42-17"><a href="#cb42-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-18"><a href="#cb42-18" aria-hidden="true" tabindex="-1"></a><span class="co">// 读取 IO Stats Context</span></span>
+<span id="cb42-19"><a href="#cb42-19" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>IOStatsContext<span class="op">*</span> io <span class="op">=</span> rocksdb<span class="op">::</span>get_iostats_context<span class="op">();</span></span>
+<span id="cb42-20"><a href="#cb42-20" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> bytes_read <span class="op">=</span> io<span class="op">-&gt;</span>bytes_read<span class="op">;</span></span>
+<span id="cb42-21"><a href="#cb42-21" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> bytes_written <span class="op">=</span> io<span class="op">-&gt;</span>bytes_written<span class="op">;</span></span></code></pre></div>
+            <p><code>PerfContext</code> 的关键字段：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>字段</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>user_key_comparison_count</code></td>
+            <td>键比较次数</td>
+            </tr>
+            <tr>
+            <td><code>block_read_count</code></td>
+            <td>从磁盘读取的 Block 数量</td>
+            </tr>
+            <tr>
+            <td><code>block_read_time</code></td>
+            <td>Block 读取的总时间（纳秒）</td>
+            </tr>
+            <tr>
+            <td><code>block_cache_hit_count</code></td>
+            <td>Block Cache 命中次数</td>
+            </tr>
+            <tr>
+            <td><code>get_from_memtable_count</code></td>
+            <td>在 MemTable 中查找的次数</td>
+            </tr>
+            <tr>
+            <td><code>seek_on_memtable_count</code></td>
+            <td>在 MemTable 中 Seek 的次数</td>
+            </tr>
+            <tr>
+            <td><code>bloom_sst_hit_count</code></td>
+            <td>布隆过滤器命中（跳过 SST 文件）的次数</td>
+            </tr>
+            <tr>
+            <td><code>bloom_sst_miss_count</code></td>
+            <td>布隆过滤器未命中（需要读 SST 文件）的次数</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>使用场景：当某个 Get 操作延迟异常高时，通过
+            <code>PerfContext</code> 可以定位是 Block Cache
+            未命中导致了磁盘读取，还是布隆过滤器误判导致了不必要的 SST
+            文件访问，还是 MemTable 层级太多导致了过多的内存查找。</p>
+            <h3 id="db-properties">8.4 DB Properties</h3>
+            <p>除了 Statistics 和 PerfContext，RocksDB 还通过
+            <code>GetProperty()</code>
+            接口暴露了大量的运行时状态。这些属性可以用于定期巡检和异常检测。</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string val<span class="op">;</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 各层的文件数和大小</span></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.levelstats&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a><span class="co">// Compaction 状态</span></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.compaction-pending&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.num-running-compactions&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-10"><a href="#cb43-10" aria-hidden="true" tabindex="-1"></a><span class="co">// 内存使用</span></span>
+<span id="cb43-11"><a href="#cb43-11" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.estimate-table-readers-mem&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span>
+<span id="cb43-12"><a href="#cb43-12" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.cur-size-all-mem-tables&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span>
+<span id="cb43-13"><a href="#cb43-13" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.block-cache-usage&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span>
+<span id="cb43-14"><a href="#cb43-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-15"><a href="#cb43-15" aria-hidden="true" tabindex="-1"></a><span class="co">// 写停顿相关</span></span>
+<span id="cb43-16"><a href="#cb43-16" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.is-write-stopped&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span>
+<span id="cb43-17"><a href="#cb43-17" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.actual-delayed-write-rate&quot;</span><span class="op">,</span> <span class="op">&amp;</span>val<span class="op">);</span></span></code></pre></div>
+            <p>生产环境建议每 10 到 30
+            秒采集一次这些属性，发送到监控系统。</p>
+            <h3 id="构建监控仪表盘">8.5 构建监控仪表盘</h3>
+            <p>一个最小可用的 RocksDB 监控仪表盘应该包含以下面板：</p>
+            <ol type="1">
+            <li><strong>写入速率与写停顿</strong>：<code>rocksdb.bytes.written</code>（写入速率）和
+            <code>rocksdb.stall.micros</code>（写停顿时间）；</li>
+            <li><strong>Block Cache
+            命中率</strong>：<code>hit / (hit + miss)</code>，趋势图；</li>
+            <li><strong>各层文件数与大小</strong>：特别关注 L0
+            文件数是否接近
+            <code>level0_slowdown_writes_trigger</code>；</li>
+            <li><strong>Pending Compaction
+            Bytes</strong>：趋势图，持续上升是写停顿的前兆；</li>
+            <li><strong>Compaction
+            I/O</strong>：<code>compaction.read.bytes</code> 和
+            <code>compaction.write.bytes</code>，用于估算写放大；</li>
+            <li><strong>内存使用</strong>：Block Cache 使用量 + MemTable
+            使用量 + Table Reader 内存。</li>
+            </ol>
+            <hr />
+            <h2 id="九常见故障模式">九、常见故障模式</h2>
+            <h3 id="写停顿write-stall-1">9.1 写停顿（Write Stall）</h3>
+            <p>这是最常见的故障模式，在第六节已经详细讨论。这里补充几个典型的触发场景。</p>
+            <p><strong>场景一：突发写入峰值</strong></p>
+            <p>应用在某个时间段（比如整点定时任务）的写入量突然翻倍。MemTable
+            快速填满，flush 速度跟不上，L0 文件堆积，触发 L0
+            写停顿。</p>
+            <p>应对：</p>
+            <ul>
+            <li>在应用层做写入削峰（比如打散定时任务的执行时间）；</li>
+            <li>预留 <code>max_write_buffer_number</code> 的余量；</li>
+            <li>增大 <code>level0_slowdown_writes_trigger</code> 到 30
+            到 40。</li>
+            </ul>
+            <p><strong>场景二：Compaction 线程被占满</strong></p>
+            <p>多个 Column Family 同时需要 Compaction，但
+            <code>max_background_jobs</code>
+            设得太小，线程全部被占用，部分 Column Family 的 Compaction
+            排不上队。</p>
+            <p>应对：</p>
+            <ul>
+            <li>增大 <code>max_background_jobs</code>；</li>
+            <li>减少 Column Family 数量；</li>
+            <li>为不同 Column Family 设置不同的 Compaction
+            触发阈值，错峰执行。</li>
+            </ul>
+            <p><strong>场景三：Rate Limiter 过于激进</strong></p>
+            <p>Rate Limiter 的限速值设得太低，Compaction 的 I/O
+            带宽不足，导致 Compaction 速度远低于写入速度。</p>
+            <p>应对：</p>
+            <ul>
+            <li>提高 Rate Limiter 的限速值；</li>
+            <li>开启 <code>auto_tuned</code>，让 RocksDB
+            在写停顿风险增大时自动提高限速。</li>
+            </ul>
+            <h3 id="空间放大爆炸">9.2 空间放大爆炸</h3>
+            <p>空间放大（Space
+            Amplification）是指磁盘上的数据总量与实际有效数据量的比值。正常情况下
+            Leveled Compaction 的空间放大在 1.1 到 1.3
+            之间，但在以下场景会急剧恶化。</p>
+            <p><strong>场景一：大量删除操作后空间未释放</strong></p>
+            <p>在 LSM-Tree
+            中，删除操作不会立即回收空间，而是写入一个墓碑标记（Tombstone）。只有当包含原始数据和墓碑标记的文件都被
+            Compaction
+            到最底层后，空间才会真正释放。如果删除操作集中在某些键范围，而
+            Compaction 还没有覆盖到这些范围，空间放大就会飙升。</p>
+            <p>应对：</p>
+            <ul>
+            <li>手动触发目标键范围的
+            Compaction：<code>CompactRange()</code>；</li>
+            <li>使用 <code>DeleteFilesInRange()</code>
+            直接删除整个键范围对应的 SST
+            文件（谨慎使用，可能破坏快照一致性）。</li>
+            </ul>
+            <p><strong>场景二：Universal Compaction
+            下的空间堆积</strong></p>
+            <p>Universal Compaction
+            允许同一键的多个版本同时存在于多个未合并的文件中。如果写入速率持续高于
+            Compaction 速率，未合并文件越积越多，空间放大可能达到 2
+            倍甚至更高。</p>
+            <p>应对：</p>
+            <ul>
+            <li>降低 <code>max_size_amplification_percent</code>，让
+            Compaction 更积极地合并文件；</li>
+            <li>切换到 Leveled Compaction。</li>
+            </ul>
+            <p><strong>场景三：Compaction
+            落后导致临时空间占用</strong></p>
+            <p>Compaction
+            过程中需要同时保留旧文件和新文件，直到新文件写完并通过校验后才能删除旧文件。如果
+            Compaction 操作的文件很大（比如底层的一次全量
+            Compaction），临时空间占用可能很高。</p>
+            <p>应对：</p>
+            <ul>
+            <li>监控磁盘可用空间，保留至少 10% 到 20% 的余量；</li>
+            <li>使用 <code>SstFileManager</code> 限制 Compaction
+            的最大临时空间使用。</li>
+            </ul>
+            <h3 id="内存膨胀">9.3 内存膨胀</h3>
+            <p>RocksDB
+            的内存使用由多个组件组成，任何一个失控都可能导致进程
+            OOM。</p>
+            <p><strong>内存组成</strong>：</p>
+            <pre class="text"><code>总内存 ≈ Block Cache
+        + MemTable（所有 Column Family）
+        + Table Readers（索引块 + 过滤器块，如果没放入 Block Cache）
+        + Block Cache 的元数据开销
+        + 迭代器（Iterator）持有的内存
+        + Compaction 的输入/输出缓冲区</code></pre>
+            <p><strong>常见的内存膨胀原因</strong>：</p>
+            <ol type="1">
+            <li><strong>索引和过滤器没有放入 Block Cache</strong>：如果
+            <code>cache_index_and_filter_blocks</code> 为
+            <code>false</code>（默认），每个 SST
+            文件的索引块和过滤器块会在文件打开时加载到堆内存中。SST
+            文件数量越多，这部分内存越大，且完全不受 Block Cache
+            大小限制。</li>
+            <li><strong>长时间持有迭代器（Iterator）</strong>：<code>Iterator</code>
+            会持有对应时刻的数据快照，阻止相关 SST 文件被删除和相关
+            MemTable 被释放。如果应用层创建了 <code>Iterator</code>
+            但长时间不关闭，内存会持续增长。</li>
+            <li><strong>Column Family 过多</strong>：每个 Column Family
+            至少消耗 <code>write_buffer_size</code> 的内存（一个活跃
+            MemTable）。50 个 Column Family × 64MB = 3.2GB，仅 MemTable
+            就占这么多。</li>
+            <li><strong>Block Cache
+            的碎片化</strong>：<code>jemalloc</code> 或
+            <code>tcmalloc</code> 的内存分配器碎片可能导致 Block Cache
+            的实际 RSS 远大于逻辑容量。</li>
+            </ol>
+            <p><strong>内存控制清单</strong>：</p>
+            <ul>
+            <li>开启
+            <code>cache_index_and_filter_blocks = true</code>；</li>
+            <li>使用 <code>WriteBufferManager</code> 限制 MemTable
+            总内存；</li>
+            <li>限制 <code>Iterator</code>
+            的持有时间，及时关闭不再使用的迭代器；</li>
+            <li>使用 <code>jemalloc</code>
+            并开启其统计功能，监控内存碎片率；</li>
+            <li>定期通过 <code>GetProperty()</code>
+            检查各组件的内存使用量。</li>
+            </ul>
+            <h3 id="compaction-债务">9.4 Compaction 债务</h3>
+            <p>压缩债务（Compaction Debt）是指等待 Compaction
+            但尚未执行的数据量。适当的 Compaction
+            债务是正常的——Compaction 不需要实时跟上写入。但如果
+            Compaction 债务持续增长不收敛，最终会导致三个后果：</p>
+            <ol type="1">
+            <li>写停顿——Pending Compaction Bytes 超过阈值；</li>
+            <li>读性能退化——未合并的层和文件越多，每次读取需要检查的文件越多；</li>
+            <li>磁盘空间耗尽——空间放大失控。</li>
+            </ol>
+            <p><strong>判断 Compaction 债务是否健康的指标</strong>：</p>
+            <pre class="text"><code>稳态条件：Compaction 写入速率 ≥ Flush 写入速率 × (写放大系数 - 1)</code></pre>
+            <p>如果在一段时间窗口内（比如 10
+            分钟），<code>pending.compaction.bytes</code>
+            的趋势是下降或稳定的，说明 Compaction
+            能跟上；如果持续上升，就需要干预。</p>
+            <p><strong>干预手段</strong>：</p>
+            <ul>
+            <li>短期：手动触发
+            Compaction（<code>CompactRange()</code>），紧急释放空间；</li>
+            <li>中期：增加 Compaction 线程数和 I/O 带宽配额；</li>
+            <li>长期：评估是否需要切换 Compaction 策略或分库分表。</li>
+            </ul>
+            <hr />
+            <h2 id="十生产配置模板与-db_bench">十、生产配置模板与
+            db_bench</h2>
+            <h3 id="ssd-生产配置模板">10.1 SSD 生产配置模板</h3>
+            <p>以下是一份面向 SSD 的生产配置模板。这份配置假设：</p>
+            <ul>
+            <li>存储介质：NVMe SSD，持续写带宽 500MB/s 以上；</li>
+            <li>内存：64GB，其中 40GB 分配给 RocksDB；</li>
+            <li>数据量：1TB 量级；</li>
+            <li>工作负载：读写混合，写入占 30%，读取占 70%。</li>
+            </ul>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co">// === DB 级别参数 ===</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>DBOptions db_options<span class="op">;</span></span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 后台任务</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>max_background_jobs <span class="op">=</span> <span class="dv">8</span><span class="op">;</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>max_background_flushes <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>max_subcompactions <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a><span class="co">// WAL</span></span>
+<span id="cb46-10"><a href="#cb46-10" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>wal_dir <span class="op">=</span> <span class="st">&quot;/data/rocksdb/wal&quot;</span><span class="op">;</span>    <span class="co">// WAL 放在独立路径（可选）</span></span>
+<span id="cb46-11"><a href="#cb46-11" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>WAL_ttl_seconds <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb46-12"><a href="#cb46-12" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>WAL_size_limit_MB <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb46-13"><a href="#cb46-13" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>max_total_wal_size <span class="op">=</span> <span class="dv">2</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 2GB</span></span>
+<span id="cb46-14"><a href="#cb46-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-15"><a href="#cb46-15" aria-hidden="true" tabindex="-1"></a><span class="co">// Direct I/O</span></span>
+<span id="cb46-16"><a href="#cb46-16" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>use_direct_reads <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb46-17"><a href="#cb46-17" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>use_direct_io_for_flush_and_compaction <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb46-18"><a href="#cb46-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-19"><a href="#cb46-19" aria-hidden="true" tabindex="-1"></a><span class="co">// Rate Limiter</span></span>
+<span id="cb46-20"><a href="#cb46-20" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>rate_limiter<span class="op">.</span>reset<span class="op">(</span>rocksdb<span class="op">::</span>NewGenericRateLimiter<span class="op">(</span></span>
+<span id="cb46-21"><a href="#cb46-21" aria-hidden="true" tabindex="-1"></a>    <span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>   <span class="co">// 256MB/s</span></span>
+<span id="cb46-22"><a href="#cb46-22" aria-hidden="true" tabindex="-1"></a>    <span class="dv">100</span> <span class="op">*</span> <span class="dv">1000</span><span class="op">,</span>          <span class="co">// 100ms refill</span></span>
+<span id="cb46-23"><a href="#cb46-23" aria-hidden="true" tabindex="-1"></a>    <span class="dv">10</span><span class="op">,</span></span>
+<span id="cb46-24"><a href="#cb46-24" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>RateLimiter<span class="op">::</span>Mode<span class="op">::</span>kWritesOnly<span class="op">,</span></span>
+<span id="cb46-25"><a href="#cb46-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">true</span>                 <span class="co">// auto_tuned</span></span>
+<span id="cb46-26"><a href="#cb46-26" aria-hidden="true" tabindex="-1"></a><span class="op">));</span></span>
+<span id="cb46-27"><a href="#cb46-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-28"><a href="#cb46-28" aria-hidden="true" tabindex="-1"></a><span class="co">// Statistics</span></span>
+<span id="cb46-29"><a href="#cb46-29" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>statistics <span class="op">=</span> rocksdb<span class="op">::</span>CreateDBStatistics<span class="op">();</span></span>
+<span id="cb46-30"><a href="#cb46-30" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>statistics<span class="op">-&gt;</span>set_stats_level<span class="op">(</span></span>
+<span id="cb46-31"><a href="#cb46-31" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>StatsLevel<span class="op">::</span>kExceptDetailedTimers<span class="op">);</span></span>
+<span id="cb46-32"><a href="#cb46-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-33"><a href="#cb46-33" aria-hidden="true" tabindex="-1"></a><span class="co">// 全局 MemTable 内存限制</span></span>
+<span id="cb46-34"><a href="#cb46-34" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> write_buffer_manager <span class="op">=</span> <span class="bu">std::</span>make_shared<span class="op">&lt;</span>rocksdb<span class="op">::</span>WriteBufferManager<span class="op">&gt;(</span></span>
+<span id="cb46-35"><a href="#cb46-35" aria-hidden="true" tabindex="-1"></a>    <span class="dv">8</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>   <span class="co">// 8GB</span></span>
+<span id="cb46-36"><a href="#cb46-36" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span>
+<span id="cb46-37"><a href="#cb46-37" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>write_buffer_manager <span class="op">=</span> write_buffer_manager<span class="op">;</span></span>
+<span id="cb46-38"><a href="#cb46-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-39"><a href="#cb46-39" aria-hidden="true" tabindex="-1"></a><span class="co">// 错误处理</span></span>
+<span id="cb46-40"><a href="#cb46-40" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>paranoid_checks <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb46-41"><a href="#cb46-41" aria-hidden="true" tabindex="-1"></a>db_options<span class="op">.</span>info_log_level <span class="op">=</span> rocksdb<span class="op">::</span>InfoLogLevel<span class="op">::</span>INFO_LEVEL<span class="op">;</span></span>
+<span id="cb46-42"><a href="#cb46-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-43"><a href="#cb46-43" aria-hidden="true" tabindex="-1"></a><span class="co">// === Column Family 级别参数 ===</span></span>
+<span id="cb46-44"><a href="#cb46-44" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>ColumnFamilyOptions cf_options<span class="op">;</span></span>
+<span id="cb46-45"><a href="#cb46-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-46"><a href="#cb46-46" aria-hidden="true" tabindex="-1"></a><span class="co">// MemTable</span></span>
+<span id="cb46-47"><a href="#cb46-47" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>write_buffer_size <span class="op">=</span> <span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>          <span class="co">// 256MB</span></span>
+<span id="cb46-48"><a href="#cb46-48" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>max_write_buffer_number <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb46-49"><a href="#cb46-49" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>min_write_buffer_number_to_merge <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb46-50"><a href="#cb46-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-51"><a href="#cb46-51" aria-hidden="true" tabindex="-1"></a><span class="co">// Compaction</span></span>
+<span id="cb46-52"><a href="#cb46-52" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>compaction_style <span class="op">=</span> rocksdb<span class="op">::</span>kCompactionStyleLevel<span class="op">;</span></span>
+<span id="cb46-53"><a href="#cb46-53" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>level0_file_num_compaction_trigger <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb46-54"><a href="#cb46-54" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>level0_slowdown_writes_trigger <span class="op">=</span> <span class="dv">20</span><span class="op">;</span></span>
+<span id="cb46-55"><a href="#cb46-55" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>level0_stop_writes_trigger <span class="op">=</span> <span class="dv">36</span><span class="op">;</span></span>
+<span id="cb46-56"><a href="#cb46-56" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>max_bytes_for_level_base <span class="op">=</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 1GB</span></span>
+<span id="cb46-57"><a href="#cb46-57" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>max_bytes_for_level_multiplier <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb46-58"><a href="#cb46-58" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>target_file_size_base <span class="op">=</span> <span class="dv">64</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>       <span class="co">// 64MB</span></span>
+<span id="cb46-59"><a href="#cb46-59" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>num_levels <span class="op">=</span> <span class="dv">7</span><span class="op">;</span></span>
+<span id="cb46-60"><a href="#cb46-60" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>compaction_pri <span class="op">=</span> rocksdb<span class="op">::</span>kMinOverlappingRatio<span class="op">;</span></span>
+<span id="cb46-61"><a href="#cb46-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-62"><a href="#cb46-62" aria-hidden="true" tabindex="-1"></a><span class="co">// 压缩</span></span>
+<span id="cb46-63"><a href="#cb46-63" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>compression_per_level <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb46-64"><a href="#cb46-64" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kNoCompression<span class="op">,</span>       <span class="co">// L0</span></span>
+<span id="cb46-65"><a href="#cb46-65" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kNoCompression<span class="op">,</span>       <span class="co">// L1</span></span>
+<span id="cb46-66"><a href="#cb46-66" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>      <span class="co">// L2</span></span>
+<span id="cb46-67"><a href="#cb46-67" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>      <span class="co">// L3</span></span>
+<span id="cb46-68"><a href="#cb46-68" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>      <span class="co">// L4</span></span>
+<span id="cb46-69"><a href="#cb46-69" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD<span class="op">,</span>                <span class="co">// L5</span></span>
+<span id="cb46-70"><a href="#cb46-70" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD                 <span class="co">// L6</span></span>
+<span id="cb46-71"><a href="#cb46-71" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb46-72"><a href="#cb46-72" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>bottommost_compression <span class="op">=</span> rocksdb<span class="op">::</span>kZSTD<span class="op">;</span></span>
+<span id="cb46-73"><a href="#cb46-73" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>bottommost_compression_opts<span class="op">.</span>level <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb46-74"><a href="#cb46-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-75"><a href="#cb46-75" aria-hidden="true" tabindex="-1"></a><span class="co">// Pending Compaction Bytes 限制</span></span>
+<span id="cb46-76"><a href="#cb46-76" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>soft_pending_compaction_bytes_limit <span class="op">=</span></span>
+<span id="cb46-77"><a href="#cb46-77" aria-hidden="true" tabindex="-1"></a>    <span class="dv">64</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>   <span class="co">// 64GB</span></span>
+<span id="cb46-78"><a href="#cb46-78" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>hard_pending_compaction_bytes_limit <span class="op">=</span></span>
+<span id="cb46-79"><a href="#cb46-79" aria-hidden="true" tabindex="-1"></a>    <span class="dv">256</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 256GB</span></span>
+<span id="cb46-80"><a href="#cb46-80" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-81"><a href="#cb46-81" aria-hidden="true" tabindex="-1"></a><span class="co">// Compaction 读取预读</span></span>
+<span id="cb46-82"><a href="#cb46-82" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>compaction_readahead_size <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>    <span class="co">// 2MB</span></span>
+<span id="cb46-83"><a href="#cb46-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-84"><a href="#cb46-84" aria-hidden="true" tabindex="-1"></a><span class="co">// === Table 级别参数（BlockBasedTableOptions） ===</span></span>
+<span id="cb46-85"><a href="#cb46-85" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions table_options<span class="op">;</span></span>
+<span id="cb46-86"><a href="#cb46-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-87"><a href="#cb46-87" aria-hidden="true" tabindex="-1"></a><span class="co">// Block Cache: 24GB</span></span>
+<span id="cb46-88"><a href="#cb46-88" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_cache <span class="op">=</span> rocksdb<span class="op">::</span>NewLRUCache<span class="op">(</span></span>
+<span id="cb46-89"><a href="#cb46-89" aria-hidden="true" tabindex="-1"></a>    <span class="dv">24</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>  <span class="co">// 24GB</span></span>
+<span id="cb46-90"><a href="#cb46-90" aria-hidden="true" tabindex="-1"></a>    <span class="dv">8</span>                             <span class="co">// 256 个分片</span></span>
+<span id="cb46-91"><a href="#cb46-91" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span>
+<span id="cb46-92"><a href="#cb46-92" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-93"><a href="#cb46-93" aria-hidden="true" tabindex="-1"></a><span class="co">// Block Size</span></span>
+<span id="cb46-94"><a href="#cb46-94" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_size <span class="op">=</span> <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 16KB</span></span>
+<span id="cb46-95"><a href="#cb46-95" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-96"><a href="#cb46-96" aria-hidden="true" tabindex="-1"></a><span class="co">// 索引和过滤器放入 Block Cache</span></span>
+<span id="cb46-97"><a href="#cb46-97" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>cache_index_and_filter_blocks <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb46-98"><a href="#cb46-98" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>cache_index_and_filter_blocks_with_high_priority <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb46-99"><a href="#cb46-99" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>pin_l0_filter_and_index_blocks_in_cache <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb46-100"><a href="#cb46-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-101"><a href="#cb46-101" aria-hidden="true" tabindex="-1"></a><span class="co">// 布隆过滤器</span></span>
+<span id="cb46-102"><a href="#cb46-102" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>filter_policy<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb46-103"><a href="#cb46-103" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewBloomFilterPolicy<span class="op">(</span><span class="dv">10</span><span class="op">,</span> <span class="kw">false</span><span class="op">));</span>  <span class="co">// 10 bits/key，全过滤器</span></span>
+<span id="cb46-104"><a href="#cb46-104" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-105"><a href="#cb46-105" aria-hidden="true" tabindex="-1"></a><span class="co">// 分区索引（Partitioned Index）</span></span>
+<span id="cb46-106"><a href="#cb46-106" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span><span class="dt">index_type</span> <span class="op">=</span></span>
+<span id="cb46-107"><a href="#cb46-107" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>BlockBasedTableOptions<span class="op">::</span>kTwoLevelIndexSearch<span class="op">;</span></span>
+<span id="cb46-108"><a href="#cb46-108" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>metadata_block_size <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span></span>
+<span id="cb46-109"><a href="#cb46-109" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>partition_filters <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb46-110"><a href="#cb46-110" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-111"><a href="#cb46-111" aria-hidden="true" tabindex="-1"></a>cf_options<span class="op">.</span>table_factory<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb46-112"><a href="#cb46-112" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewBlockBasedTableFactory<span class="op">(</span>table_options<span class="op">));</span></span></code></pre></div>
+            <h3 id="内存分配验证">10.2 内存分配验证</h3>
+            <p>配置完成后，验证内存分配是否合理：</p>
+            <pre class="text"><code>Block Cache:          24GB
+MemTable 上限:         8GB（WriteBufferManager 限制）
+Table Readers:        ～2GB（索引和过滤器在 Block Cache 内，这里主要是 Compaction 缓冲）
+操作系统保留:          ～6GB
+─────────────────────────
+总计:                 ～40GB（64GB 机器的 62.5%）</code></pre>
+            <p>留给操作系统的 24GB 看起来偏多，但 Direct I/O 模式下 Page
+            Cache 几乎不被使用，这部分内存实际上是空闲的。如果使用
+            cgroup 限制 RocksDB 进程的内存，可以设为 42GB 左右，留 2GB
+            的安全余量。</p>
+            <h3 id="配置参数优先级">10.3 配置参数优先级</h3>
+            <p>实际调优时，不要一次改所有参数。按以下优先级逐步调整：</p>
+            <ol type="1">
+            <li><strong>Block Cache
+            大小</strong>——对读性能影响最大；</li>
+            <li><strong>write_buffer_size 和
+            max_write_buffer_number</strong>——对写性能和内存影响最大；</li>
+            <li><strong>Compaction
+            策略和层级大小</strong>——对写放大和空间放大影响最大；</li>
+            <li><strong>Rate
+            Limiter</strong>——对前台延迟的稳定性影响最大；</li>
+            <li><strong>Direct
+            I/O</strong>——对内存利用效率影响最大；</li>
+            <li><strong>布隆过滤器和 Block
+            Size</strong>——对特定查询模式的优化。</li>
+            </ol>
+            <p>每次只改一个参数，用 <code>db_bench</code>
+            或线上灰度验证效果，再改下一个。</p>
+            <h3 id="db_bench-基准测试">10.4 db_bench 基准测试</h3>
+            <p><code>db_bench</code> 是 RocksDB 自带的基准测试工具，编译
+            RocksDB
+            时会自动生成。它可以模拟多种工作负载，用于评估配置变更的效果。</p>
+            <h4 id="编译-db_bench">编译 db_bench</h4>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/facebook/rocksdb.git</span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> rocksdb</span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> db_bench <span class="at">-j</span><span class="va">$(</span><span class="fu">nproc</span><span class="va">)</span> DISABLE_JEMALLOC=1</span></code></pre></div>
+            <h4 id="写入测试">写入测试</h4>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./db_bench</span> <span class="dt">\</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--benchmarks</span><span class="op">=</span>fillrandom <span class="dt">\</span></span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--db</span><span class="op">=</span>/data/rocksdb_bench <span class="dt">\</span></span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--wal_dir</span><span class="op">=</span>/data/rocksdb_bench/wal <span class="dt">\</span></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--num</span><span class="op">=</span>100000000 <span class="dt">\</span></span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key_size</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--value_size</span><span class="op">=</span>256 <span class="dt">\</span></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--write_buffer_size</span><span class="op">=</span>268435456 <span class="dt">\</span></span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_write_buffer_number</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target_file_size_base</span><span class="op">=</span>67108864 <span class="dt">\</span></span>
+<span id="cb49-11"><a href="#cb49-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_bytes_for_level_base</span><span class="op">=</span>1073741824 <span class="dt">\</span></span>
+<span id="cb49-12"><a href="#cb49-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_bytes_for_level_multiplier</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb49-13"><a href="#cb49-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_background_jobs</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb49-14"><a href="#cb49-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--compression_type</span><span class="op">=</span>lz4 <span class="dt">\</span></span>
+<span id="cb49-15"><a href="#cb49-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_direct_io_for_flush_and_compaction</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb49-16"><a href="#cb49-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--threads</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb49-17"><a href="#cb49-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">--statistics</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb49-18"><a href="#cb49-18" aria-hidden="true" tabindex="-1"></a>  <span class="at">--report_interval_seconds</span><span class="op">=</span>10</span></code></pre></div>
+            <p>参数说明：</p>
+            <ul>
+            <li><code>fillrandom</code>：随机键写入，模拟真实写入模式；</li>
+            <li><code>num</code>：总操作数，1 亿次；</li>
+            <li><code>key_size</code> /
+            <code>value_size</code>：键和值的大小，根据实际场景调整；</li>
+            <li><code>report_interval_seconds</code>：每 10
+            秒输出一次中间结果。</li>
+            </ul>
+            <h4 id="读取测试">读取测试</h4>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./db_bench</span> <span class="dt">\</span></span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--benchmarks</span><span class="op">=</span>readrandom <span class="dt">\</span></span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--db</span><span class="op">=</span>/data/rocksdb_bench <span class="dt">\</span></span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_existing_db</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--num</span><span class="op">=</span>10000000 <span class="dt">\</span></span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key_size</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--value_size</span><span class="op">=</span>256 <span class="dt">\</span></span>
+<span id="cb50-8"><a href="#cb50-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cache_size</span><span class="op">=</span>4294967296 <span class="dt">\</span></span>
+<span id="cb50-9"><a href="#cb50-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_direct_reads</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb50-10"><a href="#cb50-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--bloom_bits</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb50-11"><a href="#cb50-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--threads</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb50-12"><a href="#cb50-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--statistics</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb50-13"><a href="#cb50-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--report_interval_seconds</span><span class="op">=</span>10</span></code></pre></div>
+            <h4 id="读写混合测试">读写混合测试</h4>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./db_bench</span> <span class="dt">\</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--benchmarks</span><span class="op">=</span>readwhilewriting <span class="dt">\</span></span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--db</span><span class="op">=</span>/data/rocksdb_bench <span class="dt">\</span></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_existing_db</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--num</span><span class="op">=</span>50000000 <span class="dt">\</span></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key_size</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--value_size</span><span class="op">=</span>256 <span class="dt">\</span></span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--write_buffer_size</span><span class="op">=</span>268435456 <span class="dt">\</span></span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_write_buffer_number</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cache_size</span><span class="op">=</span>4294967296 <span class="dt">\</span></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_direct_reads</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_direct_io_for_flush_and_compaction</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--bloom_bits</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--threads</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--benchmark_write_rate_limit</span><span class="op">=</span>10000000 <span class="dt">\</span></span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--statistics</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">--report_interval_seconds</span><span class="op">=</span>10</span></code></pre></div>
+            <p><code>readwhilewriting</code>
+            模式会启动一个写线程持续写入，其余线程执行随机读。<code>benchmark_write_rate_limit</code>
+            控制写入速率（字节/秒），这里设为 10MB/s。</p>
+            <h4 id="overwrite-测试">Overwrite 测试</h4>
+            <div class="sourceCode" id="cb52"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb52-1"><a href="#cb52-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./db_bench</span> <span class="dt">\</span></span>
+<span id="cb52-2"><a href="#cb52-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--benchmarks</span><span class="op">=</span>overwrite <span class="dt">\</span></span>
+<span id="cb52-3"><a href="#cb52-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--db</span><span class="op">=</span>/data/rocksdb_bench <span class="dt">\</span></span>
+<span id="cb52-4"><a href="#cb52-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_existing_db</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb52-5"><a href="#cb52-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--num</span><span class="op">=</span>100000000 <span class="dt">\</span></span>
+<span id="cb52-6"><a href="#cb52-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key_size</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb52-7"><a href="#cb52-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--value_size</span><span class="op">=</span>256 <span class="dt">\</span></span>
+<span id="cb52-8"><a href="#cb52-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--write_buffer_size</span><span class="op">=</span>268435456 <span class="dt">\</span></span>
+<span id="cb52-9"><a href="#cb52-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_write_buffer_number</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb52-10"><a href="#cb52-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--max_background_jobs</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb52-11"><a href="#cb52-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--compression_type</span><span class="op">=</span>lz4 <span class="dt">\</span></span>
+<span id="cb52-12"><a href="#cb52-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--use_direct_io_for_flush_and_compaction</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb52-13"><a href="#cb52-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--threads</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb52-14"><a href="#cb52-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--duration</span><span class="op">=</span>600 <span class="dt">\</span></span>
+<span id="cb52-15"><a href="#cb52-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--statistics</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb52-16"><a href="#cb52-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--report_interval_seconds</span><span class="op">=</span>10</span></code></pre></div>
+            <p><code>overwrite</code>
+            会对已有的键进行随机覆盖写入，更贴近实际的更新工作负载。<code>duration</code>
+            控制测试持续时间（秒），设为 10 分钟可以观察到 Compaction
+            在稳态下的行为。</p>
+            <h3 id="db_bench-结果解读">10.5 db_bench 结果解读</h3>
+            <p><code>db_bench</code>
+            完成后会输出类似以下的统计摘要（以下为示意输出，非真实数据）：</p>
+            <pre class="text"><code>fillrandom :       3.842 micros/op 260282 ops/sec;   71.2 MB/s
+Cumulative writes: 100M writes
+Cumulative WAL: 100M writes
+Stalls(count):    5 level0_slowdown, 0 level0_numfiles,
+                  0 memtable_compaction, 0 leveln_slowdown</code></pre>
+            <p>关注的核心指标：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>含义</th>
+            <th>关注点</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>micros/op</code></td>
+            <td>每次操作的平均延迟</td>
+            <td>越低越好，关注是否有毛刺</td>
+            </tr>
+            <tr>
+            <td><code>ops/sec</code></td>
+            <td>每秒操作数</td>
+            <td>吞吐量指标</td>
+            </tr>
+            <tr>
+            <td><code>MB/s</code></td>
+            <td>每秒写入量</td>
+            <td>与磁盘带宽对比</td>
+            </tr>
+            <tr>
+            <td>Stalls</td>
+            <td>写停顿统计</td>
+            <td>理想情况下全部为 0</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>配合
+            <code>--statistics=true</code>，测试结束后还会输出完整的统计信息，包括
+            Block Cache 命中率、布隆过滤器有效率、各层文件数等。</p>
+            <h3 id="从-db_bench-到生产">10.6 从 db_bench 到生产</h3>
+            <p><code>db_bench</code>
+            的结果与生产环境的性能会有差异，主要原因包括：</p>
+            <ol type="1">
+            <li><strong>键分布不同</strong>：<code>db_bench</code>
+            默认使用均匀分布的随机键，生产环境的键分布通常有热点（Skewed
+            Distribution）；</li>
+            <li><strong>无应用层开销</strong>：<code>db_bench</code>
+            直接调用 RocksDB 的 C++
+            API，没有网络传输、序列化、事务协调等开销；</li>
+            <li><strong>单实例 vs 多实例</strong>：生产环境可能运行多个
+            RocksDB 实例，共享 CPU 和 I/O 资源。</li>
+            </ol>
+            <p>因此 <code>db_bench</code>
+            的结果应该作为”上限参考”而非”性能承诺”。生产环境的实际性能通常是
+            <code>db_bench</code> 结果的 50% 到
+            70%。正式上线前，建议用实际的工作负载做灰度测试。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="官方文档与-wiki">官方文档与 Wiki</h3>
+            <ol type="1">
+            <li><p>RocksDB GitHub Wiki, <a
+            href="https://github.com/facebook/rocksdb/wiki"
+            class="uri">https://github.com/facebook/rocksdb/wiki</a>.
+            覆盖了所有配置参数、调优指南和内部实现说明。</p></li>
+            <li><p>RocksDB Tuning Guide, <a
+            href="https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide"
+            class="uri">https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide</a>.
+            官方的调优指南，按场景分类。</p></li>
+            <li><p>RocksDB Setup Options and Basic Tuning, <a
+            href="https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning"
+            class="uri">https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning</a>.
+            基本配置和参数说明。</p></li>
+            </ol>
+            <h3 id="源码">源码</h3>
+            <ol start="4" type="1">
+            <li><p><code>facebook/rocksdb</code>,
+            <code>db/db_impl/db_impl_write.cc</code>——写路径的核心实现，包括
+            WriteBatch 处理、WAL 写入、MemTable 插入。</p></li>
+            <li><p><code>facebook/rocksdb</code>,
+            <code>db/compaction/</code>——Compaction 的各种策略实现，包括
+            <code>leveled_compaction_picker.cc</code>、<code>universal_compaction_picker.cc</code>、<code>fifo_compaction_picker.cc</code>。</p></li>
+            <li><p><code>facebook/rocksdb</code>,
+            <code>cache/lru_cache.cc</code> 和
+            <code>cache/clock_cache.cc</code>——LRU Cache 和 Clock Cache
+            的实现。</p></li>
+            <li><p><code>facebook/rocksdb</code>,
+            <code>util/rate_limiter.cc</code>——Rate Limiter
+            的令牌桶实现。</p></li>
+            </ol>
+            <h3 id="论文与设计文档">论文与设计文档</h3>
+            <ol start="8" type="1">
+            <li><p>P. O’Neil, E. Cheng, D. Gawlick, E. O’Neil, “The
+            Log-Structured Merge-Tree (LSM-Tree),” <em>Acta
+            Informatica</em>, vol. 33, no. 4, pp. 351-385, 1996.
+            LSM-Tree 的原始论文。</p></li>
+            <li><p>S. Dong, M. Callaghan, L. Galanis, D. Borthakur, T.
+            Savor, M. Strum, “Optimizing Space Amplification in
+            RocksDB,” <em>CIDR</em>, 2017. RocksDB
+            团队关于空间放大优化的论文。</p></li>
+            <li><p>N. Dayan, M. Athanassoulis, S. Idreos, “Monkey:
+            Optimal Navigable Key-Value Store,” <em>SIGMOD</em>, 2017.
+            关于 LSM-Tree 布隆过滤器内存分配优化的论文。</p></li>
+            </ol>
+            <h3 id="工具">工具</h3>
+            <ol start="11" type="1">
+            <li><p><code>db_bench</code>，RocksDB
+            自带的基准测试工具，编译后位于 <code>build/</code>
+            或项目根目录。</p></li>
+            <li><p><code>ldb</code>，RocksDB
+            自带的命令行管理工具，可以查看 SST 文件内容、MANIFEST
+            信息、WAL 记录。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../31-lsm-tree-tuning/lsm-tree-tuning.html">LSM-Tree
+            调优：从理论到参数</a> <strong>下一篇</strong>: <a
+            href="../33-lmdb-mmap/lmdb-mmap.html">LMDB 与内存映射
+            I/O</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/17-compaction/17-compaction.html">【数据湖与开放表格式】小文件与 Compaction</a></h3>
+                    <p>拆解 lakehouse 小文件的根因（频繁提交、流式、过细分区），以及 bin-pack、sort/z-order/clustering、rewrite manifests、expire snapshots、remove orphan files 这套治理操作；讲清 Puffin 中 Theta NDV sketch 对查询 planning 的作用，附 PyIceberg 真实实验对比 compaction 前后文件数与 planning 耗时。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-16 · storage</p>
+                    <h3><a href="/post/storage/68-read-optimization/read-optimization.html">【存储工程】读取性能优化</a></h3>
+                    <p>深入分析存储读取性能优化——索引设计、Bloom Filter 调优、块缓存、压缩的 CPU-I/O 权衡、预读策略与读放大测量</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-08 · storage</p>
+                    <h3><a href="/post/storage/30-bitcask/bitcask.html">【存储工程】Bitcask 与日志结构哈希表</a></h3>
+                    <p>在存储引擎（Storage Engine）的设计谱系中，Bitcask 占据着一个独特而优雅的位置： 它用最简单的数据结构——哈希表（Hash Table）与追加日志（Append-Only Log）—— 组合出了一个在特定工作负载下性能极其出色的键值存储引擎。 本文将从核心思想出发，逐层拆解 Bitcask 的架构、…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-09 · storage</p>
+                    <h3><a href="/post/storage/31-lsm-tree-tuning/lsm-tree-tuning.html">【存储工程】LSM-Tree 工程调优：三种放大的权衡</a></h3>
+                    <p>LSM-Tree 的核心设计是把随机写转换为顺序写，但这个转换不是免费的。写入经过 MemTable 刷盘、再经过多次 Compaction 合并，每一字节的用户数据在磁盘上可能被反复读写数十次。读取一个 key 时，最坏情况下需要逐层搜索，直到命中或遍历全部层级。与此同时，旧版本数据和墓碑标记占用的额外空间，在 Co…</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

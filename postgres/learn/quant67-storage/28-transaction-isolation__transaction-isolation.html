@@ -1,0 +1,2156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】事务隔离级别的存储实现 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="transaction, isolation, mvcc, 2pl, gap-lock, ssi, percolator, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/28-transaction-isolation/transaction-isolation.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】事务隔离级别的存储实现" />
+    <meta property="og:description" content="数据库事务的四大特性 ACID 中，隔离性（Isolation）是最复杂的一项。原子性靠 WAL 保证（参见 [WAL 与崩溃恢复](../27-wal-aries/wal-aries.html)），持久性靠 fsync 落盘，一致性是应用层语义——唯独隔离性，需要存储引擎在并发控制层面做出大量取舍。SQL 标准定义了…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/28-transaction-isolation/transaction-isolation.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="transaction" />
+    <meta property="article:tag" content="isolation" />
+    <meta property="article:tag" content="mvcc" />
+    <meta property="article:tag" content="2pl" />
+    <meta property="article:tag" content="gap-lock" />
+    <meta property="article:tag" content="ssi" />
+    <meta property="article:tag" content="percolator" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】事务隔离级别的存储实现" />
+    <meta name="twitter:description" content="数据库事务的四大特性 ACID 中，隔离性（Isolation）是最复杂的一项。原子性靠 WAL 保证（参见 [WAL 与崩溃恢复](../27-wal-aries/wal-aries.html)），持久性靠 fsync 落盘，一致性是应用层语义——唯独隔离性，需要存储引擎在并发控制层面做出大量取舍。SQL 标准定义了…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】事务隔离级别的存储实现", "description": "数据库事务的四大特性 ACID 中，隔离性（Isolation）是最复杂的一项。原子性靠 WAL 保证（参见 [WAL 与崩溃恢复](../27-wal-aries/wal-aries.html)），持久性靠 fsync 落盘，一致性是应用层语义——唯独隔离性，需要存储引擎在并发控制层面做出大量取舍。SQL 标准定义了…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/28-transaction-isolation/transaction-isolation.html"}, "datePublished": "2025-09-06T00:00:00+00:00", "dateModified": "2026-04-15T11:20:56+00:00", "keywords": ["transaction", "isolation", "mvcc", "2pl", "gap-lock", "ssi", "percolator"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】事务隔离级别的存储实现</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-06</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#transaction</span> <span>#isolation</span> <span>#mvcc</span> <span>#2pl</span> <span>#gap-lock</span> <span>#ssi</span> <span>#percolator</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/27-wal-aries/wal-aries.html">上一篇：【存储工程】WAL 与崩溃恢复：ARIES 协议</a><a class="post-series-nav__link" href="/post/storage/29-index-structures/index-structures.html">下一篇：【存储工程】索引结构：从 B+Tree 到倒排索引</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/transaction.html">#transaction</a><a class="chip-link" href="/tags/isolation.html">#isolation</a><a class="chip-link" href="/tags/mvcc.html">#mvcc</a><a class="chip-link" href="/tags/2pl.html">#2pl</a><a class="chip-link" href="/tags/gap-lock.html">#gap-lock</a><a class="chip-link" href="/tags/ssi-9c7550.html">#ssi</a><a class="chip-link" href="/tags/percolator.html">#percolator</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一事务隔离级别回顾"
+                id="toc-一事务隔离级别回顾">一、事务隔离级别回顾</a>
+                <ul>
+                <li><a href="#acid-中的隔离性"
+                id="toc-acid-中的隔离性">1.1 ACID 中的隔离性</a></li>
+                <li><a href="#sql-标准的四个隔离级别"
+                id="toc-sql-标准的四个隔离级别">1.2 SQL
+                标准的四个隔离级别</a></li>
+                <li><a href="#异常现象详解" id="toc-异常现象详解">1.3
+                异常现象详解</a></li>
+                <li><a href="#berenson-等人的批判"
+                id="toc-berenson-等人的批判">1.4 Berenson
+                等人的批判</a></li>
+                </ul></li>
+                <li><a href="#二锁式隔离两阶段锁2pl"
+                id="toc-二锁式隔离两阶段锁2pl">二、锁式隔离：两阶段锁（2PL）</a>
+                <ul>
+                <li><a href="#锁的基本类型" id="toc-锁的基本类型">2.1
+                锁的基本类型</a></li>
+                <li><a href="#两阶段锁协议" id="toc-两阶段锁协议">2.2
+                两阶段锁协议</a></li>
+                <li><a href="#严格两阶段锁strict-2pl"
+                id="toc-严格两阶段锁strict-2pl">2.3 严格两阶段锁（Strict
+                2PL）</a></li>
+                <li><a href="#pl-如何实现各隔离级别"
+                id="toc-pl-如何实现各隔离级别">2.4 2PL
+                如何实现各隔离级别</a></li>
+                <li><a href="#死锁检测与处理"
+                id="toc-死锁检测与处理">2.5 死锁检测与处理</a></li>
+                <li><a href="#pl-的性能问题" id="toc-pl-的性能问题">2.6
+                2PL 的性能问题</a></li>
+                </ul></li>
+                <li><a href="#三mvcc-基础" id="toc-三mvcc-基础">三、MVCC
+                基础</a>
+                <ul>
+                <li><a href="#核心思想" id="toc-核心思想">3.1
+                核心思想</a></li>
+                <li><a href="#快照读与当前读"
+                id="toc-快照读与当前读">3.2 快照读与当前读</a></li>
+                <li><a href="#读写不阻塞的本质"
+                id="toc-读写不阻塞的本质">3.3 读写不阻塞的本质</a></li>
+                <li><a href="#版本回收的必要性"
+                id="toc-版本回收的必要性">3.4 版本回收的必要性</a></li>
+                </ul></li>
+                <li><a href="#四postgresql-mvcc-实现"
+                id="toc-四postgresql-mvcc-实现">四、PostgreSQL MVCC
+                实现</a>
+                <ul>
+                <li><a href="#堆元组的版本标记"
+                id="toc-堆元组的版本标记">4.1 堆元组的版本标记</a></li>
+                <li><a href="#可见性判断规则"
+                id="toc-可见性判断规则">4.2 可见性判断规则</a></li>
+                <li><a href="#hint-bits-优化"
+                id="toc-hint-bits-优化">4.3 Hint Bits 优化</a></li>
+                <li><a href="#可见性映射visibility-map"
+                id="toc-可见性映射visibility-map">4.4
+                可见性映射（Visibility Map）</a></li>
+                <li><a href="#vacuum-机制" id="toc-vacuum-机制">4.5
+                VACUUM 机制</a></li>
+                <li><a href="#事务-id-回卷问题"
+                id="toc-事务-id-回卷问题">4.6 事务 ID 回卷问题</a></li>
+                </ul></li>
+                <li><a href="#五mysql-innodb-mvcc-实现"
+                id="toc-五mysql-innodb-mvcc-实现">五、MySQL InnoDB MVCC
+                实现</a>
+                <ul>
+                <li><a href="#undo-log-版本链"
+                id="toc-undo-log-版本链">5.1 Undo Log 版本链</a></li>
+                <li><a href="#read-view-机制"
+                id="toc-read-view-机制">5.2 Read View 机制</a></li>
+                <li><a href="#read-committed-与-repeatable-read-的差异"
+                id="toc-read-committed-与-repeatable-read-的差异">5.3
+                Read Committed 与 Repeatable Read 的差异</a></li>
+                <li><a href="#间隙锁与-next-key-lock"
+                id="toc-间隙锁与-next-key-lock">5.4 间隙锁与 Next-Key
+                Lock</a></li>
+                <li><a href="#innodb-锁信息诊断"
+                id="toc-innodb-锁信息诊断">5.5 InnoDB
+                锁信息诊断</a></li>
+                <li><a href="#purge-线程与版本回收"
+                id="toc-purge-线程与版本回收">5.6 Purge
+                线程与版本回收</a></li>
+                </ul></li>
+                <li><a href="#六ssiserializable-snapshot-isolation"
+                id="toc-六ssiserializable-snapshot-isolation">六、SSI（Serializable
+                Snapshot Isolation）</a>
+                <ul>
+                <li><a href="#快照隔离的不足"
+                id="toc-快照隔离的不足">6.1 快照隔离的不足</a></li>
+                <li><a href="#ssi-算法原理" id="toc-ssi-算法原理">6.2
+                SSI 算法原理</a></li>
+                <li><a href="#postgresql-的-ssi-实现"
+                id="toc-postgresql-的-ssi-实现">6.3 PostgreSQL 的 SSI
+                实现</a></li>
+                <li><a href="#误杀false-positives问题"
+                id="toc-误杀false-positives问题">6.4 误杀（False
+                Positives）问题</a></li>
+                </ul></li>
+                <li><a href="#七tidb-percolator-事务模型"
+                id="toc-七tidb-percolator-事务模型">七、TiDB Percolator
+                事务模型</a>
+                <ul>
+                <li><a href="#分布式事务的挑战"
+                id="toc-分布式事务的挑战">7.1 分布式事务的挑战</a></li>
+                <li><a href="#percolator-模型概述"
+                id="toc-percolator-模型概述">7.2 Percolator
+                模型概述</a></li>
+                <li><a href="#数据的存储结构"
+                id="toc-数据的存储结构">7.3 数据的存储结构</a></li>
+                <li><a href="#两阶段提交流程"
+                id="toc-两阶段提交流程">7.4 两阶段提交流程</a></li>
+                <li><a href="#读操作流程" id="toc-读操作流程">7.5
+                读操作流程</a></li>
+                <li><a href="#async-commit-与-1pc-优化"
+                id="toc-async-commit-与-1pc-优化">7.6 Async Commit 与
+                1PC 优化</a></li>
+                <li><a href="#分布式死锁检测"
+                id="toc-分布式死锁检测">7.7 分布式死锁检测</a></li>
+                </ul></li>
+                <li><a href="#八各隔离级别异常现象复现"
+                id="toc-八各隔离级别异常现象复现">八、各隔离级别异常现象复现</a>
+                <ul>
+                <li><a href="#脏读复现read-uncommitted"
+                id="toc-脏读复现read-uncommitted">8.1 脏读复现（Read
+                Uncommitted）</a></li>
+                <li><a href="#不可重复读复现read-committed"
+                id="toc-不可重复读复现read-committed">8.2
+                不可重复读复现（Read Committed）</a></li>
+                <li><a href="#幻读复现read-committed"
+                id="toc-幻读复现read-committed">8.3 幻读复现（Read
+                Committed）</a></li>
+                <li><a href="#mysql-rr-级别下幻读的部分防护"
+                id="toc-mysql-rr-级别下幻读的部分防护">8.4 MySQL RR
+                级别下幻读的部分防护</a></li>
+                <li><a
+                href="#写偏斜复现repeatable-read-snapshot-isolation"
+                id="toc-写偏斜复现repeatable-read-snapshot-isolation">8.5
+                写偏斜复现（Repeatable Read / Snapshot
+                Isolation）</a></li>
+                <li><a href="#丢失更新复现" id="toc-丢失更新复现">8.6
+                丢失更新复现</a></li>
+                </ul></li>
+                <li><a href="#九锁等待与死锁分析"
+                id="toc-九锁等待与死锁分析">九、锁等待与死锁分析</a>
+                <ul>
+                <li><a href="#锁等待超时" id="toc-锁等待超时">9.1
+                锁等待超时</a></li>
+                <li><a href="#死锁的产生条件"
+                id="toc-死锁的产生条件">9.2 死锁的产生条件</a></li>
+                <li><a href="#死锁实战案例" id="toc-死锁实战案例">9.3
+                死锁实战案例</a></li>
+                <li><a href="#死锁诊断工具" id="toc-死锁诊断工具">9.4
+                死锁诊断工具</a></li>
+                <li><a href="#死锁预防策略" id="toc-死锁预防策略">9.5
+                死锁预防策略</a></li>
+                <li><a href="#长事务的危害" id="toc-长事务的危害">9.6
+                长事务的危害</a></li>
+                </ul></li>
+                <li><a href="#十隔离级别选择指南"
+                id="toc-十隔离级别选择指南">十、隔离级别选择指南</a>
+                <ul>
+                <li><a href="#性能与正确性的权衡"
+                id="toc-性能与正确性的权衡">10.1
+                性能与正确性的权衡</a></li>
+                <li><a href="#各数据库的默认隔离级别"
+                id="toc-各数据库的默认隔离级别">10.2
+                各数据库的默认隔离级别</a></li>
+                <li><a href="#按场景选择" id="toc-按场景选择">10.3
+                按场景选择</a></li>
+                <li><a href="#通用建议" id="toc-通用建议">10.4
+                通用建议</a></li>
+                <li><a href="#隔离级别与索引设计的关系"
+                id="toc-隔离级别与索引设计的关系">10.5
+                隔离级别与索引设计的关系</a></li>
+                </ul></li>
+                <li><a href="#附参考资料"
+                id="toc-附参考资料">附：参考资料</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>数据库事务的四大特性 ACID
+            中，隔离性（Isolation）是最复杂的一项。原子性靠 WAL
+            保证（参见 <a href="../27-wal-aries/wal-aries.html">WAL
+            与崩溃恢复</a>），持久性靠 fsync
+            落盘，一致性是应用层语义——唯独隔离性，需要存储引擎在并发控制层面做出大量取舍。SQL
+            标准定义了四个隔离级别，但标准本身只描述了”禁止哪些异常现象”，没有规定实现方式。现实中，不同数据库选择了截然不同的技术路线：Oracle
+            和 PostgreSQL 走多版本并发控制（MVCC）路线，早期 DB2 和 SQL
+            Server 走锁（Locking）路线，TiDB 走分布式 MVCC
+            路线。同一个隔离级别在不同数据库中的实际行为可能完全不同——MySQL
+            的可重复读（Repeatable Read）能防止幻读，而 SQL
+            标准的可重复读允许幻读；PostgreSQL
+            的可序列化（Serializable）基于 SSI 算法，而 MySQL
+            的可序列化基于锁。</p>
+            <p>本文从隔离级别的定义与异常现象出发，逐一拆解两阶段锁（2PL）、MVCC、SSI、Percolator
+            四种主流实现路线，深入 PostgreSQL 和 MySQL InnoDB
+            的源码级实现细节，用可复现的 SQL
+            示例演示各级别下的异常行为，最后给出面向不同负载的隔离级别选择建议。关于
+            MVCC 的基础理论，可参阅 <a
+            href="../../db/mvcc/mvcc.html">MVCC 原理详解</a>。</p>
+            <hr />
+            <h2 id="一事务隔离级别回顾">一、事务隔离级别回顾</h2>
+            <h3 id="acid-中的隔离性">1.1 ACID 中的隔离性</h3>
+            <p>事务（Transaction）是数据库操作的逻辑单元。ACID
+            四大特性中：</p>
+            <ul>
+            <li><strong>原子性（Atomicity）</strong>：事务中的操作要么全部成功，要么全部回滚；</li>
+            <li><strong>一致性（Consistency）</strong>：事务执行前后，数据库从一个一致状态迁移到另一个一致状态；</li>
+            <li><strong>隔离性（Isolation）</strong>：并发事务之间互不干扰，每个事务看到的数据就像自己独占数据库一样；</li>
+            <li><strong>持久性（Durability）</strong>：事务提交后，其修改永久生效，即使系统崩溃也不丢失。</li>
+            </ul>
+            <p>隔离性的最严格定义是可序列化（Serializability）：并发事务的执行效果等价于某种串行执行顺序。但完全的可序列化代价太高——所有读写都要加锁、排队——因此
+            SQL
+            标准（SQL-92）定义了四个隔离级别，允许在性能与正确性之间做取舍。</p>
+            <h3 id="sql-标准的四个隔离级别">1.2 SQL
+            标准的四个隔离级别</h3>
+            <p>SQL-92 标准通过”禁止哪些异常现象”来定义隔离级别：</p>
+            <table>
+            <colgroup>
+            <col style="width: 11%" />
+            <col style="width: 23%" />
+            <col style="width: 39%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>隔离级别</th>
+            <th>脏读（Dirty Read）</th>
+            <th>不可重复读（Non-Repeatable Read）</th>
+            <th>幻读（Phantom Read）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>读未提交（Read Uncommitted）</td>
+            <td>允许</td>
+            <td>允许</td>
+            <td>允许</td>
+            </tr>
+            <tr>
+            <td>读已提交（Read Committed）</td>
+            <td>禁止</td>
+            <td>允许</td>
+            <td>允许</td>
+            </tr>
+            <tr>
+            <td>可重复读（Repeatable Read）</td>
+            <td>禁止</td>
+            <td>禁止</td>
+            <td>允许</td>
+            </tr>
+            <tr>
+            <td>可序列化（Serializable）</td>
+            <td>禁止</td>
+            <td>禁止</td>
+            <td>禁止</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这个表格是教科书的经典总结，但存在一个根本性缺陷：它只列举了三种异常，实际上还有更多异常（如写偏斜）不在标准范围内。这意味着即使满足
+            SQL 标准的可重复读，仍然可能出现某些非序列化的异常行为。</p>
+            <h3 id="异常现象详解">1.3 异常现象详解</h3>
+            <p><strong>脏读（Dirty Read）</strong>：事务 T1
+            修改了一行数据但尚未提交，事务 T2
+            读到了这个未提交的修改。如果 T1 随后回滚，T2
+            读到的就是一条从未在数据库中”正式存在”过的数据。</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 脏读示例</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- T1                              -- T2</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>                                   <span class="cf">BEGIN</span>;</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>                                   <span class="co">-- 读到 T1 未提交的修改值</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="kw">ROLLBACK</span>;</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>                                   <span class="co">-- T2 基于错误数据做决策</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">COMMIT</span>;</span></code></pre></div>
+            <p><strong>不可重复读（Non-Repeatable Read）</strong>：事务
+            T1 在同一事务内两次读取同一行数据，得到不同的值。原因是 T2
+            在 T1 的两次读取之间修改并提交了该行。</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 不可重复读示例</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- T1                              -- T2</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1000</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>                                   <span class="cf">BEGIN</span>;</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">UPDATE</span> accounts</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">SET</span> balance <span class="op">=</span> <span class="dv">900</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">COMMIT</span>;</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 900（同一事务内两次读取结果不同）</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <p><strong>幻读（Phantom Read）</strong>：事务 T1
+            按某个条件查询得到一组行，事务 T2
+            插入或删除了满足该条件的行并提交，T1
+            再次按同一条件查询，得到了不同的行集合。幻读的关键在于它涉及的是行集合的变化，而非单行数据的变化。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 幻读示例</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- T1                              -- T2</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> amount <span class="op">&gt;</span> <span class="dv">1000</span>;</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 3 行</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>                                   <span class="cf">BEGIN</span>;</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">INSERT</span> <span class="kw">INTO</span> orders (<span class="kw">id</span>, amount)</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">VALUES</span> (<span class="dv">99</span>, <span class="dv">1500</span>);</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">COMMIT</span>;</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> amount <span class="op">&gt;</span> <span class="dv">1000</span>;</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 4 行（多了一条幻影行）</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <p><strong>写偏斜（Write Skew）</strong>：这是 SQL
+            标准未涵盖但在实践中极其重要的一种异常。两个事务各自读取了一组重叠的数据，然后基于各自读到的数据做出了不冲突的写操作，但两个写操作组合后违反了某个约束条件。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 写偏斜示例：医院值班系统要求至少一人在岗</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- T1                              -- T2</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;                             <span class="cf">BEGIN</span>;</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> on_call</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span>;</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 2（Alice 和 Bob）</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> on_call</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">WHERE</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span>;</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>                                   <span class="co">-- 返回 2（Alice 和 Bob）</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 觉得还有 Bob 在，可以下班</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> on_call</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;off&#39;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> name <span class="op">=</span> <span class="st">&#39;Alice&#39;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span>;</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>                                   <span class="co">-- 觉得还有 Alice 在，可以下班</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">UPDATE</span> on_call</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;off&#39;</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">WHERE</span> name <span class="op">=</span> <span class="st">&#39;Bob&#39;</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">AND</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span>;</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;                            <span class="kw">COMMIT</span>;</span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 结果：夜班无人值守！</span></span></code></pre></div>
+            <h3 id="berenson-等人的批判">1.4 Berenson 等人的批判</h3>
+            <p>1995 年，Jim Gray 等人发表了经典论文”A Critique of ANSI
+            SQL Isolation Levels”，指出 SQL
+            标准的隔离级别定义存在严重不足：</p>
+            <ol type="1">
+            <li>标准基于锁模型定义异常，无法准确描述 MVCC
+            系统的行为；</li>
+            <li>遗漏了多种异常现象，包括丢失更新（Lost
+            Update）、读偏斜（Read Skew）和写偏斜（Write Skew）；</li>
+            <li>对幻读的定义过于狭窄，仅考虑了 INSERT
+            导致的幻影行，未考虑 UPDATE 和 DELETE。</li>
+            </ol>
+            <p>该论文重新定义了基于现象（Phenomenon）的隔离级别体系，成为后续理论研究的基础。Adya
+            在 1999
+            年的博士论文中进一步将隔离级别形式化为基于依赖图（Dependency
+            Graph）的定义，建立了更严格的理论框架。</p>
+            <hr />
+            <h2
+            id="二锁式隔离两阶段锁2pl">二、锁式隔离：两阶段锁（2PL）</h2>
+            <h3 id="锁的基本类型">2.1 锁的基本类型</h3>
+            <p>在基于锁的并发控制中，数据库使用两种基本锁类型：</p>
+            <ul>
+            <li><strong>共享锁（Shared Lock，S
+            锁）</strong>：也称读锁。多个事务可以同时持有同一数据对象的
+            S 锁；</li>
+            <li><strong>排他锁（Exclusive Lock，X
+            锁）</strong>：也称写锁。一个事务持有 X
+            锁时，其他事务不能获取该数据对象的任何锁。</li>
+            </ul>
+            <p>锁的兼容矩阵如下：</p>
+            <table>
+            <thead>
+            <tr>
+            <th></th>
+            <th>请求 S 锁</th>
+            <th>请求 X 锁</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>已持有 S 锁</td>
+            <td>兼容</td>
+            <td>冲突</td>
+            </tr>
+            <tr>
+            <td>已持有 X 锁</td>
+            <td>冲突</td>
+            <td>冲突</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>除了行级锁，数据库还需要意向锁（Intention
+            Lock）来支持多粒度锁定（Multiple Granularity
+            Locking）。意向锁是加在表级或页级的锁，表示事务打算在更细粒度上获取锁：</p>
+            <ul>
+            <li><strong>意向共享锁（IS）</strong>：事务打算对表中某些行加
+            S 锁；</li>
+            <li><strong>意向排他锁（IX）</strong>：事务打算对表中某些行加
+            X 锁。</li>
+            </ul>
+            <pre class="text"><code>多粒度锁的层次结构：
+
+    Database
+       |
+    Table（IS / IX / S / X）
+       |
+    Page（IS / IX / S / X）
+       |
+    Row（S / X）</code></pre>
+            <h3 id="两阶段锁协议">2.2 两阶段锁协议</h3>
+            <p>两阶段锁（Two-Phase
+            Locking，2PL）协议是保证可序列化的经典方法。协议要求每个事务的锁操作分为两个阶段：</p>
+            <ol type="1">
+            <li><strong>增长阶段（Growing
+            Phase）</strong>：事务只能获取锁，不能释放锁；</li>
+            <li><strong>收缩阶段（Shrinking
+            Phase）</strong>：事务只能释放锁，不能获取新锁。</li>
+            </ol>
+            <pre class="text"><code>事务生命周期中的锁数量变化：
+
+锁数量
+  ^
+  |        /\
+  |       /  \
+  |      /    \
+  |     /      \
+  |    /        \
+  |   /          \
+  |  /            \
+  | /              \
+  +---+------+------+---&gt; 时间
+      增长阶段  收缩阶段
+         ↑
+      锁点（Lock Point）</code></pre>
+            <p>锁点（Lock Point）是事务获取到最后一把锁的时刻。2PL
+            保证了可序列化性：所有事务按其锁点排序，就是一个合法的串行执行顺序。</p>
+            <h3 id="严格两阶段锁strict-2pl">2.3 严格两阶段锁（Strict
+            2PL）</h3>
+            <p>基本 2PL
+            有一个问题：事务可能在提交前释放锁，导致级联回滚（Cascading
+            Abort）。为了避免这个问题，实际系统使用严格两阶段锁（Strict
+            2PL）：</p>
+            <ul>
+            <li><strong>严格 2PL（Strict
+            2PL）</strong>：所有排他锁必须在事务提交或回滚后才释放；</li>
+            <li><strong>强严格 2PL（Strong Strict
+            2PL，SS2PL）</strong>：所有锁（包括共享锁和排他锁）都必须在事务提交或回滚后才释放。</li>
+            </ul>
+            <pre class="text"><code>严格 2PL 的锁生命周期：
+
+锁数量
+  ^
+  |      ___________
+  |     /           |
+  |    /            |
+  |   /             |
+  |  /              |
+  | /               |
+  +---+--------+----+---&gt; 时间
+      增长阶段   COMMIT/ROLLBACK
+                 所有锁一次性释放</code></pre>
+            <p>SS2PL
+            是目前大多数基于锁的数据库系统采用的协议。它不仅保证可序列化，还避免了级联回滚，并且使得恢复处理更加简单。</p>
+            <h3 id="pl-如何实现各隔离级别">2.4 2PL
+            如何实现各隔离级别</h3>
+            <p>通过调整锁的获取和释放策略，2PL
+            可以实现不同的隔离级别：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>隔离级别</th>
+            <th>读锁策略</th>
+            <th>写锁策略</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>读未提交（Read Uncommitted）</td>
+            <td>不加读锁</td>
+            <td>长写锁（持有到事务结束）</td>
+            </tr>
+            <tr>
+            <td>读已提交（Read Committed）</td>
+            <td>短读锁（读完立即释放）</td>
+            <td>长写锁</td>
+            </tr>
+            <tr>
+            <td>可重复读（Repeatable Read）</td>
+            <td>长读锁（持有到事务结束）</td>
+            <td>长写锁</td>
+            </tr>
+            <tr>
+            <td>可序列化（Serializable）</td>
+            <td>长读锁 + 谓词锁</td>
+            <td>长写锁</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>谓词锁（Predicate
+            Lock）是防止幻读的关键。它锁定的不是具体的行，而是满足某个查询条件的所有行——包括当前不存在但未来可能插入的行。由于谓词锁的实现代价很高，实践中通常使用索引区间锁（Index-Range
+            Lock）或间隙锁（Gap Lock）来近似实现。</p>
+            <h3 id="死锁检测与处理">2.5 死锁检测与处理</h3>
+            <p>2PL
+            的一个固有问题是死锁（Deadlock）：两个或多个事务相互等待对方释放锁，形成循环等待。</p>
+            <pre class="text"><code>死锁示例：
+
+T1: LOCK(A) → 等待 LOCK(B)
+                    ↑
+                    |
+T2: LOCK(B) → 等待 LOCK(A)</code></pre>
+            <p>数据库处理死锁的方式有两种：</p>
+            <p><strong>死锁预防（Deadlock
+            Prevention）</strong>：在事务请求锁之前，判断是否可能导致死锁。常见策略包括：</p>
+            <ul>
+            <li><strong>Wait-Die</strong>：老事务等待年轻事务释放锁，年轻事务请求老事务的锁时直接回滚（死亡）；</li>
+            <li><strong>Wound-Wait</strong>：老事务强制回滚持有锁的年轻事务（伤害），年轻事务等待老事务释放锁。</li>
+            </ul>
+            <p><strong>死锁检测（Deadlock
+            Detection）</strong>：允许死锁发生，但定期检测并打破死锁。数据库维护一个等待图（Wait-for
+            Graph），如果检测到环路，就选择一个代价最小的事务作为牺牲者（Victim）回滚。</p>
+            <pre class="text"><code>等待图（Wait-for Graph）：
+
+T1 --等待--&gt; T2 --等待--&gt; T3
+                          |
+                          |等待
+                          v
+                         T1   ← 检测到环路！回滚代价最小的事务</code></pre>
+            <p>死锁检测的频率是一个权衡：检测太频繁浪费
+            CPU，检测太慢则死锁持续时间长。MySQL InnoDB
+            默认在每次锁等待时立即进行死锁检测（即被动触发，而非周期性扫描），PostgreSQL
+            在等待超时后进行检测。</p>
+            <h3 id="pl-的性能问题">2.6 2PL 的性能问题</h3>
+            <p>2PL 的主要问题在于：</p>
+            <ol type="1">
+            <li><strong>读写冲突</strong>：读操作需要加 S
+            锁，写操作需要加 X 锁，读写之间互相阻塞。在读多写少的 OLTP
+            场景下，大量读事务被少量写事务阻塞，严重降低吞吐量；</li>
+            <li><strong>锁开销</strong>：每个锁占用内存，锁管理器需要维护哈希表，锁的获取和释放需要原子操作或互斥锁保护，在高并发下成为瓶颈；</li>
+            <li><strong>死锁</strong>：2PL
+            无法避免死锁，死锁检测和事务回滚都有代价。</li>
+            </ol>
+            <p>正是这些问题推动了 MVCC
+            技术的发展——通过维护数据的多个版本，让读操作不需要加锁，从而避免读写冲突。</p>
+            <hr />
+            <h2 id="三mvcc-基础">三、MVCC 基础</h2>
+            <h3 id="核心思想">3.1 核心思想</h3>
+            <p>多版本并发控制（Multi-Version Concurrency
+            Control，MVCC）的核心思想极其简洁：每次修改数据时，不是就地覆盖旧值，而是创建一个新版本。读操作根据事务的时间点选择可见的版本，写操作创建新版本。读和写操作之间不再需要互相等待。</p>
+            <pre class="text"><code>MVCC 版本链示例：
+
+行 key = 1 的版本链：
+
+  版本 3（最新）   版本 2           版本 1（最旧）
+  +----------+    +----------+    +----------+
+  | value: C |    | value: B |    | value: A |
+  | txn: 300 |---&gt;| txn: 200 |---&gt;| txn: 100 |
+  | ts: t3   |    | ts: t2   |    | ts: t1   |
+  +----------+    +----------+    +----------+
+
+事务 250 启动时的快照读：
+  → 选择版本 2（txn 200 &lt; 250，且已提交）
+  → 跳过版本 3（txn 300 &gt; 250，或未提交）</code></pre>
+            <p>MVCC 有几个关键的设计决策：</p>
+            <ol type="1">
+            <li><strong>版本存储方式</strong>：旧版本存在哪里——原地存储（如
+            PostgreSQL 的堆表）还是独立的版本存储区（如 MySQL InnoDB 的
+            undo log）；</li>
+            <li><strong>版本可见性判断</strong>：如何快速判断一个版本对当前事务是否可见；</li>
+            <li><strong>版本回收</strong>：旧版本何时可以安全删除，如何高效回收。</li>
+            </ol>
+            <h3 id="快照读与当前读">3.2 快照读与当前读</h3>
+            <p>MVCC 系统中有两类读操作：</p>
+            <ul>
+            <li><strong>快照读（Snapshot
+            Read）</strong>：读取事务启动时（或语句开始时）的数据快照。不加锁，不阻塞写操作。普通的
+            <code>SELECT</code> 语句就是快照读；</li>
+            <li><strong>当前读（Current
+            Read）</strong>：读取数据的最新已提交版本，并对读取的数据加锁。<code>SELECT ... FOR UPDATE</code>、<code>SELECT ... FOR SHARE</code>、<code>UPDATE</code>、<code>DELETE</code>
+            等语句会触发当前读。</li>
+            </ul>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 快照读：不加锁，读取快照版本</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 当前读：加锁，读取最新版本</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 当前读：UPDATE 语句隐含当前读</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span></code></pre></div>
+            <p>快照读与当前读的区分是 MVCC
+            系统实现不同隔离级别的关键。在读已提交级别下，每条语句都创建一个新快照；在可重复读级别下，整个事务使用同一个快照。</p>
+            <h3 id="读写不阻塞的本质">3.3 读写不阻塞的本质</h3>
+            <p>传统锁机制下，读操作需要加 S 锁，写操作需要加 X 锁，S
+            锁和 X 锁互斥，因此读写相互阻塞。MVCC 下：</p>
+            <ul>
+            <li>读操作读取旧版本，不需要加锁；</li>
+            <li>写操作创建新版本，不影响旧版本的可见性；</li>
+            <li>写和写之间仍然需要互斥（通常通过行锁实现）。</li>
+            </ul>
+            <p>这就是 MVCC
+            的核心优势：“读不阻塞写，写不阻塞读”。但要注意，<strong>写和写之间仍然需要互斥</strong>——两个事务同时修改同一行数据时，只有一个能成功，另一个必须等待或回滚。</p>
+            <h3 id="版本回收的必要性">3.4 版本回收的必要性</h3>
+            <p>MVCC
+            不断创建新版本，如果不回收旧版本，数据库会膨胀到不可接受的程度。版本回收的条件是：当一个旧版本不再被任何活跃事务需要时，就可以安全删除。这需要跟踪所有活跃事务中最老的快照时间点。</p>
+            <p>在 PostgreSQL 中，版本回收由 VACUUM 进程负责；在 MySQL
+            InnoDB 中，由 purge 线程负责清理 undo log
+            中的旧版本。版本回收不及时会导致：</p>
+            <ol type="1">
+            <li>磁盘空间膨胀（PostgreSQL 的表膨胀问题尤为突出）；</li>
+            <li>查询性能下降（需要遍历更长的版本链）；</li>
+            <li>事务 ID 耗尽（PostgreSQL 的 32 位事务 ID
+            回卷问题）。</li>
+            </ol>
+            <hr />
+            <h2 id="四postgresql-mvcc-实现">四、PostgreSQL MVCC
+            实现</h2>
+            <h3 id="堆元组的版本标记">4.1 堆元组的版本标记</h3>
+            <p>PostgreSQL 的 MVCC
+            实现最大的特点是：所有版本都存储在堆表（Heap
+            Table）中。每个堆元组（Heap Tuple）包含以下与 MVCC
+            相关的系统字段：</p>
+            <ul>
+            <li><strong>xmin</strong>：创建该元组的事务 ID。INSERT
+            操作设置 xmin；</li>
+            <li><strong>xmax</strong>：删除或锁定该元组的事务 ID。DELETE
+            操作设置 xmax，UPDATE 操作在旧元组上设置 xmax
+            并创建新元组；</li>
+            <li><strong>cmin /
+            cmax</strong>：事务内的命令序号，用于处理同一事务内多条语句的可见性；</li>
+            <li><strong>ctid</strong>：指向该元组最新版本的物理位置（行指针）。</li>
+            </ul>
+            <pre class="text"><code>PostgreSQL 堆表中的版本链（UPDATE 操作后）：
+
+Page N:                         Page M:
++------------------+            +------------------+
+| Tuple (旧版本)    |            | Tuple (新版本)    |
+| xmin = 100       |  ctid 指向  | xmin = 200       |
+| xmax = 200       | ---------&gt; | xmax = 0         |
+| data = &#39;old&#39;     |            | data = &#39;new&#39;     |
++------------------+            +------------------+</code></pre>
+            <p>注意一个关键设计选择：PostgreSQL 的 UPDATE
+            不是就地修改，而是”标记旧版本为删除 +
+            插入新版本”。这意味着一次 UPDATE
+            会在堆表中留下两个元组——旧元组的 xmax 被设置为更新事务的
+            ID，新元组的 xmin 被设置为更新事务的 ID。</p>
+            <h3 id="可见性判断规则">4.2 可见性判断规则</h3>
+            <p>PostgreSQL 判断一个元组对事务 T
+            是否可见的核心规则如下：</p>
+            <pre class="text"><code>可见性判断逻辑（简化版）：
+
+1. 如果 xmin 对应的事务未提交且不是当前事务 → 不可见
+2. 如果 xmin 对应的事务已回滚 → 不可见
+3. 如果 xmin 对应的事务已提交（或是当前事务）：
+   a. 如果 xmax 为空（未被删除） → 可见
+   b. 如果 xmax 对应的事务未提交 → 可见（删除尚未生效）
+   c. 如果 xmax 对应的事务已回滚 → 可见（删除被取消）
+   d. 如果 xmax 对应的事务已提交 → 不可见（已被删除）</code></pre>
+            <p>在可重复读和可序列化级别下，还需要额外检查事务的快照（Snapshot）。快照由三部分组成：</p>
+            <ul>
+            <li><strong>xmin</strong>：快照创建时最小的活跃事务 ID。小于
+            xmin 的事务必然已经完成（提交或回滚）；</li>
+            <li><strong>xmax</strong>：快照创建时下一个将要分配的事务
+            ID。大于等于 xmax 的事务在快照创建后才开始；</li>
+            <li><strong>xip[]</strong>：快照创建时所有活跃事务的 ID
+            列表。</li>
+            </ul>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前快照</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> txid_current_snapshot();</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回格式：xmin:xmax:xip_list</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 例如：100:105:102,104</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 含义：事务 100 之前的都已完成，</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="co">--       事务 105 及之后的还未开始，</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="co">--       事务 102 和 104 在快照创建时仍在进行中</span></span></code></pre></div>
+            <h3 id="hint-bits-优化">4.3 Hint Bits 优化</h3>
+            <p>每次判断可见性都要查询事务提交状态（存储在 CLOG / pg_xact
+            中）非常昂贵。PostgreSQL 使用提示位（Hint
+            Bits）来优化：当第一次判断某个元组的可见性时，将事务的提交/回滚状态写回元组头部的信息位中。后续判断可以直接读取提示位，避免查询
+            CLOG。</p>
+            <pre class="text"><code>元组头部的 Hint Bits：
+
+t_infomask 字段中的关键标志位：
+  HEAP_XMIN_COMMITTED  (0x0100)  -- xmin 事务已提交
+  HEAP_XMIN_INVALID    (0x0200)  -- xmin 事务已回滚
+  HEAP_XMAX_COMMITTED  (0x0400)  -- xmax 事务已提交
+  HEAP_XMAX_INVALID    (0x0800)  -- xmax 事务已回滚</code></pre>
+            <p>提示位的写入会导致页面变脏（Dirty
+            Page），需要写回磁盘。这意味着即使是纯读操作，PostgreSQL
+            也可能产生写 I/O——这是一个经常让 DBA 感到意外的行为。</p>
+            <h3 id="可见性映射visibility-map">4.4 可见性映射（Visibility
+            Map）</h3>
+            <p>可见性映射（Visibility
+            Map，VM）是堆表的一个辅助文件，为堆表中的每个页面维护两个标志位：</p>
+            <ul>
+            <li><strong>all-visible</strong>：页面中的所有元组对所有活跃事务都可见（无需逐元组判断）；</li>
+            <li><strong>all-frozen</strong>：页面中的所有元组都已冻结（不受事务
+            ID 回卷影响）。</li>
+            </ul>
+            <pre class="text"><code>可见性映射结构：
+
+堆表文件：  [Page 0] [Page 1] [Page 2] [Page 3] ...
+VM 文件：    [ 1,0 ]  [ 0,0 ]  [ 1,1 ]  [ 1,0 ]  ...
+              ↑               ↑
+              all-visible      all-visible + all-frozen</code></pre>
+            <p>VM 的主要用途：</p>
+            <ol type="1">
+            <li><strong>仅索引扫描（Index-Only Scan）</strong>：如果 VM
+            标记某个页面为 all-visible，索引扫描就不需要回表（Heap
+            Fetch），直接从索引中返回数据；</li>
+            <li><strong>VACUUM 优化</strong>：VACUUM 可以跳过
+            all-visible 的页面，大幅减少扫描量。</li>
+            </ol>
+            <h3 id="vacuum-机制">4.5 VACUUM 机制</h3>
+            <p>PostgreSQL 的 VACUUM
+            负责回收旧版本占用的空间。有两种模式：</p>
+            <p><strong>普通 VACUUM（Lazy VACUUM）</strong>：</p>
+            <ol type="1">
+            <li>扫描堆表页面，找到所有不再被任何活跃事务需要的死元组（Dead
+            Tuple）；</li>
+            <li>将死元组标记为可复用空间，更新 Free Space
+            Map（FSM）；</li>
+            <li>更新 VM 标志位；</li>
+            <li>截断文件末尾的全空页面（可选）。</li>
+            </ol>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 手动执行 VACUUM</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>VACUUM accounts;</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- VACUUM VERBOSE 显示详细信息</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>VACUUM VERBOSE accounts;</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看表的死元组数量</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, n_live_tup, n_dead_tup,</span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>       last_vacuum, last_autovacuum</span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;accounts&#39;</span>;</span></code></pre></div>
+            <p><strong>VACUUM
+            FULL</strong>：重写整个表，彻底消除空间碎片。但会锁住整个表，生产环境慎用。</p>
+            <p><strong>Autovacuum</strong>：后台自动运行的 VACUUM
+            进程。当死元组的比例超过阈值（默认 20%）时自动触发。</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- Autovacuum 关键参数</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- autovacuum_vacuum_threshold = 50        -- 最小死元组数</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- autovacuum_vacuum_scale_factor = 0.2    -- 死元组占比阈值</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 触发条件：dead_tuples &gt; threshold + scale_factor * n_live_tup</span></span></code></pre></div>
+            <h3 id="事务-id-回卷问题">4.6 事务 ID 回卷问题</h3>
+            <p>PostgreSQL 使用 32 位无符号整数作为事务
+            ID（txid），最大值约为 42 亿。事务 ID 采用环形比较（Modular
+            Arithmetic）：在环形空间中，“过去”的事务 ID 在当前 ID
+            的前半圈（约 21 亿个），“未来”的事务 ID 在后半圈。</p>
+            <pre class="text"><code>事务 ID 的环形空间：
+
+              0
+              |
+     &quot;未来&quot;   |   &quot;过去&quot;
+              |
+  2^31 ------+------ 当前 txid
+              |
+     &quot;未来&quot;   |   &quot;过去&quot;
+              |
+           2^32</code></pre>
+            <p>当事务 ID
+            接近回卷点时，原本”过去”的事务会变成”未来”的事务，导致旧数据突然对所有事务不可见。为了防止这种灾难，PostgreSQL
+            引入了冻结（Freeze）机制：</p>
+            <ul>
+            <li>VACUUM 在处理旧元组时，将其 xmin 替换为特殊的
+            FrozenTransactionId（值为 2）；</li>
+            <li>冻结后的元组对所有事务永远可见，不受事务 ID
+            回卷影响；</li>
+            <li>参数 <code>vacuum_freeze_min_age</code>
+            控制元组存活多少个事务后被冻结（默认 5000 万）。</li>
+            </ul>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看各表的最大事务年龄</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, age(relfrozenxid) <span class="kw">AS</span> xid_age</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relkind <span class="op">=</span> <span class="st">&#39;r&#39;</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> xid_age <span class="kw">DESC</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">10</span>;</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 强制冻结</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>VACUUM FREEZE accounts;</span></code></pre></div>
+            <p>如果 <code>age(relfrozenxid)</code> 接近 20
+            亿（<code>autovacuum_freeze_max_age</code>
+            默认值），PostgreSQL
+            会发出警告甚至进入只读模式以自我保护。这是 PostgreSQL
+            运维中最常见的紧急事件之一。</p>
+            <hr />
+            <h2 id="五mysql-innodb-mvcc-实现">五、MySQL InnoDB MVCC
+            实现</h2>
+            <h3 id="undo-log-版本链">5.1 Undo Log 版本链</h3>
+            <p>与 PostgreSQL 不同，MySQL InnoDB 将旧版本存储在独立的
+            undo log 中，而非堆表里。每行数据在聚簇索引（Clustered
+            Index）中只保留最新版本，旧版本通过回滚段指针（Roll
+            Pointer）链接到 undo log 中。</p>
+            <pre class="text"><code>InnoDB 的版本链结构：
+
+聚簇索引页：
++---------------------+
+| 行记录 (最新版本)     |
+| DB_TRX_ID = 300     |
+| DB_ROLL_PTR --------|--+
++---------------------+  |
+                          v
+                    Undo Log:
+                    +----------------+
+                    | 旧版本数据       |
+                    | DB_TRX_ID = 200 |
+                    | DB_ROLL_PTR ----|--+
+                    +----------------+  |
+                                        v
+                                  +----------------+
+                                  | 更旧版本数据     |
+                                  | DB_TRX_ID = 100 |
+                                  | DB_ROLL_PTR = ∅ |
+                                  +----------------+</code></pre>
+            <p>每行记录包含三个隐藏字段：</p>
+            <ul>
+            <li><strong>DB_TRX_ID</strong>（6 字节）：最后修改该行的事务
+            ID；</li>
+            <li><strong>DB_ROLL_PTR</strong>（7 字节）：回滚段指针，指向
+            undo log 中该行的上一个版本；</li>
+            <li><strong>DB_ROW_ID</strong>（6 字节）：行
+            ID，当表没有显式主键时自动生成。</li>
+            </ul>
+            <h3 id="read-view-机制">5.2 Read View 机制</h3>
+            <p>InnoDB 使用读视图（Read
+            View）来实现快照读的可见性判断。Read View
+            在事务第一次执行快照读时创建（可重复读级别）或每条语句执行时创建（读已提交级别），包含以下信息：</p>
+            <ul>
+            <li><strong>m_ids</strong>：创建 Read View 时所有活跃事务的
+            ID 列表；</li>
+            <li><strong>m_low_limit_id</strong>：创建 Read View
+            时下一个将要分配的事务 ID（即当前系统中最大事务 ID +
+            1）；</li>
+            <li><strong>m_up_limit_id</strong>：创建 Read View
+            时活跃事务中最小的事务 ID；</li>
+            <li><strong>m_creator_trx_id</strong>：创建该 Read View
+            的事务自身的 ID。</li>
+            </ul>
+            <p>可见性判断算法：</p>
+            <pre class="text"><code>判断事务 trx_id 的修改对当前 Read View 是否可见：
+
+1. 如果 trx_id == m_creator_trx_id
+   → 可见（自己的修改当然可见）
+
+2. 如果 trx_id &lt; m_up_limit_id
+   → 可见（该事务在 Read View 创建前已提交）
+
+3. 如果 trx_id &gt;= m_low_limit_id
+   → 不可见（该事务在 Read View 创建后才开始）
+
+4. 如果 m_up_limit_id &lt;= trx_id &lt; m_low_limit_id：
+   a. 如果 trx_id 在 m_ids 中
+      → 不可见（该事务在 Read View 创建时仍活跃）
+   b. 如果 trx_id 不在 m_ids 中
+      → 可见（该事务在 Read View 创建前已提交）
+
+如果当前版本不可见，沿 DB_ROLL_PTR 找到 undo log 中的上一个版本，
+对上一个版本的 DB_TRX_ID 重复上述判断，直到找到可见版本或链尾。</code></pre>
+            <h3 id="read-committed-与-repeatable-read-的差异">5.3 Read
+            Committed 与 Repeatable Read 的差异</h3>
+            <p>在 InnoDB 中，RC 和 RR 两个级别的核心差异就在于 Read View
+            的创建时机：</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 设置隔离级别为 Read Committed</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">SESSION</span> <span class="kw">TRANSACTION</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">READ</span> <span class="kw">COMMITTED</span>;</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- RC 级别下的行为</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;  <span class="co">-- 创建 Read View #1</span></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 balance = 1000</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 另一个事务提交了 balance = 900</span></span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-11"><a href="#cb23-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;  <span class="co">-- 创建新的 Read View #2</span></span>
+<span id="cb23-12"><a href="#cb23-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 balance = 900（看到了其他事务的提交）</span></span>
+<span id="cb23-13"><a href="#cb23-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-14"><a href="#cb23-14" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 设置隔离级别为 Repeatable Read</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">SESSION</span> <span class="kw">TRANSACTION</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> REPEATABLE <span class="kw">READ</span>;</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- RR 级别下的行为</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;  <span class="co">-- 创建 Read View（整个事务复用）</span></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 balance = 1000</span></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-9"><a href="#cb24-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 另一个事务提交了 balance = 900</span></span>
+<span id="cb24-10"><a href="#cb24-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-11"><a href="#cb24-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;  <span class="co">-- 复用同一个 Read View</span></span>
+<span id="cb24-12"><a href="#cb24-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 balance = 1000（看不到其他事务的提交）</span></span>
+<span id="cb24-13"><a href="#cb24-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-14"><a href="#cb24-14" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <h3 id="间隙锁与-next-key-lock">5.4 间隙锁与 Next-Key
+            Lock</h3>
+            <p>InnoDB 在可重复读级别下使用间隙锁（Gap
+            Lock）和临键锁（Next-Key Lock）来防止幻读。这是 InnoDB 与
+            SQL 标准在 RR 级别上的重要差异——标准的 RR 允许幻读，但
+            InnoDB 的 RR 通过锁机制防止了大部分幻读场景。</p>
+            <p><strong>间隙锁（Gap
+            Lock）</strong>：锁定索引记录之间的间隙，防止其他事务在该间隙中插入新记录。间隙锁本身不锁定任何已存在的记录。</p>
+            <p><strong>临键锁（Next-Key Lock）</strong>：记录锁 +
+            间隙锁的组合。锁定一个索引记录及其前面的间隙。</p>
+            <pre class="text"><code>假设索引中有记录：10, 20, 30
+
+索引空间：
+(-∞, 10] (10, 20] (20, 30] (30, +∞)
+   ↑         ↑        ↑        ↑
+Next-Key  Next-Key Next-Key  Gap Lock
+ Lock      Lock     Lock
+
+当执行 SELECT * FROM t WHERE id = 25 FOR UPDATE 时：
+  → 加 Next-Key Lock 锁定 (20, 30]
+  → 防止在 20 到 30 之间插入新记录</code></pre>
+            <p>间隙锁的行为取决于查询条件和索引类型：</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 情况一：唯一索引上的等值查询，找到记录</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 只加记录锁，不加间隙锁</span></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> t <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">20</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 情况二：唯一索引上的等值查询，未找到记录</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 加间隙锁，锁定记录所在的间隙</span></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> t <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">25</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 锁定间隙 (20, 30)</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 情况三：非唯一索引上的等值查询</span></span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 加 Next-Key Lock</span></span>
+<span id="cb26-12"><a href="#cb26-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> t <span class="kw">WHERE</span> name <span class="op">=</span> <span class="st">&#39;Alice&#39;</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb26-13"><a href="#cb26-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-14"><a href="#cb26-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 情况四：范围查询</span></span>
+<span id="cb26-15"><a href="#cb26-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 加多个 Next-Key Lock 覆盖范围</span></span>
+<span id="cb26-16"><a href="#cb26-16" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> t <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">&gt;=</span> <span class="dv">15</span> <span class="kw">AND</span> <span class="kw">id</span> <span class="op">&lt;=</span> <span class="dv">25</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb26-17"><a href="#cb26-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 锁定 (10, 20] 和 (20, 30]</span></span></code></pre></div>
+            <h3 id="innodb-锁信息诊断">5.5 InnoDB 锁信息诊断</h3>
+            <p>MySQL 8.0 提供了丰富的锁信息查询手段：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前所有锁</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> performance_schema.data_locks;</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看锁等待关系</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> performance_schema.data_lock_waits;</span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 InnoDB 引擎状态（包含死锁信息）</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看最近一次死锁信息</span></span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在 SHOW ENGINE INNODB STATUS 输出中搜索</span></span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- &quot;LATEST DETECTED DEADLOCK&quot; 部分</span></span></code></pre></div>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 典型的锁信息输出示例</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> ENGINE_LOCK_ID, ENGINE_TRANSACTION_ID,</span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a>       LOCK_TYPE, LOCK_MODE, LOCK_STATUS,</span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a>       LOCK_DATA</span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> performance_schema.data_locks;</span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- +----------------+------------------------+-----------+-----------+-------------+-----------+</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- | ENGINE_LOCK_ID | ENGINE_TRANSACTION_ID  | LOCK_TYPE | LOCK_MODE | LOCK_STATUS | LOCK_DATA |</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- +----------------+------------------------+-----------+-----------+-------------+-----------+</span></span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- | ...            | 12345                  | RECORD    | X         | GRANTED     | 20        |</span></span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- | ...            | 12345                  | RECORD    | X,GAP     | GRANTED     | 30        |</span></span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- | ...            | 12346                  | RECORD    | X         | WAITING     | 20        |</span></span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- +----------------+------------------------+-----------+-----------+-------------+-----------+</span></span></code></pre></div>
+            <h3 id="purge-线程与版本回收">5.6 Purge 线程与版本回收</h3>
+            <p>InnoDB 的 purge 线程负责清理 undo log
+            中不再需要的旧版本。当一个旧版本的 DB_TRX_ID 小于所有活跃
+            Read View 的 m_up_limit_id 时，该版本可以被安全清理。</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 purge 状态</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 关注 &quot;History list length&quot; 字段</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 该值持续增大说明 purge 跟不上写入速度</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 undo tablespace 使用情况</span></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> TABLESPACE_NAME, FILE_NAME, AUTOEXTEND_SIZE</span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> information_schema.FILES</span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> FILE_TYPE <span class="op">=</span> <span class="st">&#39;UNDO LOG&#39;</span>;</span></code></pre></div>
+            <p>长事务是 purge
+            的天敌：一个运行数小时的查询事务会阻止所有在其之后创建的旧版本被回收，导致
+            undo log 膨胀。</p>
+            <hr />
+            <h2
+            id="六ssiserializable-snapshot-isolation">六、SSI（Serializable
+            Snapshot Isolation）</h2>
+            <h3 id="快照隔离的不足">6.1 快照隔离的不足</h3>
+            <p>快照隔离（Snapshot
+            Isolation，SI）提供了优于可重复读的隔离性——它防止了幻读，但仍然允许写偏斜（Write
+            Skew）异常。</p>
+            <p>回顾写偏斜的本质：两个事务各自读取了重叠的数据，做出了看似独立的写操作，但组合后违反了约束。在快照隔离下，每个事务看到的都是一致的快照，不会看到对方的未提交写入，因此无法检测到冲突。</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 快照隔离下的写偏斜示例（黑白棋盘约束）</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 约束：黑色和白色的总数相等</span></span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 初始状态：黑 = 5，白 = 5</span></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- T1                              -- T2</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;                             <span class="cf">BEGIN</span>;</span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span> <span class="kw">FROM</span> colors</span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> color <span class="op">=</span> <span class="st">&#39;black&#39;</span>;</span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 黑 = 5</span></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">SELECT</span> <span class="fu">count</span> <span class="kw">FROM</span> colors</span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">WHERE</span> color <span class="op">=</span> <span class="st">&#39;white&#39;</span>;</span>
+<span id="cb30-12"><a href="#cb30-12" aria-hidden="true" tabindex="-1"></a>                                   <span class="co">-- 白 = 5</span></span>
+<span id="cb30-13"><a href="#cb30-13" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> colors</span>
+<span id="cb30-14"><a href="#cb30-14" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SET</span> <span class="fu">count</span> <span class="op">=</span> <span class="fu">count</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb30-15"><a href="#cb30-15" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> color <span class="op">=</span> <span class="st">&#39;black&#39;</span>;</span>
+<span id="cb30-16"><a href="#cb30-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 黑 = 6</span></span>
+<span id="cb30-17"><a href="#cb30-17" aria-hidden="true" tabindex="-1"></a>                                   <span class="kw">UPDATE</span> colors</span>
+<span id="cb30-18"><a href="#cb30-18" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">SET</span> <span class="fu">count</span> <span class="op">=</span> <span class="fu">count</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb30-19"><a href="#cb30-19" aria-hidden="true" tabindex="-1"></a>                                     <span class="kw">WHERE</span> color <span class="op">=</span> <span class="st">&#39;white&#39;</span>;</span>
+<span id="cb30-20"><a href="#cb30-20" aria-hidden="true" tabindex="-1"></a>                                   <span class="co">-- 白 = 6</span></span>
+<span id="cb30-21"><a href="#cb30-21" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;                            <span class="kw">COMMIT</span>;</span>
+<span id="cb30-22"><a href="#cb30-22" aria-hidden="true" tabindex="-1"></a><span class="co">-- 最终：黑 = 6，白 = 6（约束被打破）</span></span></code></pre></div>
+            <h3 id="ssi-算法原理">6.2 SSI 算法原理</h3>
+            <p>可序列化快照隔离（Serializable Snapshot
+            Isolation，SSI）是 Michael Cahill 在 2008
+            年提出的算法，它在快照隔离的基础上增加了读写冲突（rw-conflict）的检测，能够捕获写偏斜等异常。</p>
+            <p>SSI 的核心概念是读写依赖（rw-dependency）：如果事务 T1
+            读取了某个数据对象 x 的版本 v，而事务 T2 随后修改了 x
+            创建了新版本 v’，那么从 T1 到 T2 存在一条 rw-dependency
+            边。</p>
+            <p>SSI 检测异常的定理（基于 Fekete 等人 2005
+            年的研究）：</p>
+            <pre class="text"><code>SSI 检测规则：
+
+在一个快照隔离的依赖图中，如果存在非序列化的调度，
+则必然存在两条连续的 rw-dependency 边形成一个&quot;危险结构&quot;：
+
+  T1 --rw--&gt; T2 --rw--&gt; T3
+
+其中 T1 和 T3 可能是同一个事务（即形成环）。
+
+SSI 的做法：
+1. 跟踪所有 rw-dependency 关系；
+2. 当检测到&quot;连续两条 rw-dependency&quot;模式时，
+   中止其中一个事务来打破潜在的不可序列化调度。</code></pre>
+            <h3 id="postgresql-的-ssi-实现">6.3 PostgreSQL 的 SSI
+            实现</h3>
+            <p>PostgreSQL 从 9.1 版本开始，将可序列化隔离级别从基于 S2PL
+            的实现切换为基于 SSI 的实现。实现涉及两个关键数据结构：</p>
+            <p><strong>SIREAD
+            锁</strong>：当事务在可序列化级别执行快照读时，PostgreSQL
+            会记录”哪个事务读取了哪些数据”，但不真正阻塞其他事务。SIREAD
+            锁存在三种粒度：</p>
+            <ul>
+            <li>元组级别（Tuple）；</li>
+            <li>页面级别（Page）——当元组级 SIREAD
+            锁过多时自动升级；</li>
+            <li>关系级别（Relation）——当页面级 SIREAD
+            锁过多时自动升级。</li>
+            </ul>
+            <p><strong>rw-conflict
+            列表</strong>：当一个事务写入的数据与另一个事务的 SIREAD
+            锁冲突时，记录一条 rw-conflict。</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在 PostgreSQL 中使用 SSI</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">SERIALIZABLE</span>;</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 执行正常的 SQL 操作</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb32-9"><a href="#cb32-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果检测到不可序列化的依赖，COMMIT 会失败：</span></span>
+<span id="cb32-10"><a href="#cb32-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- ERROR:  could not serialize access due to read/write dependencies</span></span>
+<span id="cb32-11"><a href="#cb32-11" aria-hidden="true" tabindex="-1"></a><span class="co">--         among transactions</span></span></code></pre></div>
+            <h3 id="误杀false-positives问题">6.4 误杀（False
+            Positives）问题</h3>
+            <p>SSI
+            的检测是保守的——它可能中止实际上不会导致异常的事务。这些误杀（False
+            Positives）来源于：</p>
+            <ol type="1">
+            <li><strong>粒度升级</strong>：SIREAD
+            锁从元组级升级到页面级或关系级时，锁的范围扩大，可能引入不存在的冲突；</li>
+            <li><strong>不区分读取的具体值</strong>：SSI 只知道”T1
+            读了表 X”，不知道”T1 读了 X 中哪些行”，导致误判；</li>
+            <li><strong>已提交事务的依赖信息保留不足</strong>：为了控制内存使用，PostgreSQL
+            会在事务提交后合并其依赖信息，丢失部分精度。</li>
+            </ol>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 调整 SSI 相关参数以减少误杀</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- max_pred_locks_per_transaction：每个事务最大 SIREAD 锁数量</span></span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- max_pred_locks_per_relation：每个关系最大 SIREAD 锁数量</span></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- max_pred_locks_per_page：每个页面最大 SIREAD 锁数量</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 增大这些值可以延迟粒度升级，减少误杀，但增加内存消耗</span></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">SYSTEM</span> <span class="kw">SET</span> max_pred_locks_per_transaction <span class="op">=</span> <span class="dv">128</span>;</span></code></pre></div>
+            <p>在误杀率方面，PostgreSQL 的 SSI 实现在典型 OLTP
+            负载下表现良好。但在涉及大范围扫描的场景下，SIREAD
+            锁粒度升级可能导致较高的误杀率。应用层需要准备好处理序列化失败——通常的做法是捕获错误后重试事务。</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 应用层处理 SSI 序列化失败的重试逻辑</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> psycopg2</span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> execute_with_retry(conn, sql, params, max_retries<span class="op">=</span><span class="dv">3</span>):</span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> attempt <span class="kw">in</span> <span class="bu">range</span>(max_retries):</span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span>:</span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a>            <span class="cf">with</span> conn.cursor() <span class="im">as</span> cur:</span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a>                conn.autocommit <span class="op">=</span> <span class="va">False</span></span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a>                cur.execute(</span>
+<span id="cb34-10"><a href="#cb34-10" aria-hidden="true" tabindex="-1"></a>                    <span class="st">&quot;SET TRANSACTION ISOLATION LEVEL SERIALIZABLE&quot;</span></span>
+<span id="cb34-11"><a href="#cb34-11" aria-hidden="true" tabindex="-1"></a>                )</span>
+<span id="cb34-12"><a href="#cb34-12" aria-hidden="true" tabindex="-1"></a>                cur.execute(sql, params)</span>
+<span id="cb34-13"><a href="#cb34-13" aria-hidden="true" tabindex="-1"></a>                conn.commit()</span>
+<span id="cb34-14"><a href="#cb34-14" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span></span>
+<span id="cb34-15"><a href="#cb34-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">except</span> psycopg2.errors.SerializationFailure:</span>
+<span id="cb34-16"><a href="#cb34-16" aria-hidden="true" tabindex="-1"></a>            conn.rollback()</span>
+<span id="cb34-17"><a href="#cb34-17" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> attempt <span class="op">==</span> max_retries <span class="op">-</span> <span class="dv">1</span>:</span>
+<span id="cb34-18"><a href="#cb34-18" aria-hidden="true" tabindex="-1"></a>                <span class="cf">raise</span></span>
+<span id="cb34-19"><a href="#cb34-19" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 指数退避</span></span>
+<span id="cb34-20"><a href="#cb34-20" aria-hidden="true" tabindex="-1"></a>            time.sleep(<span class="fl">0.1</span> <span class="op">*</span> (<span class="dv">2</span> <span class="op">**</span> attempt))</span></code></pre></div>
+            <hr />
+            <h2 id="七tidb-percolator-事务模型">七、TiDB Percolator
+            事务模型</h2>
+            <h3 id="分布式事务的挑战">7.1 分布式事务的挑战</h3>
+            <p>在单机数据库中，锁管理器和 MVCC
+            版本链都在本地内存中，事务协调的开销很低。但在分布式数据库中，数据分布在多个节点上，一个事务可能涉及多个节点上的数据。这带来了几个核心挑战：</p>
+            <ol type="1">
+            <li><strong>全局时序</strong>：如何确定分布式环境下事务的先后顺序；</li>
+            <li><strong>原子提交</strong>：如何保证跨节点事务的原子性；</li>
+            <li><strong>分布式锁</strong>：如何在多节点之间协调锁。</li>
+            </ol>
+            <h3 id="percolator-模型概述">7.2 Percolator 模型概述</h3>
+            <p>Percolator 是 Google 在 2010
+            年发表的论文中提出的分布式事务模型，最初设计用于 Google
+            的增量网页索引系统。TiDB 的事务模型直接借鉴了
+            Percolator。</p>
+            <p>Percolator 的核心组件：</p>
+            <ul>
+            <li><strong>时间戳预言机（Timestamp
+            Oracle，TSO）</strong>：全局单调递增的时间戳分配服务。每个事务在开始时获取一个
+            start_ts，在提交时获取一个 commit_ts；</li>
+            <li><strong>两阶段提交（Two-Phase
+            Commit）</strong>：事务的提交分为 Prewrite 和 Commit
+            两个阶段；</li>
+            <li><strong>列存储</strong>：每行数据在底层 KV
+            存储中有多个”列”——data 列存储实际数据，lock
+            列存储锁信息，write 列存储已提交版本的元数据。</li>
+            </ul>
+            <h3 id="数据的存储结构">7.3 数据的存储结构</h3>
+            <p>在 TiDB 中，底层使用 TiKV 作为分布式 KV 存储。每行数据在
+            TiKV 中对应三个 Column Family（CF）：</p>
+            <pre class="text"><code>TiKV 中的数据组织：
+
+Default CF（数据列）：
+  key: {row_key}_{start_ts}
+  value: 实际数据
+
+Lock CF（锁列）：
+  key: {row_key}
+  value: {lock_type, primary_key, start_ts, ttl}
+
+Write CF（写入列）：
+  key: {row_key}_{commit_ts}
+  value: {write_type, start_ts}</code></pre>
+            <h3 id="两阶段提交流程">7.4 两阶段提交流程</h3>
+            <p><strong>第一阶段：Prewrite</strong></p>
+            <pre class="text"><code>Prewrite 流程：
+
+1. 事务从 TSO 获取 start_ts；
+2. 选择一个 key 作为 Primary Key，其余为 Secondary Keys；
+3. 对每个涉及的 key：
+   a. 检查 Write CF 中是否有 commit_ts &gt; start_ts 的记录
+      → 如果有，说明存在写写冲突，事务回滚；
+   b. 检查 Lock CF 中是否已有其他事务的锁
+      → 如果有，说明存在锁冲突，尝试清理或等待；
+   c. 写入 Lock CF：记录锁信息，指向 Primary Key；
+   d. 写入 Default CF：写入数据，key 中包含 start_ts；</code></pre>
+            <p><strong>第二阶段：Commit</strong></p>
+            <pre class="text"><code>Commit 流程：
+
+1. 事务从 TSO 获取 commit_ts；
+2. 提交 Primary Key：
+   a. 检查 Primary Key 的锁是否仍然存在；
+   b. 写入 Write CF：记录 {commit_ts → start_ts} 的映射；
+   c. 删除 Lock CF 中 Primary Key 的锁；
+   d. 以上三步作为单个 Region 内的原子操作；
+3. 异步提交 Secondary Keys：
+   a. 对每个 Secondary Key 执行与 Primary 相同的操作；
+   b. Secondary 的提交可以异步进行，因为一旦 Primary 提交成功，
+      事务的提交状态就已经确定。</code></pre>
+            <h3 id="读操作流程">7.5 读操作流程</h3>
+            <pre class="text"><code>快照读流程（使用 start_ts 作为快照时间戳）：
+
+1. 检查 Lock CF 中是否有 start_ts &lt; lock.start_ts 的锁
+   → 如果有尚未提交的锁：
+     a. 检查 Primary Key 的状态；
+     b. 如果 Primary 已提交 → 帮助 resolve lock；
+     c. 如果 Primary 的锁已过期 → 清理锁（rollback）；
+     d. 否则 → 等待或跳过（取决于策略）；
+
+2. 在 Write CF 中查找 commit_ts &lt;= start_ts 的最大版本；
+3. 根据 Write CF 中记录的 start_ts 到 Default CF 中读取实际数据；</code></pre>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- TiDB 中查看事务信息</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前活跃事务</span></span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> information_schema.cluster_tidb_trx</span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">LIMIT</span> <span class="dv">10</span>;</span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看锁等待信息</span></span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> information_schema.data_lock_waits;</span>
+<span id="cb39-8"><a href="#cb39-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-9"><a href="#cb39-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 TSO 信息</span></span>
+<span id="cb39-10"><a href="#cb39-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ADMIN</span> SHOW <span class="kw">DDL</span>;</span></code></pre></div>
+            <h3 id="async-commit-与-1pc-优化">7.6 Async Commit 与 1PC
+            优化</h3>
+            <p>原始的 Percolator 模型需要两次 TSO 请求（start_ts 和
+            commit_ts）和至少两轮 RPC（Prewrite 和 Commit）。TiDB
+            引入了两项优化：</p>
+            <p><strong>Async Commit</strong>：将 commit_ts 的计算下推到
+            TiKV 端，消除第二次 TSO 请求。commit_ts 取所有 Prewrite
+            中最大的 <code>max(prewrite_ts) + 1</code>。</p>
+            <p><strong>1PC（One-Phase
+            Commit）</strong>：当事务只涉及一个 Region 时，可以在
+            Prewrite 阶段直接完成提交，省去 Commit 阶段。</p>
+            <pre class="text"><code>优化效果对比：
+
+模式             TSO 请求    RPC 轮次    适用场景
+标准 2PC          2           2+        跨 Region 事务
+Async Commit      1           2         跨 Region 事务
+1PC               1           1         单 Region 事务</code></pre>
+            <h3 id="分布式死锁检测">7.7 分布式死锁检测</h3>
+            <p>TiDB 使用集中式死锁检测器（位于 PD 或 TiKV
+            的特定节点）。当事务在 TiKV
+            上遇到锁冲突并需要等待时，会向死锁检测器报告等待关系。检测器维护全局等待图，检测到环路时选择一个事务中止。</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- TiDB 死锁相关配置</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- pessimistic-txn.deadlock-history-capacity：死锁历史记录数量</span></span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- pessimistic-txn.deadlock-history-collect-retryable：</span></span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a><span class="co">--   是否收集可重试死锁</span></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看死锁历史</span></span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> information_schema.deadlocks;</span></code></pre></div>
+            <hr />
+            <h2
+            id="八各隔离级别异常现象复现">八、各隔离级别异常现象复现</h2>
+            <p>本节通过可复现的 SQL
+            示例，演示各隔离级别下的异常行为。所有示例均基于以下表结构：</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> accounts (</span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a>    name <span class="dt">VARCHAR</span>(<span class="dv">50</span>),</span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a>    balance <span class="dt">DECIMAL</span>(<span class="dv">10</span>, <span class="dv">2</span>)</span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span></span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a>    (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>, <span class="fl">1000.00</span>),</span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a>    (<span class="dv">2</span>, <span class="st">&#39;Bob&#39;</span>,   <span class="fl">2000.00</span>),</span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a>    (<span class="dv">3</span>, <span class="st">&#39;Carol&#39;</span>, <span class="fl">3000.00</span>);</span></code></pre></div>
+            <h3 id="脏读复现read-uncommitted">8.1 脏读复现（Read
+            Uncommitted）</h3>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1（MySQL）</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">SESSION</span> <span class="kw">TRANSACTION</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">READ</span> UNCOMMITTED;</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1000.00</span></span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="fl">500.00</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb43-10"><a href="#cb43-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 不提交</span></span>
+<span id="cb43-11"><a href="#cb43-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-12"><a href="#cb43-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb43-13"><a href="#cb43-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb43-14"><a href="#cb43-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 500.00 ← 脏读！读到了未提交的数据</span></span>
+<span id="cb43-15"><a href="#cb43-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-16"><a href="#cb43-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb43-17"><a href="#cb43-17" aria-hidden="true" tabindex="-1"></a><span class="kw">ROLLBACK</span>;</span>
+<span id="cb43-18"><a href="#cb43-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-19"><a href="#cb43-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb43-20"><a href="#cb43-20" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb43-21"><a href="#cb43-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1000.00（回到原值，之前读到的 500 从未真正生效）</span></span>
+<span id="cb43-22"><a href="#cb43-22" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <p>注意：PostgreSQL
+            的读未提交级别实际上等同于读已提交，不会出现脏读。这是
+            PostgreSQL 的实现选择——它认为允许脏读没有实际价值。</p>
+            <h3 id="不可重复读复现read-committed">8.2
+            不可重复读复现（Read Committed）</h3>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1（PostgreSQL 或 MySQL，RC 级别）</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1000.00</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb44-7"><a href="#cb44-7" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb44-8"><a href="#cb44-8" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="fl">800.00</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb44-9"><a href="#cb44-9" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb44-10"><a href="#cb44-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-11"><a href="#cb44-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb44-12"><a href="#cb44-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb44-13"><a href="#cb44-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 800.00 ← 不可重复读！同一事务两次读取结果不同</span></span>
+<span id="cb44-14"><a href="#cb44-14" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <h3 id="幻读复现read-committed">8.3 幻读复现（Read
+            Committed）</h3>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1（RC 级别）</span></span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> balance <span class="op">&gt;</span> <span class="dv">1500</span>;</span>
+<span id="cb45-4"><a href="#cb45-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1（只有 Bob 的 2000）</span></span>
+<span id="cb45-5"><a href="#cb45-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-6"><a href="#cb45-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb45-7"><a href="#cb45-7" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb45-8"><a href="#cb45-8" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span> (<span class="dv">4</span>, <span class="st">&#39;Dave&#39;</span>, <span class="fl">2500.00</span>);</span>
+<span id="cb45-9"><a href="#cb45-9" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb45-10"><a href="#cb45-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-11"><a href="#cb45-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb45-12"><a href="#cb45-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> balance <span class="op">&gt;</span> <span class="dv">1500</span>;</span>
+<span id="cb45-13"><a href="#cb45-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 2 ← 幻读！出现了新的满足条件的行</span></span>
+<span id="cb45-14"><a href="#cb45-14" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <h3 id="mysql-rr-级别下幻读的部分防护">8.4 MySQL RR
+            级别下幻读的部分防护</h3>
+            <p>MySQL InnoDB 在 RR 级别下，快照读（普通 SELECT）通过 MVCC
+            防止幻读，但当前读（SELECT … FOR UPDATE）通过 Gap Lock
+            防止幻读：</p>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1（MySQL RR 级别）</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> balance <span class="op">&gt;</span> <span class="dv">1500</span>;</span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1 行（Bob）</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span> (<span class="dv">4</span>, <span class="st">&#39;Dave&#39;</span>, <span class="fl">2500.00</span>);</span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在没有适当索引的情况下，可能被 Gap Lock 阻塞</span></span>
+<span id="cb46-10"><a href="#cb46-10" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb46-11"><a href="#cb46-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-12"><a href="#cb46-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb46-13"><a href="#cb46-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> balance <span class="op">&gt;</span> <span class="dv">1500</span>;</span>
+<span id="cb46-14"><a href="#cb46-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 仍返回 1 行（MVCC 快照读，看不到 Dave）</span></span>
+<span id="cb46-15"><a href="#cb46-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-16"><a href="#cb46-16" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> balance <span class="op">&gt;</span> <span class="dv">1500</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb46-17"><a href="#cb46-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 当前读，可能返回 2 行（取决于锁的时序）</span></span>
+<span id="cb46-18"><a href="#cb46-18" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <h3 id="写偏斜复现repeatable-read-snapshot-isolation">8.5
+            写偏斜复现（Repeatable Read / Snapshot Isolation）</h3>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 准备数据</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> on_call (</span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a>    name <span class="dt">VARCHAR</span>(<span class="dv">50</span>),</span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a>    shift <span class="dt">VARCHAR</span>(<span class="dv">20</span>),</span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a>    status <span class="dt">VARCHAR</span>(<span class="dv">10</span>) <span class="kw">DEFAULT</span> <span class="st">&#39;on&#39;</span></span>
+<span id="cb47-7"><a href="#cb47-7" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb47-8"><a href="#cb47-8" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> on_call <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>, <span class="st">&#39;night&#39;</span>, <span class="st">&#39;on&#39;</span>);</span>
+<span id="cb47-9"><a href="#cb47-9" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> on_call <span class="kw">VALUES</span> (<span class="dv">2</span>, <span class="st">&#39;Bob&#39;</span>,   <span class="st">&#39;night&#39;</span>, <span class="st">&#39;on&#39;</span>);</span>
+<span id="cb47-10"><a href="#cb47-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-11"><a href="#cb47-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1（PostgreSQL RR 级别）</span></span>
+<span id="cb47-12"><a href="#cb47-12" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span> <span class="kw">TRANSACTION</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> REPEATABLE <span class="kw">READ</span>;</span>
+<span id="cb47-13"><a href="#cb47-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> on_call</span>
+<span id="cb47-14"><a href="#cb47-14" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="st">&#39;on&#39;</span>;</span>
+<span id="cb47-15"><a href="#cb47-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 2</span></span>
+<span id="cb47-16"><a href="#cb47-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-17"><a href="#cb47-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2（PostgreSQL RR 级别）</span></span>
+<span id="cb47-18"><a href="#cb47-18" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span> <span class="kw">TRANSACTION</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> REPEATABLE <span class="kw">READ</span>;</span>
+<span id="cb47-19"><a href="#cb47-19" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> on_call</span>
+<span id="cb47-20"><a href="#cb47-20" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="st">&#39;on&#39;</span>;</span>
+<span id="cb47-21"><a href="#cb47-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 2</span></span>
+<span id="cb47-22"><a href="#cb47-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-23"><a href="#cb47-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb47-24"><a href="#cb47-24" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> on_call <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;off&#39;</span></span>
+<span id="cb47-25"><a href="#cb47-25" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> name <span class="op">=</span> <span class="st">&#39;Alice&#39;</span> <span class="kw">AND</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span>;</span>
+<span id="cb47-26"><a href="#cb47-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-27"><a href="#cb47-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb47-28"><a href="#cb47-28" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> on_call <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;off&#39;</span></span>
+<span id="cb47-29"><a href="#cb47-29" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> name <span class="op">=</span> <span class="st">&#39;Bob&#39;</span> <span class="kw">AND</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span>;</span>
+<span id="cb47-30"><a href="#cb47-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-31"><a href="#cb47-31" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb47-32"><a href="#cb47-32" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb47-33"><a href="#cb47-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-34"><a href="#cb47-34" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb47-35"><a href="#cb47-35" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb47-36"><a href="#cb47-36" aria-hidden="true" tabindex="-1"></a><span class="co">-- 两个事务都成功提交！</span></span>
+<span id="cb47-37"><a href="#cb47-37" aria-hidden="true" tabindex="-1"></a><span class="co">-- 结果：夜班无人值守，写偏斜发生了</span></span>
+<span id="cb47-38"><a href="#cb47-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-39"><a href="#cb47-39" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果使用 SERIALIZABLE 级别，终端 2 的 COMMIT 会失败：</span></span>
+<span id="cb47-40"><a href="#cb47-40" aria-hidden="true" tabindex="-1"></a><span class="co">-- ERROR: could not serialize access due to read/write dependencies</span></span></code></pre></div>
+            <h3 id="丢失更新复现">8.6 丢失更新复现</h3>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 准备</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- accounts 表中 id=1 的 balance = 1000</span></span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1（RC 或 RR 级别）</span></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb48-7"><a href="#cb48-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1000</span></span>
+<span id="cb48-8"><a href="#cb48-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 应用层计算：1000 + 100 = 1100</span></span>
+<span id="cb48-9"><a href="#cb48-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-10"><a href="#cb48-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2（RC 或 RR 级别）</span></span>
+<span id="cb48-11"><a href="#cb48-11" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb48-12"><a href="#cb48-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb48-13"><a href="#cb48-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 返回 1000</span></span>
+<span id="cb48-14"><a href="#cb48-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 应用层计算：1000 + 200 = 1200</span></span>
+<span id="cb48-15"><a href="#cb48-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-16"><a href="#cb48-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb48-17"><a href="#cb48-17" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="dv">1100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb48-18"><a href="#cb48-18" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb48-19"><a href="#cb48-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-20"><a href="#cb48-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb48-21"><a href="#cb48-21" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> <span class="dv">1200</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb48-22"><a href="#cb48-22" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb48-23"><a href="#cb48-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- 最终 balance = 1200，终端 1 的 +100 操作丢失了！</span></span>
+<span id="cb48-24"><a href="#cb48-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-25"><a href="#cb48-25" aria-hidden="true" tabindex="-1"></a><span class="co">-- 正确做法：使用原子操作</span></span>
+<span id="cb48-26"><a href="#cb48-26" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">+</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb48-27"><a href="#cb48-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 或使用 SELECT ... FOR UPDATE 获取行锁</span></span></code></pre></div>
+            <hr />
+            <h2 id="九锁等待与死锁分析">九、锁等待与死锁分析</h2>
+            <h3 id="锁等待超时">9.1 锁等待超时</h3>
+            <p>当事务请求的锁被其他事务持有时，请求方会进入等待状态。如果等待时间超过阈值，数据库会返回超时错误。</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL：查看和设置锁等待超时</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;innodb_lock_wait_timeout&#39;</span>;</span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 默认 50 秒</span></span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">SESSION</span> innodb_lock_wait_timeout <span class="op">=</span> <span class="dv">10</span>;</span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 设为 10 秒</span></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 超时后的错误信息：</span></span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- ERROR 1205 (HY000): Lock wait timeout exceeded;</span></span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- try restarting transaction</span></span></code></pre></div>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- PostgreSQL：查看和设置锁等待超时</span></span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a>SHOW lock_timeout;</span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 默认 0（无超时，无限等待）</span></span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> lock_timeout <span class="op">=</span> <span class="st">&#39;10s&#39;</span>;</span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 设为 10 秒</span></span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-8"><a href="#cb50-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 超时后的错误信息：</span></span>
+<span id="cb50-9"><a href="#cb50-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- ERROR: canceling statement due to lock timeout</span></span>
+<span id="cb50-10"><a href="#cb50-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-11"><a href="#cb50-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- deadlock_timeout：死锁检测触发的等待时间阈值</span></span>
+<span id="cb50-12"><a href="#cb50-12" aria-hidden="true" tabindex="-1"></a>SHOW deadlock_timeout;</span>
+<span id="cb50-13"><a href="#cb50-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 默认 1s</span></span></code></pre></div>
+            <h3 id="死锁的产生条件">9.2 死锁的产生条件</h3>
+            <p>死锁的四个必要条件（Coffman 条件）：</p>
+            <ol type="1">
+            <li><strong>互斥条件</strong>：资源不能共享（X
+            锁互斥）；</li>
+            <li><strong>持有并等待</strong>：事务持有至少一个锁，同时等待获取其他锁；</li>
+            <li><strong>不可抢占</strong>：已获得的锁不能被强行剥夺；</li>
+            <li><strong>循环等待</strong>：存在事务的循环等待链。</li>
+            </ol>
+            <h3 id="死锁实战案例">9.3 死锁实战案例</h3>
+            <p><strong>案例一：经典双行交叉更新死锁</strong></p>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 获取 id=1 的 X 锁</span></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">200</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">2</span>;</span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 获取 id=2 的 X 锁</span></span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">+</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">2</span>;</span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 等待 id=2 的 X 锁（被终端 2 持有）</span></span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">+</span> <span class="dv">200</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 等待 id=1 的 X 锁（被终端 1 持有）</span></span>
+<span id="cb51-18"><a href="#cb51-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 死锁！数据库检测到后回滚其中一个事务</span></span></code></pre></div>
+            <p><strong>案例二：Gap Lock 导致的死锁</strong></p>
+            <div class="sourceCode" id="cb52"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb52-1"><a href="#cb52-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 这种死锁在 MySQL RR 级别下更常见</span></span>
+<span id="cb52-2"><a href="#cb52-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 假设 accounts 表有记录 id = 1, 5, 10</span></span>
+<span id="cb52-3"><a href="#cb52-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-4"><a href="#cb52-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb52-5"><a href="#cb52-5" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb52-6"><a href="#cb52-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">3</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb52-7"><a href="#cb52-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- id=3 不存在，加 Gap Lock 锁定间隙 (1, 5)</span></span>
+<span id="cb52-8"><a href="#cb52-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-9"><a href="#cb52-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb52-10"><a href="#cb52-10" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb52-11"><a href="#cb52-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">4</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb52-12"><a href="#cb52-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- id=4 不存在，加 Gap Lock 锁定间隙 (1, 5)</span></span>
+<span id="cb52-13"><a href="#cb52-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- Gap Lock 之间不冲突，所以可以同时持有</span></span>
+<span id="cb52-14"><a href="#cb52-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-15"><a href="#cb52-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb52-16"><a href="#cb52-16" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span> (<span class="dv">3</span>, <span class="st">&#39;New1&#39;</span>, <span class="dv">100</span>);</span>
+<span id="cb52-17"><a href="#cb52-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 尝试插入到间隙 (1, 5)，被终端 2 的 Gap Lock 阻塞</span></span>
+<span id="cb52-18"><a href="#cb52-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-19"><a href="#cb52-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb52-20"><a href="#cb52-20" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span> (<span class="dv">4</span>, <span class="st">&#39;New2&#39;</span>, <span class="dv">200</span>);</span>
+<span id="cb52-21"><a href="#cb52-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 尝试插入到间隙 (1, 5)，被终端 1 的 Gap Lock 阻塞</span></span>
+<span id="cb52-22"><a href="#cb52-22" aria-hidden="true" tabindex="-1"></a><span class="co">-- 死锁！</span></span></code></pre></div>
+            <h3 id="死锁诊断工具">9.4 死锁诊断工具</h3>
+            <p><strong>MySQL 死锁诊断</strong>：</p>
+            <div class="sourceCode" id="cb53"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看最近的死锁信息</span></span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 关键输出段：</span></span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- ========================</span></span>
+<span id="cb53-6"><a href="#cb53-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- LATEST DETECTED DEADLOCK</span></span>
+<span id="cb53-7"><a href="#cb53-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- ========================</span></span>
+<span id="cb53-8"><a href="#cb53-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- *** (1) TRANSACTION:</span></span>
+<span id="cb53-9"><a href="#cb53-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- TRANSACTION 12345, ACTIVE 10 sec starting index read</span></span>
+<span id="cb53-10"><a href="#cb53-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- mysql tables in use 1, locked 1</span></span>
+<span id="cb53-11"><a href="#cb53-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- LOCK WAIT 3 lock struct(s), heap size 1136, 2 row lock(s)</span></span>
+<span id="cb53-12"><a href="#cb53-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- *** (1) HOLDS THE LOCK(S):</span></span>
+<span id="cb53-13"><a href="#cb53-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- RECORD LOCKS space id 100 page no 3 n bits 72 index PRIMARY</span></span>
+<span id="cb53-14"><a href="#cb53-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- *** (1) WAITING FOR THIS LOCK TO BE GRANTED:</span></span>
+<span id="cb53-15"><a href="#cb53-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- RECORD LOCKS space id 100 page no 3 n bits 72 index PRIMARY</span></span>
+<span id="cb53-16"><a href="#cb53-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- *** (2) TRANSACTION:</span></span>
+<span id="cb53-17"><a href="#cb53-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- ...</span></span>
+<span id="cb53-18"><a href="#cb53-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- *** WE ROLL BACK TRANSACTION (2)</span></span></code></pre></div>
+            <div class="sourceCode" id="cb54"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb54-1"><a href="#cb54-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 开启死锁日志记录到错误日志</span></span>
+<span id="cb54-2"><a href="#cb54-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">GLOBAL</span> innodb_print_all_deadlocks <span class="op">=</span> <span class="kw">ON</span>;</span></code></pre></div>
+            <p><strong>PostgreSQL 死锁诊断</strong>：</p>
+            <div class="sourceCode" id="cb55"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb55-1"><a href="#cb55-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- PostgreSQL 在日志中记录死锁信息</span></span>
+<span id="cb55-2"><a href="#cb55-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 配置日志参数</span></span>
+<span id="cb55-3"><a href="#cb55-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- log_lock_waits = on          -- 记录等待超过 deadlock_timeout 的锁</span></span>
+<span id="cb55-4"><a href="#cb55-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- deadlock_timeout = &#39;1s&#39;      -- 死锁检测触发时间</span></span>
+<span id="cb55-5"><a href="#cb55-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-6"><a href="#cb55-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前锁信息</span></span>
+<span id="cb55-7"><a href="#cb55-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, locktype, relation:<span class="ch">:regclass</span>, <span class="kw">mode</span>, granted</span>
+<span id="cb55-8"><a href="#cb55-8" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks</span>
+<span id="cb55-9"><a href="#cb55-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> <span class="kw">NOT</span> granted;</span>
+<span id="cb55-10"><a href="#cb55-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-11"><a href="#cb55-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看锁等待链</span></span>
+<span id="cb55-12"><a href="#cb55-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> blocked.pid <span class="kw">AS</span> blocked_pid,</span>
+<span id="cb55-13"><a href="#cb55-13" aria-hidden="true" tabindex="-1"></a>       blocked_activity.usename <span class="kw">AS</span> blocked_user,</span>
+<span id="cb55-14"><a href="#cb55-14" aria-hidden="true" tabindex="-1"></a>       blocked_activity.<span class="kw">query</span> <span class="kw">AS</span> blocked_query,</span>
+<span id="cb55-15"><a href="#cb55-15" aria-hidden="true" tabindex="-1"></a>       blocking.pid <span class="kw">AS</span> blocking_pid,</span>
+<span id="cb55-16"><a href="#cb55-16" aria-hidden="true" tabindex="-1"></a>       blocking_activity.usename <span class="kw">AS</span> blocking_user,</span>
+<span id="cb55-17"><a href="#cb55-17" aria-hidden="true" tabindex="-1"></a>       blocking_activity.<span class="kw">query</span> <span class="kw">AS</span> blocking_query</span>
+<span id="cb55-18"><a href="#cb55-18" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_catalog.pg_locks blocked</span>
+<span id="cb55-19"><a href="#cb55-19" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_catalog.pg_stat_activity blocked_activity</span>
+<span id="cb55-20"><a href="#cb55-20" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ON</span> blocked_activity.pid <span class="op">=</span> blocked.pid</span>
+<span id="cb55-21"><a href="#cb55-21" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_catalog.pg_locks blocking</span>
+<span id="cb55-22"><a href="#cb55-22" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ON</span> blocking.locktype <span class="op">=</span> blocked.locktype</span>
+<span id="cb55-23"><a href="#cb55-23" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> blocking.relation <span class="op">=</span> blocked.relation</span>
+<span id="cb55-24"><a href="#cb55-24" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> blocking.pid <span class="op">!=</span> blocked.pid</span>
+<span id="cb55-25"><a href="#cb55-25" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_catalog.pg_stat_activity blocking_activity</span>
+<span id="cb55-26"><a href="#cb55-26" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ON</span> blocking_activity.pid <span class="op">=</span> blocking.pid</span>
+<span id="cb55-27"><a href="#cb55-27" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> <span class="kw">NOT</span> blocked.granted;</span></code></pre></div>
+            <h3 id="死锁预防策略">9.5 死锁预防策略</h3>
+            <p>在应用层面，可以通过以下策略减少死锁的发生：</p>
+            <ol type="1">
+            <li><strong>固定加锁顺序</strong>：所有事务按照相同的顺序访问资源。例如，总是按
+            id 从小到大更新行；</li>
+            </ol>
+            <div class="sourceCode" id="cb56"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb56-1"><a href="#cb56-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 错误：不同顺序访问</span></span>
+<span id="cb56-2"><a href="#cb56-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- T1: UPDATE ... WHERE id = 1; UPDATE ... WHERE id = 2;</span></span>
+<span id="cb56-3"><a href="#cb56-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- T2: UPDATE ... WHERE id = 2; UPDATE ... WHERE id = 1;</span></span>
+<span id="cb56-4"><a href="#cb56-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-5"><a href="#cb56-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 正确：统一顺序访问</span></span>
+<span id="cb56-6"><a href="#cb56-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- T1: UPDATE ... WHERE id = 1; UPDATE ... WHERE id = 2;</span></span>
+<span id="cb56-7"><a href="#cb56-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- T2: UPDATE ... WHERE id = 1; UPDATE ... WHERE id = 2;</span></span></code></pre></div>
+            <ol start="2" type="1">
+            <li><strong>减小事务粒度</strong>：缩短事务持锁时间，减少冲突窗口；</li>
+            <li><strong>使用乐观锁</strong>：通过版本号或时间戳检测冲突，避免加锁；</li>
+            </ol>
+            <div class="sourceCode" id="cb57"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb57-1"><a href="#cb57-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 乐观锁模式</span></span>
+<span id="cb57-2"><a href="#cb57-2" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts</span>
+<span id="cb57-3"><a href="#cb57-3" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span>, version <span class="op">=</span> version <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb57-4"><a href="#cb57-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> version <span class="op">=</span> <span class="dv">5</span>;</span>
+<span id="cb57-5"><a href="#cb57-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 affected_rows = 0，说明版本已变更，需要重试</span></span></code></pre></div>
+            <ol start="4" type="1">
+            <li><strong>降低隔离级别</strong>：在读已提交级别下，间隙锁不生效，减少了死锁的可能性；</li>
+            <li><strong>设置合理的超时</strong>：缩短锁等待超时时间，让阻塞的事务尽快失败和重试。</li>
+            </ol>
+            <h3 id="长事务的危害">9.6 长事务的危害</h3>
+            <p>长事务是锁等待和死锁的主要诱因，还会导致以下问题：</p>
+            <ol type="1">
+            <li><strong>阻塞其他事务</strong>：长事务持有的锁会阻塞后续事务；</li>
+            <li><strong>阻止版本回收</strong>：长事务的快照阻止旧版本被清理，导致
+            undo log 或堆表膨胀；</li>
+            <li><strong>增加死锁概率</strong>：事务持锁时间越长，与其他事务形成循环等待的概率越大。</li>
+            </ol>
+            <div class="sourceCode" id="cb58"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb58-1"><a href="#cb58-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL：查找长事务</span></span>
+<span id="cb58-2"><a href="#cb58-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> trx_id, trx_state, trx_started,</span>
+<span id="cb58-3"><a href="#cb58-3" aria-hidden="true" tabindex="-1"></a>       TIMESTAMPDIFF(<span class="dt">SECOND</span>, trx_started, NOW()) <span class="kw">AS</span> duration_sec,</span>
+<span id="cb58-4"><a href="#cb58-4" aria-hidden="true" tabindex="-1"></a>       trx_rows_locked, trx_rows_modified,</span>
+<span id="cb58-5"><a href="#cb58-5" aria-hidden="true" tabindex="-1"></a>       trx_query</span>
+<span id="cb58-6"><a href="#cb58-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> information_schema.innodb_trx</span>
+<span id="cb58-7"><a href="#cb58-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> trx_started <span class="kw">ASC</span>;</span>
+<span id="cb58-8"><a href="#cb58-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb58-9"><a href="#cb58-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- PostgreSQL：查找长事务</span></span>
+<span id="cb58-10"><a href="#cb58-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, now() <span class="op">-</span> xact_start <span class="kw">AS</span> duration,</span>
+<span id="cb58-11"><a href="#cb58-11" aria-hidden="true" tabindex="-1"></a>       state, <span class="kw">query</span></span>
+<span id="cb58-12"><a href="#cb58-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb58-13"><a href="#cb58-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">!=</span> <span class="st">&#39;idle&#39;</span></span>
+<span id="cb58-14"><a href="#cb58-14" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> xact_start <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span id="cb58-15"><a href="#cb58-15" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> xact_start <span class="kw">ASC</span>;</span>
+<span id="cb58-16"><a href="#cb58-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb58-17"><a href="#cb58-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- PostgreSQL：查找阻止 VACUUM 的长事务</span></span>
+<span id="cb58-18"><a href="#cb58-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, backend_xid, backend_xmin,</span>
+<span id="cb58-19"><a href="#cb58-19" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> xact_start <span class="kw">AS</span> duration,</span>
+<span id="cb58-20"><a href="#cb58-20" aria-hidden="true" tabindex="-1"></a>       <span class="kw">query</span></span>
+<span id="cb58-21"><a href="#cb58-21" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb58-22"><a href="#cb58-22" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> backend_xmin <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span id="cb58-23"><a href="#cb58-23" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> backend_xmin <span class="kw">ASC</span></span>
+<span id="cb58-24"><a href="#cb58-24" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">5</span>;</span></code></pre></div>
+            <hr />
+            <h2 id="十隔离级别选择指南">十、隔离级别选择指南</h2>
+            <h3 id="性能与正确性的权衡">10.1 性能与正确性的权衡</h3>
+            <p>隔离级别的选择本质上是在性能与正确性之间做权衡。更高的隔离级别提供更强的一致性保证，但通常伴随更高的性能开销：</p>
+            <pre class="text"><code>隔离级别与开销关系：
+
+                正确性保证
+                    ↑
+  Serializable      |  ★★★★★   最强保证，最高开销
+                    |
+  Repeatable Read   |  ★★★★    防止大部分异常，中等开销
+                    |
+  Read Committed    |  ★★★     基本保证，较低开销
+                    |
+  Read Uncommitted  |  ★       几乎无保证，最低开销
+                    +-----------------------------→ 性能</code></pre>
+            <p>但实际情况比这个简化模型复杂得多：</p>
+            <ol type="1">
+            <li>基于 MVCC
+            的可重复读开销可能与读已提交相差不大（区别仅在于 Read View
+            的创建时机）；</li>
+            <li>PostgreSQL 的 SSI
+            实现使得可序列化的读操作开销接近快照隔离，只在提交时增加额外检查；</li>
+            <li>间隙锁在某些负载下可能导致可重复读比读已提交慢得多（因为锁冲突增加）。</li>
+            </ol>
+            <h3 id="各数据库的默认隔离级别">10.2
+            各数据库的默认隔离级别</h3>
+            <table>
+            <colgroup>
+            <col style="width: 30%" />
+            <col style="width: 46%" />
+            <col style="width: 23%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>数据库</th>
+            <th>默认隔离级别</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>PostgreSQL</td>
+            <td>Read Committed</td>
+            <td>社区认为 RC 是最佳默认值</td>
+            </tr>
+            <tr>
+            <td>MySQL InnoDB</td>
+            <td>Repeatable Read</td>
+            <td>历史原因（基于 binlog 的复制需要 RR）</td>
+            </tr>
+            <tr>
+            <td>Oracle</td>
+            <td>Read Committed</td>
+            <td>Oracle 不支持 RR，只有 RC 和 Serializable</td>
+            </tr>
+            <tr>
+            <td>SQL Server</td>
+            <td>Read Committed</td>
+            <td>默认基于锁的 RC，可开启基于快照的 RC</td>
+            </tr>
+            <tr>
+            <td>TiDB</td>
+            <td>Repeatable Read</td>
+            <td>兼容 MySQL 的选择</td>
+            </tr>
+            <tr>
+            <td>CockroachDB</td>
+            <td>Serializable</td>
+            <td>始终运行在 Serializable 级别</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="按场景选择">10.3 按场景选择</h3>
+            <p><strong>场景一：高吞吐 OLTP（电商、支付）</strong></p>
+            <ul>
+            <li><strong>推荐级别</strong>：读已提交（Read
+            Committed）；</li>
+            <li><strong>理由</strong>：大部分 OLTP
+            操作是简单的单行读写，RC
+            级别的并发度最高。对于需要更强一致性的操作（如转账），在应用层使用
+            <code>SELECT ... FOR UPDATE</code>
+            配合业务逻辑来保证正确性；</li>
+            <li><strong>注意</strong>：MySQL 在 RC
+            级别下不使用间隙锁，死锁概率更低，但需要注意 binlog
+            格式必须设为 ROW。</li>
+            </ul>
+            <div class="sourceCode" id="cb60"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb60-1"><a href="#cb60-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL RC 级别下的转账操作</span></span>
+<span id="cb60-2"><a href="#cb60-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">SESSION</span> <span class="kw">TRANSACTION</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">READ</span> <span class="kw">COMMITTED</span>;</span>
+<span id="cb60-3"><a href="#cb60-3" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb60-4"><a href="#cb60-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb60-5"><a href="#cb60-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 获取行锁，读取最新值</span></span>
+<span id="cb60-6"><a href="#cb60-6" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb60-7"><a href="#cb60-7" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">+</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">2</span>;</span>
+<span id="cb60-8"><a href="#cb60-8" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <p><strong>场景二：报表查询（需要一致性视图）</strong></p>
+            <ul>
+            <li><strong>推荐级别</strong>：可重复读（Repeatable
+            Read）；</li>
+            <li><strong>理由</strong>：报表查询通常涉及多个表的关联查询，需要在一个一致的时间点上读取所有数据。RR
+            级别提供事务级别的一致性快照；</li>
+            <li><strong>注意</strong>：长时间运行的报表查询会阻止版本回收，建议在只读副本上执行。</li>
+            </ul>
+            <div class="sourceCode" id="cb61"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb61-1"><a href="#cb61-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在一致性快照上执行报表查询</span></span>
+<span id="cb61-2"><a href="#cb61-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">SESSION</span> <span class="kw">TRANSACTION</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> REPEATABLE <span class="kw">READ</span>;</span>
+<span id="cb61-3"><a href="#cb61-3" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span> <span class="kw">READ</span> <span class="kw">ONLY</span>;</span>
+<span id="cb61-4"><a href="#cb61-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">sum</span>(balance) <span class="kw">FROM</span> accounts;</span>
+<span id="cb61-5"><a href="#cb61-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> transactions <span class="kw">WHERE</span> <span class="dt">date</span> <span class="op">=</span> <span class="st">&#39;2025-09-06&#39;</span>;</span>
+<span id="cb61-6"><a href="#cb61-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 两条查询看到的是同一时间点的数据</span></span>
+<span id="cb61-7"><a href="#cb61-7" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <p><strong>场景三：严格一致性需求（金融对账、库存管理）</strong></p>
+            <ul>
+            <li><strong>推荐级别</strong>：可序列化（Serializable）；</li>
+            <li><strong>理由</strong>：涉及复杂的业务约束检查，可能出现写偏斜等异常。使用可序列化级别可以让数据库自动检测和防止所有异常；</li>
+            <li><strong>注意</strong>：应用层必须准备好处理序列化失败（PostgreSQL
+            SSI）或锁等待超时（MySQL），实现重试逻辑。</li>
+            </ul>
+            <div class="sourceCode" id="cb62"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb62-1"><a href="#cb62-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- PostgreSQL SSI 级别下的约束检查</span></span>
+<span id="cb62-2"><a href="#cb62-2" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span> <span class="kw">ISOLATION</span> <span class="kw">LEVEL</span> <span class="kw">SERIALIZABLE</span>;</span>
+<span id="cb62-3"><a href="#cb62-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> on_call</span>
+<span id="cb62-4"><a href="#cb62-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="st">&#39;on&#39;</span>;</span>
+<span id="cb62-5"><a href="#cb62-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果在岗人数 &gt; 1，允许下班</span></span>
+<span id="cb62-6"><a href="#cb62-6" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> on_call <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;off&#39;</span></span>
+<span id="cb62-7"><a href="#cb62-7" aria-hidden="true" tabindex="-1"></a>  <span class="kw">WHERE</span> name <span class="op">=</span> <span class="st">&#39;Alice&#39;</span> <span class="kw">AND</span> shift <span class="op">=</span> <span class="st">&#39;night&#39;</span>;</span>
+<span id="cb62-8"><a href="#cb62-8" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb62-9"><a href="#cb62-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果检测到写偏斜，自动回滚</span></span></code></pre></div>
+            <p><strong>场景四：分布式系统</strong></p>
+            <ul>
+            <li><strong>推荐级别</strong>：取决于框架和业务；</li>
+            <li>TiDB 默认
+            RR（快照隔离），支持悲观事务模式下的当前读锁保护；</li>
+            <li>CockroachDB 只提供
+            Serializable，简化了应用开发的心智负担；</li>
+            <li>分布式系统中网络延迟是主要瓶颈，隔离级别本身的开销差异相对较小。</li>
+            </ul>
+            <h3 id="通用建议">10.4 通用建议</h3>
+            <ol type="1">
+            <li><strong>从 RC 开始</strong>：大部分 Web 应用在 RC
+            级别下就能正常工作。只在确实需要更强隔离时才提升级别；</li>
+            <li><strong>不要混用隔离级别</strong>：同一系统中使用多种隔离级别会增加理解和调试的复杂度；</li>
+            <li><strong>理解你用的数据库</strong>：同一个隔离级别在不同数据库中的行为可能不同。MySQL
+            的 RR 不等于 PostgreSQL 的 RR；</li>
+            <li><strong>监控锁争用</strong>：无论选择哪个级别，都要监控锁等待时间和死锁频率；</li>
+            <li><strong>小事务优先</strong>：缩短事务的持续时间是减少并发冲突最有效的手段；</li>
+            <li><strong>重试机制是必需的</strong>：在任何隔离级别下，事务都可能因为死锁、锁超时或序列化失败而需要重试。</li>
+            </ol>
+            <div class="sourceCode" id="cb63"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb63-1"><a href="#cb63-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 通用的事务重试框架</span></span>
+<span id="cb63-2"><a href="#cb63-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb63-3"><a href="#cb63-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> random</span>
+<span id="cb63-4"><a href="#cb63-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-5"><a href="#cb63-5" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run_transaction(connection, transaction_func, max_retries<span class="op">=</span><span class="dv">5</span>):</span>
+<span id="cb63-6"><a href="#cb63-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;执行事务，遇到可重试错误时自动重试。&quot;&quot;&quot;</span></span>
+<span id="cb63-7"><a href="#cb63-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> attempt <span class="kw">in</span> <span class="bu">range</span>(max_retries):</span>
+<span id="cb63-8"><a href="#cb63-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span>:</span>
+<span id="cb63-9"><a href="#cb63-9" aria-hidden="true" tabindex="-1"></a>            result <span class="op">=</span> transaction_func(connection)</span>
+<span id="cb63-10"><a href="#cb63-10" aria-hidden="true" tabindex="-1"></a>            connection.commit()</span>
+<span id="cb63-11"><a href="#cb63-11" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> result</span>
+<span id="cb63-12"><a href="#cb63-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">except</span> <span class="pp">Exception</span> <span class="im">as</span> e:</span>
+<span id="cb63-13"><a href="#cb63-13" aria-hidden="true" tabindex="-1"></a>            connection.rollback()</span>
+<span id="cb63-14"><a href="#cb63-14" aria-hidden="true" tabindex="-1"></a>            error_code <span class="op">=</span> <span class="bu">getattr</span>(e, <span class="st">&#39;pgcode&#39;</span>, <span class="st">&#39;&#39;</span>) <span class="kw">or</span> <span class="bu">str</span>(<span class="bu">getattr</span>(e, <span class="st">&#39;errno&#39;</span>, <span class="st">&#39;&#39;</span>))</span>
+<span id="cb63-15"><a href="#cb63-15" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 可重试错误：死锁、序列化失败、锁等待超时</span></span>
+<span id="cb63-16"><a href="#cb63-16" aria-hidden="true" tabindex="-1"></a>            retryable <span class="op">=</span> error_code <span class="kw">in</span> (<span class="st">&#39;40001&#39;</span>, <span class="st">&#39;40P01&#39;</span>, <span class="st">&#39;1205&#39;</span>, <span class="st">&#39;1213&#39;</span>)</span>
+<span id="cb63-17"><a href="#cb63-17" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="kw">not</span> retryable <span class="kw">or</span> attempt <span class="op">==</span> max_retries <span class="op">-</span> <span class="dv">1</span>:</span>
+<span id="cb63-18"><a href="#cb63-18" aria-hidden="true" tabindex="-1"></a>                <span class="cf">raise</span></span>
+<span id="cb63-19"><a href="#cb63-19" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 指数退避 + 随机抖动</span></span>
+<span id="cb63-20"><a href="#cb63-20" aria-hidden="true" tabindex="-1"></a>            delay <span class="op">=</span> <span class="bu">min</span>(<span class="fl">0.1</span> <span class="op">*</span> (<span class="dv">2</span> <span class="op">**</span> attempt) <span class="op">+</span> random.uniform(<span class="dv">0</span>, <span class="fl">0.1</span>), <span class="fl">5.0</span>)</span>
+<span id="cb63-21"><a href="#cb63-21" aria-hidden="true" tabindex="-1"></a>            time.sleep(delay)</span>
+<span id="cb63-22"><a href="#cb63-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">raise</span> <span class="pp">RuntimeError</span>(<span class="st">&quot;事务重试次数耗尽&quot;</span>)</span></code></pre></div>
+            <h3 id="隔离级别与索引设计的关系">10.5
+            隔离级别与索引设计的关系</h3>
+            <p>隔离级别的选择还会影响索引设计策略。在 MySQL InnoDB
+            中：</p>
+            <ul>
+            <li><strong>RC
+            级别</strong>：不使用间隙锁，索引的唯一性约束就是唯一的并发控制点。缺少合适索引时，扫描到的每一行都会加记录锁然后释放（不满足条件的行会立即释放锁）；</li>
+            <li><strong>RR 级别</strong>：使用间隙锁和 Next-Key
+            Lock。缺少合适索引时，可能锁定大范围的间隙，甚至全表。因此在
+            RR 级别下，良好的索引设计对并发性能尤为重要。</li>
+            </ul>
+            <div class="sourceCode" id="cb64"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- RR 级别下，缺少索引导致锁范围过大的示例</span></span>
+<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 假设 accounts 表在 balance 列上没有索引</span></span>
+<span id="cb64-3"><a href="#cb64-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb64-4"><a href="#cb64-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 1</span></span>
+<span id="cb64-5"><a href="#cb64-5" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb64-6"><a href="#cb64-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> balance <span class="op">&gt;</span> <span class="dv">1000</span> <span class="cf">FOR</span> <span class="kw">UPDATE</span>;</span>
+<span id="cb64-7"><a href="#cb64-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 由于没有 balance 索引，InnoDB 执行全表扫描</span></span>
+<span id="cb64-8"><a href="#cb64-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 锁定所有扫描到的行及其间隙</span></span>
+<span id="cb64-9"><a href="#cb64-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb64-10"><a href="#cb64-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终端 2</span></span>
+<span id="cb64-11"><a href="#cb64-11" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb64-12"><a href="#cb64-12" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> accounts <span class="kw">VALUES</span> (<span class="dv">100</span>, <span class="st">&#39;Test&#39;</span>, <span class="dv">500</span>);</span>
+<span id="cb64-13"><a href="#cb64-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可能被阻塞！即使 balance=500 不满足 &gt; 1000 的条件</span></span>
+<span id="cb64-14"><a href="#cb64-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 因为 Gap Lock 锁定了整个索引范围</span></span>
+<span id="cb64-15"><a href="#cb64-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb64-16"><a href="#cb64-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 解决方案：为 balance 列创建索引</span></span>
+<span id="cb64-17"><a href="#cb64-17" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_balance <span class="kw">ON</span> accounts(balance);</span>
+<span id="cb64-18"><a href="#cb64-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 有了索引后，锁的范围缩小到 balance &gt; 1000 的区间</span></span></code></pre></div>
+            <hr />
+            <h2 id="附参考资料">附：参考资料</h2>
+            <ol type="1">
+            <li>Berenson, H., Bernstein, P., Gray, J., et al. “A
+            Critique of ANSI SQL Isolation Levels.” <em>ACM SIGMOD
+            Record</em>, 1995. <a
+            href="https://www.microsoft.com/en-us/research/publication/a-critique-of-ansi-sql-isolation-levels/">https://www.microsoft.com/en-us/research/publication/a-critique-of-ansi-sql-isolation-levels/</a></li>
+            <li>Cahill, M. J., Röhm, U., Fekete, A. D. “Serializable
+            Isolation for Snapshot Databases.” <em>ACM SIGMOD</em>,
+            2008. <a
+            href="https://dl.acm.org/doi/10.1145/1376616.1376690">https://dl.acm.org/doi/10.1145/1376616.1376690</a></li>
+            <li>Peng, D., Dabek, F. “Large-scale Incremental Processing
+            Using Distributed Transactions and Notifications.”
+            <em>OSDI</em>, 2010. <a
+            href="https://research.google/pubs/pub36726/">https://research.google/pubs/pub36726/</a></li>
+            <li>Fekete, A., Liarokapis, D., O’Neil, E., O’Neil, P.,
+            Shasha, D. “Making Snapshot Isolation Serializable.” <em>ACM
+            TODS</em>, 2005. <a
+            href="https://dl.acm.org/doi/10.1145/1071610.1071615">https://dl.acm.org/doi/10.1145/1071610.1071615</a></li>
+            <li>Adya, A. “Weak Consistency: A Generalized Theory and
+            Optimistic Implementations for Distributed Transactions.”
+            PhD Thesis, MIT, 1999. <a
+            href="https://pmg.csail.mit.edu/papers/adya-phd.pdf">https://pmg.csail.mit.edu/papers/adya-phd.pdf</a></li>
+            <li>PostgreSQL 官方文档：Transaction Isolation. <a
+            href="https://www.postgresql.org/docs/current/transaction-iso.html">https://www.postgresql.org/docs/current/transaction-iso.html</a></li>
+            <li>MySQL 官方文档：InnoDB Transaction Isolation Levels. <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html">https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html</a></li>
+            <li>MySQL 官方文档：InnoDB Locking. <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html">https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html</a></li>
+            <li>TiDB 官方文档：事务概览. <a
+            href="https://docs.pingcap.com/zh/tidb/stable/transaction-overview">https://docs.pingcap.com/zh/tidb/stable/transaction-overview</a></li>
+            <li>Ports, D. R. K., Grittner, K. “Serializable Snapshot
+            Isolation in PostgreSQL.” <em>PVLDB</em>, 2012. <a
+            href="https://drkp.net/papers/ssi-vldb12.pdf">https://drkp.net/papers/ssi-vldb12.pdf</a></li>
+            <li>PostgreSQL 官方文档：VACUUM. <a
+            href="https://www.postgresql.org/docs/current/sql-vacuum.html">https://www.postgresql.org/docs/current/sql-vacuum.html</a></li>
+            <li>MySQL 官方文档：InnoDB Multi-Versioning. <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-multi-versioning.html">https://dev.mysql.com/doc/refman/8.0/en/innodb-multi-versioning.html</a></li>
+            <li>Eswaran, K. P., Gray, J. N., Lorie, R. A., Traiger, I.
+            L. “The Notions of Consistency and Predicate Locks in a
+            Database System.” <em>Communications of the ACM</em>, 1976.
+            <a
+            href="https://dl.acm.org/doi/10.1145/360363.360369">https://dl.acm.org/doi/10.1145/360363.360369</a></li>
+            <li>Gray, J., Reuter, A. <em>Transaction Processing:
+            Concepts and Techniques</em>. Morgan Kaufmann, 1993.</li>
+            <li>Huang, D., Liu, Q., et al. “TiDB: A Raft-based HTAP
+            Database.” <em>PVLDB</em>, 2020. <a
+            href="https://dl.acm.org/doi/10.14778/3415478.3415535">https://dl.acm.org/doi/10.14778/3415478.3415535</a></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../27-wal-aries/wal-aries.html">WAL 与崩溃恢复：ARIES
+            协议</a> <strong>下一篇</strong>: <a
+            href="../29-index-structures/index-structures.html">索引结构：从
+            B+Tree 到倒排索引</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/01-lakehouse-overview/01-lakehouse-overview.html">【数据湖与开放表格式】Lakehouse 全景：从 Hive 表到开放表格式</a></h3>
+                    <p>Hive 目录式分区表把『表』等同于『一组目录加 metastore 里的分区行』，于是没有原子提交、planning 要 LIST 目录、schema 与分区演进常要重写。本文用这三个硬伤切入，讲清 lakehouse 把表拆成『不可变数据文件 + 可变元数据指针 + catalog』三层后各自解决了什么，并给出全系列的分层地图。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/02-parquet-format/02-parquet-format.html">【数据湖与开放表格式】Parquet 文件格式深拆</a></h3>
+                    <p>拆 Parquet 的物理结构：file → row group → column chunk → page，footer 里的 FileMetaData（Thrift）与 PAR1 magic。讲清 PLAIN/RLE-bitpacking/字典/DELTA_BINARY_PACKED/BYTE_STREAM_SPLIT 各自压谁，Dremel 的 repetition/definition level 如何表达嵌套，column index/offset index 与 split-block bloom filter 怎样让谓词在读盘前裁掉 page。基于本机 pyarrow 24.0.0 真实 dump footer 与编码。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/03-orc-format/03-orc-format.html">【数据湖与开放表格式】ORC 文件格式与 Parquet 对照</a></h3>
+                    <p>ORC 用 stripe 而非 row group、用三级统计（file/stripe/row-group index）而非独立 page index、用 PRESENT/DATA 等 stream 而非 page 组织一列。本文按 ORC 规范拆其文件尾（postscript + footer）、stripe 内部结构与 RLEv2 整数编码，并用本机 pyarrow 24.0.0 把同一份 30 万行数据写成 ORC 与 Parquet，对比真实体积与物理布局，最后给出什么场景仍用 ORC。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

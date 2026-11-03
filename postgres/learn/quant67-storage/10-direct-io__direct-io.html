@@ -1,0 +1,2092 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="O_DIRECT
+什么时候该用：双重缓冲、对齐约束、文件系统坑，以及与 io_uring
+组合路径的边界。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="direct-io, o-direct, page-cache, database-io, alignment, fsync, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢 · 系统与基础设施" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/10-direct-io/direct-io.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失" />
+    <meta property="og:description" content="O_DIRECT 什么时候该用：双重缓冲、对齐约束、文件系统坑，以及与 io_uring 组合路径的边界。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/10-direct-io/direct-io.html" />
+    <meta property="og:site_name" content="土法炼钢 · 系统与基础设施" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="direct-io" />
+    <meta property="article:tag" content="o-direct" />
+    <meta property="article:tag" content="page-cache" />
+    <meta property="article:tag" content="database-io" />
+    <meta property="article:tag" content="alignment" />
+    <meta property="article:tag" content="fsync" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失" />
+    <meta name="twitter:description" content="O_DIRECT 什么时候该用：双重缓冲、对齐约束、文件系统坑，以及与 io_uring 组合路径的边界。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失", "description": "O_DIRECT 什么时候该用：双重缓冲、对齐约束、文件系统坑，以及与 io_uring 组合路径的边界。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/10-direct-io/direct-io.html"}, "datePublished": "2025-08-19T00:00:00+00:00", "dateModified": "2026-08-12T13:56:18+00:00", "keywords": ["direct-io", "o-direct", "page-cache", "database-io", "alignment", "fsync"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢 ·
+系统与基础设施</a></p>
+            <h1 class="title">【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-19</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#direct-io</span> <span>#o-direct</span> <span>#page-cache</span> <span>#database-io</span> <span>#alignment</span> <span>#fsync</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/direct-io.html">#direct-io</a><a class="chip-link" href="/tags/o-direct.html">#o-direct</a><a class="chip-link" href="/tags/page-cache.html">#page-cache</a><a class="chip-link" href="/tags/database-io.html">#database-io</a><a class="chip-link" href="/tags/alignment.html">#alignment</a><a class="chip-link" href="/tags/fsync.html">#fsync</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/09-page-cache/page-cache.html">上一篇：【存储工程】Page Cache 深度解析</a><a class="post-series-nav__link" href="/post/storage/11-linux-async-io/linux-async-io.html">下一篇：【存储工程】Linux 异步 I/O：从 POSIX AIO 到 io_uring</a></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一为什么需要绕过-page-cache"
+                id="toc-一为什么需要绕过-page-cache">一、为什么需要绕过
+                Page Cache</a>
+                <ul>
+                <li><a href="#传统-io-路径回顾"
+                id="toc-传统-io-路径回顾">1.1 传统 I/O 路径回顾</a></li>
+                <li><a href="#双重缓冲问题" id="toc-双重缓冲问题">1.2
+                双重缓冲问题</a></li>
+                <li><a href="#内存拷贝的开销"
+                id="toc-内存拷贝的开销">1.3 内存拷贝的开销</a></li>
+                <li><a href="#缓存污染" id="toc-缓存污染">1.4
+                缓存污染</a></li>
+                <li><a href="#何时-page-cache-有益"
+                id="toc-何时-page-cache-有益">1.5 何时 Page Cache
+                有益</a></li>
+                </ul></li>
+                <li><a href="#二o_direct-的语义与机制"
+                id="toc-二o_direct-的语义与机制">二、O_DIRECT
+                的语义与机制</a>
+                <ul>
+                <li><a href="#o_direct-标志" id="toc-o_direct-标志">2.1
+                O_DIRECT 标志</a></li>
+                <li><a href="#内核实现原理" id="toc-内核实现原理">2.2
+                内核实现原理</a></li>
+                <li><a href="#对齐要求" id="toc-对齐要求">2.3
+                对齐要求</a></li>
+                <li><a href="#逻辑块大小与物理块大小"
+                id="toc-逻辑块大小与物理块大小">2.4
+                逻辑块大小与物理块大小</a></li>
+                <li><a href="#o_direct-不保证持久性"
+                id="toc-o_direct-不保证持久性">2.5 O_DIRECT
+                不保证持久性</a></li>
+                </ul></li>
+                <li><a href="#三o_direct-编程实战c-语言"
+                id="toc-三o_direct-编程实战c-语言">三、O_DIRECT
+                编程实战（C 语言）</a>
+                <ul>
+                <li><a href="#分配对齐缓冲区"
+                id="toc-分配对齐缓冲区">3.1 分配对齐缓冲区</a></li>
+                <li><a href="#打开文件并执行直接-io"
+                id="toc-打开文件并执行直接-io">3.2 打开文件并执行直接
+                I/O</a></li>
+                <li><a href="#对齐错误的处理"
+                id="toc-对齐错误的处理">3.3 对齐错误的处理</a></li>
+                <li><a href="#使用-preadpwrite-实现并发访问"
+                id="toc-使用-preadpwrite-实现并发访问">3.4 使用
+                pread/pwrite 实现并发访问</a></li>
+                </ul></li>
+                <li><a href="#四o_direct-编程实战rust"
+                id="toc-四o_direct-编程实战rust">四、O_DIRECT
+                编程实战（Rust）</a>
+                <ul>
+                <li><a href="#基本的-o_direct-文件操作"
+                id="toc-基本的-o_direct-文件操作">4.1 基本的 O_DIRECT
+                文件操作</a></li>
+                <li><a href="#对齐缓冲区分配"
+                id="toc-对齐缓冲区分配">4.2 对齐缓冲区分配</a></li>
+                <li><a href="#完整的直接-io-示例"
+                id="toc-完整的直接-io-示例">4.3 完整的直接 I/O
+                示例</a></li>
+                <li><a href="#安全封装" id="toc-安全封装">4.4
+                安全封装</a></li>
+                </ul></li>
+                <li><a href="#五o_direct-fsync数据持久化保证"
+                id="toc-五o_direct-fsync数据持久化保证">五、O_DIRECT +
+                fsync：数据持久化保证</a>
+                <ul>
+                <li><a href="#写入顺序与持久化语义"
+                id="toc-写入顺序与持久化语义">5.1
+                写入顺序与持久化语义</a></li>
+                <li><a href="#fsync-与-fdatasync-的区别"
+                id="toc-fsync-与-fdatasync-的区别">5.2 fsync 与
+                fdatasync 的区别</a></li>
+                <li><a href="#sync_file_range-的细粒度控制"
+                id="toc-sync_file_range-的细粒度控制">5.3
+                sync_file_range 的细粒度控制</a></li>
+                <li><a href="#fsync-after-rename-模式"
+                id="toc-fsync-after-rename-模式">5.4 fsync-after-rename
+                模式</a></li>
+                <li><a href="#磁盘写缓存与写屏障"
+                id="toc-磁盘写缓存与写屏障">5.5
+                磁盘写缓存与写屏障</a></li>
+                </ul></li>
+                <li><a href="#六各数据库的-direct-io-策略"
+                id="toc-六各数据库的-direct-io-策略">六、各数据库的
+                Direct I/O 策略</a>
+                <ul>
+                <li><a href="#mysqlinnodb" id="toc-mysqlinnodb">6.1
+                MySQL/InnoDB</a></li>
+                <li><a href="#postgresql" id="toc-postgresql">6.2
+                PostgreSQL</a></li>
+                <li><a href="#rocksdb" id="toc-rocksdb">6.3
+                RocksDB</a></li>
+                <li><a href="#mongodbwiredtiger"
+                id="toc-mongodbwiredtiger">6.4
+                MongoDB/WiredTiger</a></li>
+                <li><a href="#sqlite" id="toc-sqlite">6.5
+                SQLite</a></li>
+                <li><a href="#策略对比总结" id="toc-策略对比总结">6.6
+                策略对比总结</a></li>
+                </ul></li>
+                <li><a href="#七o_direct-的限制与陷阱"
+                id="toc-七o_direct-的限制与陷阱">七、O_DIRECT
+                的限制与陷阱</a>
+                <ul>
+                <li><a href="#对齐违规" id="toc-对齐违规">7.1
+                对齐违规</a></li>
+                <li><a href="#混合-io-模式的不一致性"
+                id="toc-混合-io-模式的不一致性">7.2 混合 I/O
+                模式的不一致性</a></li>
+                <li><a href="#特殊文件系统上的行为差异"
+                id="toc-特殊文件系统上的行为差异">7.3
+                特殊文件系统上的行为差异</a></li>
+                <li><a href="#小随机读取的性能回退"
+                id="toc-小随机读取的性能回退">7.4
+                小随机读取的性能回退</a></li>
+                <li><a href="#文件系统元数据仍经过-page-cache"
+                id="toc-文件系统元数据仍经过-page-cache">7.5
+                文件系统元数据仍经过 Page Cache</a></li>
+                <li><a href="#ext4-与-xfs-的行为差异"
+                id="toc-ext4-与-xfs-的行为差异">7.6 ext4 与 XFS
+                的行为差异</a></li>
+                </ul></li>
+                <li><a href="#八性能对比测试"
+                id="toc-八性能对比测试">八、性能对比测试</a>
+                <ul>
+                <li><a href="#测试环境" id="toc-测试环境">8.1
+                测试环境</a></li>
+                <li><a href="#顺序写入对比" id="toc-顺序写入对比">8.2
+                顺序写入对比</a></li>
+                <li><a href="#随机读取对比" id="toc-随机读取对比">8.3
+                随机读取对比</a></li>
+                <li><a href="#数据库负载测试"
+                id="toc-数据库负载测试">8.4 数据库负载测试</a></li>
+                <li><a href="#fio-高级测试命令"
+                id="toc-fio-高级测试命令">8.5 fio 高级测试命令</a></li>
+                <li><a href="#o_direct-的适用场景总结"
+                id="toc-o_direct-的适用场景总结">8.6 O_DIRECT
+                的适用场景总结</a></li>
+                <li><a href="#内存使用对比" id="toc-内存使用对比">8.7
+                内存使用对比</a></li>
+                </ul></li>
+                <li><a href="#九替代方案与未来"
+                id="toc-九替代方案与未来">九、替代方案与未来</a>
+                <ul>
+                <li><a href="#io_uring-与异步直接-io"
+                id="toc-io_uring-与异步直接-io">9.1 io_uring 与异步直接
+                I/O</a></li>
+                <li><a href="#dax持久内存的直接访问"
+                id="toc-dax持久内存的直接访问">9.2
+                DAX：持久内存的直接访问</a></li>
+                <li><a href="#fuse-与-o_direct-直通"
+                id="toc-fuse-与-o_direct-直通">9.3 FUSE 与 O_DIRECT
+                直通</a></li>
+                <li><a href="#o_direct-在新内核中的演进"
+                id="toc-o_direct-在新内核中的演进">9.4 O_DIRECT
+                在新内核中的演进</a></li>
+                <li><a href="#面向未来的-io-架构"
+                id="toc-面向未来的-io-架构">9.5 面向未来的 I/O
+                架构</a></li>
+                </ul></li>
+                <li><a href="#十开放问题"
+                id="toc-十开放问题">十、开放问题</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#规范-手册" id="toc-规范-手册">规范 /
+                手册</a></li>
+                <li><a href="#源码" id="toc-源码">源码</a></li>
+                <li><a href="#论文-书" id="toc-论文-书">论文 /
+                书</a></li>
+                <li><a href="#实验-工具-文档"
+                id="toc-实验-工具-文档">实验 / 工具 / 文档</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <blockquote>
+            <p><strong>与 #79 的分工</strong></p>
+            <table>
+            <colgroup>
+            <col style="width: 50%" />
+            <col style="width: 50%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>文章</th>
+            <th>分工</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><strong>本文（#10）</strong></td>
+            <td><code>O_DIRECT</code>
+            <strong>语义与坑</strong>：对齐、双重缓冲、fsync
+            语义、文件系统差异、DAX/SPDK 谱系</td>
+            </tr>
+            <tr>
+            <td><a
+            href="../79-o-direct-io-uring/o-direct-io-uring.html">#79
+            O_DIRECT + io_uring</a></td>
+            <td><strong>组合路径</strong>：<code>posix_memalign</code>、<code>io_uring_register_buffers</code>、本机
+            benchmark 与选型</td>
+            </tr>
+            <tr>
+            <td><a href="../11-linux-async-io/linux-async-io.html">#11
+            异步 I/O</a> / <a href="../../io_uring/index.html">io_uring
+            系列</a></td>
+            <td>io_uring 机制与 API；生产坑见 <a
+            href="../../linux/iouring-production/iouring-production.html">io_uring
+            翻车实录</a></td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>决策边界（何时绕过 Page Cache）</strong></p>
+            <ul>
+            <li><strong>倾向 <code>O_DIRECT</code></strong>：应用已有
+            Buffer Pool / 自管缓存（InnoDB、RocksDB、Ceph
+            OSD）；大扫描会污染页缓存；需可预测的刷盘语义。</li>
+            <li><strong>保留 Page
+            Cache</strong>：无应用层缓存的小文件读、多进程只读共享、依赖内核
+            readahead 的通用负载。</li>
+            <li><strong>先定缓存策略，再选提交方式</strong>：<code>O_DIRECT</code>
+            解决「要不要内核再缓存一份」；是否叠加 io_uring 见
+            #79，勿在未确认 direct 语义前为 IOPS 上 io_uring。</li>
+            </ul>
+            </blockquote>
+            <h2 id="一为什么需要绕过-page-cache">一、为什么需要绕过 Page
+            Cache</h2>
+            <h3 id="传统-io-路径回顾">1.1 传统 I/O 路径回顾</h3>
+            <p>在 Linux 的传统 I/O 路径中，应用程序通过
+            <code>read()</code> 和 <code>write()</code>
+            系统调用与文件交互时，数据并不会直接在用户空间缓冲区（User
+            Buffer）和磁盘之间传输。内核会在两者之间插入一层页缓存（Page
+            Cache），作为磁盘数据在内存中的缓存副本。一次典型的写入流程如下：</p>
+            <pre class="text"><code>应用程序 write()
+    ↓
+用户空间缓冲区（User Buffer）
+    ↓  （数据拷贝：用户态 → 内核态）
+内核页缓存（Page Cache）
+    ↓  （内核回写线程异步刷盘）
+块设备层 → 磁盘</code></pre>
+            <p>读取流程则是反向进行：内核先检查 Page Cache
+            中是否已有目标数据，如果命中则直接拷贝给用户空间，不需要访问磁盘；如果未命中则从磁盘读入
+            Page Cache，再拷贝给用户空间。</p>
+            <p>这种设计在大多数场景下工作良好：Page Cache
+            利用了时间局部性（Temporal Locality）和空间局部性（Spatial
+            Locality），让频繁访问的数据驻留在内存中，显著减少了磁盘 I/O
+            次数。但在某些特定场景下，这层缓存反而成了负担。</p>
+            <h3 id="双重缓冲问题">1.2 双重缓冲问题</h3>
+            <p>双重缓冲问题（Double Buffering Problem）是数据库系统使用
+            Page Cache 时面临的核心矛盾。以 MySQL 的 InnoDB
+            存储引擎为例：</p>
+            <p>InnoDB 自身维护了一个缓冲池（Buffer
+            Pool），通常配置为物理内存的 50%～80%。Buffer Pool
+            中缓存了数据页、索引页、自适应哈希索引等结构。当 InnoDB
+            读取一个 16KB 的数据页时，如果走传统 I/O
+            路径，实际发生的事情是：</p>
+            <pre class="text"><code>磁盘 → Page Cache（内核缓存一份） → InnoDB Buffer Pool（应用层再缓存一份）</code></pre>
+            <p>同一份数据在内存中存在两个副本：一份在内核的 Page Cache
+            中，一份在 InnoDB 的 Buffer Pool 中。对于一个配置了 64GB
+            Buffer Pool 的数据库服务器，这意味着操作系统可能在 Page
+            Cache 中额外持有几十 GB 的重复数据，而这些内存本可以被分配给
+            Buffer Pool 或其他进程使用。</p>
+            <p>写入路径的浪费同样严重：</p>
+            <pre class="text"><code>InnoDB Buffer Pool（脏页）
+    ↓  （write() 系统调用）
+Page Cache（内核再缓存一份脏页）
+    ↓  （回写线程异步刷盘）
+磁盘</code></pre>
+            <p>数据从 Buffer Pool 拷贝到 Page
+            Cache，然后再由内核回写到磁盘。这次从用户态到内核态的数据拷贝是完全不必要的——InnoDB
+            已经在应用层完成了所有缓存管理工作。</p>
+            <h3 id="内存拷贝的开销">1.3 内存拷贝的开销</h3>
+            <p>每一次 <code>read()</code> 或 <code>write()</code>
+            系统调用，都伴随着一次 <code>memcpy</code>
+            操作：数据在用户空间缓冲区和内核 Page Cache 之间拷贝。对于
+            4KB 的小页，这次拷贝的开销看似微不足道；但当吞吐量达到 GB/s
+            级别时，拷贝开销就变得显著了。</p>
+            <p>假设一个数据库每秒刷出 2GB 的脏页，每次拷贝 16KB
+            的数据页：</p>
+            <pre class="text"><code>拷贝次数 = 2GB / 16KB = 131072 次/秒
+总拷贝量 = 2GB/秒（用户态 → 内核态）+ 2GB/秒（内核态 → 磁盘 DMA）</code></pre>
+            <p>用户态到内核态的那次 <code>memcpy</code> 消耗 CPU
+            周期，占用内存带宽，并且会污染 CPU 的 L1/L2
+            缓存。在高吞吐场景下，这些开销可以占到总 CPU 使用率的
+            5%～10%。</p>
+            <h3 id="缓存污染">1.4 缓存污染</h3>
+            <p>缓存污染（Cache Pollution）是 Page Cache
+            在大规模顺序扫描场景下的典型问题。考虑以下场景：</p>
+            <p>一个数据库服务器正常运行时，Page Cache
+            中缓存了大量热点数据页，读取命中率维持在 95%
+            以上。这时运维人员启动了一个数据备份任务，需要顺序读取整个数据库文件（假设
+            500GB）。在传统 I/O 路径下，这 500GB 的数据会依次被读入 Page
+            Cache，将原本缓存的热点数据逐出。备份完成后，数据库的缓存命中率可能从
+            95% 骤降到 10%，需要很长时间才能重新预热。</p>
+            <p>Linux 内核虽然提供了
+            <code>fadvise(POSIX_FADV_DONTNEED)</code>
+            等机制来缓解这个问题，但应用层往往很难精确控制 Page Cache
+            的行为。对于自行管理缓存的数据库系统来说，绕过 Page Cache
+            是更彻底的解决方案。</p>
+            <h3 id="何时-page-cache-有益">1.5 何时 Page Cache 有益</h3>
+            <p>并非所有场景都适合绕过 Page Cache。以下场景中，Page Cache
+            依然是更好的选择：</p>
+            <ul>
+            <li><strong>小文件频繁读取</strong>：配置文件、元数据文件等小文件被频繁读取时，Page
+            Cache 的缓存效果显著。</li>
+            <li><strong>多进程共享读取</strong>：多个进程读取同一个文件时，Page
+            Cache
+            提供了天然的数据共享机制，避免每个进程各自缓存一份。</li>
+            <li><strong>预读优化</strong>：内核的预读算法（Readahead）能够在顺序读取时提前将数据加载到
+            Page
+            Cache，对于没有自行实现预读的应用来说，这是一个免费的性能优化。</li>
+            <li><strong>应用层无缓存</strong>：如果应用程序没有自己的缓存层，绕过
+            Page Cache 意味着每次读取都要访问磁盘，性能会急剧下降。</li>
+            <li><strong>写合并</strong>：Page Cache
+            可以将多个小写入合并为一个大写入再刷盘，减少磁盘 I/O
+            次数。</li>
+            </ul>
+            <p>简单的判断原则是：如果应用程序已经在应用层实现了完善的缓存管理，并且对缓存策略有精细的控制需求，那么绕过
+            Page Cache 是值得考虑的；否则，应该依赖内核 Page Cache。</p>
+            <hr />
+            <h2 id="二o_direct-的语义与机制">二、O_DIRECT
+            的语义与机制</h2>
+            <h3 id="o_direct-标志">2.1 O_DIRECT 标志</h3>
+            <p><code>O_DIRECT</code> 是 Linux
+            提供的一个文件打开标志（Open
+            Flag），用于告知内核在读写该文件时绕过页缓存（Page
+            Cache），让数据直接在用户空间缓冲区和块设备之间传输。其基本用法如下：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/myfile.dat&quot;</span><span class="op">,</span> O_RDWR <span class="op">|</span> O_DIRECT<span class="op">);</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span><span class="st">&quot;open with O_DIRECT failed&quot;</span><span class="op">);</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>O_DIRECT</code> 最早在 SGI 的 IRIX
+            操作系统中引入，后来被 Linux 2.4.10 版本采纳。POSIX
+            标准并未定义 <code>O_DIRECT</code>，它是一个 Linux
+            特有的扩展。在 FreeBSD 中有类似的实现，但在 macOS 中需要使用
+            <code>fcntl(F_NOCACHE)</code> 来达到类似效果。</p>
+            <h3 id="内核实现原理">2.2 内核实现原理</h3>
+            <p>当应用程序使用 <code>O_DIRECT</code>
+            打开文件并执行读写操作时，内核的 I/O
+            路径发生了根本性的变化：</p>
+            <p><strong>传统缓冲 I/O 路径：</strong></p>
+            <pre class="text"><code>用户空间缓冲区 ──memcpy──→ Page Cache ──→ BIO 层 ──→ 块设备驱动 ──→ 磁盘</code></pre>
+            <p><strong>O_DIRECT I/O 路径：</strong></p>
+            <pre class="text"><code>用户空间缓冲区 ──────────────→ BIO 层 ──→ 块设备驱动 ──→ 磁盘</code></pre>
+            <p>在 O_DIRECT
+            路径中，内核直接将用户空间缓冲区的物理页面（Physical
+            Page）映射到 BIO（Block I/O）请求中，通过 DMA（Direct Memory
+            Access，直接内存访问）在用户空间缓冲区和磁盘控制器之间传输数据。这消除了数据在用户空间和内核空间之间的拷贝，也避免了
+            Page Cache 的内存占用。</p>
+            <p>内核中的关键代码路径位于
+            <code>fs/direct-io.c</code>（通用实现）和各文件系统的
+            <code>direct_IO</code> 方法中。以 ext4 为例，其
+            <code>ext4_direct_IO()</code> 函数负责将 O_DIRECT
+            请求转化为对块设备的直接操作。</p>
+            <h3 id="对齐要求">2.3 对齐要求</h3>
+            <p>O_DIRECT 最重要也最容易出错的约束就是对齐要求（Alignment
+            Requirements）。使用 O_DIRECT
+            时，以下三个参数必须满足对齐条件：</p>
+            <ol type="1">
+            <li><strong>缓冲区地址</strong>（Buffer
+            Address）：用户空间缓冲区的起始地址必须对齐到逻辑块大小。</li>
+            <li><strong>文件偏移量</strong>（File
+            Offset）：读写操作的起始偏移量必须对齐到逻辑块大小。</li>
+            <li><strong>传输长度</strong>（Transfer
+            Length）：每次读写的字节数必须是逻辑块大小的整数倍。</li>
+            </ol>
+            <p>如果任何一个条件不满足，<code>read()</code> 或
+            <code>write()</code> 系统调用会返回 <code>-1</code>，并将
+            <code>errno</code> 设置为 <code>EINVAL</code>。</p>
+            <h3 id="逻辑块大小与物理块大小">2.4
+            逻辑块大小与物理块大小</h3>
+            <p>对齐的基准是文件系统的逻辑块大小（Logical Block
+            Size），通常为 512 字节或 4096
+            字节。可以通过以下命令查询：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查询逻辑块大小（逻辑扇区大小）</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">blockdev</span> <span class="at">--getss</span> /dev/sda</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查询物理块大小（物理扇区大小）</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">blockdev</span> <span class="at">--getpbsz</span> /dev/sda</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查询文件系统块大小</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-f</span> <span class="at">--format</span><span class="op">=</span><span class="st">&quot;%S&quot;</span> /data</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者通过 sysfs 查看</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/logical_block_size</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/physical_block_size</span></code></pre></div>
+            <p>在实际编程中，最安全的做法是对齐到 4096
+            字节（4KB），因为这是目前最常见的物理扇区大小和页面大小。部分旧设备使用
+            512 字节的逻辑扇区，但对齐到 4096 字节总是兼容的。</p>
+            <p>可以通过 <code>statvfs()</code>
+            在运行时获取文件系统块大小：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/statvfs.h&gt;</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> statvfs st<span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>statvfs<span class="op">(</span><span class="st">&quot;/data&quot;</span><span class="op">,</span> <span class="op">&amp;</span>st<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;文件系统块大小：</span><span class="sc">%lu</span><span class="st"> 字节</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> st<span class="op">.</span>f_bsize<span class="op">);</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="o_direct-不保证持久性">2.5 O_DIRECT
+            不保证持久性</h3>
+            <p>一个常见的误解是认为 O_DIRECT
+            写入完成后数据就已经安全地持久化到磁盘上了。事实并非如此。</p>
+            <p><code>O_DIRECT</code> 只保证数据绕过了内核的 Page
+            Cache，但数据到达块设备层后，可能仍然停留在以下位置：</p>
+            <ul>
+            <li><strong>磁盘控制器的写缓存</strong>（Disk Write Cache /
+            Volatile Write Cache）</li>
+            <li><strong>RAID 控制器的写缓存</strong>（RAID Controller
+            Write Cache）</li>
+            <li><strong>SAN/NAS 设备的缓存层</strong></li>
+            </ul>
+            <p>如果在数据停留在这些硬件缓存中时发生掉电，数据仍然会丢失。要保证持久性，必须在
+            <code>write()</code> 之后调用 <code>fsync()</code> 或
+            <code>fdatasync()</code>，或者在 <code>open()</code>
+            时同时指定 <code>O_DIRECT | O_SYNC</code>。</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* O_DIRECT 写入 + fsync 持久化 */</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> aligned_buf<span class="op">,</span> block_size<span class="op">);</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>n <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>fd<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;fsync failed&quot;</span><span class="op">);</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <hr />
+            <h2 id="三o_direct-编程实战c-语言">三、O_DIRECT 编程实战（C
+            语言）</h2>
+            <h3 id="分配对齐缓冲区">3.1 分配对齐缓冲区</h3>
+            <p>使用 O_DIRECT 的第一步是分配满足对齐要求的缓冲区。标准的
+            <code>malloc()</code> 返回的地址通常只对齐到 8 字节或 16
+            字节，不满足 O_DIRECT 的要求。Linux
+            提供了两种方式分配对齐内存：</p>
+            <p><strong>方式一：<code>posix_memalign()</code></strong></p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>buf <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ret <span class="op">=</span> posix_memalign<span class="op">(&amp;</span>buf<span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;posix_memalign failed: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> strerror<span class="op">(</span>ret<span class="op">));</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co">/* 使用 buf 进行 O_DIRECT 读写 */</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>free<span class="op">(</span>buf<span class="op">);</span>  <span class="co">/* 使用 free() 释放 */</span></span></code></pre></div>
+            <p><code>posix_memalign()</code>
+            的第一个参数是指向指针的指针，第二个参数是对齐边界（必须是 2
+            的幂且是 <code>sizeof(void *)</code>
+            的倍数），第三个参数是分配大小。</p>
+            <p><strong>方式二：<code>aligned_alloc()</code>（C11
+            标准）</strong></p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>buf <span class="op">=</span> aligned_alloc<span class="op">(</span><span class="dv">4096</span><span class="op">,</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>buf <span class="op">==</span> NULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span><span class="st">&quot;aligned_alloc failed&quot;</span><span class="op">);</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="co">/* 使用 buf */</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>free<span class="op">(</span>buf<span class="op">);</span></span></code></pre></div>
+            <p><code>aligned_alloc()</code>
+            要求分配大小必须是对齐边界的整数倍。</p>
+            <p><strong>方式三：<code>memalign()</code>（已过时，不推荐）</strong></p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;malloc.h&gt;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>buf <span class="op">=</span> memalign<span class="op">(</span><span class="dv">4096</span><span class="op">,</span> <span class="dv">4096</span><span class="op">);</span>  <span class="co">/* 非 POSIX 标准，已过时 */</span></span></code></pre></div>
+            <p>在实际项目中，推荐使用
+            <code>posix_memalign()</code>，因为它是 POSIX
+            标准接口，可移植性最好。</p>
+            <h3 id="打开文件并执行直接-io">3.2 打开文件并执行直接
+            I/O</h3>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;errno.h&gt;</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLOCK_SIZE </span><span class="dv">4096</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define FILE_PATH </span><span class="st">&quot;/data/testfile.dat&quot;</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd<span class="op">;</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>buf <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n<span class="op">;</span></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 分配对齐缓冲区 */</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ret <span class="op">=</span> posix_memalign<span class="op">(&amp;</span>buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;posix_memalign: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> strerror<span class="op">(</span>ret<span class="op">));</span></span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 使用 O_DIRECT 打开文件 */</span></span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a>    fd <span class="op">=</span> open<span class="op">(</span>FILE_PATH<span class="op">,</span> O_RDWR <span class="op">|</span> O_CREAT <span class="op">|</span> O_DIRECT<span class="op">,</span> <span class="bn">0644</span><span class="op">);</span></span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a>        free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 写入数据 */</span></span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a>    memset<span class="op">(</span>buf<span class="op">,</span> <span class="ch">&#39;A&#39;</span><span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb14-34"><a href="#cb14-34" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb14-35"><a href="#cb14-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-36"><a href="#cb14-36" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb14-37"><a href="#cb14-37" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb14-38"><a href="#cb14-38" aria-hidden="true" tabindex="-1"></a>        free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb14-39"><a href="#cb14-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb14-40"><a href="#cb14-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-41"><a href="#cb14-41" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;写入 </span><span class="sc">%zd</span><span class="st"> 字节</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb14-42"><a href="#cb14-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-43"><a href="#cb14-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 同步到磁盘 */</span></span>
+<span id="cb14-44"><a href="#cb14-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>fd<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-45"><a href="#cb14-45" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;fsync&quot;</span><span class="op">);</span></span>
+<span id="cb14-46"><a href="#cb14-46" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-47"><a href="#cb14-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-48"><a href="#cb14-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 读回数据 */</span></span>
+<span id="cb14-49"><a href="#cb14-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lseek<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> SEEK_SET<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-50"><a href="#cb14-50" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;lseek&quot;</span><span class="op">);</span></span>
+<span id="cb14-51"><a href="#cb14-51" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb14-52"><a href="#cb14-52" aria-hidden="true" tabindex="-1"></a>        free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb14-53"><a href="#cb14-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb14-54"><a href="#cb14-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-55"><a href="#cb14-55" aria-hidden="true" tabindex="-1"></a>    memset<span class="op">(</span>buf<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb14-56"><a href="#cb14-56" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> read<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb14-57"><a href="#cb14-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-58"><a href="#cb14-58" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;read&quot;</span><span class="op">);</span></span>
+<span id="cb14-59"><a href="#cb14-59" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb14-60"><a href="#cb14-60" aria-hidden="true" tabindex="-1"></a>        free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb14-61"><a href="#cb14-61" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb14-62"><a href="#cb14-62" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-63"><a href="#cb14-63" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;读取 </span><span class="sc">%zd</span><span class="st"> 字节，首字节：</span><span class="sc">%c\n</span><span class="st">&quot;</span><span class="op">,</span> n<span class="op">,</span> <span class="op">((</span><span class="dt">char</span> <span class="op">*)</span>buf<span class="op">)[</span><span class="dv">0</span><span class="op">]);</span></span>
+<span id="cb14-64"><a href="#cb14-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-65"><a href="#cb14-65" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb14-66"><a href="#cb14-66" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb14-67"><a href="#cb14-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb14-68"><a href="#cb14-68" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>编译运行：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-o</span> direct_io_demo direct_io_demo.c <span class="at">-Wall</span> <span class="at">-Wextra</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./direct_io_demo</span></span></code></pre></div>
+            <h3 id="对齐错误的处理">3.3 对齐错误的处理</h3>
+            <p>当对齐条件不满足时，系统调用会返回
+            <code>EINVAL</code>。以下示例演示如何检测和处理对齐错误：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;errno.h&gt;</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd<span class="op">;</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n<span class="op">;</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>    fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/testfile.dat&quot;</span><span class="op">,</span> O_RDWR <span class="op">|</span> O_CREAT <span class="op">|</span> O_DIRECT<span class="op">,</span> <span class="bn">0644</span><span class="op">);</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 错误示例1：使用未对齐的缓冲区 */</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> <span class="op">*</span>unaligned_buf <span class="op">=</span> malloc<span class="op">(</span><span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> unaligned_buf<span class="op">,</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> errno <span class="op">==</span> EINVAL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;错误：缓冲区未对齐（EINVAL）</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>unaligned_buf<span class="op">);</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 错误示例2：使用未对齐的传输长度 */</span></span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>aligned_buf <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a>    posix_memalign<span class="op">(&amp;</span>aligned_buf<span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> write<span class="op">(</span>fd<span class="op">,</span> aligned_buf<span class="op">,</span> <span class="dv">1000</span><span class="op">);</span>  <span class="co">/* 1000 不是 512 的倍数 */</span></span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> errno <span class="op">==</span> EINVAL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-32"><a href="#cb16-32" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;错误：传输长度未对齐（EINVAL）</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb16-33"><a href="#cb16-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-34"><a href="#cb16-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-35"><a href="#cb16-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 错误示例3：使用未对齐的文件偏移量 */</span></span>
+<span id="cb16-36"><a href="#cb16-36" aria-hidden="true" tabindex="-1"></a>    lseek<span class="op">(</span>fd<span class="op">,</span> <span class="dv">100</span><span class="op">,</span> SEEK_SET<span class="op">);</span>  <span class="co">/* 100 不是 512 的倍数 */</span></span>
+<span id="cb16-37"><a href="#cb16-37" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> read<span class="op">(</span>fd<span class="op">,</span> aligned_buf<span class="op">,</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb16-38"><a href="#cb16-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> errno <span class="op">==</span> EINVAL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-39"><a href="#cb16-39" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;错误：文件偏移量未对齐（EINVAL）</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb16-40"><a href="#cb16-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-41"><a href="#cb16-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-42"><a href="#cb16-42" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>aligned_buf<span class="op">);</span></span>
+<span id="cb16-43"><a href="#cb16-43" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb16-44"><a href="#cb16-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb16-45"><a href="#cb16-45" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="使用-preadpwrite-实现并发访问">3.4 使用 pread/pwrite
+            实现并发访问</h3>
+            <p>在多线程环境中，使用 <code>pread()</code> 和
+            <code>pwrite()</code> 可以避免文件偏移量的竞争条件（Race
+            Condition），因为这两个系统调用将偏移量作为参数传入，不依赖文件描述符的当前位置：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;pthread.h&gt;</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLOCK_SIZE </span><span class="dv">4096</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NUM_THREADS </span><span class="dv">4</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd<span class="op">;</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> thread_id<span class="op">;</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> thread_arg_t<span class="op">;</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>writer_thread<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>arg<span class="op">)</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>    thread_arg_t <span class="op">*</span>ta <span class="op">=</span> <span class="op">(</span>thread_arg_t <span class="op">*)</span>arg<span class="op">;</span></span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>buf <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>    posix_memalign<span class="op">(&amp;</span>buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 每个线程写入不同的偏移位置 */</span></span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>    off_t offset <span class="op">=</span> <span class="op">(</span>off_t<span class="op">)</span>ta<span class="op">-&gt;</span>thread_id <span class="op">*</span> BLOCK_SIZE<span class="op">;</span></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>    memset<span class="op">(</span>buf<span class="op">,</span> <span class="ch">&#39;A&#39;</span> <span class="op">+</span> ta<span class="op">-&gt;</span>thread_id<span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> n <span class="op">=</span> pwrite<span class="op">(</span>ta<span class="op">-&gt;</span>fd<span class="op">,</span> buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> offset<span class="op">);</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;pwrite&quot;</span><span class="op">);</span></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;线程 </span><span class="sc">%d</span><span class="st">：在偏移 </span><span class="sc">%ld</span><span class="st"> 写入 </span><span class="sc">%zd</span><span class="st"> 字节</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>               ta<span class="op">-&gt;</span>thread_id<span class="op">,</span> <span class="op">(</span><span class="dt">long</span><span class="op">)</span>offset<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/concurrent_test.dat&quot;</span><span class="op">,</span></span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>                  O_RDWR <span class="op">|</span> O_CREAT <span class="op">|</span> O_DIRECT<span class="op">,</span> <span class="bn">0644</span><span class="op">);</span></span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a>    pthread_t threads<span class="op">[</span>NUM_THREADS<span class="op">];</span></span>
+<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a>    thread_arg_t args<span class="op">[</span>NUM_THREADS<span class="op">];</span></span>
+<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> NUM_THREADS<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb17-51"><a href="#cb17-51" aria-hidden="true" tabindex="-1"></a>        args<span class="op">[</span>i<span class="op">].</span>fd <span class="op">=</span> fd<span class="op">;</span></span>
+<span id="cb17-52"><a href="#cb17-52" aria-hidden="true" tabindex="-1"></a>        args<span class="op">[</span>i<span class="op">].</span>thread_id <span class="op">=</span> i<span class="op">;</span></span>
+<span id="cb17-53"><a href="#cb17-53" aria-hidden="true" tabindex="-1"></a>        pthread_create<span class="op">(&amp;</span>threads<span class="op">[</span>i<span class="op">],</span> NULL<span class="op">,</span> writer_thread<span class="op">,</span> <span class="op">&amp;</span>args<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb17-54"><a href="#cb17-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-55"><a href="#cb17-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-56"><a href="#cb17-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> NUM_THREADS<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb17-57"><a href="#cb17-57" aria-hidden="true" tabindex="-1"></a>        pthread_join<span class="op">(</span>threads<span class="op">[</span>i<span class="op">],</span> NULL<span class="op">);</span></span>
+<span id="cb17-58"><a href="#cb17-58" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-59"><a href="#cb17-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-60"><a href="#cb17-60" aria-hidden="true" tabindex="-1"></a>    fsync<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb17-61"><a href="#cb17-61" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb17-62"><a href="#cb17-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb17-63"><a href="#cb17-63" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>编译时需要链接 pthread 库：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-o</span> concurrent_dio concurrent_dio.c <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-lpthread</span></span></code></pre></div>
+            <hr />
+            <h2 id="四o_direct-编程实战rust">四、O_DIRECT
+            编程实战（Rust）</h2>
+            <h3 id="基本的-o_direct-文件操作">4.1 基本的 O_DIRECT
+            文件操作</h3>
+            <p>Rust 标准库的 <code>std::fs::OpenOptions</code>
+            不直接支持 <code>O_DIRECT</code> 标志，需要通过
+            <code>std::os::unix::fs::OpenOptionsExt</code>
+            扩展来设置自定义标志：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode rust"><code class="sourceCode rust"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::fs::</span>OpenOptions<span class="op">;</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::io::</span><span class="op">{</span><span class="bu">Read</span><span class="op">,</span> <span class="bu">Write</span><span class="op">,</span> <span class="bu">Seek</span><span class="op">,</span> SeekFrom<span class="op">};</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::os::unix::fs::</span>OpenOptionsExt<span class="op">;</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">-&gt;</span> <span class="pp">std::io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> fd <span class="op">=</span> <span class="pp">OpenOptions::</span>new()</span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>read(<span class="cn">true</span>)</span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>write(<span class="cn">true</span>)</span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>create(<span class="cn">true</span>)</span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>custom_flags(<span class="pp">libc::</span>O_DIRECT)</span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>open(<span class="st">&quot;/data/testfile.dat&quot;</span>)<span class="op">?;</span></span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;文件以 O_DIRECT 模式打开成功&quot;</span>)<span class="op">;</span></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>在 <code>Cargo.toml</code> 中添加 <code>libc</code>
+            依赖：</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode toml"><code class="sourceCode toml"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[dependencies]</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="dt">libc</span> <span class="op">=</span> <span class="st">&quot;0.2&quot;</span></span></code></pre></div>
+            <h3 id="对齐缓冲区分配">4.2 对齐缓冲区分配</h3>
+            <p>Rust 中可以使用 <code>std::alloc</code>
+            模块分配对齐内存：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode rust"><code class="sourceCode rust"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::alloc::</span><span class="op">{</span>alloc<span class="op">,</span> dealloc<span class="op">,</span> Layout<span class="op">};</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> AlignedBuffer <span class="op">{</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>    ptr<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    layout<span class="op">:</span> Layout<span class="op">,</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> AlignedBuffer <span class="op">{</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> new(size<span class="op">:</span> <span class="dt">usize</span><span class="op">,</span> alignment<span class="op">:</span> <span class="dt">usize</span>) <span class="op">-&gt;</span> <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> layout <span class="op">=</span> <span class="pp">Layout::</span>from_size_align(size<span class="op">,</span> alignment)</span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>expect(<span class="st">&quot;无效的布局参数&quot;</span>)<span class="op">;</span></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> ptr <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span> alloc(layout) <span class="op">};</span></span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> ptr<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a>            <span class="pp">panic!</span>(<span class="st">&quot;内存分配失败&quot;</span>)<span class="op">;</span></span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a>        AlignedBuffer <span class="op">{</span> ptr<span class="op">,</span> layout <span class="op">}</span></span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> as_slice(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="op">&amp;</span>[<span class="dt">u8</span>] <span class="op">{</span></span>
+<span id="cb21-20"><a href="#cb21-20" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">std::slice::</span>from_raw_parts(<span class="kw">self</span><span class="op">.</span>ptr<span class="op">,</span> <span class="kw">self</span><span class="op">.</span>layout<span class="op">.</span>size()) <span class="op">}</span></span>
+<span id="cb21-21"><a href="#cb21-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-22"><a href="#cb21-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-23"><a href="#cb21-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> as_mut_slice(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">-&gt;</span> <span class="op">&amp;</span><span class="kw">mut</span> [<span class="dt">u8</span>] <span class="op">{</span></span>
+<span id="cb21-24"><a href="#cb21-24" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">std::slice::</span>from_raw_parts_mut(<span class="kw">self</span><span class="op">.</span>ptr<span class="op">,</span> <span class="kw">self</span><span class="op">.</span>layout<span class="op">.</span>size()) <span class="op">}</span></span>
+<span id="cb21-25"><a href="#cb21-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-26"><a href="#cb21-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb21-27"><a href="#cb21-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-28"><a href="#cb21-28" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> <span class="bu">Drop</span> <span class="cf">for</span> AlignedBuffer <span class="op">{</span></span>
+<span id="cb21-29"><a href="#cb21-29" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> drop(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">{</span></span>
+<span id="cb21-30"><a href="#cb21-30" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> dealloc(<span class="kw">self</span><span class="op">.</span>ptr<span class="op">,</span> <span class="kw">self</span><span class="op">.</span>layout) <span class="op">};</span></span>
+<span id="cb21-31"><a href="#cb21-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-32"><a href="#cb21-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="完整的直接-io-示例">4.3 完整的直接 I/O 示例</h3>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode rust"><code class="sourceCode rust"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::fs::</span>OpenOptions<span class="op">;</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::io::</span><span class="op">{</span><span class="bu">Seek</span><span class="op">,</span> SeekFrom<span class="op">};</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::os::unix::fs::</span>OpenOptionsExt<span class="op">;</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::os::unix::io::</span>AsRawFd<span class="op">;</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::alloc::</span><span class="op">{</span>alloc<span class="op">,</span> dealloc<span class="op">,</span> Layout<span class="op">};</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> BLOCK_SIZE<span class="op">:</span> <span class="dt">usize</span> <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> AlignedBuffer <span class="op">{</span></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a>    ptr<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a>    layout<span class="op">:</span> Layout<span class="op">,</span></span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a>    len<span class="op">:</span> <span class="dt">usize</span><span class="op">,</span></span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-14"><a href="#cb22-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-15"><a href="#cb22-15" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> AlignedBuffer <span class="op">{</span></span>
+<span id="cb22-16"><a href="#cb22-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> new(size<span class="op">:</span> <span class="dt">usize</span><span class="op">,</span> alignment<span class="op">:</span> <span class="dt">usize</span>) <span class="op">-&gt;</span> <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb22-17"><a href="#cb22-17" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> layout <span class="op">=</span> <span class="pp">Layout::</span>from_size_align(size<span class="op">,</span> alignment)</span>
+<span id="cb22-18"><a href="#cb22-18" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>expect(<span class="st">&quot;无效的布局参数&quot;</span>)<span class="op">;</span></span>
+<span id="cb22-19"><a href="#cb22-19" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> ptr <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span> alloc(layout) <span class="op">};</span></span>
+<span id="cb22-20"><a href="#cb22-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> ptr<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb22-21"><a href="#cb22-21" aria-hidden="true" tabindex="-1"></a>            <span class="pp">panic!</span>(<span class="st">&quot;内存分配失败&quot;</span>)<span class="op">;</span></span>
+<span id="cb22-22"><a href="#cb22-22" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb22-23"><a href="#cb22-23" aria-hidden="true" tabindex="-1"></a>        AlignedBuffer <span class="op">{</span> ptr<span class="op">,</span> layout<span class="op">,</span> len<span class="op">:</span> size <span class="op">}</span></span>
+<span id="cb22-24"><a href="#cb22-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> as_slice(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="op">&amp;</span>[<span class="dt">u8</span>] <span class="op">{</span></span>
+<span id="cb22-27"><a href="#cb22-27" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">std::slice::</span>from_raw_parts(<span class="kw">self</span><span class="op">.</span>ptr<span class="op">,</span> <span class="kw">self</span><span class="op">.</span>len) <span class="op">}</span></span>
+<span id="cb22-28"><a href="#cb22-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-29"><a href="#cb22-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-30"><a href="#cb22-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> as_mut_slice(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">-&gt;</span> <span class="op">&amp;</span><span class="kw">mut</span> [<span class="dt">u8</span>] <span class="op">{</span></span>
+<span id="cb22-31"><a href="#cb22-31" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">std::slice::</span>from_raw_parts_mut(<span class="kw">self</span><span class="op">.</span>ptr<span class="op">,</span> <span class="kw">self</span><span class="op">.</span>len) <span class="op">}</span></span>
+<span id="cb22-32"><a href="#cb22-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-33"><a href="#cb22-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-34"><a href="#cb22-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-35"><a href="#cb22-35" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> <span class="bu">Drop</span> <span class="cf">for</span> AlignedBuffer <span class="op">{</span></span>
+<span id="cb22-36"><a href="#cb22-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> drop(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">{</span></span>
+<span id="cb22-37"><a href="#cb22-37" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> dealloc(<span class="kw">self</span><span class="op">.</span>ptr<span class="op">,</span> <span class="kw">self</span><span class="op">.</span>layout) <span class="op">};</span></span>
+<span id="cb22-38"><a href="#cb22-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-39"><a href="#cb22-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-40"><a href="#cb22-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-41"><a href="#cb22-41" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> direct_write(fd<span class="op">:</span> <span class="dt">i32</span><span class="op">,</span> buf<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]<span class="op">,</span> offset<span class="op">:</span> <span class="dt">i64</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span><span class="dt">usize</span><span class="op">,</span> <span class="dt">String</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb22-42"><a href="#cb22-42" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> n <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb22-43"><a href="#cb22-43" aria-hidden="true" tabindex="-1"></a>        <span class="pp">libc::</span>pwrite(fd<span class="op">,</span> buf<span class="op">.</span>as_ptr() <span class="kw">as</span> <span class="op">*</span><span class="kw">const</span> <span class="pp">libc::</span><span class="dt">c_void</span><span class="op">,</span></span>
+<span id="cb22-44"><a href="#cb22-44" aria-hidden="true" tabindex="-1"></a>                     buf<span class="op">.</span>len()<span class="op">,</span> offset)</span>
+<span id="cb22-45"><a href="#cb22-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb22-46"><a href="#cb22-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> n <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb22-47"><a href="#cb22-47" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(<span class="pp">format!</span>(<span class="st">&quot;pwrite 失败：{}&quot;</span><span class="op">,</span> <span class="pp">std::io::</span><span class="bu">Error</span><span class="pp">::</span>last_os_error()))</span>
+<span id="cb22-48"><a href="#cb22-48" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb22-49"><a href="#cb22-49" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(n <span class="kw">as</span> <span class="dt">usize</span>)</span>
+<span id="cb22-50"><a href="#cb22-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-51"><a href="#cb22-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-52"><a href="#cb22-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-53"><a href="#cb22-53" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> direct_read(fd<span class="op">:</span> <span class="dt">i32</span><span class="op">,</span> buf<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> [<span class="dt">u8</span>]<span class="op">,</span> offset<span class="op">:</span> <span class="dt">i64</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span><span class="dt">usize</span><span class="op">,</span> <span class="dt">String</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb22-54"><a href="#cb22-54" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> n <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb22-55"><a href="#cb22-55" aria-hidden="true" tabindex="-1"></a>        <span class="pp">libc::</span>pread(fd<span class="op">,</span> buf<span class="op">.</span>as_mut_ptr() <span class="kw">as</span> <span class="op">*</span><span class="kw">mut</span> <span class="pp">libc::</span><span class="dt">c_void</span><span class="op">,</span></span>
+<span id="cb22-56"><a href="#cb22-56" aria-hidden="true" tabindex="-1"></a>                    buf<span class="op">.</span>len()<span class="op">,</span> offset)</span>
+<span id="cb22-57"><a href="#cb22-57" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb22-58"><a href="#cb22-58" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> n <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb22-59"><a href="#cb22-59" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(<span class="pp">format!</span>(<span class="st">&quot;pread 失败：{}&quot;</span><span class="op">,</span> <span class="pp">std::io::</span><span class="bu">Error</span><span class="pp">::</span>last_os_error()))</span>
+<span id="cb22-60"><a href="#cb22-60" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb22-61"><a href="#cb22-61" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(n <span class="kw">as</span> <span class="dt">usize</span>)</span>
+<span id="cb22-62"><a href="#cb22-62" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-63"><a href="#cb22-63" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-64"><a href="#cb22-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-65"><a href="#cb22-65" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">std::error::</span><span class="bu">Error</span><span class="op">&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb22-66"><a href="#cb22-66" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> file <span class="op">=</span> <span class="pp">OpenOptions::</span>new()</span>
+<span id="cb22-67"><a href="#cb22-67" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>read(<span class="cn">true</span>)</span>
+<span id="cb22-68"><a href="#cb22-68" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>write(<span class="cn">true</span>)</span>
+<span id="cb22-69"><a href="#cb22-69" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>create(<span class="cn">true</span>)</span>
+<span id="cb22-70"><a href="#cb22-70" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>custom_flags(<span class="pp">libc::</span>O_DIRECT)</span>
+<span id="cb22-71"><a href="#cb22-71" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>open(<span class="st">&quot;/data/rust_dio_test.dat&quot;</span>)<span class="op">?;</span></span>
+<span id="cb22-72"><a href="#cb22-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-73"><a href="#cb22-73" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> fd <span class="op">=</span> file<span class="op">.</span>as_raw_fd()<span class="op">;</span></span>
+<span id="cb22-74"><a href="#cb22-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-75"><a href="#cb22-75" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 写入 */</span></span>
+<span id="cb22-76"><a href="#cb22-76" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> write_buf <span class="op">=</span> <span class="pp">AlignedBuffer::</span>new(BLOCK_SIZE<span class="op">,</span> BLOCK_SIZE)<span class="op">;</span></span>
+<span id="cb22-77"><a href="#cb22-77" aria-hidden="true" tabindex="-1"></a>    write_buf<span class="op">.</span>as_mut_slice()<span class="op">.</span>fill(<span class="ch">b&#39;R&#39;</span>)<span class="op">;</span></span>
+<span id="cb22-78"><a href="#cb22-78" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> written <span class="op">=</span> direct_write(fd<span class="op">,</span> write_buf<span class="op">.</span>as_slice()<span class="op">,</span> <span class="dv">0</span>)<span class="op">?;</span></span>
+<span id="cb22-79"><a href="#cb22-79" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;写入 {} 字节&quot;</span><span class="op">,</span> written)<span class="op">;</span></span>
+<span id="cb22-80"><a href="#cb22-80" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-81"><a href="#cb22-81" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* fsync 确保持久化 */</span></span>
+<span id="cb22-82"><a href="#cb22-82" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">libc::</span>fsync(fd) <span class="op">};</span></span>
+<span id="cb22-83"><a href="#cb22-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-84"><a href="#cb22-84" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 读取 */</span></span>
+<span id="cb22-85"><a href="#cb22-85" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> read_buf <span class="op">=</span> <span class="pp">AlignedBuffer::</span>new(BLOCK_SIZE<span class="op">,</span> BLOCK_SIZE)<span class="op">;</span></span>
+<span id="cb22-86"><a href="#cb22-86" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> read_n <span class="op">=</span> direct_read(fd<span class="op">,</span> read_buf<span class="op">.</span>as_mut_slice()<span class="op">,</span> <span class="dv">0</span>)<span class="op">?;</span></span>
+<span id="cb22-87"><a href="#cb22-87" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;读取 {} 字节，首字节：{}&quot;</span><span class="op">,</span> read_n<span class="op">,</span> read_buf<span class="op">.</span>as_slice()[<span class="dv">0</span>] <span class="kw">as</span> <span class="dt">char</span>)<span class="op">;</span></span>
+<span id="cb22-88"><a href="#cb22-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-89"><a href="#cb22-89" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb22-90"><a href="#cb22-90" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="安全封装">4.4 安全封装</h3>
+            <p>在生产代码中，建议将直接 I/O 操作封装为安全的 Rust
+            接口，隐藏底层的 <code>unsafe</code> 细节：</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode rust"><code class="sourceCode rust"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::fs::</span>File<span class="op">;</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>io<span class="op">;</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::os::unix::io::</span>AsRawFd<span class="op">;</span></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> DirectFile <span class="op">{</span></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a>    file<span class="op">:</span> File<span class="op">,</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a>    block_size<span class="op">:</span> <span class="dt">usize</span><span class="op">,</span></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-11"><a href="#cb23-11" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> DirectFile <span class="op">{</span></span>
+<span id="cb23-12"><a href="#cb23-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> open<span class="op">&lt;</span>P<span class="op">:</span> <span class="bu">AsRef</span><span class="op">&lt;</span><span class="dt">Path</span><span class="op">&gt;&gt;</span>(path<span class="op">:</span> P<span class="op">,</span> block_size<span class="op">:</span> <span class="dt">usize</span>) <span class="op">-&gt;</span> <span class="pp">io::</span><span class="dt">Result</span><span class="op">&lt;</span><span class="dt">Self</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb23-13"><a href="#cb23-13" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> file <span class="op">=</span> <span class="pp">OpenOptions::</span>new()</span>
+<span id="cb23-14"><a href="#cb23-14" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>read(<span class="cn">true</span>)</span>
+<span id="cb23-15"><a href="#cb23-15" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>write(<span class="cn">true</span>)</span>
+<span id="cb23-16"><a href="#cb23-16" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>create(<span class="cn">true</span>)</span>
+<span id="cb23-17"><a href="#cb23-17" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>custom_flags(<span class="pp">libc::</span>O_DIRECT)</span>
+<span id="cb23-18"><a href="#cb23-18" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>open(path)<span class="op">?;</span></span>
+<span id="cb23-19"><a href="#cb23-19" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(DirectFile <span class="op">{</span> file<span class="op">,</span> block_size <span class="op">}</span>)</span>
+<span id="cb23-20"><a href="#cb23-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-21"><a href="#cb23-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-22"><a href="#cb23-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> write_block(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> block_num<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">-&gt;</span> <span class="pp">io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb23-23"><a href="#cb23-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> data<span class="op">.</span>len() <span class="op">!=</span> <span class="kw">self</span><span class="op">.</span>block_size <span class="op">{</span></span>
+<span id="cb23-24"><a href="#cb23-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="cn">Err</span>(<span class="pp">io::</span><span class="bu">Error</span><span class="pp">::</span>new(</span>
+<span id="cb23-25"><a href="#cb23-25" aria-hidden="true" tabindex="-1"></a>                <span class="pp">io::ErrorKind::</span>InvalidInput<span class="op">,</span></span>
+<span id="cb23-26"><a href="#cb23-26" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;数据长度必须等于块大小&quot;</span></span>
+<span id="cb23-27"><a href="#cb23-27" aria-hidden="true" tabindex="-1"></a>            ))<span class="op">;</span></span>
+<span id="cb23-28"><a href="#cb23-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb23-29"><a href="#cb23-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> data<span class="op">.</span>as_ptr() <span class="kw">as</span> <span class="dt">usize</span> <span class="op">%</span> <span class="kw">self</span><span class="op">.</span>block_size <span class="op">!=</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb23-30"><a href="#cb23-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="cn">Err</span>(<span class="pp">io::</span><span class="bu">Error</span><span class="pp">::</span>new(</span>
+<span id="cb23-31"><a href="#cb23-31" aria-hidden="true" tabindex="-1"></a>                <span class="pp">io::ErrorKind::</span>InvalidInput<span class="op">,</span></span>
+<span id="cb23-32"><a href="#cb23-32" aria-hidden="true" tabindex="-1"></a>                <span class="st">&quot;缓冲区地址未对齐&quot;</span></span>
+<span id="cb23-33"><a href="#cb23-33" aria-hidden="true" tabindex="-1"></a>            ))<span class="op">;</span></span>
+<span id="cb23-34"><a href="#cb23-34" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb23-35"><a href="#cb23-35" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> offset <span class="op">=</span> (block_num <span class="kw">as</span> <span class="dt">i64</span>) <span class="op">*</span> (<span class="kw">self</span><span class="op">.</span>block_size <span class="kw">as</span> <span class="dt">i64</span>)<span class="op">;</span></span>
+<span id="cb23-36"><a href="#cb23-36" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> fd <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>file<span class="op">.</span>as_raw_fd()<span class="op">;</span></span>
+<span id="cb23-37"><a href="#cb23-37" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> n <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb23-38"><a href="#cb23-38" aria-hidden="true" tabindex="-1"></a>            <span class="pp">libc::</span>pwrite(fd<span class="op">,</span> data<span class="op">.</span>as_ptr() <span class="kw">as</span> <span class="op">*</span><span class="kw">const</span> <span class="pp">libc::</span><span class="dt">c_void</span><span class="op">,</span></span>
+<span id="cb23-39"><a href="#cb23-39" aria-hidden="true" tabindex="-1"></a>                         data<span class="op">.</span>len()<span class="op">,</span> offset)</span>
+<span id="cb23-40"><a href="#cb23-40" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb23-41"><a href="#cb23-41" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> n <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb23-42"><a href="#cb23-42" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(<span class="pp">io::</span><span class="bu">Error</span><span class="pp">::</span>last_os_error())</span>
+<span id="cb23-43"><a href="#cb23-43" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb23-44"><a href="#cb23-44" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(())</span>
+<span id="cb23-45"><a href="#cb23-45" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb23-46"><a href="#cb23-46" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-47"><a href="#cb23-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-48"><a href="#cb23-48" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> sync(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="pp">io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb23-49"><a href="#cb23-49" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>file<span class="op">.</span>sync_all()</span>
+<span id="cb23-50"><a href="#cb23-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-51"><a href="#cb23-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <hr />
+            <h2 id="五o_direct-fsync数据持久化保证">五、O_DIRECT +
+            fsync：数据持久化保证</h2>
+            <h3 id="写入顺序与持久化语义">5.1 写入顺序与持久化语义</h3>
+            <p>理解数据持久化需要区分三个层次：</p>
+            <ol type="1">
+            <li><strong>应用层可见</strong>：<code>write()</code>
+            返回成功，数据对同一进程（以及其他使用 <code>O_DIRECT</code>
+            读取的进程）可见。</li>
+            <li><strong>内核层可见</strong>：数据到达块设备驱动层，已提交到硬件队列。</li>
+            <li><strong>持久化完成</strong>：数据已写入非易失性存储介质（磁盘盘片、NAND
+            闪存颗粒）。</li>
+            </ol>
+            <p><code>O_DIRECT</code>
+            只保证数据到达第二个层次——内核块设备层。从块设备层到实际持久化之间，还有磁盘控制器的写缓存（通常为
+            64MB～256MB 的
+            DRAM）。要达到第三个层次，必须执行显式的同步操作。</p>
+            <p>标准的持久化写入模式如下：</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 第一步：O_DIRECT 写入——数据到达块设备层 */</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> n <span class="op">=</span> pwrite<span class="op">(</span>fd<span class="op">,</span> aligned_buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> offset<span class="op">);</span></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>n <span class="op">!=</span> BLOCK_SIZE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 处理部分写入或错误 */</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a><span class="co">/* 第二步：fsync——刷出硬件写缓存，保证持久化 */</span></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>fd<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb24-9"><a href="#cb24-9" aria-hidden="true" tabindex="-1"></a>    perror<span class="op">(</span><span class="st">&quot;fsync&quot;</span><span class="op">);</span></span>
+<span id="cb24-10"><a href="#cb24-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 数据可能未持久化，需要重试或回滚 */</span></span>
+<span id="cb24-11"><a href="#cb24-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="fsync-与-fdatasync-的区别">5.2 fsync 与 fdatasync
+            的区别</h3>
+            <p><code>fsync()</code> 和 <code>fdatasync()</code>
+            都用于将文件的修改同步到磁盘，但它们在元数据（Metadata）处理上有差异：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>操作</th>
+            <th>数据同步</th>
+            <th>元数据同步</th>
+            <th>典型延迟</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>fsync()</code></td>
+            <td>是</td>
+            <td>全部元数据（包括 mtime、atime）</td>
+            <td>较高</td>
+            </tr>
+            <tr>
+            <td><code>fdatasync()</code></td>
+            <td>是</td>
+            <td>仅影响后续读取的元数据（如文件大小）</td>
+            <td>较低</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>对于数据库的预分配文件（文件大小不变，只更新内容），<code>fdatasync()</code>
+            的性能优于
+            <code>fsync()</code>，因为它不需要更新文件的修改时间戳。</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 文件大小未变的覆盖写入，使用 fdatasync 即可 */</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a>pwrite<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> offset<span class="op">);</span>  <span class="co">/* 覆盖已有数据，大小不变 */</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a>fdatasync<span class="op">(</span>fd<span class="op">);</span>                         <span class="co">/* 不更新 mtime，性能更好 */</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* 追加写入（文件大小改变），必须使用 fsync */</span></span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a>pwrite<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> new_offset<span class="op">);</span>  <span class="co">/* 写入到文件末尾之后 */</span></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a>fsync<span class="op">(</span>fd<span class="op">);</span>                                 <span class="co">/* 需要同步文件大小元数据 */</span></span></code></pre></div>
+            <h3 id="sync_file_range-的细粒度控制">5.3 sync_file_range
+            的细粒度控制</h3>
+            <p><code>sync_file_range()</code> 提供了比
+            <code>fsync()</code>
+            更细粒度的同步控制，允许只同步文件的一个特定范围，并且可以异步启动回写：</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="co">/* 异步启动回写，不等待完成 */</span></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a>sync_file_range<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a>                SYNC_FILE_RANGE_WRITE<span class="op">);</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a><span class="co">/* 等待之前启动的回写完成 */</span></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a>sync_file_range<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a>                SYNC_FILE_RANGE_WAIT_BEFORE <span class="op">|</span></span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a>                SYNC_FILE_RANGE_WRITE <span class="op">|</span></span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a>                SYNC_FILE_RANGE_WAIT_AFTER<span class="op">);</span></span></code></pre></div>
+            <p>需要特别注意的是，<code>sync_file_range()</code>
+            不保证元数据的同步，也不保证数据在掉电后一定可恢复。它主要用于性能优化——提前启动回写以减少后续
+            <code>fsync()</code> 的等待时间。PostgreSQL 在 WAL
+            预写日志中就使用了这种两阶段同步策略。</p>
+            <h3 id="fsync-after-rename-模式">5.4 fsync-after-rename
+            模式</h3>
+            <p>在需要原子性替换文件内容的场景下，<code>fsync-after-rename</code>
+            是一种常用的模式。其基本流程如下：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 第一步：创建临时文件并写入新内容 */</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> tmp_fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/config.tmp&quot;</span><span class="op">,</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a>                  O_WRONLY <span class="op">|</span> O_CREAT <span class="op">|</span> O_DIRECT<span class="op">,</span> <span class="bn">0644</span><span class="op">);</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a>pwrite<span class="op">(</span>tmp_fd<span class="op">,</span> new_data<span class="op">,</span> data_len<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* 第二步：同步临时文件的数据 */</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a>fsync<span class="op">(</span>tmp_fd<span class="op">);</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a>close<span class="op">(</span>tmp_fd<span class="op">);</span></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a><span class="co">/* 第三步：原子性重命名 */</span></span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a>rename<span class="op">(</span><span class="st">&quot;/data/config.tmp&quot;</span><span class="op">,</span> <span class="st">&quot;/data/config.dat&quot;</span><span class="op">);</span></span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-13"><a href="#cb27-13" aria-hidden="true" tabindex="-1"></a><span class="co">/* 第四步：同步目录元数据（确保 rename 操作持久化） */</span></span>
+<span id="cb27-14"><a href="#cb27-14" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> dir_fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb27-15"><a href="#cb27-15" aria-hidden="true" tabindex="-1"></a>fsync<span class="op">(</span>dir_fd<span class="op">);</span></span>
+<span id="cb27-16"><a href="#cb27-16" aria-hidden="true" tabindex="-1"></a>close<span class="op">(</span>dir_fd<span class="op">);</span></span></code></pre></div>
+            <p>这个模式保证了即使在任何一步之后发生掉电，文件要么是旧的完整内容，要么是新的完整内容，不会出现半写入的损坏状态。RocksDB
+            的 SST 文件写入和 etcd 的快照保存都使用了这种模式。</p>
+            <h3 id="磁盘写缓存与写屏障">5.5 磁盘写缓存与写屏障</h3>
+            <p>现代磁盘通常启用了写缓存（Write
+            Cache），也称为易失性写缓存（Volatile Write
+            Cache）。当应用程序调用 <code>fsync()</code>
+            时，内核会向磁盘发送缓存刷出命令（Cache Flush
+            Command）：</p>
+            <ul>
+            <li><strong>SATA/SAS 磁盘</strong>：<code>FLUSH CACHE</code>
+            或 <code>FLUSH CACHE EXT</code> 命令</li>
+            <li><strong>NVMe 设备</strong>（Non-Volatile Memory
+            Express）：Flush 命令</li>
+            </ul>
+            <p>这些命令指示磁盘将其内部写缓存中的所有数据刷到持久存储介质上。在
+            <code>fsync()</code>
+            返回之前，内核会等待磁盘确认刷出操作完成。</p>
+            <p>写屏障（Write
+            Barrier）是内核用来保证写入顺序的机制。在启用写屏障的情况下，内核保证屏障之前的写入在屏障之后的写入到达磁盘之前完成。可以通过以下命令查看和控制磁盘写缓存：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看磁盘写缓存状态</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="ex">hdparm</span> <span class="at">-W</span> /dev/sda</span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用磁盘写缓存（谨慎使用，会降低性能）</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="ex">hdparm</span> <span class="at">-W0</span> /dev/sda</span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用磁盘写缓存</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="ex">hdparm</span> <span class="at">-W1</span> /dev/sda</span></code></pre></div>
+            <p>对于带有电池备份单元（Battery Backup Unit，BBU）的 RAID
+            控制器，写缓存是由电池保护的，即使掉电也不会丢失数据。在这种配置下，<code>fsync()</code>
+            只需要将数据从操作系统层面刷到 RAID
+            控制器的缓存中即可，延迟更低。</p>
+            <hr />
+            <h2 id="六各数据库的-direct-io-策略">六、各数据库的 Direct
+            I/O 策略</h2>
+            <h3 id="mysqlinnodb">6.1 MySQL/InnoDB</h3>
+            <p>InnoDB 提供了 <code>innodb_flush_method</code>
+            参数来控制数据文件和日志文件的 I/O 方式：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># MySQL 配置文件 my.cnf</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[mysqld]</span></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_flush_method </span><span class="ot">=</span><span class="st"> O_DIRECT</span></span></code></pre></div>
+            <p>可选值及其含义：</p>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 11%" />
+            <col style="width: 33%" />
+            <col style="width: 33%" />
+            <col style="width: 22%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>值</th>
+            <th>数据文件</th>
+            <th>日志文件</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>fsync</code>（默认）</td>
+            <td>缓冲 I/O + fsync</td>
+            <td>缓冲 I/O + fsync</td>
+            <td>依赖 Page Cache</td>
+            </tr>
+            <tr>
+            <td><code>O_DIRECT</code></td>
+            <td>O_DIRECT + fsync</td>
+            <td>缓冲 I/O + fsync</td>
+            <td>数据文件绕过缓存</td>
+            </tr>
+            <tr>
+            <td><code>O_DIRECT_NO_FSYNC</code></td>
+            <td>O_DIRECT（无 fsync）</td>
+            <td>缓冲 I/O + fsync</td>
+            <td>依赖硬件保证持久性</td>
+            </tr>
+            <tr>
+            <td><code>O_DSYNC</code></td>
+            <td>缓冲 I/O + fsync</td>
+            <td>O_SYNC</td>
+            <td>日志同步写入</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>在生产环境中，<code>O_DIRECT</code> 是最常用的配置，因为
+            InnoDB 的 Buffer Pool 已经提供了应用层缓存，再使用 Page
+            Cache 只会浪费内存。<code>O_DIRECT_NO_FSYNC</code>
+            仅适用于配备 BBU RAID
+            控制器的环境，在这种环境下可以安全地省略 <code>fsync</code>
+            调用。</p>
+            <p>日志文件（Redo Log）仍然使用缓冲 I/O，是因为 InnoDB 的
+            Redo Log 写入模式（小块追加写入）更适合 Page Cache
+            的写合并特性。并且 InnoDB 通过
+            <code>innodb_flush_log_at_trx_commit</code>
+            参数精确控制日志的刷盘时机。</p>
+            <h3 id="postgresql">6.2 PostgreSQL</h3>
+            <p>PostgreSQL 默认不使用
+            <code>O_DIRECT</code>，而是完全依赖操作系统的 Page
+            Cache。这是一个有争议的设计决策，PostgreSQL
+            社区的理由包括：</p>
+            <ul>
+            <li>PostgreSQL 的共享缓冲区（Shared
+            Buffers）通常只配置为物理内存的 25%，剩余内存留给 Page Cache
+            使用。</li>
+            <li>PostgreSQL 的预读和缓存管理不如 InnoDB 精细，需要 Page
+            Cache 作为补充。</li>
+            <li><code>O_DIRECT</code>
+            的对齐要求增加了代码复杂性和平台可移植性问题。</li>
+            </ul>
+            <p>从 PostgreSQL 16 开始，引入了 <code>io_method</code>
+            参数的实验性支持。未来版本可能会提供 <code>O_DIRECT</code>
+            选项。</p>
+            <p>社区中有人通过修改源码测试了
+            <code>O_DIRECT</code>，结果表明：在 Shared Buffers
+            大于可用内存 50% 的配置下，<code>O_DIRECT</code> 可以减少约
+            30% 的内存占用，但随机读性能会有 10%～20% 的下降（因为失去了
+            Page Cache 的缓存作用）。</p>
+            <h3 id="rocksdb">6.3 RocksDB</h3>
+            <p>RocksDB 提供了细粒度的 O_DIRECT 控制选项：</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a><span class="co">/* 读取时使用 O_DIRECT */</span></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>use_direct_reads <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* 刷写和压缩时使用 O_DIRECT */</span></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>use_direct_io_for_flush_and_compaction <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span></code></pre></div>
+            <p>RocksDB 的 O_DIRECT 策略反映了 LSM-Tree（Log-Structured
+            Merge Tree）的 I/O 特征：</p>
+            <ul>
+            <li><strong>读取路径</strong>：用户读取首先检查 MemTable 和
+            Block Cache。未命中时才访问 SST 文件。启用
+            <code>use_direct_reads</code> 可以避免 Page Cache 缓存 SST
+            文件数据，因为 Block Cache 已经提供了缓存。</li>
+            <li><strong>写入/压缩路径</strong>：刷写（Flush）和压缩（Compaction）操作涉及大量顺序
+            I/O，会严重污染 Page Cache。启用
+            <code>use_direct_io_for_flush_and_compaction</code>
+            可以防止这种污染。</li>
+            </ul>
+            <h3 id="mongodbwiredtiger">6.4 MongoDB/WiredTiger</h3>
+            <p>MongoDB 的 WiredTiger 存储引擎支持通过
+            <code>--wiredTigerDirectoryForDirectIO</code>
+            选项或配置文件启用 O_DIRECT：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># mongod.conf</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="fu">storage</span><span class="kw">:</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">wiredTiger</span><span class="kw">:</span></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">engineConfig</span><span class="kw">:</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">directoryForIndexes</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">collectionConfig</span><span class="kw">:</span></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">blockCompressor</span><span class="kw">:</span><span class="at"> snappy</span></span></code></pre></div>
+            <p>WiredTiger 也可以通过更底层的引擎配置字符串启用
+            O_DIRECT：</p>
+            <pre class="text"><code>direct_io=[data,log,checkpoint]</code></pre>
+            <p>WiredTiger 自行维护了一个内部缓存（WiredTiger Internal
+            Cache），其大小默认为 <code>(RAM - 1GB) / 2</code> 或
+            256MB（取较大值）。启用 O_DIRECT
+            时，所有数据访问都通过这个内部缓存进行，不依赖操作系统 Page
+            Cache。</p>
+            <h3 id="sqlite">6.5 SQLite</h3>
+            <p>SQLite 不支持
+            <code>O_DIRECT</code>。其设计理念是作为一个嵌入式数据库，运行在各种环境下（包括不支持
+            O_DIRECT 的文件系统和操作系统），因此不使用平台特定的 I/O
+            优化。</p>
+            <p>SQLite 使用标准的缓冲 I/O 加 <code>fsync()</code>
+            来保证数据持久性。其 VFS（Virtual File
+            System，虚拟文件系统）层提供了足够的抽象，用户可以通过自定义
+            VFS 实现来使用 O_DIRECT，但这不在官方支持范围内。</p>
+            <h3 id="策略对比总结">6.6 策略对比总结</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>数据库</th>
+            <th>默认 I/O</th>
+            <th>O_DIRECT 支持</th>
+            <th>应用层缓存</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>MySQL/InnoDB</td>
+            <td>缓冲 I/O</td>
+            <td>完善</td>
+            <td>Buffer Pool</td>
+            <td>OLTP</td>
+            </tr>
+            <tr>
+            <td>PostgreSQL</td>
+            <td>缓冲 I/O</td>
+            <td>实验性</td>
+            <td>Shared Buffers</td>
+            <td>OLTP/OLAP</td>
+            </tr>
+            <tr>
+            <td>RocksDB</td>
+            <td>可配置</td>
+            <td>细粒度</td>
+            <td>Block Cache + MemTable</td>
+            <td>写密集型</td>
+            </tr>
+            <tr>
+            <td>MongoDB/WiredTiger</td>
+            <td>缓冲 I/O</td>
+            <td>支持</td>
+            <td>Internal Cache</td>
+            <td>文档存储</td>
+            </tr>
+            <tr>
+            <td>SQLite</td>
+            <td>缓冲 I/O</td>
+            <td>不支持</td>
+            <td>页缓存</td>
+            <td>嵌入式</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="七o_direct-的限制与陷阱">七、O_DIRECT
+            的限制与陷阱</h2>
+            <h3 id="对齐违规">7.1 对齐违规</h3>
+            <p>对齐违规是 O_DIRECT
+            最常见的错误来源。以下总结了三种对齐要求及其常见的违规场景：</p>
+            <pre class="text"><code>1. 缓冲区地址对齐：
+   ✗ malloc(4096)                     → 地址可能不对齐
+   ✓ posix_memalign(&amp;buf, 4096, 4096) → 地址保证 4096 字节对齐
+
+2. 文件偏移量对齐：
+   ✗ pwrite(fd, buf, 4096, 100)       → 偏移 100 不对齐
+   ✓ pwrite(fd, buf, 4096, 4096)      → 偏移 4096 对齐
+
+3. 传输长度对齐：
+   ✗ pwrite(fd, buf, 1000, 0)         → 长度 1000 不是块大小的倍数
+   ✓ pwrite(fd, buf, 4096, 0)         → 长度 4096 是块大小的倍数</code></pre>
+            <p>在调试对齐问题时，可以使用 <code>strace</code>
+            观察系统调用的参数和返回值：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-e</span> trace=read,write,pread64,pwrite64 ./my_program <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">grep</span> EINVAL</span></code></pre></div>
+            <h3 id="混合-io-模式的不一致性">7.2 混合 I/O
+            模式的不一致性</h3>
+            <p>在同一个文件上同时使用 O_DIRECT 和缓冲 I/O
+            是危险的。考虑以下场景：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 进程 A：缓冲写入 */</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd_buf <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/file.dat&quot;</span><span class="op">,</span> O_WRONLY<span class="op">);</span></span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a>write<span class="op">(</span>fd_buf<span class="op">,</span> <span class="st">&quot;hello&quot;</span><span class="op">,</span> <span class="dv">5</span><span class="op">);</span>  <span class="co">/* 数据写入 Page Cache */</span></span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* 进程 B：O_DIRECT 读取 */</span></span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd_dio <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/file.dat&quot;</span><span class="op">,</span> O_RDONLY <span class="op">|</span> O_DIRECT<span class="op">);</span></span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a>pread<span class="op">(</span>fd_dio<span class="op">,</span> buf<span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span>  <span class="co">/* 直接从磁盘读取，可能看不到 A 的写入 */</span></span></code></pre></div>
+            <p>进程 A 通过缓冲 I/O 写入的数据停留在 Page Cache
+            中，尚未刷到磁盘。进程 B 通过 O_DIRECT 读取时绕过了 Page
+            Cache，直接从磁盘读取，因此读到的是旧数据。</p>
+            <p>Linux
+            内核文档明确警告了这种用法的风险。如果必须混合使用两种模式，需要在缓冲写入后执行
+            <code>fsync()</code> 以确保数据已刷到磁盘，然后再进行
+            O_DIRECT 读取。</p>
+            <h3 id="特殊文件系统上的行为差异">7.3
+            特殊文件系统上的行为差异</h3>
+            <p>O_DIRECT 在不同文件系统和存储后端上的行为并不一致：</p>
+            <p><strong>tmpfs</strong>：tmpfs
+            是基于内存的文件系统，所有数据都存储在 Page Cache 中。在
+            tmpfs 上使用 O_DIRECT 时，内核会静默地忽略
+            <code>O_DIRECT</code> 标志，退回到缓冲 I/O。这意味着在 tmpfs
+            上测试 O_DIRECT
+            代码的行为可能与在实际磁盘文件系统上不同。</p>
+            <p><strong>NFS（Network File
+            System，网络文件系统）</strong>：NFS 对 O_DIRECT
+            的支持取决于服务端和客户端的版本。NFSv3 和 NFSv4 支持
+            O_DIRECT，但语义与本地文件系统有所不同——O_DIRECT
+            只保证客户端不缓存数据，服务端可能仍然使用缓存。在某些 NFS
+            实现中，O_DIRECT 会导致每个 I/O
+            操作都等待服务端确认，严重影响性能。</p>
+            <p><strong>FUSE（Filesystem in Userspace）</strong>：FUSE
+            文件系统对 O_DIRECT 的支持在 Linux 6.6 之前是受限的。FUSE
+            守护进程默认使用缓冲 I/O 与内核交互，即使应用程序指定了
+            O_DIRECT。从 Linux 6.6 开始，FUSE 引入了 O_DIRECT
+            直通（Passthrough）模式，可以将 O_DIRECT
+            请求直接传递给底层文件系统。</p>
+            <h3 id="小随机读取的性能回退">7.4 小随机读取的性能回退</h3>
+            <p>在没有应用层缓存的情况下使用 O_DIRECT
+            进行小随机读取，性能可能比缓冲 I/O 差得多。原因在于：</p>
+            <ul>
+            <li><strong>缓冲 I/O
+            路径</strong>：内核的预读算法会在读取一个 4KB
+            页时，预读后续的 128KB 数据到 Page
+            Cache。如果后续读取命中了这些预读数据，就不需要额外的磁盘
+            I/O。</li>
+            <li><strong>O_DIRECT 路径</strong>：每次读取精确地请求
+            4KB，不会预读。即使后续访问的是相邻数据，也需要单独的磁盘
+            I/O。</li>
+            </ul>
+            <p>在 HDD（Hard Disk
+            Drive，机械硬盘）上，每次随机读取的寻道时间约为 5～10
+            毫秒。使用 O_DIRECT
+            的小随机读取会频繁触发寻道，吞吐量可能只有缓冲 I/O
+            的十分之一。即使在 SSD（Solid State
+            Drive，固态硬盘）上，O_DIRECT
+            的小随机读取性能也会因为缺少预读而略低于缓冲 I/O。</p>
+            <h3 id="文件系统元数据仍经过-page-cache">7.5
+            文件系统元数据仍经过 Page Cache</h3>
+            <p>O_DIRECT
+            只能绕过文件数据的缓存，文件系统元数据（目录项、inode、块分配位图等）的读写仍然经过
+            Page Cache。这意味着：</p>
+            <ul>
+            <li><code>rename()</code>、<code>mkdir()</code>、<code>link()</code>
+            等元数据操作仍然需要 <code>fsync()</code>
+            来保证持久性。</li>
+            <li>文件系统的日志（ext4 的 JBD2、XFS 的日志）仍然使用缓冲
+            I/O。</li>
+            <li>扩展属性（Extended Attributes）的读写也经过 Page
+            Cache。</li>
+            </ul>
+            <h3 id="ext4-与-xfs-的行为差异">7.6 ext4 与 XFS
+            的行为差异</h3>
+            <p>ext4 和 XFS 在 O_DIRECT
+            的实现上有一些值得注意的差异：</p>
+            <p><strong>ext4</strong>： - 当 O_DIRECT
+            写入导致文件扩展（文件大小增长）时，ext4
+            可能需要分配新的数据块。这个分配过程涉及元数据更新，可能会阻塞
+            O_DIRECT 写入。 - ext4 的 <code>data=ordered</code>
+            日志模式下，O_DIRECT 写入仍然受到日志提交（Journal
+            Commit）的影响。 -
+            对于未对齐到文件系统块大小的文件末尾区域，ext4
+            可能会退回到缓冲 I/O。</p>
+            <p><strong>XFS</strong>： - XFS 对 O_DIRECT
+            的支持更加成熟和一致，是大规模存储系统中最常用的文件系统。 -
+            XFS 支持 O_DIRECT 与 <code>fallocate()</code>
+            结合使用，可以预分配磁盘空间避免写入时的块分配开销。 - XFS
+            的 extent-based 分配策略使得大文件的 O_DIRECT
+            顺序写入更加高效。 - XFS 在 O_DIRECT
+            模式下对并发写入同一文件的支持比 ext4 更好，不需要获取 inode
+            互斥锁。</p>
+            <p>生产环境中的数据库服务器，如果使用 O_DIRECT，通常推荐搭配
+            XFS 文件系统。</p>
+            <hr />
+            <h2 id="八性能对比测试">八、性能对比测试</h2>
+            <blockquote>
+            <p><strong>环境声明</strong>：本节 fio/sysbench
+            命令可在读者环境复现；表中数字为<strong>同一套命令在 8.1
+            所述硬件上的示例输出形态</strong>，用于说明趋势（冷缓存 vs
+            热缓存、双重缓冲内存占用），<strong>不是跨环境通用
+            IOPS</strong>——结论须在本机重跑后采信。</p>
+            </blockquote>
+            <h3 id="测试环境">8.1 测试环境</h3>
+            <pre class="text"><code>硬件配置：
+  CPU：Intel Xeon Gold 6248R（24 核 48 线程）
+  内存：256GB DDR4-2933
+  存储：Intel P4610 NVMe SSD（3.2TB）
+  文件系统：XFS（4KB 块大小）
+
+软件环境：
+  操作系统：Ubuntu 22.04 LTS
+  内核版本：5.15.0
+  fio 版本：3.33</code></pre>
+            <h3 id="顺序写入对比">8.2 顺序写入对比</h3>
+            <p>使用 <code>fio</code> 测试 128KB 顺序写入，比较缓冲 I/O
+            和 O_DIRECT 的性能：</p>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 缓冲 I/O 顺序写入</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>buffered_seq_write <span class="dt">\</span></span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>sync <span class="dt">\</span></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>write <span class="dt">\</span></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>128k <span class="dt">\</span></span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="dt">\</span></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>0 <span class="dt">\</span></span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--fsync</span><span class="op">=</span>0 <span class="dt">\</span></span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/data/fio_test <span class="dt">\</span></span>
+<span id="cb37-11"><a href="#cb37-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-format</span><span class="op">=</span>json</span>
+<span id="cb37-12"><a href="#cb37-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-13"><a href="#cb37-13" aria-hidden="true" tabindex="-1"></a><span class="co"># O_DIRECT 顺序写入</span></span>
+<span id="cb37-14"><a href="#cb37-14" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>direct_seq_write <span class="dt">\</span></span>
+<span id="cb37-15"><a href="#cb37-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>sync <span class="dt">\</span></span>
+<span id="cb37-16"><a href="#cb37-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>write <span class="dt">\</span></span>
+<span id="cb37-17"><a href="#cb37-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>128k <span class="dt">\</span></span>
+<span id="cb37-18"><a href="#cb37-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="dt">\</span></span>
+<span id="cb37-19"><a href="#cb37-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb37-20"><a href="#cb37-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb37-21"><a href="#cb37-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--fsync</span><span class="op">=</span>0 <span class="dt">\</span></span>
+<span id="cb37-22"><a href="#cb37-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/data/fio_test <span class="dt">\</span></span>
+<span id="cb37-23"><a href="#cb37-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-format</span><span class="op">=</span>json</span></code></pre></div>
+            <p>示例输出形态（128KB 顺序写，本机 fio 复现）：</p>
+            <pre class="text"><code>                      缓冲 I/O        O_DIRECT
+吞吐量 / 延迟 / CPU     本机测量        本机测量
+趋势（常见）            写合并可能更高吞吐   memcpy 更少，延迟尖刺更少</code></pre>
+            <p>在顺序写入场景中，缓冲 I/O 的吞吐量略高（得益于 Page
+            Cache 的写合并），但 CPU 使用率也更高（因为 memcpy
+            开销）。O_DIRECT 的延迟略高但更稳定，没有因为 Page Cache
+            回写而产生的延迟尖刺（Latency Spike）。</p>
+            <h3 id="随机读取对比">8.3 随机读取对比</h3>
+            <p>使用 <code>fio</code> 测试 4KB 随机读取：</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 缓冲 I/O 随机读取（冷缓存）</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 3 <span class="op">&gt;</span> /proc/sys/vm/drop_caches</span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>buffered_rand_read <span class="dt">\</span></span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>sync <span class="dt">\</span></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randread <span class="dt">\</span></span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="dt">\</span></span>
+<span id="cb39-8"><a href="#cb39-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb39-9"><a href="#cb39-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>0 <span class="dt">\</span></span>
+<span id="cb39-10"><a href="#cb39-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/data/fio_test <span class="dt">\</span></span>
+<span id="cb39-11"><a href="#cb39-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>60 <span class="dt">\</span></span>
+<span id="cb39-12"><a href="#cb39-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span> <span class="dt">\</span></span>
+<span id="cb39-13"><a href="#cb39-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-format</span><span class="op">=</span>json</span>
+<span id="cb39-14"><a href="#cb39-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-15"><a href="#cb39-15" aria-hidden="true" tabindex="-1"></a><span class="co"># O_DIRECT 随机读取</span></span>
+<span id="cb39-16"><a href="#cb39-16" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>direct_rand_read <span class="dt">\</span></span>
+<span id="cb39-17"><a href="#cb39-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>sync <span class="dt">\</span></span>
+<span id="cb39-18"><a href="#cb39-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randread <span class="dt">\</span></span>
+<span id="cb39-19"><a href="#cb39-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb39-20"><a href="#cb39-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="dt">\</span></span>
+<span id="cb39-21"><a href="#cb39-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb39-22"><a href="#cb39-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb39-23"><a href="#cb39-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/data/fio_test <span class="dt">\</span></span>
+<span id="cb39-24"><a href="#cb39-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>60 <span class="dt">\</span></span>
+<span id="cb39-25"><a href="#cb39-25" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span> <span class="dt">\</span></span>
+<span id="cb39-26"><a href="#cb39-26" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-format</span><span class="op">=</span>json</span></code></pre></div>
+            <p>示例输出形态（须在本机 fio 复现后替换）：</p>
+            <pre class="text"><code>                      缓冲 I/O（冷缓存）   缓冲 I/O（热缓存）   O_DIRECT
+IOPS                   （本机测量）          （本机测量）         （本机测量）
+平均 / P99 延迟         冷缓存通常高于热缓存   热缓存命中时最低      与冷缓存接近，少 memcpy</code></pre>
+            <p>随机读取场景中，如果数据能够全部放入 Page
+            Cache（热缓存），缓冲 I/O 的性能远超
+            O_DIRECT。但在冷缓存场景下，两者性能接近，O_DIRECT
+            甚至因为减少了 memcpy 开销而在 P99 延迟上略有优势。</p>
+            <h3 id="数据库负载测试">8.4 数据库负载测试</h3>
+            <p>使用 sysbench 测试 MySQL/InnoDB 在不同 I/O
+            模式下的性能：</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 准备数据（10 张表，每张 100 万行）</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysbench</span> oltp_read_write <span class="dt">\</span></span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-user</span><span class="op">=</span>root <span class="dt">\</span></span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-db</span><span class="op">=</span>sbtest <span class="dt">\</span></span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--tables</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--table-size</span><span class="op">=</span>1000000 <span class="dt">\</span></span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a>    prepare</span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 运行基准测试</span></span>
+<span id="cb41-12"><a href="#cb41-12" aria-hidden="true" tabindex="-1"></a><span class="ex">sysbench</span> oltp_read_write <span class="dt">\</span></span>
+<span id="cb41-13"><a href="#cb41-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb41-14"><a href="#cb41-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb41-15"><a href="#cb41-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-user</span><span class="op">=</span>root <span class="dt">\</span></span>
+<span id="cb41-16"><a href="#cb41-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-db</span><span class="op">=</span>sbtest <span class="dt">\</span></span>
+<span id="cb41-17"><a href="#cb41-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">--tables</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb41-18"><a href="#cb41-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--table-size</span><span class="op">=</span>1000000 <span class="dt">\</span></span>
+<span id="cb41-19"><a href="#cb41-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--threads</span><span class="op">=</span>32 <span class="dt">\</span></span>
+<span id="cb41-20"><a href="#cb41-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time</span><span class="op">=</span>300 <span class="dt">\</span></span>
+<span id="cb41-21"><a href="#cb41-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--report-interval</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb41-22"><a href="#cb41-22" aria-hidden="true" tabindex="-1"></a>    run</span></code></pre></div>
+            <p>示例对比维度（sysbench 在本机 MySQL 上复现；勿跨环境引用
+            TPS）：</p>
+            <pre class="text"><code>innodb_flush_method    关注指标
+fsync                  TPS、P95、总内存（含 Page Cache 膨胀）
+O_DIRECT               双重缓冲消除后，内存可转给 Buffer Pool
+O_DIRECT_NO_FSYNC      刷盘语义变化，须单独评估数据安全</code></pre>
+            <p>在 Buffer Pool 能够覆盖工作集（Working
+            Set）的情况下，O_DIRECT 模式的性能优于默认的
+            <code>fsync</code> 模式。主要收益来自：</p>
+            <ol type="1">
+            <li>消除了双重缓冲，释放了更多内存。</li>
+            <li>减少了 memcpy 开销。</li>
+            <li>避免了 Page Cache 回写产生的延迟尖刺。</li>
+            </ol>
+            <h3 id="fio-高级测试命令">8.5 fio 高级测试命令</h3>
+            <p>以下是一些更详细的 fio 测试命令，用于评估 O_DIRECT
+            在不同场景下的表现：</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 混合随机读写（70% 读 / 30% 写）</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>mixed_rw <span class="dt">\</span></span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randrw <span class="dt">\</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rwmixread</span><span class="op">=</span>70 <span class="dt">\</span></span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="dt">\</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--iodepth</span><span class="op">=</span>32 <span class="dt">\</span></span>
+<span id="cb43-10"><a href="#cb43-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-11"><a href="#cb43-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/data/fio_test <span class="dt">\</span></span>
+<span id="cb43-12"><a href="#cb43-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>120 <span class="dt">\</span></span>
+<span id="cb43-13"><a href="#cb43-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span> <span class="dt">\</span></span>
+<span id="cb43-14"><a href="#cb43-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">--group_reporting</span></span>
+<span id="cb43-15"><a href="#cb43-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-16"><a href="#cb43-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 延迟直方图测试</span></span>
+<span id="cb43-17"><a href="#cb43-17" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>latency_test <span class="dt">\</span></span>
+<span id="cb43-18"><a href="#cb43-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb43-19"><a href="#cb43-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randread <span class="dt">\</span></span>
+<span id="cb43-20"><a href="#cb43-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb43-21"><a href="#cb43-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="dt">\</span></span>
+<span id="cb43-22"><a href="#cb43-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-23"><a href="#cb43-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">--iodepth</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-24"><a href="#cb43-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-25"><a href="#cb43-25" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/data/fio_test <span class="dt">\</span></span>
+<span id="cb43-26"><a href="#cb43-26" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>60 <span class="dt">\</span></span>
+<span id="cb43-27"><a href="#cb43-27" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span> <span class="dt">\</span></span>
+<span id="cb43-28"><a href="#cb43-28" aria-hidden="true" tabindex="-1"></a>    <span class="at">--lat_percentiles</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-29"><a href="#cb43-29" aria-hidden="true" tabindex="-1"></a>    <span class="at">--percentile_list</span><span class="op">=</span>50:90:95:99:99.9:99.99</span>
+<span id="cb43-30"><a href="#cb43-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-31"><a href="#cb43-31" aria-hidden="true" tabindex="-1"></a><span class="co"># O_DIRECT + io_uring 引擎</span></span>
+<span id="cb43-32"><a href="#cb43-32" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>io_uring_test <span class="dt">\</span></span>
+<span id="cb43-33"><a href="#cb43-33" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>io_uring <span class="dt">\</span></span>
+<span id="cb43-34"><a href="#cb43-34" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randread <span class="dt">\</span></span>
+<span id="cb43-35"><a href="#cb43-35" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb43-36"><a href="#cb43-36" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="dt">\</span></span>
+<span id="cb43-37"><a href="#cb43-37" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-38"><a href="#cb43-38" aria-hidden="true" tabindex="-1"></a>    <span class="at">--iodepth</span><span class="op">=</span>128 <span class="dt">\</span></span>
+<span id="cb43-39"><a href="#cb43-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-40"><a href="#cb43-40" aria-hidden="true" tabindex="-1"></a>    <span class="at">--fixedbufs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-41"><a href="#cb43-41" aria-hidden="true" tabindex="-1"></a>    <span class="at">--sqthread_poll</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb43-42"><a href="#cb43-42" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/data/fio_test <span class="dt">\</span></span>
+<span id="cb43-43"><a href="#cb43-43" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>60 <span class="dt">\</span></span>
+<span id="cb43-44"><a href="#cb43-44" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span></span></code></pre></div>
+            <h3 id="o_direct-的适用场景总结">8.6 O_DIRECT
+            的适用场景总结</h3>
+            <p>基于以上测试结果，可以总结出 O_DIRECT 的适用场景：</p>
+            <p><strong>O_DIRECT 占优的场景：</strong></p>
+            <ul>
+            <li>数据库系统已有应用层缓存（Buffer Pool / Block
+            Cache）</li>
+            <li>高吞吐顺序写入，要求稳定延迟</li>
+            <li>大文件顺序扫描（避免 Page Cache 污染）</li>
+            <li>内存受限环境（避免双重缓冲的内存浪费）</li>
+            </ul>
+            <p><strong>缓冲 I/O 占优的场景：</strong></p>
+            <ul>
+            <li>应用无自有缓存，依赖 Page Cache 提升重复读性能</li>
+            <li>小文件频繁读写</li>
+            <li>多进程共享读取同一文件</li>
+            <li>随机读取工作集远大于可用内存</li>
+            </ul>
+            <h3 id="内存使用对比">8.7 内存使用对比</h3>
+            <p>以下是对比缓冲 I/O 和 O_DIRECT
+            在数据库场景下的内存使用情况：</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 Page Cache 使用量</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/meminfo <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;^(MemTotal|MemFree|Cached|Buffers|Active\(file\)|Inactive\(file\))&quot;</span></span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看特定文件的 Page Cache 占用（需要 vmtouch 工具）</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="ex">vmtouch</span> /data/mysql/ibdata1</span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a><span class="ex">vmtouch</span> <span class="at">-v</span> /data/mysql/ib_logfile0</span></code></pre></div>
+            <p>示例对比维度（<code>vmtouch</code> +
+            <code>/proc/meminfo</code>，本机复现）：</p>
+            <pre class="text"><code>指标                    缓冲 I/O（fsync）    O_DIRECT
+InnoDB Buffer Pool      配置值               配置值
+Page Cache 占用         常随数据文件膨胀      通常仅元数据/日志
+可用内存                常被 Page Cache 挤占  可转给 Buffer Pool</code></pre>
+            <hr />
+            <h2 id="九替代方案与未来">九、替代方案与未来</h2>
+            <h3 id="io_uring-与异步直接-io">9.1 io_uring 与异步直接
+            I/O</h3>
+            <p>io_uring 解决的是<strong>提交效率</strong>（批量
+            SQ/CQ、减少 syscall），不替代 <code>O_DIRECT</code>
+            的缓存语义。机制见 <a
+            href="../11-linux-async-io/linux-async-io.html">#11 Linux
+            异步 I/O</a> 与 <a href="../../io_uring/index.html">io_uring
+            系列索引</a>；<strong><code>O_DIRECT</code> + io_uring
+            的对齐、<code>register_buffers</code> 与本机 IOPS
+            对比</strong>见 <a
+            href="../79-o-direct-io-uring/o-direct-io-uring.html">#79</a>。生产启用前须读
+            <a
+            href="../../linux/iouring-production/iouring-production.html">io_uring
+            翻车实录</a> 中的版本边界与内核 bug。</p>
+            <p>下面保留最小可读示例（完整组合路径与 benchmark
+            不在本文展开）：</p>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;liburing.h&gt;</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLOCK_SIZE </span><span class="dv">4096</span></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define QUEUE_DEPTH </span><span class="dv">64</span></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-10"><a href="#cb46-10" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb46-11"><a href="#cb46-11" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb46-12"><a href="#cb46-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> io_uring ring<span class="op">;</span></span>
+<span id="cb46-13"><a href="#cb46-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> io_uring_sqe <span class="op">*</span>sqe<span class="op">;</span></span>
+<span id="cb46-14"><a href="#cb46-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> io_uring_cqe <span class="op">*</span>cqe<span class="op">;</span></span>
+<span id="cb46-15"><a href="#cb46-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd<span class="op">;</span></span>
+<span id="cb46-16"><a href="#cb46-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>buf<span class="op">;</span></span>
+<span id="cb46-17"><a href="#cb46-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-18"><a href="#cb46-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 初始化 io_uring，启用内核轮询线程 */</span></span>
+<span id="cb46-19"><a href="#cb46-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> io_uring_params params<span class="op">;</span></span>
+<span id="cb46-20"><a href="#cb46-20" aria-hidden="true" tabindex="-1"></a>    memset<span class="op">(&amp;</span>params<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>params<span class="op">));</span></span>
+<span id="cb46-21"><a href="#cb46-21" aria-hidden="true" tabindex="-1"></a>    params<span class="op">.</span>flags <span class="op">=</span> IORING_SETUP_SQPOLL<span class="op">;</span></span>
+<span id="cb46-22"><a href="#cb46-22" aria-hidden="true" tabindex="-1"></a>    params<span class="op">.</span>sq_thread_idle <span class="op">=</span> <span class="dv">2000</span><span class="op">;</span>  <span class="co">/* 空闲 2 秒后休眠 */</span></span>
+<span id="cb46-23"><a href="#cb46-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-24"><a href="#cb46-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ret <span class="op">=</span> io_uring_queue_init_params<span class="op">(</span>QUEUE_DEPTH<span class="op">,</span> <span class="op">&amp;</span>ring<span class="op">,</span> <span class="op">&amp;</span>params<span class="op">);</span></span>
+<span id="cb46-25"><a href="#cb46-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb46-26"><a href="#cb46-26" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;io_uring_queue_init: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> strerror<span class="op">(-</span>ret<span class="op">));</span></span>
+<span id="cb46-27"><a href="#cb46-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb46-28"><a href="#cb46-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb46-29"><a href="#cb46-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-30"><a href="#cb46-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 打开文件 */</span></span>
+<span id="cb46-31"><a href="#cb46-31" aria-hidden="true" tabindex="-1"></a>    fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/data/testfile.dat&quot;</span><span class="op">,</span> O_RDONLY <span class="op">|</span> O_DIRECT<span class="op">);</span></span>
+<span id="cb46-32"><a href="#cb46-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb46-33"><a href="#cb46-33" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb46-34"><a href="#cb46-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb46-35"><a href="#cb46-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb46-36"><a href="#cb46-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-37"><a href="#cb46-37" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 分配对齐缓冲区 */</span></span>
+<span id="cb46-38"><a href="#cb46-38" aria-hidden="true" tabindex="-1"></a>    posix_memalign<span class="op">(&amp;</span>buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> BLOCK_SIZE<span class="op">);</span></span>
+<span id="cb46-39"><a href="#cb46-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-40"><a href="#cb46-40" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 提交读取请求 */</span></span>
+<span id="cb46-41"><a href="#cb46-41" aria-hidden="true" tabindex="-1"></a>    sqe <span class="op">=</span> io_uring_get_sqe<span class="op">(&amp;</span>ring<span class="op">);</span></span>
+<span id="cb46-42"><a href="#cb46-42" aria-hidden="true" tabindex="-1"></a>    io_uring_prep_read<span class="op">(</span>sqe<span class="op">,</span> fd<span class="op">,</span> buf<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb46-43"><a href="#cb46-43" aria-hidden="true" tabindex="-1"></a>    io_uring_sqe_set_data<span class="op">(</span>sqe<span class="op">,</span> buf<span class="op">);</span></span>
+<span id="cb46-44"><a href="#cb46-44" aria-hidden="true" tabindex="-1"></a>    io_uring_submit<span class="op">(&amp;</span>ring<span class="op">);</span></span>
+<span id="cb46-45"><a href="#cb46-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-46"><a href="#cb46-46" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 等待完成 */</span></span>
+<span id="cb46-47"><a href="#cb46-47" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> io_uring_wait_cqe<span class="op">(&amp;</span>ring<span class="op">,</span> <span class="op">&amp;</span>cqe<span class="op">);</span></span>
+<span id="cb46-48"><a href="#cb46-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb46-49"><a href="#cb46-49" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;io_uring_wait_cqe: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> strerror<span class="op">(-</span>ret<span class="op">));</span></span>
+<span id="cb46-50"><a href="#cb46-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb46-51"><a href="#cb46-51" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>cqe<span class="op">-&gt;</span>res <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb46-52"><a href="#cb46-52" aria-hidden="true" tabindex="-1"></a>            fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;异步读取失败：</span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> strerror<span class="op">(-</span>cqe<span class="op">-&gt;</span>res<span class="op">));</span></span>
+<span id="cb46-53"><a href="#cb46-53" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb46-54"><a href="#cb46-54" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;异步读取完成：</span><span class="sc">%d</span><span class="st"> 字节</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> cqe<span class="op">-&gt;</span>res<span class="op">);</span></span>
+<span id="cb46-55"><a href="#cb46-55" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb46-56"><a href="#cb46-56" aria-hidden="true" tabindex="-1"></a>        io_uring_cqe_seen<span class="op">(&amp;</span>ring<span class="op">,</span> cqe<span class="op">);</span></span>
+<span id="cb46-57"><a href="#cb46-57" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb46-58"><a href="#cb46-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-59"><a href="#cb46-59" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb46-60"><a href="#cb46-60" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb46-61"><a href="#cb46-61" aria-hidden="true" tabindex="-1"></a>    io_uring_queue_exit<span class="op">(&amp;</span>ring<span class="op">);</span></span>
+<span id="cb46-62"><a href="#cb46-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb46-63"><a href="#cb46-63" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>编译：</p>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-o</span> io_uring_dio io_uring_dio.c <span class="at">-luring</span> <span class="at">-Wall</span> <span class="at">-Wextra</span></span></code></pre></div>
+            <p>绝对 IOPS 与设备、队列深度、是否
+            <code>register_buffers</code> 强相关；本站仅在 <a
+            href="../79-o-direct-io-uring/o-direct-io-uring.html">#79</a>
+            给出<strong>标注环境</strong>的本机实测，本文不列跨环境数字。</p>
+            <h3 id="dax持久内存的直接访问">9.2
+            DAX：持久内存的直接访问</h3>
+            <p>DAX（Direct Access，直接访问）是为持久内存（Persistent
+            Memory，PMEM）设计的一种文件访问模式。与 O_DIRECT 不同，DAX
+            完全绕过了内核的 I/O 栈和块设备层，允许应用程序通过
+            <code>mmap()</code>
+            直接映射持久内存到用户空间地址空间，然后通过普通的
+            load/store 指令读写数据。</p>
+            <pre class="text"><code>传统 I/O 路径：    应用 → 系统调用 → VFS → 文件系统 → 块设备 → 磁盘
+O_DIRECT 路径：   应用 → 系统调用 → VFS → 文件系统 → 块设备 → 磁盘（绕过 Page Cache）
+DAX 路径：        应用 → 直接 load/store → 持久内存（绕过所有中间层）</code></pre>
+            <p>要使用 DAX，需要满足以下条件：</p>
+            <ol type="1">
+            <li>硬件：支持持久内存的平台（如 Intel Optane DCPMM）</li>
+            <li>文件系统：ext4 或 XFS，以 <code>-o dax</code>
+            选项挂载</li>
+            <li>应用程序：使用 <code>mmap()</code> 映射文件，使用
+            <code>clflush</code> / <code>clwb</code> 指令保证持久性</li>
+            </ol>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 挂载 DAX 文件系统</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> /dev/pmem0</span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> dax /dev/pmem0 /mnt/pmem</span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者使用 per-file DAX（Linux 5.8+）</span></span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_io</span> <span class="at">-c</span> <span class="st">&quot;chattr +x&quot;</span> /mnt/pmem/myfile</span></code></pre></div>
+            <p>DAX
+            消除了所有软件层面的开销，读写延迟可以降低到数百纳秒级别。但
+            DAX 要求应用程序自行管理数据一致性和持久化（通过 CPU
+            缓存刷出指令），编程复杂度远高于 O_DIRECT。</p>
+            <p>PMDK（Persistent Memory Development
+            Kit，持久内存开发套件）提供了一系列库和工具来简化 DAX
+            编程。</p>
+            <h3 id="fuse-与-o_direct-直通">9.3 FUSE 与 O_DIRECT
+            直通</h3>
+            <p>FUSE（Filesystem in
+            Userspace，用户空间文件系统）允许在用户空间实现文件系统。传统的
+            FUSE 实现中，即使应用程序指定了 O_DIRECT，数据仍然会经过
+            FUSE 守护进程的用户空间缓冲区，无法真正绕过缓存。</p>
+            <p>Linux 6.6 内核引入了 FUSE 的直通模式（Passthrough
+            Mode），允许 FUSE 文件系统将 I/O
+            请求直接转发到底层文件系统，无需经过 FUSE 守护进程。这解决了
+            FUSE 文件系统在 O_DIRECT 场景下的性能瓶颈。</p>
+            <p>直通模式的典型应用场景包括：</p>
+            <ul>
+            <li><strong>Android 的 FUSE 文件系统</strong>：Android 使用
+            FUSE 实现存储访问框架（Storage Access
+            Framework），直通模式可以显著提升 Android 设备的 I/O
+            性能。</li>
+            <li><strong>容器存储驱动</strong>：一些容器存储方案使用 FUSE
+            实现overlay文件系统，直通模式可以减少容器 I/O 的延迟。</li>
+            <li><strong>加密文件系统</strong>：eCryptfs
+            等加密文件系统使用 FUSE
+            实现，直通模式可以在加密解密不需要时（如已解密区域的读取）提供更好的性能。</li>
+            </ul>
+            <h3 id="o_direct-在新内核中的演进">9.4 O_DIRECT
+            在新内核中的演进</h3>
+            <p>O_DIRECT 在 Linux
+            内核中持续演进，以下是近年来的重要变化：</p>
+            <p><strong>Linux 5.1（2019）</strong>：io_uring 框架引入，为
+            O_DIRECT 提供了高性能的异步接口。</p>
+            <p><strong>Linux 5.4（2019）</strong>：<code>io_uring</code>
+            增加了 <code>IOSQE_FIXED_FILE</code>
+            标志，允许预注册文件描述符，减少每次 I/O
+            操作的系统调用开销。</p>
+            <p><strong>Linux 5.6（2020）</strong>：<code>io_uring</code>
+            引入
+            <code>IORING_REGISTER_BUFFERS</code>，允许预注册用户空间缓冲区。对于
+            O_DIRECT 来说，预注册缓冲区可以避免每次 I/O
+            操作时的页表锁定（Page Pinning）开销。</p>
+            <p><strong>Linux 5.11（2021）</strong>：优化了 O_DIRECT 在
+            ext4 上的并发写入性能，减少了 inode 锁的争用。</p>
+            <p><strong>Linux 6.1（2022）</strong>：引入了
+            <code>IORING_SETUP_SINGLE_ISSUER</code> 标志，针对单线程
+            O_DIRECT 工作负载优化了 io_uring 的性能。</p>
+            <p><strong>Linux 6.6（2023）</strong>：FUSE 直通模式支持
+            O_DIRECT。</p>
+            <p><strong>Linux 6.7（2024）</strong>：改进了大块 O_DIRECT
+            写入在 XFS 上的性能，减少了对块分配锁的依赖。</p>
+            <p>这些演进表明，内核社区在持续优化 O_DIRECT
+            的性能和可用性，O_DIRECT
+            在可预见的未来仍将是高性能存储系统的核心技术。</p>
+            <h3 id="面向未来的-io-架构">9.5 面向未来的 I/O 架构</h3>
+            <p>综合来看，Linux I/O
+            栈的发展趋势是提供越来越多的方式让应用程序直接控制 I/O
+            路径：</p>
+            <pre class="text"><code>灵活性增加 ──────────────────────────────→
+┌──────────┐  ┌──────────┐  ┌─────┐  ┌─────┐
+│ 缓冲 I/O │  │ O_DIRECT │  │ DAX │  │SPDK │
+│          │  │          │  │     │  │     │
+│ 内核完全 │  │ 绕过     │  │ 绕过 │  │ 完全│
+│ 管理缓存 │  │ Page     │  │ 整个 │  │ 绕过│
+│          │  │ Cache    │  │ I/O  │  │ 内核│
+│          │  │          │  │ 栈   │  │     │
+└──────────┘  └──────────┘  └─────┘  └─────┘
+控制力增加 ──────────────────────────────→
+复杂度增加 ──────────────────────────────→</code></pre>
+            <p>SPDK（Storage Performance Development
+            Kit，存储性能开发套件）代表了最极端的方式：完全绕过内核，在用户空间直接与
+            NVMe 设备交互。SPDK 可以达到最低的延迟和最高的
+            IOPS，但要求应用程序完全接管设备管理、中断处理和内存管理等工作。</p>
+            <p>对于大多数数据库系统来说，<code>O_DIRECT</code>
+            解决缓存语义；是否叠加 io_uring 见 <a
+            href="../79-o-direct-io-uring/o-direct-io-uring.html">#79</a>。更极端的用户态路径是
+            SPDK（完全绕过内核块层）。</p>
+            <hr />
+            <h2 id="十开放问题">十、开放问题</h2>
+            <ol type="1">
+            <li><strong>Copy-on-write 与 reflink 文件系统上的 direct
+            语义。</strong> Btrfs/ZFS 等 CoW 路径下
+            <code>O_DIRECT</code> 与快照、克隆的交互仍依赖具体 FS
+            实现；生产前须在目标文件系统上实测写顺序与空间分配。</li>
+            <li><strong>Buffered 与 direct 混用同一 inode。</strong>
+            部分内核/FS 组合对同一文件混用 <code>mmap</code>/缓冲 fd 与
+            <code>O_DIRECT</code> fd 的行为不一致；InnoDB
+            等引擎通常整库统一 direct，避免 silent corruption
+            类风险。</li>
+            </ol>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="规范-手册">规范 / 手册</h3>
+            <ul>
+            <li>Linux
+            <code>man 2 open</code>（<code>O_DIRECT</code>）、<code>man 2 fsync</code>、<code>fadvise(2)</code></li>
+            <li>Linux Kernel Documentation — ext4/XFS direct I/O
+            说明</li>
+            </ul>
+            <h3 id="源码">源码</h3>
+            <ul>
+            <li>Linux 内核 <code>fs/direct-io.c</code>、各文件系统
+            <code>*_direct_IO</code> 入口</li>
+            </ul>
+            <h3 id="论文-书">论文 / 书</h3>
+            <ul>
+            <li>Sweeney, A. <em>Scalability in the XFS File
+            System</em>（USENIX ATC 1996）— direct I/O 工程起源之一</li>
+            <li>Mathur et al., <em>The new ext4 filesystem</em>（Linux
+            Symposium 2007）</li>
+            <li>Love, R. <em>Linux Kernel Development</em>, 3rd ed.</li>
+            </ul>
+            <h3 id="实验-工具-文档">实验 / 工具 / 文档</h3>
+            <ul>
+            <li>MySQL Reference Manual —
+            <code>innodb_flush_method</code></li>
+            <li>RocksDB Wiki — Direct IO</li>
+            <li>fio、<code>vmtouch</code>（本节 benchmark
+            复现工具）</li>
+            <li>本站 <a
+            href="../79-o-direct-io-uring/o-direct-io-uring.html">#79
+            O_DIRECT + io_uring</a>、<a
+            href="../64-storage-benchmarking/storage-benchmarking.html">#64
+            存储基准方法论</a></li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>：<a
+            href="../09-page-cache/page-cache.html">Page Cache
+            深度解析</a> <strong>下一篇</strong>：<a
+            href="../11-linux-async-io/linux-async-io.html">Linux 异步
+            I/O：从 POSIX AIO 到 io_uring</a> <strong>相关</strong>：<a
+            href="../79-o-direct-io-uring/o-direct-io-uring.html">O_DIRECT
+            与 io_uring 组合工程</a></p>
+        <section class="post-recommendations"><h2>读完这篇，下一步读什么</h2><p>优先读同系列或同问题的下一篇，把单篇消费变成主题集群。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-12 · storage</p>
+                    <h3><a href="/post/storage/79-o-direct-io-uring/o-direct-io-uring.html">【存储工程】O_DIRECT 与 io_uring：固定缓冲区、register_buffers 与工程选型</a></h3>
+                    <p>拆解 O_DIRECT 对齐约束与 io_uring 固定缓冲区（IORING_REGISTER_BUFFERS）如何叠加；对比 buffered/Direct I/O 的 io_uring 实测 IOPS，给出数据库与块设备场景选型。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-21 · storage</p>
+                    <h3><a href="/post/storage/12-data-integrity/data-integrity.html">【存储工程】数据完整性：从 fsync 到端到端校验</a></h3>
+                    <p>从 fsync 语义、写屏障与电源故障到静默损坏与端到端校验——建立存储栈各层丢失/损坏认知；算法选型见 checksum 篇，ZFS 实现见 zfs-integrity 篇。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-14 · storage</p>
+                    <h3><a href="/post/storage/66-cache-engineering/cache-engineering.html">【存储工程】缓存工程：从 Page Cache 到应用层缓存</a></h3>
+                    <p>深入分析存储多级缓存架构——Page Cache、Buffer Pool、应用缓存的协同设计，缓存淘汰算法对比，缓存穿透/击穿/雪崩的防护策略</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-15 · storage</p>
+                    <h3><a href="/post/storage/67-write-optimization/write-optimization.html">【存储工程】写入性能优化</a></h3>
+                    <p>深入分析存储写入性能优化——WAL 分组提交、批量写入、Write Buffer 调优、fsync 频率控制、写入限速与写停顿分析</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,1209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】查询规划器 — 统计信息与代价模型：优化器为什么选错了索引 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+查询优化器的决策基础：pg_statistic 中 MCV/histogram/correlation
+的存储结构、ANALYZE 的采样流程与精度边界、clauselist_selectivity
+如何逐层估算选择率、seq_page_cost 等代价常量的物理意义与调优依据、CREATE
+STATISTICS 解决多列相关性问题、以及统计信息漂移的诊断 SQL
+与排查路径。读完你能回答：优化器为什么选 Seq Scan
+而不是你建的索引，以及怎么定位根因。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, query-planner, statistics, cost-model, selectivity, analyze, histogram, mcv, stats-drift, create-statistics, random-page-cost, explain, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/10-statistics-cost/10-statistics-cost.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】查询规划器 — 统计信息与代价模型：优化器为什么选错了索引" />
+    <meta property="og:description" content="拆解 PostgreSQL 查询优化器的决策基础：pg_statistic 中 MCV/histogram/correlation 的存储结构、ANALYZE 的采样流程与精度边界、clauselist_selectivity 如何逐层估算选择率、seq_page_cost 等代价常量的物理意义与调优依据、CREATE STATISTICS 解决多列相关性问题、以及统计信息漂移的诊断 SQL 与排查路径。读完你能回答：优化器为什么选 Seq Scan 而不是你建的索引，以及怎么定位根因。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/10-statistics-cost/10-statistics-cost.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="query-planner" />
+    <meta property="article:tag" content="statistics" />
+    <meta property="article:tag" content="cost-model" />
+    <meta property="article:tag" content="selectivity" />
+    <meta property="article:tag" content="analyze" />
+    <meta property="article:tag" content="histogram" />
+    <meta property="article:tag" content="mcv" />
+    <meta property="article:tag" content="stats-drift" />
+    <meta property="article:tag" content="create-statistics" />
+    <meta property="article:tag" content="random-page-cost" />
+    <meta property="article:tag" content="explain" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】查询规划器 — 统计信息与代价模型：优化器为什么选错了索引" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 查询优化器的决策基础：pg_statistic 中 MCV/histogram/correlation 的存储结构、ANALYZE 的采样流程与精度边界、clauselist_selectivity 如何逐层估算选择率、seq_page_cost 等代价常量的物理意义与调优依据、CREATE STATISTICS 解决多列相关性问题、以及统计信息漂移的诊断 SQL 与排查路径。读完你能回答：优化器为什么选 Seq Scan 而不是你建的索引，以及怎么定位根因。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】查询规划器 — 统计信息与代价模型：优化器为什么选错了索引", "description": "拆解 PostgreSQL 查询优化器的决策基础：pg_statistic 中 MCV/histogram/correlation 的存储结构、ANALYZE 的采样流程与精度边界、clauselist_selectivity 如何逐层估算选择率、seq_page_cost 等代价常量的物理意义与调优依据、CREATE STATISTICS 解决多列相关性问题、以及统计信息漂移的诊断 SQL 与排查路径。读完你能回答：优化器为什么选 Seq Scan 而不是你建的索引，以及怎么定位根因。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/10-statistics-cost/10-statistics-cost.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "query-planner", "statistics", "cost-model", "selectivity", "analyze", "histogram", "mcv", "stats-drift", "create-statistics", "random-page-cost", "explain"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】查询规划器 — 统计信息与代价模型：优化器为什么选错了索引</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#query-planner</span> <span>#statistics</span> <span>#cost-model</span> <span>#selectivity</span> <span>#analyze</span> <span>#histogram</span> <span>#mcv</span> <span>#stats-drift</span> <span>#create-statistics</span> <span>#random-page-cost</span> <span>#explain</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/query-planner.html">#query-planner</a><a class="chip-link" href="/tags/statistics.html">#statistics</a><a class="chip-link" href="/tags/cost-model.html">#cost-model</a><a class="chip-link" href="/tags/selectivity.html">#selectivity</a><a class="chip-link" href="/tags/analyze.html">#analyze</a><a class="chip-link" href="/tags/histogram.html">#histogram</a><a class="chip-link" href="/tags/mcv.html">#mcv</a><a class="chip-link" href="/tags/stats-drift.html">#stats-drift</a><a class="chip-link" href="/tags/create-statistics.html">#create-statistics</a><a class="chip-link" href="/tags/random-page-cost.html">#random-page-cost</a><a class="chip-link" href="/tags/explain.html">#explain</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#查询规划器-统计信息与代价模型优化器为什么选错了索引"
+                id="toc-查询规划器-统计信息与代价模型优化器为什么选错了索引">查询规划器
+                — 统计信息与代价模型：优化器为什么选错了索引</a>
+                <ul>
+                <li><a href="#一pg_class-和-pg_statistic-里存了什么"
+                id="toc-一pg_class-和-pg_statistic-里存了什么">一、pg_class
+                和 pg_statistic 里存了什么</a>
+                <ul>
+                <li><a href="#pg_class宏观信息"
+                id="toc-pg_class宏观信息">pg_class：宏观信息</a></li>
+                <li><a href="#采样精度问题"
+                id="toc-采样精度问题">采样精度问题</a></li>
+                <li><a href="#统计信息写入"
+                id="toc-统计信息写入">统计信息写入</a></li>
+                </ul></li>
+                <li><a
+                href="#三选择率估算clauselist_selectivity-的调用链"
+                id="toc-三选择率估算clauselist_selectivity-的调用链">三、选择率估算：clauselist_selectivity
+                的调用链</a>
+                <ul>
+                <li><a href="#调用链全景"
+                id="toc-调用链全景">调用链全景</a></li>
+                <li><a href="#各类-xxxsel-函数的估算逻辑"
+                id="toc-各类-xxxsel-函数的估算逻辑">各类 xxxsel
+                函数的估算逻辑</a></li>
+                <li><a href="#独立性与多列陷阱"
+                id="toc-独立性与多列陷阱">独立性与多列陷阱</a></li>
+                </ul></li>
+                <li><a href="#四代价常量从选择率到执行成本"
+                id="toc-四代价常量从选择率到执行成本">四、代价常量：从选择率到执行成本</a>
+                <ul>
+                <li><a href="#代价常量的定义与物理意义"
+                id="toc-代价常量的定义与物理意义">代价常量的定义与物理意义</a></li>
+                <li><a href="#如何判断是否需要扩展统计"
+                id="toc-如何判断是否需要扩展统计">如何判断是否需要扩展统计</a></li>
+                <li><a href="#解释" id="toc-解释">解释</a></li>
+                <li><a href="#优化器为什么选错了"
+                id="toc-优化器为什么选错了">优化器为什么”选错”了</a></li>
+                </ul></li>
+                <li><a href="#七排查统计信息漂移的诊断"
+                id="toc-七排查统计信息漂移的诊断">七、排查：统计信息漂移的诊断</a>
+                <ul>
+                <li><a
+                href="#第一步检查-n_mod_since_analyze-和-last_analyze"
+                id="toc-第一步检查-n_mod_since_analyze-和-last_analyze">第一步：检查
+                n_mod_since_analyze 和 last_analyze</a></li>
+                <li><a href="#第三步insert-only-表的特殊问题"
+                id="toc-第三步insert-only-表的特殊问题">第三步：insert-only
+                表的特殊问题</a></li>
+                <li><a
+                href="#第四步检查-default_statistics_target-是否过低"
+                id="toc-第四步检查-default_statistics_target-是否过低">第四步：检查
+                default_statistics_target 是否过低</a></li>
+                </ul></li>
+                <li><a
+                href="#八auto_explain-auto_analyze-不触发的根因排查"
+                id="toc-八auto_explain-auto_analyze-不触发的根因排查">八、auto_explain
+                + auto_analyze 不触发的根因排查</a>
+                <ul>
+                <li><a href="#auto_explain-配置检查"
+                id="toc-auto_explain-配置检查">auto_explain
+                配置检查</a></li>
+                <li><a href="#auto_analyze-不触发的常见根因"
+                id="toc-auto_analyze-不触发的常见根因">auto_analyze
+                不触发的常见根因</a></li>
+                <li><a href="#没有统计信息的临时表的行为"
+                id="toc-没有统计信息的临时表的行为">没有统计信息的临时表的行为</a></li>
+                </ul></li>
+                <li><a href="#十一关键要点"
+                id="toc-十一关键要点">十一、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#工具与实验"
+                id="toc-工具与实验">工具与实验</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="查询规划器-统计信息与代价模型优化器为什么选错了索引">查询规划器
+            — 统计信息与代价模型：优化器为什么选错了索引</h1>
+            <p>你建了索引，<code>EXPLAIN</code> 一看，优化器还是在走 Seq
+            Scan。你排查了索引损坏、检查了数据类型、确认了查询条件是
+            <code>=</code> 而非 <code>LIKE</code>——最后发现
+            <code>EXPLAIN ANALYZE</code> 里 “rows=1”
+            的估计，实际跑出来是 100 万行。</p>
+            <p>这就是统计信息不准导致灾难性计划的经典场景。优化器不是错了——在它眼中，用索引查
+            1
+            行确实比扫全表划算。问题出在它”眼中”的数据分布和真实数据已经完全错位。</p>
+            <p>PG
+            的查询优化器是一个基于代价（cost-based）的规划器。它做每一个决策——走
+            Seq Scan 还是 Index Scan、用 NestLoop 还是 HashJoin、先 join
+            表 A 还是表
+            B——都依赖两样东西：统计数据（<code>pg_statistic</code>
+            系统表）和代价常量（<code>seq_page_cost</code>、<code>random_page_cost</code>
+            等
+            GUC）。本文拆解的就是这两样东西在源码中是如何产生、存储、计算，以及出错后怎么诊断。</p>
+            <hr />
+            <h2 id="一pg_class-和-pg_statistic-里存了什么">一、pg_class
+            和 pg_statistic 里存了什么</h2>
+            <p>优化器在做代价估算之前，首先要回答一个更基本的问题：<strong>这个查询会返回多少行？</strong>
+            这个数字叫选择率（selectivity），它决定了所有后续决策。而选择率的计算，完全依赖
+            <code>pg_class</code> 和 <code>pg_statistic</code>
+            两个系统表。</p>
+            <h3 id="pg_class宏观信息">pg_class：宏观信息</h3>
+            <p><code>pg_class</code>
+            存储每个表（和索引）的基础统计元组：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, relpages, reltuples, relallvisible</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;orders&#39;</span>;</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>| 字段 | 含义 | 优化器用途 |</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|-----------|</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>| `relpages` | 表的页面数（由 <span class="kw">ANALYZE</span> 估算） | Seq <span class="kw">Scan</span> 的 I<span class="op">/</span>O 代价：`relpages × seq_page_cost` |</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>| `reltuples` | 表的行数（由 <span class="kw">ANALYZE</span> 估算） | 所有选择率的基数（所有 `rows` 估计都来自这个值） |</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>| `relallvisible` | 全可见页面数（VM 中的标记） | <span class="kw">Index</span><span class="op">-</span><span class="kw">Only</span> <span class="kw">Scan</span> 代价计算：可见页面可跳过 <span class="kw">heap</span> fetch |</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>这三个字段是优化器估算的起点。`relpages` 和 `reltuples` 由 `ANALYZE` 通过采样估算，不是精确值——对大表来说，误差可能显著。</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>### pg_statistic：每一列的数据画像</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>`pg_statistic` 存储每一列的数据分布统计，是优化器做选择率估算的核心输入。它的表结构设计得比较特殊——用 <span class="ot">&quot;slot&quot;</span> 机制存储不同类型的统计值，避免了一个列只有一个统计表示的限制：</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看某表某列的统计信息（通过 pg_stats 视图，它是 pg_statistic 的可读封装）</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> attname, n_distinct, null_frac, avg_width,</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>       most_common_vals, most_common_freqs,</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>       histogram_bounds, correlation</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stats</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> tablename <span class="op">=</span> <span class="st">&#39;orders&#39;</span> <span class="kw">AND</span> attname <span class="op">=</span> <span class="st">&#39;status&#39;</span>;</span></code></pre></div>
+            <p>底层 <code>pg_statistic</code> 的关键字段：</p>
+            <table>
+            <colgroup>
+            <col style="width: 50%" />
+            <col style="width: 50%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>字段</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>starelid</code></td>
+            <td>表 OID</td>
+            </tr>
+            <tr>
+            <td><code>staattnum</code></td>
+            <td>列编号（<code>pg_attribute.attnum</code>）</td>
+            </tr>
+            <tr>
+            <td><code>stanullfrac</code></td>
+            <td>NULL 值比例（0 到 1）</td>
+            </tr>
+            <tr>
+            <td><code>stawidth</code></td>
+            <td>非 NULL 值的平均宽度（字节）</td>
+            </tr>
+            <tr>
+            <td><code>stadistinct</code></td>
+            <td>去重值数量（正数 = 精确估计，负数 =
+            其绝对值是总行数的比例）</td>
+            </tr>
+            <tr>
+            <td><code>stakind1</code> ~ <code>stakind5</code></td>
+            <td>5 个槽位各自存储的统计类型代码</td>
+            </tr>
+            <tr>
+            <td><code>stanumbersN</code></td>
+            <td>对应槽位的 <code>float4[]</code> 数值</td>
+            </tr>
+            <tr>
+            <td><code>stavaluesN</code></td>
+            <td>对应槽位的 <code>anyarray</code> 值</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>stakind</code> 的类型代码定义在
+            <code>src/include/catalog/pg_statistic.h</code>：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define STATISTIC_KIND_MCV          </span><span class="dv">1</span><span class="pp">   </span><span class="co">// Most Common Values + 频率</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define STATISTIC_KIND_HISTOGRAM    </span><span class="dv">2</span><span class="pp">   </span><span class="co">// 等深直方图（equi-depth histogram）</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define STATISTIC_KIND_CORRELATION  </span><span class="dv">3</span><span class="pp">   </span><span class="co">// 物理行序与逻辑值序的相关系数</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define STATISTIC_KIND_MCELEM       </span><span class="dv">4</span><span class="pp">   </span><span class="co">// 扩展统计的 MCV（多列）</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define STATISTIC_KIND_DECHIST      </span><span class="dv">5</span><span class="pp">   </span><span class="co">// 扩展统计的直方图（数组类型）</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>三个核心统计类型：</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>MCV（Most Common Values）<span class="op">**</span>：存储最高频的值及其出现频率。如果查询条件是 `WHERE status <span class="op">=</span> <span class="ch">&#39;a</span><span class="er">ctive</span><span class="ch">&#39;</span>`，优化器先在 MCV 列表中查找 `<span class="ch">&#39;a</span><span class="er">ctive</span><span class="ch">&#39;</span>`，命中则直接取对应频率；未命中则用直方图估算。</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>Histogram（等深直方图）<span class="op">**</span>：将数据按值排序后分成 N 个桶，每个桶包含约等量的行（不是等宽）。存储的是每个桶的上界值。PG 的直方图是等深（equi<span class="op">-</span>depth）不是等宽（equi<span class="op">-</span>width）——这意味着在数据倾斜时，高频值的桶边界更窄，从而保持较好的分辨率。</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>Correlation<span class="op">**</span>：物理行序与列值逻辑序的皮尔逊相关系数，范围 $<span class="op">[-</span><span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">]</span>$。如果值为 $<span class="dv">1</span>$ 或 $<span class="op">-</span><span class="dv">1</span>$，说明列值与物理存储顺序高度相关——这意味着 Index Scan 的随机 I<span class="op">/</span>O 代价比随机假设要小，优化器会更倾向选索引扫描。此值由 `analyze<span class="op">.</span>c` 中的 `compute_correlation<span class="op">()</span>` 计算。</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>`stadistinct` 的负数表示法：当值为 <span class="op">-</span><span class="fl">0.3</span> 时，表示去重值数量约为 `reltuples × <span class="fl">0.3</span>`。这是对<span class="st">&quot;列中不同值数量随行数线性增长&quot;</span>这种情况的优化——当表增长时，不需要重新 ANALYZE 也能大致推算新的去重数。</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 二、ANALYZE 的采样流程</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>ANALYZE 的入口在 `src<span class="op">/</span>backend<span class="op">/</span>commands<span class="op">/</span>analyze<span class="op">.</span>c` 的 `do_analyze_rel<span class="op">()</span>`。不是读全表，而是采样。</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 采样算法</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>PG 使用的是两阶段采样：</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>页面采样<span class="op">**</span>：随机选取 `targrows <span class="op">/</span> rows_per_page` 个页面。`targrows` 默认是 `<span class="dv">300</span> × default_statistics_target`（即 <span class="dv">30000</span> 行）。如果表有 <span class="dv">100</span> 个页面、期望采样 <span class="dv">3000</span> 行，则可能会选中约 <span class="dv">30</span> 个页面。</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>行采样（Reservoir Sampling）<span class="op">**</span>：在每个选中页面中，用 Vitter<span class="ch">&#39;s</span><span class="er"> Algorithm Z 做水库采样（reservoir sampling），保证每一行被选中的概率相等。</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/commands/analyze.c, acquire_sample_rows() 简化流程</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>acquire_sample_rows<span class="op">(</span>Relation onerel<span class="op">,</span> <span class="dt">int</span> elevel<span class="op">,</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>                    HeapTuple <span class="op">*</span>rows<span class="op">,</span> <span class="dt">int</span> targrows<span class="op">,</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>                    <span class="dt">double</span> <span class="op">*</span>totalrows<span class="op">,</span> <span class="dt">double</span> <span class="op">*</span>totaldeadrows<span class="op">)</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 获取表的总页面数</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>    totalblocks <span class="op">=</span> RelationGetNumberOfBlocks<span class="op">(</span>onerel<span class="op">);</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 计算采样页面数</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    targrows 默认 = 300 * default_statistics_target</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    samplerows <span class="op">=</span> targrows<span class="op">;</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 循环：随机选取一个页面 → 读取所有行 → Reservoir Sampling 选入 rows[]</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>        targblock <span class="op">=</span> random<span class="op">()</span> <span class="op">%</span> totalblocks<span class="op">;</span>   <span class="co">// 随机页面</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>        heapam_scan_analyze_next_block<span class="op">(...);</span>   <span class="co">// 读取页面</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 对每一行，Vitter&#39;s Algorithm Z</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>rowstoskip <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>            reservoir_sample_add<span class="op">(</span>row<span class="op">,</span> rows<span class="op">,</span> samplerows<span class="op">);</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 估算总行数</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>totalrows <span class="op">=</span> liverows <span class="op">*</span> totalblocks <span class="op">/</span> scanned_pages<span class="op">;</span></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>totaldeadrows <span class="op">=</span> deadrows <span class="op">*</span> totalblocks <span class="op">/</span> scanned_pages<span class="op">;</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="采样精度问题">采样精度问题</h3>
+            <p>默认 <code>default_statistics_target = 100</code>
+            时，<code>targrows = 30000</code>。对于 1
+            亿行的表，采样比例仅为 0.03%。这意味着：</p>
+            <ul>
+            <li>小表中高频值的频率可能被高估或低估</li>
+            <li>大表中低频值（“长尾”）很可能根本不会出现在样本中</li>
+            <li>数据分布不均匀时（如 Zipf
+            分布），少量采样无法捕捉完整分布</li>
+            </ul>
+            <p>当表的行数超过
+            <code>(300 × default_statistics_target)</code> 时，ANALYZE
+            采样比例就已经低于 1/<code>default_statistics_target</code>
+            了。对于 PB 级大表，这个比例可能低至百万分之一。</p>
+            <h3 id="统计信息写入">统计信息写入</h3>
+            <p>采样完成后，<code>compute_stats()</code>
+            计算每种统计类型（MCV、Histogram、Correlation）的值，然后通过
+            <code>update_attstats()</code> 写入
+            <code>pg_statistic</code>。写入是在一个事务内完成的——ANALYZE
+            的统计更新是原子的，要么全更新，要么全不更新（比如 ANALYZE
+            被 cancel）。</p>
+            <hr />
+            <h2
+            id="三选择率估算clauselist_selectivity-的调用链">三、选择率估算：clauselist_selectivity
+            的调用链</h2>
+            <p>有了统计信息，优化器下一步就是用它们估算每个查询条件的选择率。入口是
+            <code>clauselist_selectivity()</code>。</p>
+            <h3 id="调用链全景">调用链全景</h3>
+            <pre class="text"><code>clauselist_selectivity(root, clauses, ...)                     // clausesel.c
+  → clause_selectivity(root, clause, ...)                      // clausesel.c
+    → restriction_selectivity(root, opno, args, ...)          // plancat.c
+      → OidFunctionCall4(oprrest, ...)                        // 调用 pg_operator.oprrest 函数
+        → eqsel() / scalarineqsel() / neqsel() / ...          // selfuncs.c
+          → 读取 pg_statistic 的 MCV / histogram
+          → 计算选择率</code></pre>
+            <p><code>clauselist_selectivity()</code> 对 WHERE
+            子句中的每个条件调用
+            <code>clause_selectivity()</code>，然后假设各条件之间独立，将选择率相乘。这个<strong>独立性假设</strong>是许多估算灾难的根源。</p>
+            <h3 id="各类-xxxsel-函数的估算逻辑">各类 xxxsel
+            函数的估算逻辑</h3>
+            <p>以 <code>eqsel()</code>（等值条件选择率）为例，在
+            <code>src/backend/utils/adt/selfuncs.c</code> 中：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// selfuncs.c, eqsel() 的简化逻辑</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>Datum eqsel<span class="op">(</span>PG_FUNCTION_ARGS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 查 MCV 列表：如果查询常量在 MCV 中，直接取对应频率</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>get_attstatsslot<span class="op">(&amp;</span>sslot<span class="op">,</span> statsTuple<span class="op">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>                         STATISTIC_KIND_MCV<span class="op">,</span> <span class="op">...))</span> <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>        <span class="co">// mcv_match: 查找常量在 MCV 中的位置</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        selec <span class="op">=</span> sslot<span class="op">.</span>numbers<span class="op">[</span>mcv_match<span class="op">];</span>  <span class="co">// 该值的频率</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 不在 MCV 中：使用直方图估算</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>get_attstatsslot<span class="op">(&amp;</span>sslot<span class="op">,</span> statsTuple<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>                              STATISTIC_KIND_HISTOGRAM<span class="op">,</span> <span class="op">...))</span> <span class="op">{</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        selec <span class="op">=</span> ineq_histogram_selectivity<span class="op">(...);</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 只有 MCV 没有直方图：对非 MCV 值使用均匀假设</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        selec <span class="op">=</span> <span class="op">(</span><span class="fl">1.0</span> <span class="op">-</span> sum_of_mcv_freqs<span class="op">)</span> <span class="op">/</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>                <span class="op">(</span>stadistinct <span class="op">-</span> mcv_count<span class="op">);</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 最后：乘以 (1 - stanullfrac) 排除 NULL</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    selec <span class="op">*=</span> <span class="op">(</span><span class="fl">1.0</span> <span class="op">-</span> stanullfrac<span class="op">);</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>`scalarineqsel<span class="op">()</span>`（范围条件：`<span class="op">&lt;</span>`<span class="op">,</span> `<span class="op">&gt;</span>`<span class="op">,</span> `<span class="op">&lt;=</span>`<span class="op">,</span> `<span class="op">&gt;=</span>`）的处理更复杂：</span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> 先查 MCV，累加满足条件的 MCV 值的频率</span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> 剩余未覆盖的行数部分，通过直方图插值估算</span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> 直方图假设桶内均匀分布——在桶内做线性插值</span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a><span class="co">// selfuncs.c, ineq_histogram_selectivity() 的简化逻辑</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a><span class="co">// hist: [10, 20, 30, 40, 50] → 4 个桶</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="co">// 查询: WHERE x &lt; 25</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a><span class="co">// → 桶 1 [10, 20] 完全在范围内 → +1/4</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="co">// → 桶 2 [20, 30] 部分在范围内 → (25-20)/(30-20) * 1/4 = 0.5 * 1/4</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="co">// → 总选择率 = 0.25 + 0.125 = 0.375</span></span></code></pre></div>
+            <p><code>scalarltsel()</code> / <code>scalargtsel()</code>
+            还有一个特殊逻辑：如果条件值与直方图边界重合（如
+            <code>WHERE id &gt; max_id</code>），选择率直接返回 0 或
+            1。这是由 <code>get_actual_variable_range()</code>
+            实现的——优化器会从索引中读取实际的 min/max
+            值，避免直方图边界不准。</p>
+            <h3 id="独立性与多列陷阱">独立性与多列陷阱</h3>
+            <p>优化器对每个条件分别估算选择率，然后相乘。当列之间存在相关性时——例如
+            <code>city = 'Beijing' AND district = 'Haidian'</code>，知道
+            <code>city</code> 就很大程度上知道
+            <code>district</code>——独立假设会严重低估选择率，导致优化器选择
+            Nested Loop（以为只返回几行）而非 Hash
+            Join（实际返回数百万行）。扩展统计（第六节）正是为解决这个问题而设计的。</p>
+            <hr />
+            <h2
+            id="四代价常量从选择率到执行成本">四、代价常量：从选择率到执行成本</h2>
+            <p>选择率算出后，代价模型将其转化为具体的成本数字。代价由两大部分组成：</p>
+            <h3
+            id="代价常量的定义与物理意义">代价常量的定义与物理意义</h3>
+            <p>PG 的代价单位是抽象的 “1 个 seq page
+            读取的成本”。所有代价常量定义在
+            <code>src/backend/optimizer/path/costsize.c</code> 中：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// costsize.c，关键代价常量（PG 17）</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> seq_page_cost        <span class="op">=</span> DEFAULT_SEQ_PAGE_COST<span class="op">;</span>         <span class="co">// 1.0</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> random_page_cost     <span class="op">=</span> DEFAULT_RANDOM_PAGE_COST<span class="op">;</span>      <span class="co">// 4.0</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> cpu_tuple_cost       <span class="op">=</span> DEFAULT_CPU_TUPLE_COST<span class="op">;</span>        <span class="co">// 0.01</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> cpu_index_tuple_cost <span class="op">=</span> DEFAULT_CPU_INDEX_TUPLE_COST<span class="op">;</span>  <span class="co">// 0.005</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> cpu_operator_cost    <span class="op">=</span> DEFAULT_CPU_OPERATOR_COST<span class="op">;</span>     <span class="co">// 0.0025</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> parallel_setup_cost  <span class="op">=</span> DEFAULT_PARALLEL_SETUP_COST<span class="op">;</span>   <span class="co">// 1000.0</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> parallel_tuple_cost  <span class="op">=</span> DEFAULT_PARALLEL_TUPLE_COST<span class="op">;</span>   <span class="co">// 0.1</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 常量 <span class="op">|</span> 物理意义 <span class="op">|</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">|------|---------|</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `seq_page_cost` <span class="op">|</span> 在顺序 scan 中读一个页面的代价。设为 <span class="fl">1.0</span> 作为基准。 <span class="op">|</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `random_page_cost` <span class="op">|</span> 在随机位置读一个页面的代价。HDD 上寻道 <span class="op">+</span> 旋转延迟约是顺序读的 <span class="dv">4</span> 倍；NVMe SSD 上这个比率接近 <span class="fl">1.0</span>。 <span class="op">|</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `cpu_tuple_cost` <span class="op">|</span> 处理一行（检查可见性、解包 HeapTuple）的 CPU 代价 <span class="op">|</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `cpu_index_tuple_cost` <span class="op">|</span> 处理一条索引项的 CPU 代价（比 tuple 小，因为只在 index page 中操作） <span class="op">|</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `cpu_operator_cost` <span class="op">|</span> 一次 `<span class="op">=</span>`、`<span class="op">&lt;</span>`、`<span class="op">&gt;</span>` 等运算符的 CPU 代价 <span class="op">|</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `effective_cache_size` <span class="op">|</span> 优化器对总缓存（shared_buffers <span class="op">+</span> OS page cache）的估算，用于判断 Index Scan 时有多少索引页面可能已在缓存中 <span class="op">|</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## Seq Scan 的代价公式</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>`cost_seqscan<span class="op">()</span>` 中对一个表做顺序扫描的代价：</span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>$$C_<span class="op">{</span>\text<span class="op">{</span>seq<span class="op">}}</span> <span class="op">=</span> N_<span class="op">{</span>\text<span class="op">{</span>pages<span class="op">}}</span> \times \text<span class="op">{</span>seq\_page\_cost<span class="op">}</span> <span class="op">+</span> N_<span class="op">{</span>\text<span class="op">{</span>tuples<span class="op">}}</span> \times \text<span class="op">{</span>cpu\_tuple\_cost<span class="op">}</span>$$</span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>还有启动成本（startup cost），如 `cost_seqscan<span class="op">()</span>` 中设置的 `startup_cost <span class="op">=</span> <span class="dv">0</span>`（Seq Scan 可以马上返回第一行）。</span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## Index Scan 的代价公式</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>`cost_index<span class="op">()</span>` 更复杂，分三部分：</span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>索引页面访问<span class="op">**</span>：假设 B<span class="op">-</span>Tree 中满足条件的 `N_<span class="op">{</span>\text<span class="op">{</span>index\_tuples<span class="op">}}</span>` 个索引项分布在 `N_<span class="op">{</span>\text<span class="op">{</span>index\_pages<span class="op">}}</span>` 个索引页面中。使用 Mackert<span class="op">-</span>Lohman 公式估算需要访问多少个不同的索引页面。</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>表页面访问<span class="op">**</span>：每个满足条件的索引项指向一个 heap tuple。关键假设是这些 heap 页面的访问顺序近似随机（除非 correlation 接近 <span class="dv">1</span>）。`cost_index<span class="op">()</span>` 使用以下公式估算随机访问的页面数：</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>$$N_<span class="op">{</span>\text<span class="op">{</span>heap\_pages<span class="op">}}</span> <span class="op">=</span> \min<span class="op">(</span>N_<span class="op">{</span>\text<span class="op">{</span>total\_heap\_pages<span class="op">}},</span> \text<span class="op">{</span>indexSelectivity<span class="op">}</span> \times N_<span class="op">{</span>\text<span class="op">{</span>total\_heap\_pages<span class="op">}})</span>$$</span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>其中 indexSelectivity 是索引扫描的选择率。对于小选择率（如 <span class="fl">0.001</span>），`cost_index<span class="op">()</span>` 使用更复杂的近似模型——当选择率很小时，即使随机访问，一个页面也可能被多次命中（同一页面可能包含多个匹配的 tuple），所以实际需要读取的页面数小于 `selectivity × total_pages`。这就是 Mackert<span class="op">-</span>Lohman 公式的作用。</span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>CPU 代价<span class="op">**</span>：</span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a>$$C_<span class="op">{</span>\text<span class="op">{</span>index<span class="op">}}</span> <span class="op">=</span> C_<span class="op">{</span>\text<span class="op">{</span>startup<span class="op">}}</span> <span class="op">+</span> C_<span class="op">{</span>\text<span class="op">{</span>index\_pages<span class="op">}}</span> \times \text<span class="op">{</span>random\_page\_cost<span class="op">}</span> <span class="op">+</span> C_<span class="op">{</span>\text<span class="op">{</span>heap\_pages<span class="op">}}</span> \times \text<span class="op">{</span>random\_page\_cost<span class="op">}</span> <span class="op">+</span> N_<span class="op">{</span>\text<span class="op">{</span>index\_tuples<span class="op">}}</span> \times \text<span class="op">{</span>cpu\_index\_tuple\_cost<span class="op">}</span> <span class="op">+</span> N_<span class="op">{</span>\text<span class="op">{</span>output\_tuples<span class="op">}}</span> \times \text<span class="op">{</span>cpu\_tuple\_cost<span class="op">}</span> <span class="op">+</span> N_<span class="op">{</span>\text<span class="op">{</span>qual\_ops<span class="op">}}</span> \times \text<span class="op">{</span>cpu\_operator\_cost<span class="op">}</span>$$</span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## random_page_cost 在 SSD 上的问题</span></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a>默认 `random_page_cost <span class="op">=</span> <span class="fl">4.0</span>` 来自 HDD 时代——随机 I<span class="op">/</span>O 的寻道和旋转延迟使其约为顺序 I<span class="op">/</span>O 的 <span class="dv">4</span> 倍。但 NVMe SSD 没有机械寻道，随机和顺序读的延迟比接近 <span class="fl">1.0</span> <span class="op">~</span> <span class="fl">1.5</span>。</span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a>当 `random_page_cost` 保持 <span class="fl">4.0</span> 时，Index Scan 的代价被大幅高估。优化器会偏向 Seq Scan，即使索引扫描实际快得多。很多人发现 <span class="st">&quot;EXPLAIN 显示 Seq Scan，但加 `SET enable_seqscan = off` 后 Index Scan 快 10 倍&quot;</span>——根因就是 `random_page_cost` 没适配存储。</span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>调整建议<span class="op">**</span>：在 NVMe SSD 上设为 <span class="fl">1.0</span> <span class="op">~</span> <span class="fl">1.5</span>；SATA SSD 上设为 <span class="fl">1.5</span> <span class="op">~</span> <span class="fl">2.5</span>；HDD RAID 上保持 <span class="fl">3.0</span> <span class="op">~</span> <span class="fl">4.0</span>。可以用 `pg_test_fsync` 测量实际随机<span class="op">/</span>顺序 I<span class="op">/</span>O 比率。</span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## effective_cache_size 的作用</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a>`effective_cache_size` 不分配任何内存。它在 `cost_index<span class="op">()</span>` 中影响一个关键判断：<span class="op">**</span>一个随机访问的 heap 页面是否已在 OS cache 中<span class="op">**</span>：</span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true" tabindex="-1"></a>$$P_<span class="op">{</span>\text<span class="op">{</span>cached<span class="op">}}</span> <span class="op">=</span> \min\left<span class="op">(</span><span class="dv">1</span><span class="op">,</span> \frac<span class="op">{</span>\text<span class="op">{</span>effective\_cache\_size<span class="op">}}{</span>N_<span class="op">{</span>\text<span class="op">{</span>index\_pages<span class="op">}}</span> <span class="op">+</span> N_<span class="op">{</span>\text<span class="op">{</span>heap\_pages<span class="op">}}}</span>\right<span class="op">)</span>$$</span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-58"><a href="#cb5-58" aria-hidden="true" tabindex="-1"></a>缓存的页面用 `seq_page_cost` 计代价，而非 `random_page_cost`。如果 `effective_cache_size` 设得太小（比如默认的 <span class="dv">4</span><span class="er">GB</span>，而实际 OS page cache 有 <span class="dv">128</span><span class="er">GB</span>），优化器会高估 Index Scan 的 I<span class="op">/</span>O 代价，错误地选择 Seq Scan。</span>
+<span id="cb5-59"><a href="#cb5-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-60"><a href="#cb5-60" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb5-61"><a href="#cb5-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-62"><a href="#cb5-62" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 五、扩展统计（CREATE STATISTICS）：解决多列相关</span></span>
+<span id="cb5-63"><a href="#cb5-63" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-64"><a href="#cb5-64" aria-hidden="true" tabindex="-1"></a>`CREATE STATISTICS` 是 PG <span class="dv">10</span> 引入的机制，用于解决<span class="st">&quot;优化器假设列之间独立&quot;</span>的问题。</span>
+<span id="cb5-65"><a href="#cb5-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-66"><a href="#cb5-66" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 三种扩展统计类型</span></span>
+<span id="cb5-67"><a href="#cb5-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-68"><a href="#cb5-68" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb5-69"><a href="#cb5-69" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 创建多列统计对象</span>
+<span id="cb5-70"><a href="#cb5-70" aria-hidden="true" tabindex="-1"></a>CREATE STATISTICS s1 <span class="op">(</span>dependencies<span class="op">)</span> ON a<span class="op">,</span> b FROM t<span class="op">;</span></span>
+<span id="cb5-71"><a href="#cb5-71" aria-hidden="true" tabindex="-1"></a>CREATE STATISTICS s2 <span class="op">(</span>ndistinct<span class="op">)</span>   ON a<span class="op">,</span> b FROM t<span class="op">;</span></span>
+<span id="cb5-72"><a href="#cb5-72" aria-hidden="true" tabindex="-1"></a>CREATE STATISTICS s3 <span class="op">(</span>mcv<span class="op">)</span>         ON a<span class="op">,</span> b FROM t<span class="op">;</span></span></code></pre></div>
+            <p><strong>dependencies（函数依赖）</strong>：量化
+            <code>a</code> 的值对 <code>b</code> 的值的决定程度。例如
+            <code>zip</code> 对 <code>city</code>
+            有强依赖。<code>dependencies</code> 的类型被编译进
+            <code>pg_statistic_ext_data</code>，计算由
+            <code>statext_dependencies_build()</code>
+            完成（<code>src/backend/statistics/dependencies.c</code>）。依赖度的计算方式：统计每个
+            <code>a</code> 值对应的 <code>b</code> 值的去重数，如果每个
+            <code>a</code> 恰好对应一个 <code>b</code>，则依赖度为
+            1.0。优化器使用该值修正独立假设下的选择率估算。</p>
+            <p><strong>ndistinct（多列去重数）</strong>：<code>GROUP BY a, b</code>
+            的组数。单列去重数相乘会高估组数（如 <code>zip</code> 和
+            <code>city</code> 的乘积远大于实际 <code>(zip, city)</code>
+            的组数）。<code>ndistinct</code>
+            统计直接给出正确的多列组合去重数，优化器在做
+            <code>GROUP BY</code> 估算时用它替代单列去重的乘积。</p>
+            <p><strong>mcv（多列 MCV）</strong>：组合值
+            <code>(a, b)</code> 的频率列表。当查询条件同时涉及多列时（如
+            <code>WHERE a = 1 AND b = 2</code>），优化器可以在 MCV
+            中直接查找组合频率，而不需要调用独立性假设。</p>
+            <h3
+            id="如何判断是否需要扩展统计">如何判断是否需要扩展统计</h3>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看某个查询中哪些列之间有相关性</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- EXPLAIN 中 &quot;rows&quot; 与 &quot;actual rows&quot; 差异大的列对，通常需要扩展统计</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看已有扩展统计</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> stxname, stxkeys, stxddependencies, stxndistinct, stxdmcv</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_statistic_ext</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_statistic_ext_data <span class="kw">ON</span> pg_statistic_ext.<span class="kw">oid</span> <span class="op">=</span> pg_statistic_ext_data.stxoid</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> stxrelid <span class="op">=</span> <span class="st">&#39;orders&#39;</span>:<span class="ch">:regclass</span>;</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>有用扩展统计的典型场景：</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 城市和邮政编码</span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 产品类别和子类别</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 订单创建日期和发货日期（虽然不是函数依赖，但高度相关）</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `WHERE a <span class="op">=</span> x <span class="kw">AND</span> b <span class="op">=</span> y` 类型的多条件查询，且实际结果集远大于或远小于估算</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>创建扩展统计后需要执行 `ANALYZE` 才会生效。统计信息存储在 `pg_statistic_ext_data` 中，与 `pg_statistic_ext` 分离（PG <span class="dv">12</span> 的 catalog 分离改进）。</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>## 六、统计信息不准：一个糟糕计划的解剖</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>下面构造一个生产中常见的场景：统计信息严重滞后导致优化器选错计划。</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>### 场景构造</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 建表，插入 100 万行均匀数据</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    event_type TEXT,</span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    created_at TIMESTAMPTZ <span class="kw">DEFAULT</span> now()</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span> (event_type)</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="st">&#39;view&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">990000</span>);</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建索引</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_event_type <span class="kw">ON</span> <span class="kw">events</span>(event_type);</span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> <span class="kw">events</span>;</span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此时统计信息：&#39;view&#39; 占 ~99%, 选择率估值正确</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a><span class="co">-- EXPLAIN 会正确选择 Seq Scan（几乎所有行都要返回）</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_type <span class="op">=</span> <span class="st">&#39;view&#39;</span>;</span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a><span class="co">-- 预期：Seq Scan on events  (rows=990000)</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 插入 10000 行 &#39;purchase&#39;（占总数据不到 1%）</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> <span class="kw">events</span> (event_type)</span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="st">&#39;purchase&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">10000</span>);</span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a><span class="co">-- 但没有 ANALYZE！</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a><span class="co">-- pg_statistic 中只有 &#39;view&#39; 的统计</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a><span class="co">-- 优化器不知道有 &#39;purchase&#39; 这个值</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 查询 &#39;purchase&#39; 事件</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_type <span class="op">=</span> <span class="st">&#39;purchase&#39;</span>;</span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a><span class="co">-- 优化器估算：没有 &#39;purchase&#39; 的 MCV → 用直方图或默认假设</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a><span class="co">-- 结果可能估算为 rows=1 或一个很小的值</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a><span class="co">-- → 选择了 Index Scan（以为只返回很少的行）</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a><span class="co">-- 实际返回：10000 行</span></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此时：10000 行的 Index Scan + heap fetch 可能比 Seq Scan 慢得多</span></span></code></pre></div>
+            <h3 id="解释">解释</h3>
+            <p><code>eqsel()</code> 查 MCV 时找不到
+            <code>'purchase'</code>，会走到非 MCV
+            估算路径。在没有直方图的情况下（如果列中只有
+            <code>'view'</code> 一个值、去重数小于 MCV 槽位数，PG 只存
+            MCV 不存直方图），非 MCV 值的选择率估算为
+            <code>(1.0 - sum_mcv_freqs) / (stadistinct - mcv_count)</code>。如果
+            <code>stadistinct = 1</code>（因为 ANALYZE 时只有
+            <code>'view'</code>），这个公式产生除以 0，PG 会
+            <code>clamp</code> 到一个很小的默认值。于是优化器以为
+            <code>'purchase'</code> 只返回 1 行，选了 Index
+            Scan——而实际有 10000 行。10000 次随机读 vs
+            一次全表顺序扫描，前者可能慢一个数量级。</p>
+            <h3 id="优化器为什么选错了">优化器为什么”选错”了</h3>
+            <p>优化器没有错——它基于现有统计信息做出了完全合理的决策。错的是<strong>统计信息与数据现实之间的偏差</strong>。这就是为什么诊断要关注”统计信息准不准”而不是”优化器是不是有
+            bug”。</p>
+            <hr />
+            <h2
+            id="七排查统计信息漂移的诊断">七、排查：统计信息漂移的诊断</h2>
+            <p>统计信息漂移（stats drift）指的是数据分布已发生变化，但
+            <code>pg_statistic</code>
+            中的统计没有跟上。诊断按以下顺序进行。</p>
+            <h3
+            id="第一步检查-n_mod_since_analyze-和-last_analyze">第一步：检查
+            n_mod_since_analyze 和 last_analyze</h3>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    schemaname <span class="op">||</span> <span class="st">&#39;.&#39;</span> <span class="op">||</span> relname <span class="kw">AS</span> table_name,</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    n_live_tup,</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    n_mod_since_analyze,</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    last_analyze,</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    last_autoanalyze,</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ROUND</span>(<span class="fl">100.0</span> <span class="op">*</span> n_mod_since_analyze <span class="op">/</span> <span class="fu">NULLIF</span>(n_live_tup, <span class="dv">0</span>), <span class="dv">2</span>) <span class="kw">AS</span> pct_modified</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> n_mod_since_analyze <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> n_mod_since_analyze <span class="kw">DESC</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>;</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>| 信号 | 含义 | 建议 |</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|------|</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>| `n_mod_since_analyze <span class="op">&gt;</span> n_live_tup × <span class="fl">0.1</span>` | 超过 <span class="dv">10</span>% 数据已变更 | 手动 `ANALYZE` |</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>| `last_analyze <span class="kw">IS</span> NULL` 且表非空 | 该表从未被 <span class="kw">ANALYZE</span> | 立即 `ANALYZE` |</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>| `last_autoanalyze` 是很久以前 | autovacuum <span class="kw">analyze</span> 可能未触发 | 检查 autovacuum 配置 |</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>### 第二步：检查 autovacuum <span class="kw">analyze</span> 的触发条件</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- 检查表的 autovacuum 相关设置</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    schemaname <span class="op">||</span> <span class="st">&#39;.&#39;</span> <span class="op">||</span> relname <span class="kw">AS</span> table_name,</span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    reloptions</span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;your_table&#39;</span> <span class="kw">AND</span> reloptions <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span>;</span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="co">-- 全局阈值</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>SHOW autovacuum_analyze_scale_factor;    <span class="co">-- 默认 0.1</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>SHOW autovacuum_analyze_threshold;        <span class="co">-- 默认 50</span></span></code></pre></div>
+            <p><strong>触发 auto-analyze 的条件</strong>：</p>
+            <p><code>n_mod_since_analyze &gt; autovacuum_analyze_threshold + autovacuum_analyze_scale_factor × n_live_tup</code></p>
+            <p>即默认：变更行数 &gt; 50 + 0.1 × 行数。最少 50 行或
+            10%。</p>
+            <h3 id="第三步insert-only-表的特殊问题">第三步：insert-only
+            表的特殊问题</h3>
+            <p>对于只插入不更新的表（如日志表、事件表），如果
+            <code>autovacuum_analyze_scale_factor = 0.1</code>（默认），auto-analyze
+            必须在表中插入 10% 的新行后才触发（相对于 ANALYZE
+            时已有的数据量）。在一个持续增长的 1
+            亿行日志表中，这需要插入 1000 万行才触发一次
+            ANALYZE——可能永远不会达到。结果是新插入的数据完全没有统计信息。</p>
+            <p>诊断 insert-only 表：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    schemaname <span class="op">||</span> <span class="st">&#39;.&#39;</span> <span class="op">||</span> relname <span class="kw">AS</span> table_name,</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    n_live_tup,</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    n_tup_ins,</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    n_tup_upd,</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    n_tup_del,</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    last_autoanalyze,</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">CASE</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">WHEN</span> n_tup_upd <span class="op">+</span> n_tup_del <span class="op">=</span> <span class="dv">0</span> <span class="kw">AND</span> last_autoanalyze <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>             <span class="kw">AND</span> last_autoanalyze <span class="op">&lt;</span> now() <span class="op">-</span> <span class="dt">INTERVAL</span> <span class="st">&#39;1 day&#39;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">THEN</span> <span class="st">&#39;insert-only table, may need more frequent ANALYZE&#39;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">END</span> <span class="kw">AS</span> warning</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> n_live_tup <span class="op">&gt;</span> <span class="dv">100000</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> n_tup_ins <span class="op">&gt;</span> n_live_tup <span class="op">*</span> <span class="fl">0.1</span>;</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>解决方案<span class="op">**</span>：对 <span class="kw">insert</span><span class="op">-</span><span class="kw">only</span> 表降低 `autovacuum_analyze_scale_factor`，或者使用 cron 定期执行 `ANALYZE`：</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> <span class="kw">events</span> <span class="kw">SET</span> (autovacuum_analyze_scale_factor <span class="op">=</span> <span class="fl">0.01</span>);</span></code></pre></div>
+            <h3
+            id="第四步检查-default_statistics_target-是否过低">第四步：检查
+            default_statistics_target 是否过低</h3>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>SHOW default_statistics_target;</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看具体列的 settings</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> attname, attstattarget</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_attribute</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> attrelid <span class="op">=</span> <span class="st">&#39;your_table&#39;</span>:<span class="ch">:regclass</span> <span class="kw">AND</span> attstattarget <span class="op">&gt;=</span> <span class="dv">0</span>;</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>`default_statistics_target` 直接影响：</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> MCV 列表的长度</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 直方图的桶数</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>默认值 <span class="dv">100</span> 对大多数场景足够。但对具有以下特征的列，应该调高：</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 去重值数量巨大（如用户 ID、订单号）</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 分布高度不均匀（如城市列中 <span class="dv">90</span>% 是 <span class="ot">&quot;Beijing&quot;</span>，需要更多桶来区分剩余城市）</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 查询常用作过滤条件且 `EXPLAIN` 中 `rows` 估计偏差超过 <span class="dv">10</span> 倍</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>调高时注意：每个 `target` 值增加约 <span class="dv">300</span> 个采样行和相应的存储开销。对于 <span class="dv">1000</span> 列的表，将全局 `default_statistics_target` 设到 <span class="dv">1000</span> 会导致 <span class="kw">ANALYZE</span> 耗时和 `pg_statistic` 大小线性增长。</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>### 第五步：对比 <span class="kw">EXPLAIN</span> 估算与实际执行</span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>这是最直接的诊断手段：</span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS, TIMING)</span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="kw">events</span> <span class="kw">WHERE</span> event_type <span class="op">=</span> <span class="st">&#39;purchase&#39;</span>;</span></code></pre></div>
+            <p>关注输出中 <code>rows</code>（估算行数）和
+            <code>actual rows</code>（实际行数）的差异。如果偏差超过
+            5-10 倍，统计信息值得怀疑。用
+            <code>SET enable_seqscan = off</code>
+            强制走索引，对比实际执行时间（<code>ANALYZE</code>
+            能看到真实时间），判断优化器的选择是否真的是次优的。</p>
+            <hr />
+            <h2
+            id="八auto_explain-auto_analyze-不触发的根因排查">八、auto_explain
+            + auto_analyze 不触发的根因排查</h2>
+            <p><code>auto_explain</code> 和 <code>auto_analyze</code>
+            是两个独立机制，但常被一起配置。排查顺序：</p>
+            <h3 id="auto_explain-配置检查">auto_explain 配置检查</h3>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 确保 auto_explain 在 shared_preload_libraries 中</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 检查 pg_settings 中的配置</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> name, setting, <span class="kw">source</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_settings</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">&#39;auto_explain%&#39;</span>;</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>`auto_explain` 必须通过 `shared_preload_libraries` 加载并重启才能生效。如果只通过 `SET` 或 `ALTER <span class="kw">SYSTEM</span> SET` 改了参数但没有加到 `shared_preload_libraries`，`auto_explain` 模块根本没有加载，日志中不会有任何 <span class="kw">plan</span> 输出。</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>核查：</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a># 检查 postgresql.conf</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>grep shared_preload_libraries <span class="op">/</span>path<span class="op">/</span><span class="kw">to</span><span class="op">/</span>postgresql.conf</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a># 需要包含 auto_explain</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a># shared_preload_libraries <span class="op">=</span> <span class="st">&#39;pg_stat_statements, auto_explain&#39;</span></span></code></pre></div>
+            <h3 id="auto_analyze-不触发的常见根因">auto_analyze
+            不触发的常见根因</h3>
+            <p><strong>根因 A：autovacuum_analyze_scale_factor
+            过大</strong></p>
+            <p>前面已讨论。默认 0.1 意味着只有 10% 的数据变更才触发
+            auto-analyze。insert-only 表永远达不到。</p>
+            <p><strong>根因 B：autovacuum 本身被禁用</strong></p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 全局检查</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>SHOW autovacuum;</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 表级检查</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, reloptions</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;your_table&#39;</span> <span class="kw">AND</span> reloptions:<span class="ch">:text</span> <span class="kw">LIKE</span> <span class="st">&#39;%autovacuum%&#39;</span>;</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>根因 C：autovacuum worker 不足或全部繁忙<span class="op">**</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前运行的 autovacuum worker</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, <span class="kw">query</span>, state, backend_start</span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> backend_type <span class="op">=</span> <span class="st">&#39;autovacuum worker&#39;</span>;</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 最大 autovacuum worker 数</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>SHOW autovacuum_max_workers;  <span class="co">-- 默认 3</span></span></code></pre></div>
+            <p>如果只有 3 个 worker 但有 50
+            张表需要处理，低优先级的表可能永远排不到。</p>
+            <p><strong>根因 D：autovacuum 被限速过狠</strong></p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>SHOW autovacuum_vacuum_cost_delay;  <span class="co">-- 默认 2ms</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>SHOW autovacuum_vacuum_cost_limit;  <span class="co">-- 默认 200</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>对于 auto<span class="op">-</span>analyze，限速影响较小（ANALYZE 只是采样读，不来全表）。但极端限速仍然可能导致 worker 在某个表上停留过久。</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>## 九、临时表与统计信息的特殊行为</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>临时表（`CREATE TEMP TABLE`）的统计信息行为与普通表有本质差异：</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>### 临时表不受 autovacuum 管理</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>Autovacuum 只处理持久表（catalog 中 `relpersistence <span class="op">=</span> <span class="st">&#39;p&#39;</span>`）。临时表的 `relpersistence <span class="op">=</span> <span class="st">&#39;t&#39;</span>`，autovacuum launcher 在遍历表列表时会跳过它们。这意味着：</span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 临时表不会自动 <span class="kw">ANALYZE</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 临时表不会自动 VACUUM</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `pg_stat_user_tables` 中<span class="op">**</span>不会出现<span class="op">**</span>临时表（临时表只在自己的 <span class="kw">session</span> 的 `pg_stat_user_tables` 中可见，对其他 <span class="kw">session</span> 不可见，也不会被 autovacuum 考虑）</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>### 临时表的 <span class="kw">ANALYZE</span> 必须显式执行</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> TEMP <span class="kw">TABLE</span> tmp_data <span class="kw">AS</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000000</span>) <span class="kw">AS</span> <span class="kw">id</span>;</span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此时 pg_class 中 reltuples = -1（未知）</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="co">-- 优化器使用默认假设（reltuples = 1000 或类似硬编码值）</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a><span class="co">-- 必须手动执行</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> tmp_data;</span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此时 pg_class 和 pg_statistic 才有数据</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a><span class="co">-- 注意：pg_statistic 中的统计只在创建了临时表的那个 session 中可见</span></span></code></pre></div>
+            <h3
+            id="没有统计信息的临时表的行为">没有统计信息的临时表的行为</h3>
+            <p>当 <code>reltuples = -1</code>（从未
+            ANALYZE）时，<code>costsize.c</code> 中的
+            <code>set_baserel_size_estimates()</code>
+            会触发逻辑去通过其他方式估算（如检查是否有 WHERE
+            条件配合索引信息）。如果完全无法估算，优化器使用硬编码的行数估计（通常是
+            <code>BLCKSZ / (sizeof(int) × 2)</code>
+            级别的小数字）。这会导致优化器选择 Nested Loop 或 Index
+            Scan（以为表很小），而实际临时表可能有百万行。</p>
+            <p><strong>排查临时表的统计问题</strong>：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, reltuples, relpages</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relpersistence <span class="op">=</span> <span class="st">&#39;t&#39;</span>;</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>如果 `reltuples <span class="op">=</span> <span class="op">-</span><span class="dv">1</span>`，必须 `ANALYZE`。</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>## 十、统计信息诊断 SQL 工具箱</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>以下查询可以组合成一个诊断脚本：</span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 哪些表的统计信息可能过期</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>    schemaname <span class="op">||</span> <span class="st">&#39;.&#39;</span> <span class="op">||</span> relname <span class="kw">AS</span> table_name,</span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>    n_live_tup,</span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>    n_dead_tup,</span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>    n_mod_since_analyze,</span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>    last_analyze,</span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>    last_autoanalyze,</span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">CASE</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">WHEN</span> last_analyze <span class="kw">IS</span> <span class="kw">NULL</span> <span class="cf">THEN</span> <span class="st">&#39;NEVER_ANALYZED&#39;</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">WHEN</span> n_mod_since_analyze <span class="op">&gt;</span> n_live_tup <span class="op">*</span> <span class="fl">0.1</span> <span class="cf">THEN</span> <span class="st">&#39;STALE&#39;</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">WHEN</span> last_analyze <span class="op">&lt;</span> now() <span class="op">-</span> <span class="dt">INTERVAL</span> <span class="st">&#39;7 days&#39;</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>             <span class="kw">AND</span> n_live_tup <span class="op">&gt;</span> <span class="dv">100000</span> <span class="cf">THEN</span> <span class="st">&#39;OLD&#39;</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">ELSE</span> <span class="st">&#39;OK&#39;</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">END</span> <span class="kw">AS</span> stats_status</span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> n_mod_since_analyze <span class="kw">DESC</span> <span class="kw">NULLS</span> <span class="fu">LAST</span>;</span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 哪些 EXPLAIN 估算与实际行数偏差大（需要 pg_stat_statements）</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果安装了 pg_stat_statements 且开启了 track_planning:</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a>    queryid,</span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">LEFT</span>(<span class="kw">query</span>, <span class="dv">80</span>) <span class="kw">AS</span> query_preview,</span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a>    calls,</span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>    mean_exec_time,</span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ROUND</span>(shared_blks_read <span class="op">*</span> <span class="fl">8192.0</span> <span class="op">/</span> <span class="dv">1048576</span>, <span class="dv">2</span>) <span class="kw">AS</span> mb_read</span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_statements</span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> mean_exec_time <span class="op">&gt;</span> <span class="dv">100</span>  <span class="co">-- ms</span></span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> mean_exec_time <span class="kw">DESC</span></span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>;</span>
+<span id="cb13-45"><a href="#cb13-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 检查是否有列从未 ANALYZE</span></span>
+<span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a>    c.relname <span class="kw">AS</span> table_name,</span>
+<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>    a.attname <span class="kw">AS</span> col_name,</span>
+<span id="cb13-50"><a href="#cb13-50" aria-hidden="true" tabindex="-1"></a>    <span class="fu">coalesce</span>(s.stanullfrac, <span class="op">-</span><span class="dv">1</span>) <span class="kw">AS</span> null_frac</span>
+<span id="cb13-51"><a href="#cb13-51" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class c</span>
+<span id="cb13-52"><a href="#cb13-52" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_attribute a <span class="kw">ON</span> a.attrelid <span class="op">=</span> c.<span class="kw">oid</span></span>
+<span id="cb13-53"><a href="#cb13-53" aria-hidden="true" tabindex="-1"></a><span class="kw">LEFT</span> <span class="kw">JOIN</span> pg_statistic s <span class="kw">ON</span> s.starelid <span class="op">=</span> c.<span class="kw">oid</span> <span class="kw">AND</span> s.staattnum <span class="op">=</span> a.attnum</span>
+<span id="cb13-54"><a href="#cb13-54" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.relkind <span class="op">=</span> <span class="st">&#39;r&#39;</span></span>
+<span id="cb13-55"><a href="#cb13-55" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> a.attnum <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span id="cb13-56"><a href="#cb13-56" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> <span class="kw">NOT</span> a.attisdropped</span>
+<span id="cb13-57"><a href="#cb13-57" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> s.starelid <span class="kw">IS</span> <span class="kw">NULL</span></span>
+<span id="cb13-58"><a href="#cb13-58" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> <span class="kw">EXISTS</span> (<span class="kw">SELECT</span> <span class="dv">1</span> <span class="kw">FROM</span> pg_stat_user_tables t <span class="kw">WHERE</span> t.relid <span class="op">=</span> c.<span class="kw">oid</span> <span class="kw">AND</span> t.n_live_tup <span class="op">&gt;</span> <span class="dv">0</span>);</span>
+<span id="cb13-59"><a href="#cb13-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-60"><a href="#cb13-60" aria-hidden="true" tabindex="-1"></a><span class="co">-- 4. 哪些表有 autovacuum 设置覆盖</span></span>
+<span id="cb13-61"><a href="#cb13-61" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-62"><a href="#cb13-62" aria-hidden="true" tabindex="-1"></a>    schemaname <span class="op">||</span> <span class="st">&#39;.&#39;</span> <span class="op">||</span> relname <span class="kw">AS</span> table_name,</span>
+<span id="cb13-63"><a href="#cb13-63" aria-hidden="true" tabindex="-1"></a>    reloptions</span>
+<span id="cb13-64"><a href="#cb13-64" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class</span>
+<span id="cb13-65"><a href="#cb13-65" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relkind <span class="op">=</span> <span class="st">&#39;r&#39;</span> <span class="kw">AND</span> reloptions <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span>;</span>
+<span id="cb13-66"><a href="#cb13-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-67"><a href="#cb13-67" aria-hidden="true" tabindex="-1"></a><span class="co">-- 5. 扩展统计对象列表</span></span>
+<span id="cb13-68"><a href="#cb13-68" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-69"><a href="#cb13-69" aria-hidden="true" tabindex="-1"></a>    stxnamespace:<span class="ch">:regnamespace</span>:<span class="ch">:text</span> <span class="kw">AS</span> <span class="kw">schema</span>,</span>
+<span id="cb13-70"><a href="#cb13-70" aria-hidden="true" tabindex="-1"></a>    stxrelid:<span class="ch">:regclass</span>:<span class="ch">:text</span> <span class="kw">AS</span> table_name,</span>
+<span id="cb13-71"><a href="#cb13-71" aria-hidden="true" tabindex="-1"></a>    stxname,</span>
+<span id="cb13-72"><a href="#cb13-72" aria-hidden="true" tabindex="-1"></a>    stxkeys,</span>
+<span id="cb13-73"><a href="#cb13-73" aria-hidden="true" tabindex="-1"></a>    stxkind</span>
+<span id="cb13-74"><a href="#cb13-74" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_statistic_ext</span>
+<span id="cb13-75"><a href="#cb13-75" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> stxnamespace, stxrelid, stxname;</span></code></pre></div>
+            <hr />
+            <h2 id="十一关键要点">十一、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>优化器的所有决策都依赖统计信息</strong>：<code>pg_class</code>
+            提供行数和页面数，<code>pg_statistic</code>
+            提供每一列的数据分布（MCV、Histogram、Correlation）。统计数据不准，计划就不可能对。</p></li>
+            <li><p><strong>ANALYZE
+            是采样而非全量统计</strong>：默认采样约 30000
+            行，对大表来说精度有限。增大
+            <code>default_statistics_target</code> 可以提高 MCV
+            列表和直方图的分辨率，但会增加 ANALYZE 的时间和
+            <code>pg_statistic</code> 的存储开销。</p></li>
+            <li><p><strong>选择率估算假设列之间独立</strong>：当列存在相关性时，估算可能差几个数量级。<code>CREATE STATISTICS</code>
+            填补了这个差距，但需要显式创建。</p></li>
+            <li><p><strong>代价常量需要适配硬件</strong>：<code>random_page_cost = 4.0</code>
+            在 NVMe SSD 上严重高估随机 I/O 代价，是许多人发现 “禁用 Seq
+            Scan 快很多” 的根因。<code>effective_cache_size</code>
+            不影响实际内存分配，但在 Index Scan vs Seq Scan
+            的决策中至关重要。</p></li>
+            <li><p><strong>统计信息漂移是沉默杀手</strong>：数据在变，统计不更新，计划越来越差。<code>n_mod_since_analyze</code>
+            是最直接的信号。insert-only 表需要特别注意——默认的
+            <code>autovacuum_analyze_scale_factor = 0.1</code>
+            对它们几乎不工作。</p></li>
+            <li><p><strong>临时表的统计信息是 session-local
+            的</strong>：autovacuum 不管临时表，必须手动 ANALYZE。未
+            ANALYZE 的临时表可能触发灾难性的计划选择。</p></li>
+            </ol>
+            <p>上一章：<a
+            href="../09-parse-rewrite/09-parse-rewrite.html">查询解析与重写</a>
+            下一章：<a
+            href="../11-join-paths/11-join-paths.html">查询规划器 — Join
+            顺序与路径生成</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/optimizer/path/costsize.c</code>：代价估算函数（<code>cost_seqscan()</code>,
+            <code>cost_index()</code>, <code>cost_nestloop()</code>,
+            <code>cost_hashjoin()</code>,
+            <code>cost_mergejoin()</code>）</li>
+            <li><code>src/backend/optimizer/path/clausesel.c</code>：选择率估算入口（<code>clauselist_selectivity()</code>,
+            <code>clause_selectivity()</code>）</li>
+            <li><code>src/backend/utils/adt/selfuncs.c</code>：各操作符的选择率函数（<code>eqsel()</code>,
+            <code>scalarineqsel()</code>, <code>neqsel()</code>
+            等）</li>
+            <li><code>src/backend/commands/analyze.c</code>：ANALYZE
+            实现（<code>do_analyze_rel()</code>,
+            <code>acquire_sample_rows()</code>,
+            <code>compute_stats()</code>）</li>
+            <li><code>src/include/catalog/pg_statistic.h</code>：<code>pg_statistic</code>
+            的结构定义和 <code>STATISTIC_KIND_*</code> 常量</li>
+            <li><code>src/backend/statistics/</code>：扩展统计模块（<code>dependencies.c</code>,
+            <code>mcv.c</code>, <code>mvdistinct.c</code>,
+            <code>extended_stats.c</code>）</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 14: Performance
+            Tips（<code>random_page_cost</code> 调优建议）</li>
+            <li>PostgreSQL Documentation, Section 14.2: Statistics Used
+            by the Planner</li>
+            <li>PostgreSQL Documentation, Section 14.4: Planner Cost
+            Constants</li>
+            <li>PostgreSQL Documentation, Chapter 68: How the Planner
+            Uses Statistics</li>
+            <li>PostgreSQL Documentation, <code>CREATE STATISTICS</code>
+            reference page</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Selinger, P. G. et al. <em>Access Path Selection in a
+            Relational Database Management System</em>. SIGMOD 1979. —
+            System R 代价模型的学术起源，PG
+            的代价模型直接继承自此论文。</li>
+            <li>Mackert, L. F. &amp; Lohman, G. M. <em>R</em> Optimizer
+            Validation and Performance Evaluation for Local Queries*.
+            SIGMOD 1986. — PG <code>cost_index()</code> 中使用的
+            Mackert-Lohman 公式的论文来源。</li>
+            <li>Vitter, J. S. <em>Random Sampling with a Reservoir</em>.
+            ACM TOMS, 1985. — PG ANALYZE 使用的 Reservoir Sampling
+            算法（Algorithm Z）。</li>
+            </ul>
+            <h3 id="工具与实验">工具与实验</h3>
+            <ul>
+            <li><code>pg_test_fsync</code>：测量文件系统的 fsync 和 I/O
+            性能，帮助校准 <code>random_page_cost</code> 和
+            <code>wal_sync_method</code>。</li>
+            <li><code>pg_stat_statements</code>：跟踪查询统计信息，配合
+            <code>EXPLAIN (ANALYZE)</code> 定位估算偏差大的查询。</li>
+            <li><code>auto_explain</code>：自动记录超过阈值的查询及其执行计划，帮助捕获间歇性的糟糕计划。</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/11-join-paths/11-join-paths.html">【PG 内核】查询规划器 — Join 顺序与路径生成：优化器如何选中 Nested Loop</a></h3>
+                    <p>拆解 PostgreSQL 查询优化器的路径生成：make_one_rel() 从基表访问到 Join 路径的完整流程、四种扫描路径 (SeqScan/IndexScan/IndexOnlyScan/BitmapScan) 的创建条件、三种 Join 方式 (NestLoop/HashJoin/MergeJoin) 的代价比较与选择逻辑、动态规划到 GEQO 遗传算法的切换条件 (geqo_threshold)、并行路径的生成机制。配 EXPLAIN (ANALYZE, BUFFERS) 输出与 planner 内部决策的逐项对照实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/23-perf-investigation/23-perf-investigation.html">【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链</a></h3>
+                    <p>不是工具箱罗列，而是一条按顺序推进的调查链：从 pg_stat_statements 定位可疑 queryid，到 EXPLAIN (ANALYZE, BUFFERS) 解剖执行计划，到 pg_stat_activity + wait_event 诊断等待类型，到 pg_locks + pg_blocking_pids() 追踪锁等待树，最后用 OS 层工具（iostat/perf/bpftrace）确认物理瓶颈。覆盖三个特殊场景：计划缓存的快慢切换、CPU 100% 无慢查询的 LWLock 自旋根因、命中率 99% 但 IO 打满的统计骗局。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/26-config-pitfalls/26-config-pitfalls.html">【PG 内核】配置陷阱与生产最佳实践：11 个最危险的 GUC 和它们的正确设置</a></h3>
+                    <p>逐一拆解 11 个最容易被误解和配错的 PostgreSQL GUC 参数：shared_buffers 的 double buffering 反噬、work_mem 作为&#x27;每个操作&#x27;而非&#x27;每个查询&#x27;的内存炸弹、effective_cache_size 和 random_page_cost 如何误导优化器走向灾难计划、fsync=off 和 synchronous_commit=off 的数据丢失边界、huge_pages 在容器中的静默退化、maintenance_work_mem 不足导致 VACUUM 瘫痪、idle_in_transaction_session_timeout 为什么必须设、log_lock_waits 与 deadlock_timeout 的联动、以及 log_min_duration_statement 与 auto_explain 的日志洪水叠加。每条配查验 SQL 和 shell 命令——不是&#x27;设成 X 就好了&#x27;，而是&#x27;通过什么视图和日志确认当前设置有问题&#x27;。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

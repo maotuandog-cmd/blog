@@ -1,0 +1,1902 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】MinIO 原理和架构 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="MinIO 机制、AGPL 与 upstream
+archived 风险：纠删码布局、运维边界与选型时必须核对的证据。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="minio, s3-compatible, erasure-set, distributed-storage, object-storage, healing, agpl, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢 · 系统与基础设施" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/48-minio/minio.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】MinIO 原理和架构" />
+    <meta property="og:description" content="MinIO 机制、AGPL 与 upstream archived 风险：纠删码布局、运维边界与选型时必须核对的证据。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/48-minio/minio.html" />
+    <meta property="og:site_name" content="土法炼钢 · 系统与基础设施" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="minio" />
+    <meta property="article:tag" content="s3-compatible" />
+    <meta property="article:tag" content="erasure-set" />
+    <meta property="article:tag" content="distributed-storage" />
+    <meta property="article:tag" content="object-storage" />
+    <meta property="article:tag" content="healing" />
+    <meta property="article:tag" content="agpl" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】MinIO 原理和架构" />
+    <meta name="twitter:description" content="MinIO 机制、AGPL 与 upstream archived 风险：纠删码布局、运维边界与选型时必须核对的证据。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】MinIO 原理和架构", "description": "MinIO 机制、AGPL 与 upstream archived 风险：纠删码布局、运维边界与选型时必须核对的证据。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/48-minio/minio.html"}, "datePublished": "2025-09-26T00:00:00+00:00", "dateModified": "2026-08-12T13:56:18+00:00", "keywords": ["minio", "s3-compatible", "erasure-set", "distributed-storage", "object-storage", "healing", "agpl"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢 ·
+系统与基础设施</a></p>
+            <h1 class="title">【存储工程】MinIO 原理和架构</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-26</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#minio</span> <span>#s3-compatible</span> <span>#erasure-set</span> <span>#distributed-storage</span> <span>#object-storage</span> <span>#healing</span> <span>#agpl</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/minio.html">#minio</a><a class="chip-link" href="/tags/s3-compatible.html">#s3-compatible</a><a class="chip-link" href="/tags/erasure-set.html">#erasure-set</a><a class="chip-link" href="/tags/distributed-storage.html">#distributed-storage</a><a class="chip-link" href="/tags/object-storage.html">#object-storage</a><a class="chip-link" href="/tags/healing.html">#healing</a><a class="chip-link" href="/tags/agpl-1cf0c1.html">#agpl</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/47-s3-api/s3-api.html">上一篇：【存储工程】S3 API 深度解析</a><a class="post-series-nav__link" href="/post/storage/49-erasure-coding/erasure-coding.html">下一篇：【存储工程】纠删码原理与存储效率</a></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一minio-的设计取舍"
+                id="toc-一minio-的设计取舍">一、MinIO 的设计取舍</a>
+                <ul>
+                <li><a href="#要解决的问题" id="toc-要解决的问题">1.1
+                要解决的问题</a></li>
+                <li><a href="#云原生部署面" id="toc-云原生部署面">1.2
+                云原生部署面</a></li>
+                <li><a href="#架构形态对照非性能榜"
+                id="toc-架构形态对照非性能榜">1.3
+                架构形态对照（非性能榜）</a></li>
+                </ul></li>
+                <li><a href="#二minio-分布式架构"
+                id="toc-二minio-分布式架构">二、MinIO 分布式架构</a>
+                <ul>
+                <li><a href="#核心概念" id="toc-核心概念">2.1
+                核心概念</a></li>
+                <li><a href="#纠删集的形成规则"
+                id="toc-纠删集的形成规则">2.2 纠删集的形成规则</a></li>
+                <li><a href="#对象到纠删集的映射"
+                id="toc-对象到纠删集的映射">2.3
+                对象到纠删集的映射</a></li>
+                <li><a href="#server-pool-的扩展"
+                id="toc-server-pool-的扩展">2.4 Server Pool
+                的扩展</a></li>
+                </ul></li>
+                <li><a href="#三元数据管理"
+                id="toc-三元数据管理">三、元数据管理</a>
+                <ul>
+                <li><a href="#xl.meta-格式" id="toc-xl.meta-格式">3.1
+                xl.meta 格式</a></li>
+                <li><a href="#内联元数据inline-data"
+                id="toc-内联元数据inline-data">3.2 内联元数据（Inline
+                Data）</a></li>
+                <li><a href="#元数据一致性保证"
+                id="toc-元数据一致性保证">3.3 元数据一致性保证</a></li>
+                </ul></li>
+                <li><a href="#四数据写入路径"
+                id="toc-四数据写入路径">四、数据写入路径</a>
+                <ul>
+                <li><a href="#写入流程概览" id="toc-写入流程概览">4.1
+                写入流程概览</a></li>
+                <li><a href="#纠删码编码详解"
+                id="toc-纠删码编码详解">4.2 纠删码编码详解</a></li>
+                <li><a href="#存储类别storage-class"
+                id="toc-存储类别storage-class">4.3 存储类别（Storage
+                Class）</a></li>
+                <li><a href="#大对象与多段上传"
+                id="toc-大对象与多段上传">4.4 大对象与多段上传</a></li>
+                <li><a href="#写入仲裁write-quorum"
+                id="toc-写入仲裁write-quorum">4.5 写入仲裁（Write
+                Quorum）</a></li>
+                </ul></li>
+                <li><a href="#五数据修复机制"
+                id="toc-五数据修复机制">五、数据修复机制</a>
+                <ul>
+                <li><a href="#修复概述" id="toc-修复概述">5.1
+                修复概述</a></li>
+                <li><a href="#位腐检测bitrot-detection"
+                id="toc-位腐检测bitrot-detection">5.2 位腐检测（Bitrot
+                Detection）</a></li>
+                <li><a href="#后台修复扫描器scanner"
+                id="toc-后台修复扫描器scanner">5.3
+                后台修复扫描器（Scanner）</a></li>
+                <li><a href="#手动触发修复" id="toc-手动触发修复">5.4
+                手动触发修复</a></li>
+                <li><a href="#磁盘更换流程" id="toc-磁盘更换流程">5.5
+                磁盘更换流程</a></li>
+                </ul></li>
+                <li><a href="#六对象版本控制与生命周期"
+                id="toc-六对象版本控制与生命周期">六、对象版本控制与生命周期</a>
+                <ul>
+                <li><a href="#版本控制object-versioning"
+                id="toc-版本控制object-versioning">6.1 版本控制（Object
+                Versioning）</a></li>
+                <li><a href="#删除标记delete-marker"
+                id="toc-删除标记delete-marker">6.2 删除标记（Delete
+                Marker）</a></li>
+                <li><a href="#生命周期管理lifecycle-management"
+                id="toc-生命周期管理lifecycle-management">6.3
+                生命周期管理（Lifecycle Management）</a></li>
+                <li><a href="#对象锁定object-locking"
+                id="toc-对象锁定object-locking">6.4 对象锁定（Object
+                Locking）</a></li>
+                </ul></li>
+                <li><a href="#七minio-iam-与策略系统"
+                id="toc-七minio-iam-与策略系统">七、MinIO IAM
+                与策略系统</a>
+                <ul>
+                <li><a href="#身份与访问管理概述"
+                id="toc-身份与访问管理概述">7.1
+                身份与访问管理概述</a></li>
+                <li><a href="#内置策略" id="toc-内置策略">7.2
+                内置策略</a></li>
+                <li><a href="#自定义策略" id="toc-自定义策略">7.3
+                自定义策略</a></li>
+                <li><a href="#用户与组管理" id="toc-用户与组管理">7.4
+                用户与组管理</a></li>
+                <li><a href="#stssecurity-token-service"
+                id="toc-stssecurity-token-service">7.5 STS（Security
+                Token Service）</a></li>
+                <li><a href="#桶策略与访问控制列表"
+                id="toc-桶策略与访问控制列表">7.6
+                桶策略与访问控制列表</a></li>
+                </ul></li>
+                <li><a href="#八minio-集群部署实战"
+                id="toc-八minio-集群部署实战">八、MinIO 集群部署实战</a>
+                <ul>
+                <li><a href="#硬件规划" id="toc-硬件规划">8.1
+                硬件规划</a></li>
+                <li><a href="#多节点部署" id="toc-多节点部署">8.2
+                多节点部署</a></li>
+                <li><a href="#systemd-服务配置"
+                id="toc-systemd-服务配置">8.3 Systemd 服务配置</a></li>
+                <li><a href="#tls-加密配置" id="toc-tls-加密配置">8.4
+                TLS 加密配置</a></li>
+                <li><a href="#nginx-负载均衡配置"
+                id="toc-nginx-负载均衡配置">8.5 Nginx
+                负载均衡配置</a></li>
+                <li><a href="#kubernetes-部署"
+                id="toc-kubernetes-部署">8.6 Kubernetes 部署</a></li>
+                </ul></li>
+                <li><a href="#九minio-性能调优与监控"
+                id="toc-九minio-性能调优与监控">九、MinIO
+                性能调优与监控</a>
+                <ul>
+                <li><a href="#性能调优要点" id="toc-性能调优要点">9.1
+                性能调优要点</a></li>
+                <li><a href="#warp怎么测而不是抄谁的数字"
+                id="toc-warp怎么测而不是抄谁的数字">9.2
+                warp：怎么测，而不是抄谁的数字</a></li>
+                <li><a href="#prometheus-监控集成"
+                id="toc-prometheus-监控集成">9.3 Prometheus
+                监控集成</a></li>
+                <li><a href="#关键监控指标" id="toc-关键监控指标">9.4
+                关键监控指标</a></li>
+                <li><a href="#grafana-仪表板"
+                id="toc-grafana-仪表板">9.5 Grafana 仪表板</a></li>
+                </ul></li>
+                <li><a href="#十多站点复制"
+                id="toc-十多站点复制">十、多站点复制</a>
+                <ul>
+                <li><a href="#复制架构概述" id="toc-复制架构概述">10.1
+                复制架构概述</a></li>
+                <li><a href="#站点复制模式" id="toc-站点复制模式">10.2
+                站点复制模式</a></li>
+                <li><a href="#复制机制深入" id="toc-复制机制深入">10.3
+                复制机制深入</a></li>
+                <li><a href="#灾备切换实战" id="toc-灾备切换实战">10.4
+                灾备切换实战</a></li>
+                <li><a href="#复制监控" id="toc-复制监控">10.5
+                复制监控</a></li>
+                </ul></li>
+                <li><a href="#十一许可证上游状态与未决问题"
+                id="toc-十一许可证上游状态与未决问题">十一、许可证、上游状态与未决问题</a>
+                <ul>
+                <li><a href="#agpl-不是脚注" id="toc-agpl-不是脚注">11.1
+                AGPL 不是脚注</a></li>
+                <li><a href="#上游-archived-意味着什么"
+                id="toc-上游-archived-意味着什么">11.2 上游 archived
+                意味着什么</a></li>
+                <li><a href="#仍开放的工程问题"
+                id="toc-仍开放的工程问题">11.3 仍开放的工程问题</a></li>
+                </ul></li>
+                <li><a href="#十二参考文献"
+                id="toc-十二参考文献">十二、参考文献</a>
+                <ul>
+                <li><a href="#规范与官方文档"
+                id="toc-规范与官方文档">规范与官方文档</a></li>
+                <li><a href="#源码与许可证"
+                id="toc-源码与许可证">源码与许可证</a></li>
+                <li><a href="#论文纠删背景机制细节见下一篇"
+                id="toc-论文纠删背景机制细节见下一篇">论文（纠删背景，机制细节见下一篇）</a></li>
+                <li><a href="#工具" id="toc-工具">工具</a></li>
+                <li><a href="#本站相关"
+                id="toc-本站相关">本站相关</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>选型对象存储时，MinIO 常被当成「单二进制、S3
+            兼容、纠删码、无中心」的默认答案。这个答案只覆盖架构形状，不覆盖工程约束：它从
+            2021 年起整仓 AGPLv3；截至本文修订日（2026-08-07），GitHub
+            仓库 <code>minio/minio</code> 的 API 字段
+            <code>archived=true</code>，最新公开 tag 为
+            <code>RELEASE.2025-10-15T17-29-55Z</code>。继续把 MinIO
+            当「活跃上游 + 宽松开源」来写，会误导部署决策。</p>
+            <p>本文只做三件事：</p>
+            <ol type="1">
+            <li>把 Erasure Set、Server Pool、<code>xl.meta</code>
+            共置、仲裁读与 healing
+            的机制钉在可核对的设计上（以官方文档与源码目录为准，版本边界见下）。</li>
+            <li>把扩容、复制、运维命令写成「怎么跑」，不写成「一定快」。</li>
+            <li>把许可证与上游状态写成显式风险，而不是脚注。</li>
+            </ol>
+            <p>不展开：Ceph/Swift 的完整对比评测、自测 warp
+            数字（本文没有跑本地
+            benchmark，凡出现吞吐表述一律不当作实测结论）、商业发行版功能表。</p>
+            <blockquote>
+            <p><strong>版本与证据边界</strong></p>
+            <ul>
+            <li>机制叙述以 MinIO 官方 Linux 文档与仓库
+            <code>docs/</code>、纠删相关设计说明为准；命令示例对应社区
+            <code>mc</code> / server 用法，具体 flag 随 release
+            变化，部署前用同版本 <code>--help</code> 核对。</li>
+            <li>许可证：上游博客写明自
+            <code>RELEASE.2021-05-11T23-27-41Z</code> 起
+            server/client/gateway 为 GNU AGPLv3（SDK 仍多为
+            Apache-2.0）；源码侧 license 变更可追溯到 2021-04
+            的提交。</li>
+            <li>活跃度：以 GitHub API 在修订日读到的
+            <code>archived</code> / <code>pushed_at</code> / latest
+            release 为准；fork 与第三方发行不在本文认证范围内。</li>
+            <li>对比表是<strong>架构形态对照</strong>，不是性能排行；单元格来自各项目公开文档的常见部署模型，未做同机同负载实测。</li>
+            </ul>
+            </blockquote>
+            <hr />
+            <h2 id="一minio-的设计取舍">一、MinIO 的设计取舍</h2>
+            <h3 id="要解决的问题">1.1 要解决的问题</h3>
+            <p>MinIO 面向的核心约束是：在私有化 / 边缘 /
+            多云旁路场景里，用尽量少的运维组件提供 S3
+            API，并用纠删码换空间效率。相对 Ceph RGW、Swift 一类「控制面
+            + 多服务」栈，它的取舍很陡：</p>
+            <ul>
+            <li><strong>单一静态链接 Go
+            二进制</strong>：服务端依赖面小，安装路径短；代价是功能演进、发行节奏、许可证策略都集中在同一
+            upstream。</li>
+            <li><strong>S3
+            语义优先</strong>：Multipart、Versioning、Object
+            Lock、SSE、Bucket Policy
+            等走兼容路径；「完整」是相对常见子集而言，边缘 API 与 AWS
+            行为差仍需按版本回归。</li>
+            <li><strong>无中心协调写</strong>：任意节点可接请求并协调分片写入；没有独立元数据集群，也就没有独立扩展元数据的旋钮——元数据压力落回磁盘与纠删集。</li>
+            </ul>
+            <p>「高性能」在官方营销里是目标陈述，不是本文可引用的 A
+            级结论。能否跑满网卡，取决于盘型、EC
+            参数、对象大小分布与客户端并发；需要数字时用
+            <code>warp</code> 在目标拓扑上自测，见第九节。</p>
+            <h3 id="云原生部署面">1.2 云原生部署面</h3>
+            <p>MinIO 提供 Kubernetes Operator 与 DirectPV（前身
+            DirectCSI）管理本地盘与租户生命周期。进程侧尽量无状态：持久状态在盘上的对象与
+            <code>xl.meta</code>。扩容主路径是追加 Server
+            Pool，而不是在池内做全量再平衡。这些是部署模型事实；Operator
+            与 Console 在社区版 /
+            商业版之间的功能切割随发行变化，选型时要对照当前发行说明，不能默认「文档截图里有的都在社区二进制里」。</p>
+            <h3 id="架构形态对照非性能榜">1.3
+            架构形态对照（非性能榜）</h3>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 11%" />
+            <col style="width: 13%" />
+            <col style="width: 19%" />
+            <col style="width: 33%" />
+            <col style="width: 21%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>MinIO</th>
+            <th>Ceph RGW</th>
+            <th>OpenStack Swift</th>
+            <th>SeaweedFS</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>控制面形状</td>
+            <td>对等节点</td>
+            <td>Monitor + OSD 等分层</td>
+            <td>Proxy + 多服务环</td>
+            <td>Master + Volume</td>
+            </tr>
+            <tr>
+            <td>元数据</td>
+            <td>与数据共置（<code>xl.meta</code>）</td>
+            <td>独立 pool / 集群组件</td>
+            <td>账户/容器元数据服务</td>
+            <td>Master 侧为主</td>
+            </tr>
+            <tr>
+            <td>冗余</td>
+            <td>纠删码为主</td>
+            <td>副本或 EC</td>
+            <td>多副本常见</td>
+            <td>副本或 EC</td>
+            </tr>
+            <tr>
+            <td>S3 入口</td>
+            <td>进程原生</td>
+            <td>RGW 网关</td>
+            <td>s3api 等中间层</td>
+            <td>原生子集</td>
+            </tr>
+            <tr>
+            <td>扩容单元</td>
+            <td>Server Pool</td>
+            <td>OSD / 主机</td>
+            <td>环与存储节点</td>
+            <td>Volume Server</td>
+            </tr>
+            <tr>
+            <td>主要实现语言</td>
+            <td>Go</td>
+            <td>C++ 等</td>
+            <td>Python</td>
+            <td>Go</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>读这张表时只问「组件怎么拆、状态放哪」，不要读成「谁更快」。Ceph/Swift
+            的运维复杂度高，换来的是更长的生产谱系与更细的调参面；MinIO
+            的复杂度低，换来的是更陡的许可证与上游集中度。</p>
+            <hr />
+            <h2 id="二minio-分布式架构">二、MinIO 分布式架构</h2>
+            <h3 id="核心概念">2.1 核心概念</h3>
+            <p>MinIO 的分布式架构围绕以下核心概念构建：</p>
+            <pre class="text"><code>                    MinIO 集群架构总览
+
+  ┌─────────────────────────────────────────────────┐
+  │                   集群（Cluster）                 │
+  │                                                   │
+  │  ┌──────────────────┐  ┌──────────────────┐      │
+  │  │  服务器池 1        │  │  服务器池 2        │      │
+  │  │  (Server Pool 1)  │  │  (Server Pool 2)  │      │
+  │  │                    │  │                    │      │
+  │  │ ┌──────────────┐  │  │ ┌──────────────┐  │      │
+  │  │ │ 纠删集 1      │  │  │ │ 纠删集 3      │  │      │
+  │  │ │ (Erasure Set) │  │  │ │ (Erasure Set) │  │      │
+  │  │ │               │  │  │ │               │  │      │
+  │  │ │  drive drive  │  │  │ │  drive drive  │  │      │
+  │  │ │  drive drive  │  │  │ │  drive drive  │  │      │
+  │  │ └──────────────┘  │  │ └──────────────┘  │      │
+  │  │ ┌──────────────┐  │  │ ┌──────────────┐  │      │
+  │  │ │ 纠删集 2      │  │  │ │ 纠删集 4      │  │      │
+  │  │ │ (Erasure Set) │  │  │ │ (Erasure Set) │  │      │
+  │  │ │               │  │  │ │               │  │      │
+  │  │ │  drive drive  │  │  │ │  drive drive  │  │      │
+  │  │ │  drive drive  │  │  │ │  drive drive  │  │      │
+  │  │ └──────────────┘  │  │ └──────────────┘  │      │
+  │  └──────────────────┘  └──────────────────┘      │
+  └─────────────────────────────────────────────────┘
+
+  集群 = 多个 Server Pool
+  Server Pool = 多个 Erasure Set
+  Erasure Set = 一组磁盘（通常 4~16 块）</code></pre>
+            <p><strong>磁盘（Drive）</strong>：MinIO
+            的最小存储单元，通常对应一个挂载点。MinIO 要求每个磁盘使用
+            XFS 文件系统，因为 XFS
+            在大量小文件和大文件场景下都有稳定的性能表现。</p>
+            <p><strong>纠删集（Erasure
+            Set）</strong>：一组磁盘组成的纠删码编码单元。一个纠删集中的磁盘数量在
+            4 到 16
+            之间。对象的分片（Shard）会均匀分布在同一个纠删集的所有磁盘上。</p>
+            <p><strong>服务器池（Server
+            Pool）</strong>：一组服务器节点和其上的磁盘共同组成一个服务器池。一个服务器池包含一个或多个纠删集。服务器池是
+            MinIO 的扩容单元——新增容量时，添加一个新的服务器池即可。</p>
+            <p><strong>集群（Cluster）</strong>：由一个或多个服务器池组成的完整
+            MinIO 部署。</p>
+            <h3 id="纠删集的形成规则">2.2 纠删集的形成规则</h3>
+            <p>MinIO
+            在启动时根据节点数和每节点磁盘数自动计算纠删集的划分方式。其核心算法遵循以下规则：</p>
+            <ol type="1">
+            <li>总磁盘数 = 节点数 × 每节点磁盘数</li>
+            <li>纠删集大小（SetDriveCount）必须在 4~16 之间</li>
+            <li>总磁盘数必须能被纠删集大小整除</li>
+            <li>MinIO
+            优先选择较大的纠删集大小，以获得更高的数据冗余度</li>
+            </ol>
+            <p>举例说明：</p>
+            <pre class="text"><code>场景：4 节点，每节点 4 块盘
+总磁盘数 = 16
+可能的纠删集大小：4, 8, 16
+MinIO 选择 16 → 1 个纠删集，包含 16 块盘
+
+场景：8 节点，每节点 4 块盘
+总磁盘数 = 32
+可能的纠删集大小：4, 8, 16
+MinIO 选择 16 → 2 个纠删集，每组 16 块盘
+
+场景：4 节点，每节点 8 块盘
+总磁盘数 = 32
+MinIO 选择 16 → 2 个纠删集，每组 16 块盘</code></pre>
+            <h3 id="对象到纠删集的映射">2.3 对象到纠删集的映射</h3>
+            <p>当客户端上传对象时，MinIO
+            需要决定将该对象写入哪个纠删集。映射过程如下：</p>
+            <ol type="1">
+            <li>计算对象路径（bucket/object）的哈希值：<code>hash = sipHash(bucket + "/" + object)</code></li>
+            <li>对纠删集数量取模：<code>erasureSetIndex = hash % totalErasureSets</code></li>
+            <li>在选定的纠删集中，按照固定顺序将分片写入各磁盘</li>
+            </ol>
+            <p>这种确定性映射保证了同一对象的所有版本始终写入同一个纠删集，简化了版本管理和修复逻辑。</p>
+            <h3 id="server-pool-的扩展">2.4 Server Pool 的扩展</h3>
+            <p>当现有容量不足时，管理员可以通过启动参数追加新的服务器池：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 初始部署：4 节点，每节点 4 盘</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">minio</span> server http://node{1...4}/data{1...4}</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 扩容：追加一个新的 Server Pool（4 节点，每节点 4 盘）</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">minio</span> server http://node{1...4}/data{1...4} http://node{5...8}/data{1...4}</span></code></pre></div>
+            <p>新对象会根据各服务器池的可用容量比例分配到不同的池中，已有对象不会发生迁移。这种设计避免了传统分布式系统中扩容时的大规模数据再平衡开销。</p>
+            <hr />
+            <h2 id="三元数据管理">三、元数据管理</h2>
+            <h3 id="xl.meta-格式">3.1 xl.meta 格式</h3>
+            <p>MinIO
+            将对象的元数据与数据存储在同一磁盘上，元数据文件命名为
+            <code>xl.meta</code>。该文件采用 MessagePack
+            编码的二进制格式，包含以下关键信息：</p>
+            <pre class="text"><code>xl.meta 文件结构（逻辑视图）：
+
+Header:
+  - 格式版本（Format Version）
+  - 标志位（Flags）
+
+Versions[]:            // 对象的所有版本
+  ├── VersionID        // 版本标识（UUID）
+  ├── ModTime          // 修改时间
+  ├── Type             // 对象类型（Object / DeleteMarker）
+  ├── ObjectMeta:
+  │   ├── ErasureInfo:
+  │   │   ├── Algorithm      // 纠删码算法（reedsolomon）
+  │   │   ├── DataBlocks     // 数据分片数
+  │   │   ├── ParityBlocks   // 校验分片数
+  │   │   ├── BlockSize      // 分块大小
+  │   │   └── Distribution[] // 分片在磁盘上的分布顺序
+  │   ├── Parts[]:
+  │   │   ├── PartNumber     // 分段编号
+  │   │   ├── Size           // 分段大小
+  │   │   ├── ActualSize     // 实际大小（压缩前）
+  │   │   └── ETag           // 校验和
+  │   ├── UserMetadata       // 用户自定义元数据
+  │   ├── ContentType        // 内容类型
+  │   └── Size               // 对象总大小
+  └── FreeVersion            // 是否为空闲版本</code></pre>
+            <h3 id="内联元数据inline-data">3.2 内联元数据（Inline
+            Data）</h3>
+            <p>对于小对象（默认阈值约
+            128KiB，以目标版本配置为准），MinIO 可将对象数据内联进
+            <code>xl.meta</code>，而不是再开独立数据文件。工程效果是：</p>
+            <ul>
+            <li><strong>少一次按对象的数据文件打开</strong>：读路径常变为读元数据文件；同时减少对应
+            inode / dentry 压力。</li>
+            <li><strong>不自动等于更低延迟</strong>：仲裁读仍可能触及多盘，尾延迟仍由最慢分片决定。</li>
+            <li><strong>「吞吐提升 N
+            倍」类说法</strong>：离开对象大小分布与盘型无法成立；本文不引用未复现的倍数。</li>
+            </ul>
+            <p>内联阈值可通过环境变量配置（名称以目标 release
+            为准）：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置内联阈值为 256KiB</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_STORAGE_CLASS_INLINE</span><span class="op">=</span>262144</span></code></pre></div>
+            <h3 id="元数据一致性保证">3.3 元数据一致性保证</h3>
+            <p>由于元数据分散存储在各磁盘上，MinIO
+            需要处理元数据不一致的情况。其策略如下：</p>
+            <ol type="1">
+            <li><strong>写入时</strong>：对象写入完成后，所有数据分片和
+            xl.meta 通过 <code>fdatasync</code> 刷盘，确保持久化。</li>
+            <li><strong>读取时</strong>：从纠删集中的所有磁盘读取
+            xl.meta，进行仲裁（Quorum）。若多数磁盘上的元数据一致，则使用该版本；若发现不一致，自动触发修复。</li>
+            <li><strong>版本冲突解决</strong>：通过修改时间戳和版本 UUID
+            进行排序，选择最新的一致版本。</li>
+            </ol>
+            <hr />
+            <h2 id="四数据写入路径">四、数据写入路径</h2>
+            <h3 id="写入流程概览">4.1 写入流程概览</h3>
+            <p>一个完整的 PUT Object 请求在 MinIO 内部经历以下步骤：</p>
+            <pre class="text"><code>客户端 PUT /bucket/object
+       │
+       ▼
+  ┌─────────┐
+  │ API 层   │  解析请求、认证、鉴权
+  └────┬────┘
+       │
+       ▼
+  ┌──────────────┐
+  │ 对象层        │  确定目标 Server Pool 和 Erasure Set
+  │ (Object Layer)│
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────────────┐
+  │ 纠删码编码            │  将数据块拆分为 data + parity 分片
+  │ (Erasure Coding)      │
+  └──────┬───────────────┘
+         │
+         ▼
+  ┌──────────────────────┐
+  │ 并发写入磁盘          │  将各分片并发写入纠删集中的磁盘
+  │ (Concurrent Write)    │
+  └──────┬───────────────┘
+         │
+         ▼
+  ┌──────────────────────┐
+  │ 元数据写入            │  生成 xl.meta 并写入各磁盘
+  │ (Metadata Write)      │
+  └──────┬───────────────┘
+         │
+         ▼
+  返回 200 OK + ETag</code></pre>
+            <h3 id="纠删码编码详解">4.2 纠删码编码详解</h3>
+            <p>MinIO 使用里德-所罗门码（Reed-Solomon
+            Code）进行纠删码编码。默认配置下，一个纠删集有 N
+            块磁盘，其中：</p>
+            <ul>
+            <li>数据分片数（Data Shards）= N/2</li>
+            <li>校验分片数（Parity Shards）= N/2</li>
+            </ul>
+            <p>这意味着一个 16 盘的纠删集可以容忍 8
+            块盘同时故障而不丢失数据。</p>
+            <p>编码过程：</p>
+            <pre class="text"><code>原始数据块（例如 10MB）
+    │
+    ▼
+分割为 data_shards 个等长分片
+    │
+    ▼ Reed-Solomon 编码
+生成 parity_shards 个校验分片
+    │
+    ▼
+总共 N 个分片，分别写入纠删集的 N 块磁盘
+
+示例（16 盘纠删集，EC:8+8）：
+  原始数据 = 10MB
+  每个分片 = 10MB / 8 = 1.25MB
+  总写入量 = 1.25MB × 16 = 20MB
+  存储效率 = 10MB / 20MB = 50%</code></pre>
+            <h3 id="存储类别storage-class">4.3 存储类别（Storage
+            Class）</h3>
+            <p>MinIO 支持通过存储类别调整纠删码的数据与校验比例：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置标准存储类别为 EC:4（即 4 个校验分片）</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_STORAGE_CLASS_STANDARD</span><span class="op">=</span><span class="st">&quot;EC:4&quot;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置低冗余存储类别为 EC:2（即 2 个校验分片）</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_STORAGE_CLASS_RRS</span><span class="op">=</span><span class="st">&quot;EC:2&quot;</span></span></code></pre></div>
+            <p>不同存储类别的对比：</p>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 31%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>配置（16 盘纠删集）</th>
+            <th>数据分片</th>
+            <th>校验分片</th>
+            <th>容错盘数</th>
+            <th>存储效率</th>
+            <th>写入放大</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>EC:8（默认）</td>
+            <td>8</td>
+            <td>8</td>
+            <td>8</td>
+            <td>50.0%</td>
+            <td>2.0x</td>
+            </tr>
+            <tr>
+            <td>EC:6</td>
+            <td>10</td>
+            <td>6</td>
+            <td>6</td>
+            <td>62.5%</td>
+            <td>1.6x</td>
+            </tr>
+            <tr>
+            <td>EC:4</td>
+            <td>12</td>
+            <td>4</td>
+            <td>4</td>
+            <td>75.0%</td>
+            <td>1.33x</td>
+            </tr>
+            <tr>
+            <td>EC:2</td>
+            <td>14</td>
+            <td>2</td>
+            <td>2</td>
+            <td>87.5%</td>
+            <td>1.14x</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="大对象与多段上传">4.4 大对象与多段上传</h3>
+            <p>对于大对象，MinIO 采用分段（Part）处理：</p>
+            <ol type="1">
+            <li>对象按 <code>BlockSize</code>（默认 5MiB
+            或根据对象大小动态调整）拆分为多个块（Block）。</li>
+            <li>每个块独立进行纠删码编码，生成 N 个分片。</li>
+            <li>分片写入磁盘时，同一个分段的所有块按顺序追加到对应磁盘上的分段文件中。</li>
+            </ol>
+            <p>多段上传（Multipart Upload）的流程：</p>
+            <pre class="text"><code>InitiateMultipartUpload → 返回 UploadID
+    │
+    ├── UploadPart 1 → 纠删码编码 → 写入磁盘
+    ├── UploadPart 2 → 纠删码编码 → 写入磁盘
+    ├── ...
+    └── UploadPart N → 纠删码编码 → 写入磁盘
+    │
+CompleteMultipartUpload → 合并元数据 → 写入 xl.meta → 返回 ETag</code></pre>
+            <h3 id="写入仲裁write-quorum">4.5 写入仲裁（Write
+            Quorum）</h3>
+            <p>MinIO 的写入仲裁要求如下：</p>
+            <ul>
+            <li>写入仲裁 = 数据分片数 + 1</li>
+            <li>例如 EC:8 配置下，写入仲裁 = 9（需要至少 9
+            个磁盘成功写入）</li>
+            <li>如果写入的成功磁盘数低于仲裁值，整个写入操作失败，客户端收到错误响应</li>
+            </ul>
+            <p>读取仲裁则更为宽松：</p>
+            <ul>
+            <li>读取仲裁 = 数据分片数</li>
+            <li>例如 EC:8 配置下，读取仲裁 = 8（需要至少 8
+            个磁盘可读）</li>
+            </ul>
+            <hr />
+            <h2 id="五数据修复机制">五、数据修复机制</h2>
+            <h3 id="修复概述">5.1 修复概述</h3>
+            <p>MinIO
+            的修复机制（Healing）是保证数据持久性的核心组件。它负责检测并修复以下类型的数据损坏：</p>
+            <ul>
+            <li><strong>磁盘故障后更换新盘</strong>：新盘上没有任何数据，需要从其他分片重建。</li>
+            <li><strong>静默数据损坏（Silent Data
+            Corruption）</strong>：磁盘固件或硬件 bug
+            导致数据被悄无声息地修改，也称为位腐（Bit Rot）。</li>
+            <li><strong>元数据不一致</strong>：由于异常断电、进程崩溃等原因导致部分磁盘上的
+            xl.meta 不完整或过期。</li>
+            </ul>
+            <h3 id="位腐检测bitrot-detection">5.2 位腐检测（Bitrot
+            Detection）</h3>
+            <p>MinIO
+            在写入每个分片时，会计算并存储该分片的校验和（Checksum）。支持的校验算法包括：</p>
+            <ul>
+            <li><strong>HighwayHash-256</strong>（默认）：由 Google
+            开发的高性能哈希算法，在现代 CPU 上可达到数 GB/s
+            的计算速度。</li>
+            <li><strong>BLAKE2b-256</strong>：安全性更高但略慢的备选方案。</li>
+            <li><strong>SHA-256</strong>：兼容性最好但性能最低的选项。</li>
+            </ul>
+            <p>读取时的校验流程：</p>
+            <pre class="text"><code>1. 从磁盘读取分片数据
+2. 计算分片的校验和
+3. 与 xl.meta 中存储的校验和比较
+4. 若不匹配 → 标记该分片为损坏
+5. 使用纠删码从其他健康分片重建数据
+6. 将重建后的分片写回磁盘</code></pre>
+            <h3 id="后台修复扫描器scanner">5.3
+            后台修复扫描器（Scanner）</h3>
+            <p>MinIO
+            运行一个后台扫描器，定期遍历所有对象并检查数据完整性：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 配置扫描器速度（默认为 default）</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 可选值：fastest, fast, default, slow, slowest</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_SCANNER_SPEED</span><span class="op">=</span>default</span></code></pre></div>
+            <p>扫描器的工作逻辑：</p>
+            <ol type="1">
+            <li><strong>周期性扫描</strong>：默认每 30
+            天完成一次全量扫描。</li>
+            <li><strong>增量优先</strong>：优先扫描最近修改的对象和已知有问题的磁盘。</li>
+            <li><strong>限速机制</strong>：根据
+            <code>MINIO_SCANNER_SPEED</code> 配置自动调节 I/O
+            速率，避免影响前台读写性能。</li>
+            <li><strong>自动修复</strong>：发现问题后自动触发修复，无需管理员干预。</li>
+            </ol>
+            <h3 id="手动触发修复">5.4 手动触发修复</h3>
+            <p>管理员也可以通过 <code>mc</code>
+            命令行工具手动触发修复：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 修复整个集群</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin heal <span class="at">-r</span> mycluster/</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 修复指定桶</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin heal <span class="at">-r</span> mycluster/mybucket</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 修复指定对象</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin heal mycluster/mybucket/myobject</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看修复状态</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin heal mycluster/ <span class="at">--json</span> <span class="kw">|</span> <span class="ex">jq</span> <span class="st">&#39;.items_healed&#39;</span></span></code></pre></div>
+            <h3 id="磁盘更换流程">5.5 磁盘更换流程</h3>
+            <p>当某块磁盘发生物理故障需要更换时，操作流程如下：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 确认故障磁盘</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin info mycluster/ <span class="at">--json</span> <span class="kw">|</span> <span class="ex">jq</span> <span class="st">&#39;.info.servers[].drives[] | select(.state == &quot;offline&quot;)&#39;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 物理更换磁盘后，格式化为 XFS</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> /dev/sdX</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> /dev/sdX /data/driveN</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. MinIO 自动检测到新盘并开始修复</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 可以通过日志或 mc 命令监控修复进度</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin trace mycluster/ <span class="at">--call</span> healing</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 修复完成后验证</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin heal mycluster/ <span class="at">--dry-run</span></span></code></pre></div>
+            <hr />
+            <h2
+            id="六对象版本控制与生命周期">六、对象版本控制与生命周期</h2>
+            <h3 id="版本控制object-versioning">6.1 版本控制（Object
+            Versioning）</h3>
+            <p>MinIO 完整支持 S3
+            对象版本控制语义。启用版本控制后，每次对象写入都会生成一个新版本，而非覆盖旧数据。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 通过 mc 启用桶版本控制</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> version enable mycluster/mybucket</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看对象的所有版本</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> ls <span class="at">--versions</span> mycluster/mybucket/myobject</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 下载指定版本</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> cp <span class="at">--version-id</span> <span class="st">&quot;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&quot;</span> mycluster/mybucket/myobject ./local_file</span></code></pre></div>
+            <p>版本控制在磁盘上的存储方式：</p>
+            <pre class="text"><code>/data/drive1/mybucket/myobject/
+  └── xl.meta          // 包含所有版本的元数据
+                        // Versions[] 数组中每个元素对应一个版本
+
+/data/drive1/mybucket/myobject/
+  ├── &lt;version-uuid-1&gt;/part.1   // 版本 1 的数据分片
+  ├── &lt;version-uuid-2&gt;/part.1   // 版本 2 的数据分片
+  └── ...</code></pre>
+            <h3 id="删除标记delete-marker">6.2 删除标记（Delete
+            Marker）</h3>
+            <p>启用版本控制的桶中，删除对象不会真正删除数据，而是创建一个删除标记（Delete
+            Marker）：</p>
+            <ul>
+            <li>后续对该对象的 GET 请求会返回 404 状态码。</li>
+            <li>列举桶内容时，该对象不会出现在默认列表中。</li>
+            <li>通过版本列表仍然可以看到所有历史版本和删除标记。</li>
+            <li>真正回收存储空间需要通过生命周期规则或手动删除指定版本。</li>
+            </ul>
+            <h3 id="生命周期管理lifecycle-management">6.3
+            生命周期管理（Lifecycle Management）</h3>
+            <p>MinIO 支持 S3 生命周期配置，用于自动化数据管理：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode json"><code class="sourceCode json"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;Rules&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;ID&quot;</span><span class="fu">:</span> <span class="st">&quot;expire-old-versions&quot;</span><span class="fu">,</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Status&quot;</span><span class="fu">:</span> <span class="st">&quot;Enabled&quot;</span><span class="fu">,</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;NoncurrentVersionExpiration&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;NoncurrentDays&quot;</span><span class="fu">:</span> <span class="dv">30</span><span class="fu">,</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;NewerNoncurrentVersions&quot;</span><span class="fu">:</span> <span class="dv">5</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;ID&quot;</span><span class="fu">:</span> <span class="st">&quot;expire-delete-markers&quot;</span><span class="fu">,</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Status&quot;</span><span class="fu">:</span> <span class="st">&quot;Enabled&quot;</span><span class="fu">,</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Expiration&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;ExpiredObjectDeleteMarker&quot;</span><span class="fu">:</span> <span class="kw">true</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;ID&quot;</span><span class="fu">:</span> <span class="st">&quot;transition-to-cold&quot;</span><span class="fu">,</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Status&quot;</span><span class="fu">:</span> <span class="st">&quot;Enabled&quot;</span><span class="fu">,</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Transition&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;Days&quot;</span><span class="fu">:</span> <span class="dv">90</span><span class="fu">,</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;StorageClass&quot;</span><span class="fu">:</span> <span class="st">&quot;COLD_TIER&quot;</span></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+            <p>生命周期规则支持的操作类型：</p>
+            <ul>
+            <li><strong>过期删除（Expiration）</strong>：在指定天数后删除对象或非当前版本。</li>
+            <li><strong>存储层转换（Transition）</strong>：将对象迁移到远程存储层（如另一个
+            S3 兼容系统或 Azure Blob Storage）。</li>
+            <li><strong>删除标记清理</strong>：自动清理孤立的删除标记。</li>
+            <li><strong>不完整上传清理（AbortIncompleteMultipartUpload）</strong>：清理超时未完成的多段上传。</li>
+            </ul>
+            <h3 id="对象锁定object-locking">6.4 对象锁定（Object
+            Locking）</h3>
+            <p>MinIO 支持 S3 对象锁定（WORM，Write Once Read
+            Many），用于合规性场景：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建启用对象锁定的桶</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> mb <span class="at">--with-lock</span> mycluster/compliance-bucket</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置默认保留策略</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> retention set <span class="at">--default</span> COMPLIANCE 365d mycluster/compliance-bucket</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 对单个对象设置保留</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> retention set GOVERNANCE 30d mycluster/compliance-bucket/report.pdf</span></code></pre></div>
+            <p>两种保留模式：</p>
+            <ul>
+            <li><strong>合规模式（Compliance）</strong>：任何人（包括
+            root 用户）在保留期内都无法删除或修改对象。</li>
+            <li><strong>治理模式（Governance）</strong>：具有特定权限的用户可以绕过保留策略。</li>
+            </ul>
+            <hr />
+            <h2 id="七minio-iam-与策略系统">七、MinIO IAM
+            与策略系统</h2>
+            <h3 id="身份与访问管理概述">7.1 身份与访问管理概述</h3>
+            <p>MinIO 的身份与访问管理（Identity and Access
+            Management，IAM）系统遵循 AWS IAM
+            的设计理念，提供细粒度的访问控制能力：</p>
+            <pre class="text"><code>IAM 体系结构：
+
+  ┌──────────────┐
+  │  外部 IdP     │  LDAP / OpenID Connect / Active Directory
+  └──────┬───────┘
+         │ 联邦认证
+         ▼
+  ┌──────────────┐
+  │  STS 服务     │  临时凭证签发
+  └──────┬───────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────┐
+  │  MinIO IAM                                    │
+  │                                               │
+  │  ┌────────┐    ┌────────┐    ┌────────────┐  │
+  │  │ 用户    │───→│ 组      │───→│ 策略        │  │
+  │  │ (User)  │    │ (Group) │    │ (Policy)    │  │
+  │  └────────┘    └────────┘    └────────────┘  │
+  │       │                           │           │
+  │       └───────── 直接关联 ─────────┘           │
+  └─────────────────────────────────────────────┘</code></pre>
+            <h3 id="内置策略">7.2 内置策略</h3>
+            <p>MinIO 提供以下内置策略（Built-in Policies）：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看所有内置策略</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin policy ls mycluster/</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 内置策略列表：</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="co"># - readwrite     : 完全读写权限</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="co"># - readonly      : 只读权限</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="co"># - writeonly     : 只写权限</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="co"># - diagnostics   : 诊断信息访问权限</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a><span class="co"># - consoleAdmin  : 控制台管理权限</span></span></code></pre></div>
+            <h3 id="自定义策略">7.3 自定义策略</h3>
+            <p>MinIO 支持与 AWS IAM 策略语法兼容的 JSON 策略文档：</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode json"><code class="sourceCode json"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;Version&quot;</span><span class="fu">:</span> <span class="st">&quot;2012-10-17&quot;</span><span class="fu">,</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;Statement&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Effect&quot;</span><span class="fu">:</span> <span class="st">&quot;Allow&quot;</span><span class="fu">,</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Action&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;s3:GetObject&quot;</span><span class="ot">,</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;s3:ListBucket&quot;</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Resource&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;arn:aws:s3:::data-lake&quot;</span><span class="ot">,</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;arn:aws:s3:::data-lake/*&quot;</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Condition&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;StringLike&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;s3:prefix&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;public/*&quot;</span><span class="ot">,</span> <span class="st">&quot;shared/*&quot;</span><span class="ot">]</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>        <span class="fu">},</span></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;IpAddress&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;aws:SourceIp&quot;</span><span class="fu">:</span> <span class="st">&quot;10.0.0.0/8&quot;</span></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a>        <span class="fu">}</span></span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb20-24"><a href="#cb20-24" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Effect&quot;</span><span class="fu">:</span> <span class="st">&quot;Deny&quot;</span><span class="fu">,</span></span>
+<span id="cb20-25"><a href="#cb20-25" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Action&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb20-26"><a href="#cb20-26" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;s3:DeleteObject&quot;</span><span class="ot">,</span></span>
+<span id="cb20-27"><a href="#cb20-27" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;s3:DeleteBucket&quot;</span></span>
+<span id="cb20-28"><a href="#cb20-28" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb20-29"><a href="#cb20-29" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Resource&quot;</span><span class="fu">:</span> <span class="st">&quot;arn:aws:s3:::*&quot;</span></span>
+<span id="cb20-30"><a href="#cb20-30" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb20-31"><a href="#cb20-31" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb20-32"><a href="#cb20-32" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+            <p>策略管理操作：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建自定义策略</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin policy create mycluster/ data-reader ./data-reader-policy.json</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 将策略关联到用户</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin policy attach mycluster/ data-reader <span class="at">--user</span><span class="op">=</span>analyst01</span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 将策略关联到组</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin policy attach mycluster/ data-reader <span class="at">--group</span><span class="op">=</span>analytics-team</span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看用户的有效策略</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin user info mycluster/ analyst01</span></code></pre></div>
+            <h3 id="用户与组管理">7.4 用户与组管理</h3>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建用户</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin user add mycluster/ newuser newpassword123</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建组并添加成员</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin group add mycluster/ dev-team user1 user2 user3</span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用用户</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin user disable mycluster/ newuser</span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看组成员</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin group info mycluster/ dev-team</span></code></pre></div>
+            <h3 id="stssecurity-token-service">7.5 STS（Security Token
+            Service）</h3>
+            <p>MinIO 支持 STS
+            协议，用于签发临时安全凭证。常见的使用场景包括：</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># AssumeRoleWithWebIdentity：通过 OpenID Connect 令牌获取临时凭证</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> POST <span class="st">&quot;https://minio.example.com&quot;</span> <span class="dt">\</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&quot;Action=AssumeRoleWithWebIdentity&quot;</span> <span class="dt">\</span></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&quot;WebIdentityToken=</span><span class="va">${OIDC_TOKEN}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&quot;Version=2011-06-15&quot;</span> <span class="dt">\</span></span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-urlencode</span> <span class="st">&quot;DurationSeconds=3600&quot;</span></span></code></pre></div>
+            <p>STS 支持的认证源：</p>
+            <ul>
+            <li><strong>OpenID Connect（OIDC）</strong>：对接
+            Keycloak、Okta、Auth0 等身份提供商。</li>
+            <li><strong>LDAP/Active
+            Directory</strong>：企业内部目录服务集成。</li>
+            <li><strong>客户端证书（Client TLS
+            Certificate）</strong>：基于 X.509 证书的认证。</li>
+            </ul>
+            <h3 id="桶策略与访问控制列表">7.6 桶策略与访问控制列表</h3>
+            <p>除了 IAM 策略，MinIO 还支持桶级别的访问控制：</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置桶为公开只读</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> anonymous set download mycluster/public-assets</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置自定义桶策略</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> anonymous set-json ./bucket-policy.json mycluster/mybucket</span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看桶策略</span></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> anonymous get-json mycluster/mybucket</span></code></pre></div>
+            <hr />
+            <h2 id="八minio-集群部署实战">八、MinIO 集群部署实战</h2>
+            <h3 id="硬件规划">8.1 硬件规划</h3>
+            <p>生产环境部署 MinIO 的硬件推荐：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>组件</th>
+            <th>最低配置</th>
+            <th>推荐配置</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>CPU</td>
+            <td>8 核</td>
+            <td>16~32 核</td>
+            <td>纠删码编解码为 CPU 密集操作</td>
+            </tr>
+            <tr>
+            <td>内存</td>
+            <td>16GB</td>
+            <td>32~64GB</td>
+            <td>主要用于缓存和并发连接管理</td>
+            </tr>
+            <tr>
+            <td>系统盘</td>
+            <td>100GB SSD</td>
+            <td>200GB NVMe</td>
+            <td>存放操作系统和 MinIO 二进制</td>
+            </tr>
+            <tr>
+            <td>数据盘</td>
+            <td>4×1TB HDD</td>
+            <td>8~16×4TB NVMe/SSD</td>
+            <td>XFS 格式，独占挂载点</td>
+            </tr>
+            <tr>
+            <td>网络</td>
+            <td>10GbE</td>
+            <td>25GbE / 100GbE</td>
+            <td>节点间数据同步对网络带宽要求高</td>
+            </tr>
+            <tr>
+            <td>节点数</td>
+            <td>4</td>
+            <td>8~16</td>
+            <td>最少 4 节点以满足分布式纠删码要求</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="多节点部署">8.2 多节点部署</h3>
+            <p>以下是一个 4 节点、每节点 4 盘的生产部署示例：</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="co"># deploy_minio.sh - MinIO 集群部署脚本</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 环境变量配置</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_ROOT_USER</span><span class="op">=</span><span class="st">&quot;minioadmin&quot;</span></span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_ROOT_PASSWORD</span><span class="op">=</span><span class="st">&quot;CHANGE_ME_TO_A_STRONG_PASSWORD&quot;</span></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 存储类别配置</span></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_STORAGE_CLASS_STANDARD</span><span class="op">=</span><span class="st">&quot;EC:4&quot;</span></span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 区域配置</span></span>
+<span id="cb25-12"><a href="#cb25-12" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_REGION</span><span class="op">=</span><span class="st">&quot;cn-east-1&quot;</span></span>
+<span id="cb25-13"><a href="#cb25-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-14"><a href="#cb25-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 日志级别</span></span>
+<span id="cb25-15"><a href="#cb25-15" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_LOGGER_WEBHOOK_ENABLE_default</span><span class="op">=</span><span class="st">&quot;on&quot;</span></span>
+<span id="cb25-16"><a href="#cb25-16" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_LOGGER_WEBHOOK_ENDPOINT_default</span><span class="op">=</span><span class="st">&quot;http://logstash.internal:8080/minio&quot;</span></span>
+<span id="cb25-17"><a href="#cb25-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-18"><a href="#cb25-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 启动 MinIO（在每个节点上执行）</span></span>
+<span id="cb25-19"><a href="#cb25-19" aria-hidden="true" tabindex="-1"></a><span class="ex">minio</span> server <span class="dt">\</span></span>
+<span id="cb25-20"><a href="#cb25-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">--address</span> <span class="st">&quot;:9000&quot;</span> <span class="dt">\</span></span>
+<span id="cb25-21"><a href="#cb25-21" aria-hidden="true" tabindex="-1"></a>  <span class="at">--console-address</span> <span class="st">&quot;:9001&quot;</span> <span class="dt">\</span></span>
+<span id="cb25-22"><a href="#cb25-22" aria-hidden="true" tabindex="-1"></a>  http://minio{1...4}.example.com/data{1...4}</span></code></pre></div>
+            <h3 id="systemd-服务配置">8.3 Systemd 服务配置</h3>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/systemd/system/minio.service</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">MinIO Object Storage</span></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a><span class="dt">Documentation</span><span class="ot">=</span><span class="st">https://min.io/docs</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a><span class="dt">Wants</span><span class="ot">=</span><span class="st">network-online.target</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a><span class="dt">After</span><span class="ot">=</span><span class="st">network-online.target</span></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a><span class="dt">Type</span><span class="ot">=</span><span class="st">notify</span></span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a><span class="dt">User</span><span class="ot">=</span><span class="st">minio-user</span></span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a><span class="dt">Group</span><span class="ot">=</span><span class="st">minio-user</span></span>
+<span id="cb26-12"><a href="#cb26-12" aria-hidden="true" tabindex="-1"></a><span class="dt">EnvironmentFile</span><span class="ot">=</span><span class="st">/etc/default/minio</span></span>
+<span id="cb26-13"><a href="#cb26-13" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">/usr/local/bin/minio server --config-dir /etc/minio $MINIO_OPTS</span></span>
+<span id="cb26-14"><a href="#cb26-14" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">always</span></span>
+<span id="cb26-15"><a href="#cb26-15" aria-hidden="true" tabindex="-1"></a><span class="dt">RestartSec</span><span class="ot">=</span><span class="dv">5</span></span>
+<span id="cb26-16"><a href="#cb26-16" aria-hidden="true" tabindex="-1"></a><span class="dt">LimitNOFILE</span><span class="ot">=</span><span class="dv">65536</span></span>
+<span id="cb26-17"><a href="#cb26-17" aria-hidden="true" tabindex="-1"></a><span class="dt">TasksMax</span><span class="ot">=</span><span class="st">infinity</span></span>
+<span id="cb26-18"><a href="#cb26-18" aria-hidden="true" tabindex="-1"></a><span class="dt">TimeoutStartSec</span><span class="ot">=</span><span class="dv">0</span></span>
+<span id="cb26-19"><a href="#cb26-19" aria-hidden="true" tabindex="-1"></a><span class="dt">TimeoutStopSec</span><span class="ot">=</span><span class="dv">120</span></span>
+<span id="cb26-20"><a href="#cb26-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-21"><a href="#cb26-21" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
+<span id="cb26-22"><a href="#cb26-22" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">multi-user.target</span></span></code></pre></div>
+            <p>对应的环境变量文件：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/default/minio</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="va">MINIO_ROOT_USER</span><span class="op">=</span>minioadmin</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="va">MINIO_ROOT_PASSWORD</span><span class="op">=</span>CHANGE_ME_TO_A_STRONG_PASSWORD</span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="va">MINIO_VOLUMES</span><span class="op">=</span><span class="st">&quot;http://minio{1...4}.example.com/data{1...4}&quot;</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="va">MINIO_OPTS</span><span class="op">=</span><span class="st">&quot;--address :9000 --console-address :9001&quot;</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a><span class="va">MINIO_STORAGE_CLASS_STANDARD</span><span class="op">=</span><span class="st">&quot;EC:4&quot;</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a><span class="va">MINIO_REGION</span><span class="op">=</span><span class="st">&quot;cn-east-1&quot;</span></span></code></pre></div>
+            <h3 id="tls-加密配置">8.4 TLS 加密配置</h3>
+            <p>生产环境必须启用 TLS 传输加密：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 准备证书文件</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="co"># MinIO 默认从以下路径加载证书：</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="co">#   ${HOME}/.minio/certs/public.crt</span></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co">#   ${HOME}/.minio/certs/private.key</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 也可通过 --certs-dir 参数指定证书目录</span></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 生成自签名证书（测试环境）</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> req <span class="at">-x509</span> <span class="at">-nodes</span> <span class="at">-days</span> 365 <span class="dt">\</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-newkey</span> rsa:2048 <span class="dt">\</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-keyout</span> private.key <span class="dt">\</span></span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">-out</span> public.crt <span class="dt">\</span></span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">-subj</span> <span class="st">&quot;/CN=minio.example.com&quot;</span> <span class="dt">\</span></span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">-addext</span> <span class="st">&quot;subjectAltName=DNS:minio1.example.com,DNS:minio2.example.com,DNS:minio3.example.com,DNS:minio4.example.com&quot;</span></span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 部署证书</span></span>
+<span id="cb28-16"><a href="#cb28-16" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /home/minio-user/.minio/certs</span>
+<span id="cb28-17"><a href="#cb28-17" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> public.crt private.key /home/minio-user/.minio/certs/</span>
+<span id="cb28-18"><a href="#cb28-18" aria-hidden="true" tabindex="-1"></a><span class="fu">chown</span> <span class="at">-R</span> minio-user:minio-user /home/minio-user/.minio/certs</span>
+<span id="cb28-19"><a href="#cb28-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-20"><a href="#cb28-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 如果使用自签名 CA，将 CA 证书放入</span></span>
+<span id="cb28-21"><a href="#cb28-21" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> ca.crt /home/minio-user/.minio/certs/CAs/</span></code></pre></div>
+            <h3 id="nginx-负载均衡配置">8.5 Nginx 负载均衡配置</h3>
+            <pre class="nginx"><code># /etc/nginx/conf.d/minio.conf
+
+upstream minio_s3 {
+    least_conn;
+    server minio1.example.com:9000;
+    server minio2.example.com:9000;
+    server minio3.example.com:9000;
+    server minio4.example.com:9000;
+}
+
+upstream minio_console {
+    least_conn;
+    server minio1.example.com:9001;
+    server minio2.example.com:9001;
+    server minio3.example.com:9001;
+    server minio4.example.com:9001;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name s3.example.com;
+
+    ssl_certificate     /etc/nginx/certs/s3.example.com.crt;
+    ssl_certificate_key /etc/nginx/certs/s3.example.com.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # 允许大文件上传
+    client_max_body_size 0;
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    location / {
+        proxy_pass https://minio_s3;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 300s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name console.example.com;
+
+    ssl_certificate     /etc/nginx/certs/console.example.com.crt;
+    ssl_certificate_key /etc/nginx/certs/console.example.com.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    location / {
+        proxy_pass https://minio_console;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket 支持（控制台需要）
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection &quot;upgrade&quot;;
+    }
+}</code></pre>
+            <h3 id="kubernetes-部署">8.6 Kubernetes 部署</h3>
+            <p>使用 MinIO Operator 在 Kubernetes 上部署：</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co"># minio-tenant.yaml</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> minio.min.io/v2</span></span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Tenant</span></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> minio-production</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> minio-system</span></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image</span><span class="kw">:</span><span class="at"> quay.io/minio/minio:latest</span></span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pools</span><span class="kw">:</span></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> pool-0</span></span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">servers</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb30-12"><a href="#cb30-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">volumesPerServer</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb30-13"><a href="#cb30-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">volumeClaimTemplate</span><span class="kw">:</span></span>
+<span id="cb30-14"><a href="#cb30-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb30-15"><a href="#cb30-15" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">name</span><span class="kw">:</span><span class="at"> data</span></span>
+<span id="cb30-16"><a href="#cb30-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb30-17"><a href="#cb30-17" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">accessModes</span><span class="kw">:</span></span>
+<span id="cb30-18"><a href="#cb30-18" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> ReadWriteOnce</span></span>
+<span id="cb30-19"><a href="#cb30-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb30-20"><a href="#cb30-20" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb30-21"><a href="#cb30-21" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">storage</span><span class="kw">:</span><span class="at"> 1Ti</span></span>
+<span id="cb30-22"><a href="#cb30-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">storageClassName</span><span class="kw">:</span><span class="at"> directpv-min-io</span></span>
+<span id="cb30-23"><a href="#cb30-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb30-24"><a href="#cb30-24" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb30-25"><a href="#cb30-25" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;4&quot;</span></span>
+<span id="cb30-26"><a href="#cb30-26" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 16Gi</span></span>
+<span id="cb30-27"><a href="#cb30-27" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb30-28"><a href="#cb30-28" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;8&quot;</span></span>
+<span id="cb30-29"><a href="#cb30-29" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 32Gi</span></span>
+<span id="cb30-30"><a href="#cb30-30" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">mountPath</span><span class="kw">:</span><span class="at"> /export</span></span>
+<span id="cb30-31"><a href="#cb30-31" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">requestAutoCert</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb30-32"><a href="#cb30-32" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">features</span><span class="kw">:</span></span>
+<span id="cb30-33"><a href="#cb30-33" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">bucketDNS</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb30-34"><a href="#cb30-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">domains</span><span class="kw">:</span></span>
+<span id="cb30-35"><a href="#cb30-35" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">minio</span><span class="kw">:</span></span>
+<span id="cb30-36"><a href="#cb30-36" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> s3.example.com</span></span>
+<span id="cb30-37"><a href="#cb30-37" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">console</span><span class="kw">:</span><span class="at"> console.example.com</span></span>
+<span id="cb30-38"><a href="#cb30-38" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb30-39"><a href="#cb30-39" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> MINIO_STORAGE_CLASS_STANDARD</span></span>
+<span id="cb30-40"><a href="#cb30-40" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;EC:4&quot;</span></span>
+<span id="cb30-41"><a href="#cb30-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> MINIO_REGION</span></span>
+<span id="cb30-42"><a href="#cb30-42" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">value</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;cn-east-1&quot;</span></span></code></pre></div>
+            <hr />
+            <h2 id="九minio-性能调优与监控">九、MinIO
+            性能调优与监控</h2>
+            <h3 id="性能调优要点">9.1 性能调优要点</h3>
+            <p><strong>操作系统层面</strong>：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 调整文件描述符限制</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;minio-user soft nofile 1048576&quot;</span> <span class="op">&gt;&gt;</span> /etc/security/limits.conf</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;minio-user hard nofile 1048576&quot;</span> <span class="op">&gt;&gt;</span> /etc/security/limits.conf</span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 禁用 THP（Transparent Huge Pages）</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> never <span class="op">&gt;</span> /sys/kernel/mm/transparent_hugepage/enabled</span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> never <span class="op">&gt;</span> /sys/kernel/mm/transparent_hugepage/defrag</span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 网络优化</span></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> net.core.somaxconn=65535</span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> net.ipv4.tcp_max_syn_backlog=65535</span>
+<span id="cb31-12"><a href="#cb31-12" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> net.core.rmem_max=16777216</span>
+<span id="cb31-13"><a href="#cb31-13" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> net.core.wmem_max=16777216</span>
+<span id="cb31-14"><a href="#cb31-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-15"><a href="#cb31-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. XFS 挂载参数优化</span></span>
+<span id="cb31-16"><a href="#cb31-16" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/fstab 中添加：</span></span>
+<span id="cb31-17"><a href="#cb31-17" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/sdX /data/driveN xfs defaults,noatime,nodiratime,logbufs=8,logbsize=256k 0 0</span></span></code></pre></div>
+            <p><strong>MinIO
+            层面</strong>（环境变量名随版本增减，上线前用目标 release
+            的文档核对；过期项不要从旧博客照抄）：</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 并发与超时类配置示例——数值不是通用最优解</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_API_REQUESTS_MAX</span><span class="op">=</span>1600</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_API_REQUESTS_DEADLINE</span><span class="op">=</span>10s</span></code></pre></div>
+            <p>不要把「某次实验室配置」写成集群默认。缓存类、<code>DRIVE_SYNC</code>
+            类开关在不同 release
+            中存在过实验或移除路径，本文不列出未在当前文档交叉核对的变量。</p>
+            <h3 id="warp怎么测而不是抄谁的数字">9.2
+            warp：怎么测，而不是抄谁的数字</h3>
+            <p><code>warp</code>（<a
+            href="https://github.com/minio/warp"
+            class="uri">https://github.com/minio/warp</a>）是 MinIO
+            维护的 S3
+            负载工具。本节只给可执行模板；<strong>下面没有附带任何吞吐或延迟数字</strong>——那些数字离开盘型、EC、对象大小与并发设定没有意义，本文也未在本机复现。</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 安装（固定版本优于 @latest，便于复现）</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> install github.com/minio/warp@latest</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 混合读写：先固定 duration / concurrent / obj.size，再改一个变量重跑</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a><span class="ex">warp</span> mixed <span class="dt">\</span></span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--host</span><span class="op">=</span>s3.example.com:443 <span class="dt">\</span></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--tls</span> <span class="dt">\</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--access-key</span><span class="op">=</span>ACCESS <span class="dt">\</span></span>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--secret-key</span><span class="op">=</span>SECRET <span class="dt">\</span></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--obj.size</span><span class="op">=</span>1MiB <span class="dt">\</span></span>
+<span id="cb33-11"><a href="#cb33-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--duration</span><span class="op">=</span>5m <span class="dt">\</span></span>
+<span id="cb33-12"><a href="#cb33-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">--concurrent</span><span class="op">=</span>32 <span class="dt">\</span></span>
+<span id="cb33-13"><a href="#cb33-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">--get-distrib</span><span class="op">=</span>45 <span class="dt">\</span></span>
+<span id="cb33-14"><a href="#cb33-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">--put-distrib</span><span class="op">=</span>40 <span class="dt">\</span></span>
+<span id="cb33-15"><a href="#cb33-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">--stat-distrib</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb33-16"><a href="#cb33-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">--delete-distrib</span><span class="op">=</span>5 <span class="dt">\</span></span>
+<span id="cb33-17"><a href="#cb33-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">--benchdata</span> mixed-baseline.csv.zst</span>
+<span id="cb33-18"><a href="#cb33-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-19"><a href="#cb33-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 大对象与小对象分开测，避免平均吞吐掩盖 IOPS 瓶颈</span></span>
+<span id="cb33-20"><a href="#cb33-20" aria-hidden="true" tabindex="-1"></a><span class="ex">warp</span> put <span class="at">--host</span><span class="op">=</span>... <span class="at">--obj.size</span><span class="op">=</span>256MiB <span class="at">--concurrent</span><span class="op">=</span>16 <span class="at">--duration</span><span class="op">=</span>10m <span class="at">--benchdata</span> put-large.csv.zst</span>
+<span id="cb33-21"><a href="#cb33-21" aria-hidden="true" tabindex="-1"></a><span class="ex">warp</span> put <span class="at">--host</span><span class="op">=</span>... <span class="at">--obj.size</span><span class="op">=</span>4KiB   <span class="at">--concurrent</span><span class="op">=</span>64 <span class="at">--duration</span><span class="op">=</span>5m  <span class="at">--benchdata</span> put-small.csv.zst</span>
+<span id="cb33-22"><a href="#cb33-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-23"><a href="#cb33-23" aria-hidden="true" tabindex="-1"></a><span class="ex">warp</span> cmp mixed-baseline.csv.zst mixed-after.csv.zst</span></code></pre></div>
+            <p>报告里至少写清：MinIO release、节点与盘拓扑、EC 实际
+            parity、客户端机型与网卡、是否跨
+            NUMA、预热是否丢弃。缺这些字段的「GiB/s」只能当广告。</p>
+            <h3 id="prometheus-监控集成">9.3 Prometheus 监控集成</h3>
+            <p>MinIO 原生暴露 Prometheus 格式的监控指标（Metrics）：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># prometheus.yml 配置</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="fu">scrape_configs</span><span class="kw">:</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">job_name</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;minio-cluster&#39;</span></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metrics_path</span><span class="kw">:</span><span class="at"> /minio/v2/metrics/cluster</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scheme</span><span class="kw">:</span><span class="at"> https</span></span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">tls_config</span><span class="kw">:</span></span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">insecure_skip_verify</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">ca_file</span><span class="kw">:</span><span class="at"> /etc/prometheus/certs/ca.crt</span></span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">bearer_token</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;PROMETHEUS_BEARER_TOKEN&quot;</span></span>
+<span id="cb34-10"><a href="#cb34-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">static_configs</span><span class="kw">:</span></span>
+<span id="cb34-11"><a href="#cb34-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">targets</span><span class="kw">:</span></span>
+<span id="cb34-12"><a href="#cb34-12" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="st">&#39;s3.example.com:443&#39;</span></span>
+<span id="cb34-13"><a href="#cb34-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-14"><a href="#cb34-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">job_name</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;minio-node&#39;</span></span>
+<span id="cb34-15"><a href="#cb34-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metrics_path</span><span class="kw">:</span><span class="at"> /minio/v2/metrics/node</span></span>
+<span id="cb34-16"><a href="#cb34-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scheme</span><span class="kw">:</span><span class="at"> https</span></span>
+<span id="cb34-17"><a href="#cb34-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">tls_config</span><span class="kw">:</span></span>
+<span id="cb34-18"><a href="#cb34-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">insecure_skip_verify</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb34-19"><a href="#cb34-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">ca_file</span><span class="kw">:</span><span class="at"> /etc/prometheus/certs/ca.crt</span></span>
+<span id="cb34-20"><a href="#cb34-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">bearer_token</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;PROMETHEUS_BEARER_TOKEN&quot;</span></span>
+<span id="cb34-21"><a href="#cb34-21" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">static_configs</span><span class="kw">:</span></span>
+<span id="cb34-22"><a href="#cb34-22" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">targets</span><span class="kw">:</span></span>
+<span id="cb34-23"><a href="#cb34-23" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="st">&#39;minio1.example.com:9000&#39;</span></span>
+<span id="cb34-24"><a href="#cb34-24" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="st">&#39;minio2.example.com:9000&#39;</span></span>
+<span id="cb34-25"><a href="#cb34-25" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="st">&#39;minio3.example.com:9000&#39;</span></span>
+<span id="cb34-26"><a href="#cb34-26" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="st">&#39;minio4.example.com:9000&#39;</span></span>
+<span id="cb34-27"><a href="#cb34-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-28"><a href="#cb34-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">job_name</span><span class="kw">:</span><span class="at"> </span><span class="st">&#39;minio-bucket&#39;</span></span>
+<span id="cb34-29"><a href="#cb34-29" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metrics_path</span><span class="kw">:</span><span class="at"> /minio/v2/metrics/bucket</span></span>
+<span id="cb34-30"><a href="#cb34-30" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">scheme</span><span class="kw">:</span><span class="at"> https</span></span>
+<span id="cb34-31"><a href="#cb34-31" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">tls_config</span><span class="kw">:</span></span>
+<span id="cb34-32"><a href="#cb34-32" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">insecure_skip_verify</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb34-33"><a href="#cb34-33" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">ca_file</span><span class="kw">:</span><span class="at"> /etc/prometheus/certs/ca.crt</span></span>
+<span id="cb34-34"><a href="#cb34-34" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">bearer_token</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;PROMETHEUS_BEARER_TOKEN&quot;</span></span>
+<span id="cb34-35"><a href="#cb34-35" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">static_configs</span><span class="kw">:</span></span>
+<span id="cb34-36"><a href="#cb34-36" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">targets</span><span class="kw">:</span></span>
+<span id="cb34-37"><a href="#cb34-37" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="st">&#39;s3.example.com:443&#39;</span></span></code></pre></div>
+            <p>生成 Prometheus Bearer Token：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin prometheus generate mycluster/</span></code></pre></div>
+            <h3 id="关键监控指标">9.4 关键监控指标</h3>
+            <p>以下是生产环境中需要重点关注的监控指标：</p>
+            <table>
+            <colgroup>
+            <col style="width: 28%" />
+            <col style="width: 17%" />
+            <col style="width: 17%" />
+            <col style="width: 37%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>指标名称</th>
+            <th>类型</th>
+            <th>含义</th>
+            <th>告警阈值建议</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>minio_node_drive_free_bytes</code></td>
+            <td>Gauge</td>
+            <td>磁盘剩余空间</td>
+            <td>&lt; 10% 容量</td>
+            </tr>
+            <tr>
+            <td><code>minio_node_drive_errors_total</code></td>
+            <td>Counter</td>
+            <td>磁盘 I/O 错误累计</td>
+            <td>&gt; 0 且持续增长</td>
+            </tr>
+            <tr>
+            <td><code>minio_s3_requests_total</code></td>
+            <td>Counter</td>
+            <td>S3 请求总数</td>
+            <td>用于趋势分析</td>
+            </tr>
+            <tr>
+            <td><code>minio_s3_requests_errors_total</code></td>
+            <td>Counter</td>
+            <td>S3 请求错误总数</td>
+            <td>错误率 &gt; 1%</td>
+            </tr>
+            <tr>
+            <td><code>minio_s3_ttfb_seconds</code></td>
+            <td>Histogram</td>
+            <td>首字节响应时间</td>
+            <td>P99 &gt; 500ms</td>
+            </tr>
+            <tr>
+            <td><code>minio_node_process_cpu_total_seconds</code></td>
+            <td>Counter</td>
+            <td>CPU 使用时间</td>
+            <td>持续 &gt; 80%</td>
+            </tr>
+            <tr>
+            <td><code>minio_node_process_resident_memory_bytes</code></td>
+            <td>Gauge</td>
+            <td>内存使用量</td>
+            <td>&gt; 80% 物理内存</td>
+            </tr>
+            <tr>
+            <td><code>minio_cluster_heal_objects_total</code></td>
+            <td>Counter</td>
+            <td>修复对象总数</td>
+            <td>用于修复进度追踪</td>
+            </tr>
+            <tr>
+            <td><code>minio_cluster_disk_offline_total</code></td>
+            <td>Gauge</td>
+            <td>离线磁盘数量</td>
+            <td>&gt; 0</td>
+            </tr>
+            <tr>
+            <td><code>minio_bucket_usage_total_bytes</code></td>
+            <td>Gauge</td>
+            <td>桶使用量</td>
+            <td>接近配额限制</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="grafana-仪表板">9.5 Grafana 仪表板</h3>
+            <p>MinIO 官方提供了预构建的 Grafana
+            仪表板（Dashboard），可以从 Grafana 仪表板市场导入：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 仪表板 ID（从 Grafana 官方市场获取）</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="co"># MinIO Dashboard: 13502</span></span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a><span class="co"># MinIO Bucket Dashboard: 19237</span></span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a><span class="co"># MinIO Node Dashboard: 19238</span></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 通过 Grafana API 导入</span></span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> POST http://grafana.internal:3000/api/dashboards/import <span class="dt">\</span></span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&quot;Content-Type: application/json&quot;</span> <span class="dt">\</span></span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">${GRAFANA_API_KEY}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{</span></span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;dashboard&quot;: {&quot;id&quot;: 13502},</span></span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;overwrite&quot;: true,</span></span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;inputs&quot;: [</span></span>
+<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a><span class="st">      {&quot;name&quot;: &quot;DS_PROMETHEUS&quot;, &quot;type&quot;: &quot;datasource&quot;, &quot;pluginId&quot;: &quot;prometheus&quot;, &quot;value&quot;: &quot;Prometheus&quot;}</span></span>
+<span id="cb36-15"><a href="#cb36-15" aria-hidden="true" tabindex="-1"></a><span class="st">    ]</span></span>
+<span id="cb36-16"><a href="#cb36-16" aria-hidden="true" tabindex="-1"></a><span class="st">  }&#39;</span></span></code></pre></div>
+            <hr />
+            <h2 id="十多站点复制">十、多站点复制</h2>
+            <h3 id="复制架构概述">10.1 复制架构概述</h3>
+            <p>MinIO 的站点复制（Site Replication）支持在多个独立的
+            MinIO 集群之间同步数据和配置。它主要解决以下场景：</p>
+            <ul>
+            <li><strong>地理灾备（Geo-DR）</strong>：在不同地域部署多个集群，任一站点故障时其他站点可以接管服务。</li>
+            <li><strong>数据就近访问</strong>：在多地部署读副本，减少跨地域访问延迟。</li>
+            <li><strong>合规性要求</strong>：满足数据主权法规，将数据副本存储在特定地理区域。</li>
+            </ul>
+            <h3 id="站点复制模式">10.2 站点复制模式</h3>
+            <p>MinIO 支持两种复制模式：</p>
+            <p><strong>桶复制（Bucket
+            Replication）</strong>：针对特定桶配置复制规则，支持细粒度控制。</p>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加远程目标</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin bucket remote add mycluster/mybucket <span class="dt">\</span></span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a>  https://repl-user:repl-password@remote-minio.example.com/mybucket <span class="dt">\</span></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--service</span> replication <span class="dt">\</span></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--region</span> cn-west-1</span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 配置复制规则</span></span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> replicate add mycluster/mybucket <span class="dt">\</span></span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--remote-bucket</span> mybucket <span class="dt">\</span></span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--replicate</span> <span class="st">&quot;delete,delete-marker,existing-objects,metadata-sync&quot;</span></span></code></pre></div>
+            <p><strong>站点复制（Site
+            Replication）</strong>：全集群级别的复制，同步所有桶、对象、IAM
+            策略、桶策略等。</p>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 在三个站点之间建立站点复制</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin replicate add <span class="dt">\</span></span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a>  site1 site2 site3</span>
+<span id="cb38-4"><a href="#cb38-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb38-5"><a href="#cb38-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看复制状态</span></span>
+<span id="cb38-6"><a href="#cb38-6" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin replicate info site1</span>
+<span id="cb38-7"><a href="#cb38-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb38-8"><a href="#cb38-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看复制状态详情</span></span>
+<span id="cb38-9"><a href="#cb38-9" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin replicate status site1</span>
+<span id="cb38-10"><a href="#cb38-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb38-11"><a href="#cb38-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 删除站点复制关系</span></span>
+<span id="cb38-12"><a href="#cb38-12" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin replicate remove site1 <span class="at">--site</span> site3 <span class="at">--force</span></span></code></pre></div>
+            <h3 id="复制机制深入">10.3 复制机制深入</h3>
+            <p>站点复制的工作原理如下：</p>
+            <pre class="text"><code>站点复制数据流：
+
+  Site A (cn-east-1)          Site B (cn-west-1)          Site C (cn-south-1)
+  ┌──────────────┐            ┌──────────────┐            ┌──────────────┐
+  │              │◄──────────►│              │◄──────────►│              │
+  │  MinIO 集群   │   双向复制  │  MinIO 集群   │   双向复制  │  MinIO 集群   │
+  │              │            │              │            │              │
+  └──────────────┘            └──────────────┘            └──────────────┘
+
+同步内容：
+  1. 对象数据和元数据（包括版本）
+  2. 删除标记
+  3. 桶配置（策略、加密、版本控制）
+  4. IAM 用户、组、策略
+  5. 对象锁定配置</code></pre>
+            <p>复制的一致性保证：</p>
+            <ul>
+            <li><strong>最终一致性（Eventual
+            Consistency）</strong>：复制操作是异步的，存在短暂的延迟窗口。</li>
+            <li><strong>冲突解决</strong>：基于版本 UUID
+            和时间戳的确定性冲突解决策略。后写入的版本优先（Last Writer
+            Wins）。</li>
+            <li><strong>带宽控制</strong>：可以限制复制使用的网络带宽，避免影响前台业务。</li>
+            </ul>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置复制带宽限制</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin config set mycluster/ api replication_max_workers=4</span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin config set mycluster/ api replication_priority=auto</span></code></pre></div>
+            <h3 id="灾备切换实战">10.4 灾备切换实战</h3>
+            <p>以下是一个双站点灾备切换的实战场景：</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 正常运行时，客户端通过 DNS 解析到 Site A</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="co"># s3.example.com → Site A (cn-east-1)</span></span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Site A 发生故障时的切换步骤：</span></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 确认 Site A 不可用</span></span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin info siteA/ <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-q</span> <span class="st">&quot;error&quot;</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> <span class="st">&quot;Site A is DOWN&quot;</span></span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 检查 Site B 的复制延迟</span></span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin replicate status siteB/ <span class="at">--bucket</span> mybucket</span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-12"><a href="#cb41-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 切换 DNS 指向 Site B</span></span>
+<span id="cb41-13"><a href="#cb41-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 通过 DNS 提供商 API 或手动修改：</span></span>
+<span id="cb41-14"><a href="#cb41-14" aria-hidden="true" tabindex="-1"></a><span class="co"># s3.example.com → Site B (cn-west-1)</span></span>
+<span id="cb41-15"><a href="#cb41-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-16"><a href="#cb41-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 验证 Site B 服务正常</span></span>
+<span id="cb41-17"><a href="#cb41-17" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> ls siteB/mybucket <span class="at">--summarize</span></span>
+<span id="cb41-18"><a href="#cb41-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-19"><a href="#cb41-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. Site A 恢复后，重新加入复制</span></span>
+<span id="cb41-20"><a href="#cb41-20" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin replicate resync start siteA/ <span class="at">--site</span> siteB</span>
+<span id="cb41-21"><a href="#cb41-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-22"><a href="#cb41-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 6. 等待同步完成后切回 Site A（可选）</span></span>
+<span id="cb41-23"><a href="#cb41-23" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin replicate status siteA/</span></code></pre></div>
+            <h3 id="复制监控">10.5 复制监控</h3>
+            <p>关键的复制监控指标：</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看复制队列深度</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> replicate status mycluster/mybucket</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 关键字段说明：</span></span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a><span class="co"># - Replication Status: 当前复制状态（Active / Failed / Pending）</span></span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a><span class="co"># - Pending Count: 等待复制的对象数量</span></span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a><span class="co"># - Failed Count: 复制失败的对象数量</span></span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a><span class="co"># - Replica Count: 已完成复制的对象数量</span></span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a><span class="co"># - Pending Size: 等待复制的数据量</span></span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a><span class="co"># - Average Latency: 平均复制延迟</span></span></code></pre></div>
+            <hr />
+            <h2
+            id="十一许可证上游状态与未决问题">十一、许可证、上游状态与未决问题</h2>
+            <h3 id="agpl-不是脚注">11.1 AGPL 不是脚注</h3>
+            <p>MinIO server / client / gateway 自
+            <code>RELEASE.2021-05-11T23-27-41Z</code> 起以 GNU AGPLv3
+            发行（公司博客：<a
+            href="https://www.min.io/blog/from-open-source-to-free-and-open-source-minio-is-now-fully-licensed-under-gnu-agplv3">From
+            Open Source to Free and Open Source…</a>；源码 license
+            变更可对照 2021-04 相关提交）。AGPL 的网络交互触发源码
+            reciprocal 义务，和「内网挂一个 S3
+            兼容层就完事」的常见用法会冲突：</p>
+            <ul>
+            <li>修改后对组织外提供网络服务，通常要按 AGPL
+            履行对应义务（具体场景要法务看，本文不做法务结论）。</li>
+            <li>与闭源业务二进制静态/动态链接、或把修改版当托管服务卖，都是高频踩雷点。</li>
+            <li>SDK 仍多为 Apache-2.0，<strong>不等于</strong> server
+            可按 Apache 理解。</li>
+            </ul>
+            <p>把 MinIO 写进架构选型 checklist
+            时，许可证应与纠删参数、盘型并列，而不是「开源所以可商用」一笔带过。更广的
+            AGPL/SSPL/BSL 脉络见本站 <a
+            href="../../opensource/08-agpl-sspl-bsl/agpl-sspl-bsl.html">AGPL、SSPL、BSL：云厂商时代的「反云」许可证</a>。</p>
+            <h3 id="上游-archived-意味着什么">11.2 上游 archived
+            意味着什么</h3>
+            <p>修订日通过 GitHub API 读取
+            <code>minio/minio</code>：<code>archived=true</code>，最新
+            tag <code>RELEASE.2025-10-15T17-29-55Z</code>。归档仓库仍可
+            clone、仍可跑既有二进制，但默认预期应改为：</p>
+            <ul>
+            <li>安全修复与行为变更不再按「活跃项目」节奏假设；</li>
+            <li>第三方 fork /
+            商业发行需要单独认证供应链，不能自动继承「官方推荐拓扑」；</li>
+            <li>本文机制章节描述的是归档前主流设计，<strong>不保证</strong>
+            fork 线行为一致。</li>
+            </ul>
+            <h3 id="仍开放的工程问题">11.3 仍开放的工程问题</h3>
+            <ol type="1">
+            <li><strong>元数据共置的规模边界</strong>：无独立元数据服务简化了部署，但小对象极端密度下，仲裁读与
+            healing
+            是否成为主瓶颈，取决于盘与网，缺乏跨版本、跨拓扑的公开对照实验可直接引用。</li>
+            <li><strong>Server Pool
+            只增不迁</strong>：避免再平衡，也把不均衡与退役策略甩给上层；多池容量倾斜时的调度是否「够好」，仍是运维经验区。</li>
+            <li><strong>S3
+            兼容的行为差</strong>：Versioning、加密、条件写等与 AWS
+            的细偏差，只能靠目标版本的兼容矩阵与回归，不能凭「S3
+            兼容」一句话。</li>
+            <li><strong>社区版功能面</strong>：Console /
+            部分企业能力与社区二进制的切割随发行变化；文档截图不等于可部署表面。</li>
+            </ol>
+            <hr />
+            <h2 id="十二参考文献">十二、参考文献</h2>
+            <h3 id="规范与官方文档">规范与官方文档</h3>
+            <ol type="1">
+            <li>MinIO Documentation. <a href="https://min.io/docs"
+            class="uri">https://min.io/docs</a> —
+            部署、纠删与运维说明（对照目标 release）。</li>
+            <li>Amazon S3 API Reference. <a
+            href="https://docs.aws.amazon.com/AmazonS3/latest/API/"
+            class="uri">https://docs.aws.amazon.com/AmazonS3/latest/API/</a>
+            — 兼容面对照。</li>
+            <li>MinIO erasure design notes. <a
+            href="https://github.com/minio/minio/tree/master/docs/erasure"
+            class="uri">https://github.com/minio/minio/tree/master/docs/erasure</a>
+            — 纠删相关设计文档目录。</li>
+            </ol>
+            <h3 id="源码与许可证">源码与许可证</h3>
+            <ol start="4" type="1">
+            <li><code>minio/minio</code> repository (AGPLv3; API
+            <code>archived</code> 状态以查询当日为准). <a
+            href="https://github.com/minio/minio"
+            class="uri">https://github.com/minio/minio</a></li>
+            <li>MinIO. (2021-10-05). <em>From Open Source to Free and
+            Open Source, MinIO is now fully licensed under GNU
+            AGPLv3</em>. <a
+            href="https://www.min.io/blog/from-open-source-to-free-and-open-source-minio-is-now-fully-licensed-under-gnu-agplv3"
+            class="uri">https://www.min.io/blog/from-open-source-to-free-and-open-source-minio-is-now-fully-licensed-under-gnu-agplv3</a></li>
+            <li>License change commit discussion context:
+            minio/minio#12143 / Discussion #12157 (2021-04).</li>
+            </ol>
+            <h3
+            id="论文纠删背景机制细节见下一篇">论文（纠删背景，机制细节见下一篇）</h3>
+            <ol start="7" type="1">
+            <li>Reed, I. S., &amp; Solomon, G. (1960). <em>Polynomial
+            Codes Over Certain Finite Fields</em>. SIAM Journal on
+            Applied Mathematics.</li>
+            <li>Plank, J. S. (2013). <em>Erasure Codes for Storage
+            Systems: A Brief Primer</em>. ;login: USENIX Magazine.</li>
+            </ol>
+            <h3 id="工具">工具</h3>
+            <ol start="9" type="1">
+            <li><code>minio/warp</code>. <a
+            href="https://github.com/minio/warp"
+            class="uri">https://github.com/minio/warp</a> — S3
+            负载发生器；数字需自测。</li>
+            <li>MinIO Operator docs. <a
+            href="https://min.io/docs/minio/kubernetes/upstream/"
+            class="uri">https://min.io/docs/minio/kubernetes/upstream/</a></li>
+            </ol>
+            <h3 id="本站相关">本站相关</h3>
+            <ol start="11" type="1">
+            <li><a
+            href="../49-erasure-coding/erasure-coding.html">纠删码原理与存储效率</a></li>
+            <li><a href="../47-s3-api/s3-api.html">S3 API
+            深度解析</a></li>
+            <li><a
+            href="../../opensource/08-agpl-sspl-bsl/agpl-sspl-bsl.html">AGPL、SSPL、BSL</a></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../47-s3-api/s3-api.html">S3 API 深度解析</a>
+            <strong>下一篇</strong>: <a
+            href="../49-erasure-coding/erasure-coding.html">纠删码原理与存储效率</a></p>
+        <section class="post-recommendations"><h2>读完这篇，下一步读什么</h2><p>优先读同系列或同问题的下一篇，把单篇消费变成主题集群。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/75-small-file-problem/small-file-problem.html">【存储工程】小文件问题：为什么文件数量比文件大小更致命</a></h3>
+                    <p>系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-24 · storage</p>
+                    <h3><a href="/post/storage/46-object-storage-model/object-storage-model.html">【存储工程】对象存储模型：从文件到对象的范式转变</a></h3>
+                    <p>深入分析对象存储的设计哲学——文件系统与对象存储的本质差异、CAP 权衡、最终一致性到强一致性的演进，以及 S3 API 核心操作实战</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-28 · storage</p>
+                    <h3><a href="/post/storage/50-object-gateway/object-gateway.html">【存储工程】对象存储网关与兼容层</a></h3>
+                    <p>深入分析 S3 兼容性工程——各厂商兼容差异、对象存储网关架构、跨云数据迁移工具与多云对象存储策略</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

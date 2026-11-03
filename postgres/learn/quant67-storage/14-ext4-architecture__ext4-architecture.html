@@ -1,0 +1,2057 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】ext4 架构与调优 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="ext4, filesystem, journaling, extent-tree, delayed-allocation, e2fsprogs, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/14-ext4-architecture/ext4-architecture.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】ext4 架构与调优" />
+    <meta property="og:description" content="ext4 是 Linux 世界中使用最广泛的本地文件系统（Local Filesystem）。从 2008 年合入内核主线至今， 它已经在无数生产服务器、嵌入式设备以及桌面系统上稳定运行了十余年。本文将从磁盘布局、 核心数据结构、日志机制、分配策略等维度，对 ext4 进行全面剖析，并结合实际调优场景给出 可落地的最佳…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/14-ext4-architecture/ext4-architecture.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="ext4" />
+    <meta property="article:tag" content="filesystem" />
+    <meta property="article:tag" content="journaling" />
+    <meta property="article:tag" content="extent-tree" />
+    <meta property="article:tag" content="delayed-allocation" />
+    <meta property="article:tag" content="e2fsprogs" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】ext4 架构与调优" />
+    <meta name="twitter:description" content="ext4 是 Linux 世界中使用最广泛的本地文件系统（Local Filesystem）。从 2008 年合入内核主线至今， 它已经在无数生产服务器、嵌入式设备以及桌面系统上稳定运行了十余年。本文将从磁盘布局、 核心数据结构、日志机制、分配策略等维度，对 ext4 进行全面剖析，并结合实际调优场景给出 可落地的最佳…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】ext4 架构与调优", "description": "ext4 是 Linux 世界中使用最广泛的本地文件系统（Local Filesystem）。从 2008 年合入内核主线至今， 它已经在无数生产服务器、嵌入式设备以及桌面系统上稳定运行了十余年。本文将从磁盘布局、 核心数据结构、日志机制、分配策略等维度，对 ext4 进行全面剖析，并结合实际调优场景给出 可落地的最佳…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/14-ext4-architecture/ext4-architecture.html"}, "datePublished": "2025-08-23T00:00:00+00:00", "dateModified": "2026-04-15T10:56:08+00:00", "keywords": ["ext4", "filesystem", "journaling", "extent-tree", "delayed-allocation", "e2fsprogs"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】ext4 架构与调优</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-23</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#ext4</span> <span>#filesystem</span> <span>#journaling</span> <span>#extent-tree</span> <span>#delayed-allocation</span> <span>#e2fsprogs</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/13-filesystem-basics/filesystem-basics.html">上一篇：【存储工程】文件系统基础：inode、目录与 VFS</a><a class="post-series-nav__link" href="/post/storage/15-xfs-architecture/xfs-architecture.html">下一篇：【存储工程】XFS 架构：大文件与高并发</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/ext4.html">#ext4</a><a class="chip-link" href="/tags/filesystem.html">#filesystem</a><a class="chip-link" href="/tags/journaling.html">#journaling</a><a class="chip-link" href="/tags/extent-tree.html">#extent-tree</a><a class="chip-link" href="/tags/delayed-allocation.html">#delayed-allocation</a><a class="chip-link" href="/tags/e2fsprogs.html">#e2fsprogs</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#ext4-架构与调优"
+                id="toc-ext4-架构与调优">ext4 架构与调优</a>
+                <ul>
+                <li><a href="#一ext-系列演进史"
+                id="toc-一ext-系列演进史">一、ext 系列演进史</a>
+                <ul>
+                <li><a href="#ext2奠基之作" id="toc-ext2奠基之作">1.1
+                ext2：奠基之作</a></li>
+                <li><a href="#ext3引入日志" id="toc-ext3引入日志">1.2
+                ext3：引入日志</a></li>
+                <li><a href="#ext4全面进化" id="toc-ext4全面进化">1.3
+                ext4：全面进化</a></li>
+                </ul></li>
+                <li><a href="#二ext4-磁盘布局"
+                id="toc-二ext4-磁盘布局">二、ext4 磁盘布局</a>
+                <ul>
+                <li><a href="#超级块与块组" id="toc-超级块与块组">2.1
+                超级块与块组</a></li>
+                <li><a href="#弹性块组flex-block-group"
+                id="toc-弹性块组flex-block-group">2.2 弹性块组（Flex
+                Block Group）</a></li>
+                <li><a href="#位支持" id="toc-位支持">2.3 64
+                位支持</a></li>
+                <li><a href="#索引节点inode结构"
+                id="toc-索引节点inode结构">2.4
+                索引节点（Inode）结构</a></li>
+                <li><a href="#目录结构" id="toc-目录结构">2.5
+                目录结构</a></li>
+                </ul></li>
+                <li><a href="#三extent-tree"
+                id="toc-三extent-tree">三、Extent Tree</a>
+                <ul>
+                <li><a href="#间接块的局限性"
+                id="toc-间接块的局限性">3.1 间接块的局限性</a></li>
+                <li><a href="#区段的设计" id="toc-区段的设计">3.2
+                区段的设计</a></li>
+                <li><a href="#区段树结构" id="toc-区段树结构">3.3
+                区段树结构</a></li>
+                <li><a href="#区段树操作" id="toc-区段树操作">3.4
+                区段树操作</a></li>
+                <li><a href="#区段状态标志" id="toc-区段状态标志">3.5
+                区段状态标志</a></li>
+                </ul></li>
+                <li><a href="#四日志journaling"
+                id="toc-四日志journaling">四、日志（Journaling）</a>
+                <ul>
+                <li><a href="#日志的基本原理"
+                id="toc-日志的基本原理">4.1 日志的基本原理</a></li>
+                <li><a href="#jbd2-日志层" id="toc-jbd2-日志层">4.2 JBD2
+                日志层</a></li>
+                <li><a href="#三种日志模式" id="toc-三种日志模式">4.3
+                三种日志模式</a></li>
+                <li><a href="#日志校验和" id="toc-日志校验和">4.4
+                日志校验和</a></li>
+                <li><a href="#日志大小调优" id="toc-日志大小调优">4.5
+                日志大小调优</a></li>
+                <li><a href="#提交间隔" id="toc-提交间隔">4.6
+                提交间隔</a></li>
+                </ul></li>
+                <li><a href="#五延迟分配delayed-allocation"
+                id="toc-五延迟分配delayed-allocation">五、延迟分配（Delayed
+                Allocation）</a>
+                <ul>
+                <li><a href="#传统分配方式的问题"
+                id="toc-传统分配方式的问题">5.1
+                传统分配方式的问题</a></li>
+                <li><a href="#延迟分配的工作机制"
+                id="toc-延迟分配的工作机制">5.2
+                延迟分配的工作机制</a></li>
+                <li><a href="#延迟分配的优势"
+                id="toc-延迟分配的优势">5.3 延迟分配的优势</a></li>
+                <li><a href="#延迟分配的风险"
+                id="toc-延迟分配的风险">5.4 延迟分配的风险</a></li>
+                <li><a href="#空间预留机制" id="toc-空间预留机制">5.5
+                空间预留机制</a></li>
+                </ul></li>
+                <li><a href="#六多块分配与预分配"
+                id="toc-六多块分配与预分配">六、多块分配与预分配</a>
+                <ul>
+                <li><a href="#mballoc-分配器"
+                id="toc-mballoc-分配器">6.1 mballoc 分配器</a></li>
+                <li><a href="#分配策略参数" id="toc-分配策略参数">6.2
+                分配策略参数</a></li>
+                <li><a href="#fallocate-预分配"
+                id="toc-fallocate-预分配">6.3 fallocate 预分配</a></li>
+                <li><a href="#分配对齐" id="toc-分配对齐">6.4
+                分配对齐</a></li>
+                </ul></li>
+                <li><a href="#七在线碎片整理"
+                id="toc-七在线碎片整理">七、在线碎片整理</a>
+                <ul>
+                <li><a href="#碎片化的成因" id="toc-碎片化的成因">7.1
+                碎片化的成因</a></li>
+                <li><a href="#诊断碎片化" id="toc-诊断碎片化">7.2
+                诊断碎片化</a></li>
+                <li><a href="#在线碎片整理e4defrag"
+                id="toc-在线碎片整理e4defrag">7.3
+                在线碎片整理（e4defrag）</a></li>
+                <li><a href="#碎片整理的实践建议"
+                id="toc-碎片整理的实践建议">7.4
+                碎片整理的实践建议</a></li>
+                </ul></li>
+                <li><a href="#八ext4-高级特性"
+                id="toc-八ext4-高级特性">八、ext4 高级特性</a>
+                <ul>
+                <li><a href="#大块分配bigalloc"
+                id="toc-大块分配bigalloc">8.1
+                大块分配（bigalloc）</a></li>
+                <li><a href="#项目配额project-quota"
+                id="toc-项目配额project-quota">8.2 项目配额（Project
+                Quota）</a></li>
+                <li><a href="#内联数据inline-data"
+                id="toc-内联数据inline-data">8.3 内联数据（Inline
+                Data）</a></li>
+                <li><a href="#文件系统级加密fscrypt"
+                id="toc-文件系统级加密fscrypt">8.4
+                文件系统级加密（fscrypt）</a></li>
+                <li><a href="#元数据校验和metadata-checksums"
+                id="toc-元数据校验和metadata-checksums">8.5
+                元数据校验和（Metadata Checksums）</a></li>
+                <li><a href="#快速提交fast-commit"
+                id="toc-快速提交fast-commit">8.6 快速提交（Fast
+                Commit）</a></li>
+                </ul></li>
+                <li><a href="#九ext4-调优实战"
+                id="toc-九ext4-调优实战">九、ext4 调优实战</a>
+                <ul>
+                <li><a href="#mkfs-选项优化" id="toc-mkfs-选项优化">9.1
+                mkfs 选项优化</a></li>
+                <li><a href="#挂载选项优化" id="toc-挂载选项优化">9.2
+                挂载选项优化</a></li>
+                <li><a href="#sysctl-参数调优"
+                id="toc-sysctl-参数调优">9.3 sysctl 参数调优</a></li>
+                <li><a href="#io-调度器调优" id="toc-io-调度器调优">9.4
+                I/O 调度器调优</a></li>
+                <li><a href="#数据库工作负载调优"
+                id="toc-数据库工作负载调优">9.5
+                数据库工作负载调优</a></li>
+                <li><a href="#预分配数据库文件"
+                id="toc-预分配数据库文件">9.6 预分配数据库文件</a></li>
+                <li><a href="#ext4-日常维护" id="toc-ext4-日常维护">9.7
+                ext4 日常维护</a></li>
+                <li><a href="#性能基准测试方法"
+                id="toc-性能基准测试方法">9.8 性能基准测试方法</a></li>
+                </ul></li>
+                <li><a href="#十ext4-vs-xfs-对比"
+                id="toc-十ext4-vs-xfs-对比">十、ext4 vs XFS 对比</a>
+                <ul>
+                <li><a href="#架构差异概述" id="toc-架构差异概述">10.1
+                架构差异概述</a></li>
+                <li><a href="#性能对比方法论"
+                id="toc-性能对比方法论">10.2 性能对比方法论</a></li>
+                <li><a href="#各工作负载对比"
+                id="toc-各工作负载对比">10.3 各工作负载对比</a></li>
+                <li><a href="#选型建议" id="toc-选型建议">10.4
+                选型建议</a></li>
+                <li><a href="#迁移注意事项" id="toc-迁移注意事项">10.5
+                迁移注意事项</a></li>
+                </ul></li>
+                <li><a href="#附录" id="toc-附录">附录</a>
+                <ul>
+                <li><a href="#附录-aext4-特性标志速查表"
+                id="toc-附录-aext4-特性标志速查表">附录 A：ext4
+                特性标志速查表</a></li>
+                <li><a href="#附录-b常用诊断命令"
+                id="toc-附录-b常用诊断命令">附录
+                B：常用诊断命令</a></li>
+                <li><a href="#附录-c故障排除"
+                id="toc-附录-c故障排除">附录 C：故障排除</a></li>
+                </ul></li>
+                <li><a href="#参考资料"
+                id="toc-参考资料">参考资料</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="ext4-架构与调优">ext4 架构与调优</h1>
+            <p>ext4 是 Linux 世界中使用最广泛的本地文件系统（Local
+            Filesystem）。从 2008 年合入内核主线至今，
+            它已经在无数生产服务器、嵌入式设备以及桌面系统上稳定运行了十余年。本文将从磁盘布局、
+            核心数据结构、日志机制、分配策略等维度，对 ext4
+            进行全面剖析，并结合实际调优场景给出 可落地的最佳实践。</p>
+            <hr />
+            <h2 id="一ext-系列演进史">一、ext 系列演进史</h2>
+            <h3 id="ext2奠基之作">1.1 ext2：奠基之作</h3>
+            <p>ext2（Second Extended Filesystem）于 1993 年由 Rémy Card
+            开发，是 Linux 上第一个
+            被广泛使用的文件系统。它引入了块组（Block
+            Group）的概念，将磁盘划分为若干个固定大小的
+            块组，每个块组内包含独立的位图（Bitmap）、索引节点表（Inode
+            Table）以及数据块（Data Block）。
+            这种设计的核心目的是将相关数据放置在物理上相邻的区域，从而减少磁头寻道（Seek）时间。</p>
+            <p>ext2 的主要特征如下：</p>
+            <ul>
+            <li>最大文件系统大小为 4 TiB（使用 4 KiB 块大小时）；</li>
+            <li>最大单文件大小为 2 TiB；</li>
+            <li>文件名最长 255 字节；</li>
+            <li>使用间接块（Indirect
+            Block）管理大文件的数据块映射；</li>
+            <li>不具备日志（Journal）能力。</li>
+            </ul>
+            <p>由于缺少日志功能，在系统异常断电后需要对整个文件系统执行
+            fsck 检查，大容量分区的
+            恢复时间可能长达数十分钟甚至数小时。这一致命缺陷催生了 ext3
+            的诞生。</p>
+            <h3 id="ext3引入日志">1.2 ext3：引入日志</h3>
+            <p>ext3 于 2001 年由 Stephen Tweedie 开发并合入 Linux 2.4.15
+            内核。它在 ext2 的基础上 增加了日志层（Journaling
+            Layer），采用 JBD（Journaling Block Device）作为日志后端。
+            ext3 保持了与 ext2 完全相同的磁盘布局，因此支持从 ext2
+            无损升级到 ext3——只需使用 <code>tune2fs</code>
+            工具添加日志即可。</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 从 ext2 升级到 ext3</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-j</span> /dev/sda1</span></code></pre></div>
+            <p>ext3 提供了三种日志模式：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>模式</th>
+            <th>元数据日志</th>
+            <th>数据日志</th>
+            <th>性能</th>
+            <th>安全性</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>journal</td>
+            <td>是</td>
+            <td>是</td>
+            <td>低</td>
+            <td>高</td>
+            </tr>
+            <tr>
+            <td>ordered</td>
+            <td>是</td>
+            <td>否（但保证写入顺序）</td>
+            <td>中</td>
+            <td>中</td>
+            </tr>
+            <tr>
+            <td>writeback</td>
+            <td>是</td>
+            <td>否</td>
+            <td>高</td>
+            <td>低</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>虽然 ext3 解决了崩溃恢复（Crash
+            Recovery）的问题，但它仍然继承了 ext2 的诸多局限：</p>
+            <ul>
+            <li>依旧使用间接块映射，大文件的元数据开销巨大；</li>
+            <li>不支持区段（Extent）映射；</li>
+            <li>时间戳精度仅为秒级；</li>
+            <li>文件系统容量上限仍受 32 位块号限制。</li>
+            </ul>
+            <h3 id="ext4全面进化">1.3 ext4：全面进化</h3>
+            <p>ext4 的开发始于 2006 年，最初以 ext3dev 的名义出现，于
+            2008 年在 Linux 2.6.28 中 被正式标记为稳定版本。ext4
+            的设计目标是在保持向后兼容的前提下突破 ext3 的性能和容量
+            限制。主要改进包括：</p>
+            <ul>
+            <li><strong>区段树（Extent
+            Tree）</strong>：使用连续区段替代间接块，大幅减少元数据开销；</li>
+            <li><strong>延迟分配（Delayed
+            Allocation）</strong>：推迟到数据写回（Writeback）时再分配物理块；</li>
+            <li><strong>多块分配器（Multiblock
+            Allocator，mballoc）</strong>：一次分配多个连续块；</li>
+            <li><strong>持久预分配（Persistent
+            Preallocation）</strong>：通过 <code>fallocate()</code>
+            系统调用预留空间；</li>
+            <li><strong>64 位块号</strong>：支持最大 1 EiB
+            的文件系统容量；</li>
+            <li><strong>纳秒级时间戳（Nanosecond
+            Timestamps）</strong>：提高时间精度至纳秒级别；</li>
+            <li><strong>在线碎片整理（Online
+            Defragmentation）</strong>：无需卸载即可进行碎片整理；</li>
+            <li><strong>日志校验和（Journal
+            Checksumming）</strong>：提高日志的可靠性。</li>
+            </ul>
+            <p>下表总结了三代文件系统的关键参数对比：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>特性</th>
+            <th>ext2</th>
+            <th>ext3</th>
+            <th>ext4</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>最大文件系统容量</td>
+            <td>4 TiB</td>
+            <td>16 TiB</td>
+            <td>1 EiB</td>
+            </tr>
+            <tr>
+            <td>最大单文件大小</td>
+            <td>2 TiB</td>
+            <td>2 TiB</td>
+            <td>16 TiB</td>
+            </tr>
+            <tr>
+            <td>子目录数上限</td>
+            <td>31998</td>
+            <td>31998</td>
+            <td>无限制</td>
+            </tr>
+            <tr>
+            <td>块映射方式</td>
+            <td>间接块</td>
+            <td>间接块</td>
+            <td>区段树</td>
+            </tr>
+            <tr>
+            <td>日志支持</td>
+            <td>无</td>
+            <td>有</td>
+            <td>有（含校验和）</td>
+            </tr>
+            <tr>
+            <td>时间戳精度</td>
+            <td>秒</td>
+            <td>秒</td>
+            <td>纳秒</td>
+            </tr>
+            <tr>
+            <td>在线扩容</td>
+            <td>否</td>
+            <td>是</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td>延迟分配</td>
+            <td>否</td>
+            <td>否</td>
+            <td>是</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="二ext4-磁盘布局">二、ext4 磁盘布局</h2>
+            <h3 id="超级块与块组">2.1 超级块与块组</h3>
+            <p>ext4 的磁盘布局延续了 ext2/ext3 的块组（Block
+            Group）架构。整个文件系统被划分为
+            若干个大小相等的块组，每个块组包含以下结构：</p>
+            <pre class="text"><code>+------------------------------------------------------------+
+| Block Group 0 | Block Group 1 | ... | Block Group N        |
++------------------------------------------------------------+
+
+单个 Block Group 内部结构：
++--------+--------+--------+--------+--------+---------------+
+| Super  | Group  | Data   | Inode  | Inode  | Data          |
+| Block  | Desc.  | Bitmap | Bitmap | Table  | Blocks        |
++--------+--------+--------+--------+--------+---------------+</code></pre>
+            <p><strong>超级块（Superblock）</strong>存储文件系统的全局元数据，包括：</p>
+            <ul>
+            <li>总块数、总索引节点数；</li>
+            <li>每个块组的块数与索引节点数；</li>
+            <li>块大小（通常为 4 KiB）；</li>
+            <li>文件系统状态（干净/错误）；</li>
+            <li>特性标志（Feature Flags）；</li>
+            <li>UUID 与卷标。</li>
+            </ul>
+            <p>超级块的冗余副本分布在多个块组中。默认情况下，ext4
+            使用稀疏超级块（Sparse Superblock） 策略——仅在编号为 0、1
+            以及 3、5、7 的幂次方的块组中保存超级块副本。这一策略通过
+            <code>sparse_super</code> 特性标志启用。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看超级块信息</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> <span class="at">-h</span> /dev/sda1 <span class="kw">|</span> <span class="fu">head</span> <span class="at">-60</span></span></code></pre></div>
+            <p><strong>组描述符（Group
+            Descriptor）</strong>紧随超级块之后，为每个块组记录：</p>
+            <ul>
+            <li>块位图的位置；</li>
+            <li>索引节点位图的位置；</li>
+            <li>索引节点表的起始位置；</li>
+            <li>空闲块数、空闲索引节点数、目录数。</li>
+            </ul>
+            <p>在启用 64 位特性后，组描述符从 32 字节扩展到 64
+            字节，以容纳 64 位的块地址。</p>
+            <h3 id="弹性块组flex-block-group">2.2 弹性块组（Flex Block
+            Group）</h3>
+            <p>传统的块组设计将元数据分散在各个块组中，导致读取元数据时磁头需要频繁跳转。ext4
+            引入了 弹性块组（Flexible Block
+            Group，flex_bg）特性来解决这一问题。</p>
+            <p>flex_bg
+            将若干个连续的块组组合成一个弹性块组，并将这些块组的位图和索引节点表集中存储
+            在第一个块组中。这样做的好处是：</p>
+            <ul>
+            <li>元数据更集中，减少了寻道操作；</li>
+            <li>数据区域更加连续，有利于大文件的顺序分配；</li>
+            <li>与 mballoc 配合时，能分配更大的连续区域。</li>
+            </ul>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 flex_bg 大小</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> <span class="at">-h</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&quot;Flex block group size&quot;</span></span></code></pre></div>
+            <p>默认的 flex_bg 大小为 16，即每 16
+            个块组组成一个弹性块组。使用 4 KiB 块大小时，
+            一个标准块组包含 32768 个块（128
+            MiB），因此一个弹性块组的大小为 2 GiB。</p>
+            <h3 id="位支持">2.3 64 位支持</h3>
+            <p>传统 ext3 使用 32 位块号，在 4 KiB
+            块大小下，文件系统容量上限为：</p>
+            <pre class="text"><code>2^32 × 4 KiB = 16 TiB</code></pre>
+            <p>ext4 引入了 <code>64bit</code> 特性标志，将块号扩展到 48
+            位（当前实现），理论上限为：</p>
+            <pre class="text"><code>2^48 × 4 KiB = 1 EiB</code></pre>
+            <p>启用 64
+            位支持后，组描述符、区段索引等数据结构中的块号字段从 32
+            位扩展为 48 位。 需要注意的是，64 位支持必须在
+            <code>mkfs.ext4</code> 时指定，无法事后添加：</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建支持 64 位块号的文件系统</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-O</span> 64bit /dev/sda1</span></code></pre></div>
+            <h3 id="索引节点inode结构">2.4 索引节点（Inode）结构</h3>
+            <p>ext4 的索引节点（Inode）默认大小为 256 字节（ext3 为 128
+            字节），扩展的空间用于 存储：</p>
+            <ul>
+            <li>纳秒级时间戳（创建时间 crtime、修改时间 mtime、访问时间
+            atime、变更时间 ctime）；</li>
+            <li>区段树的根节点；</li>
+            <li>扩展属性（Extended
+            Attributes，xattr）的内联存储空间。</li>
+            </ul>
+            <p>索引节点中与区段相关的 60
+            字节空间（<code>i_block[15]</code>）被重新定义为区段树的根：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ext4_inode <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    __le16  i_mode<span class="op">;</span>         <span class="co">/* 文件模式 */</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    __le16  i_uid<span class="op">;</span>          <span class="co">/* 所有者 UID 低 16 位 */</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    __le32  i_size_lo<span class="op">;</span>      <span class="co">/* 文件大小低 32 位 */</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    __le32  i_atime<span class="op">;</span>        <span class="co">/* 访问时间 */</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    __le32  i_ctime<span class="op">;</span>        <span class="co">/* 变更时间 */</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    __le32  i_mtime<span class="op">;</span>        <span class="co">/* 修改时间 */</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    __le32  i_dtime<span class="op">;</span>        <span class="co">/* 删除时间 */</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    __le16  i_gid<span class="op">;</span>          <span class="co">/* 组 GID 低 16 位 */</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    __le16  i_links_count<span class="op">;</span>  <span class="co">/* 硬链接计数 */</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    __le32  i_blocks_lo<span class="op">;</span>    <span class="co">/* 块计数低 32 位 */</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    __le32  i_flags<span class="op">;</span>        <span class="co">/* 文件标志 */</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    __le32  i_block<span class="op">[</span><span class="dv">15</span><span class="op">];</span>    <span class="co">/* 区段树根节点 / 间接块指针 */</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <h3 id="目录结构">2.5 目录结构</h3>
+            <p>ext4 支持两种目录实现：</p>
+            <ol type="1">
+            <li><p><strong>线性目录（Linear
+            Directory）</strong>：目录项按顺序排列，查找时需要遍历整个目录。
+            适用于目录项较少的场景。</p></li>
+            <li><p><strong>哈希树目录（HTree
+            Directory）</strong>：使用半满 B 树（Half-full
+            B-tree）加速查找，
+            将目录项按文件名的哈希值组织。当目录项数量超过一个块的容量时自动启用。</p></li>
+            </ol>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看目录是否使用 htree</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">debugfs</span> <span class="at">-R</span> <span class="st">&quot;htree_dump /path/to/dir&quot;</span> /dev/sda1</span></code></pre></div>
+            <p>哈希树目录（HTree Directory）使用的哈希算法默认为
+            <code>half_md4</code>，也支持 <code>tea</code> 和
+            <code>legacy</code> 等算法。哈希算法可以在创建文件系统时通过
+            <code>-E hash_alg</code> 选项指定。</p>
+            <hr />
+            <h2 id="三extent-tree">三、Extent Tree</h2>
+            <h3 id="间接块的局限性">3.1 间接块的局限性</h3>
+            <p>在 ext2/ext3 中，文件的数据块映射采用间接块（Indirect
+            Block）机制。每个索引节点 包含 15 个块指针：</p>
+            <ul>
+            <li>指针 0-11：直接指向数据块（直接块）；</li>
+            <li>指针 12：指向一级间接块（Single Indirect Block）；</li>
+            <li>指针 13：指向二级间接块（Double Indirect Block）；</li>
+            <li>指针 14：指向三级间接块（Triple Indirect Block）。</li>
+            </ul>
+            <pre class="text"><code>Inode
++------+
+| 0-11 | -----&gt; 数据块 （12 个直接块）
++------+
+|  12  | -----&gt; [间接块] -----&gt; 数据块
++------+
+|  13  | -----&gt; [二级间接块] -----&gt; [间接块] -----&gt; 数据块
++------+
+|  14  | -----&gt; [三级间接块] -----&gt; [二级间接块] -----&gt; [间接块] -----&gt; 数据块
++------+</code></pre>
+            <p>使用 4 KiB 块大小时，一个间接块可以容纳 1024 个 32
+            位块号。对于一个连续写入的 1 GiB 文件，间接块机制需要分配约
+            256 个额外的元数据块来存储映射关系。这带来了
+            严重的性能问题：</p>
+            <ul>
+            <li>元数据块分散在磁盘各处，读取大文件时需要多次寻道；</li>
+            <li>删除大文件时需要逐级回收间接块，耗时较长；</li>
+            <li>元数据占用了大量的磁盘空间和内存缓存。</li>
+            </ul>
+            <h3 id="区段的设计">3.2 区段的设计</h3>
+            <p>ext4
+            使用区段（Extent）替代间接块。一个区段表示一段连续的物理块到逻辑块的映射：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ext4_extent <span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    __le32  ee_block<span class="op">;</span>       <span class="co">/* 逻辑块号起始位置 */</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    __le16  ee_len<span class="op">;</span>         <span class="co">/* 区段覆盖的块数（最大 32768） */</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    __le16  ee_start_hi<span class="op">;</span>    <span class="co">/* 物理块号高 16 位 */</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    __le32  ee_start_lo<span class="op">;</span>    <span class="co">/* 物理块号低 32 位 */</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>每个区段占 12 字节，描述了最多 32768 个连续块（128
+            MiB）的映射。对于一个完全 连续的 1 GiB 文件，仅需要 8
+            个区段即可完成映射，相比间接块的 256 个元数据块，
+            元数据开销大幅降低。</p>
+            <h3 id="区段树结构">3.3 区段树结构</h3>
+            <p>当文件的区段数量超过索引节点中 <code>i_block</code>
+            字段能容纳的上限（4 个区段）时，ext4 使用 区段树（Extent
+            Tree）来组织区段。区段树是一棵 B+ 树（B+
+            Tree），由三种节点组成：</p>
+            <p><strong>区段头（Extent Header）</strong>：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ext4_extent_header <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    __le16  eh_magic<span class="op">;</span>       <span class="co">/* 魔数，0xF30A */</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    __le16  eh_entries<span class="op">;</span>     <span class="co">/* 有效条目数 */</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    __le16  eh_max<span class="op">;</span>         <span class="co">/* 最大条目容量 */</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    __le16  eh_depth<span class="op">;</span>       <span class="co">/* 树的深度（叶子节点为 0） */</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    __le32  eh_generation<span class="op">;</span>  <span class="co">/* 树的版本号 */</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><strong>区段索引（Extent Index）</strong>——内部节点：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ext4_extent_idx <span class="op">{</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>    __le32  ei_block<span class="op">;</span>       <span class="co">/* 该子树覆盖的起始逻辑块号 */</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    __le32  ei_leaf_lo<span class="op">;</span>     <span class="co">/* 子节点块号低 32 位 */</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    __le16  ei_leaf_hi<span class="op">;</span>     <span class="co">/* 子节点块号高 16 位 */</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    __le16  ei_unused<span class="op">;</span>      <span class="co">/* 保留字段 */</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><strong>区段（Extent）</strong>——叶子节点：</p>
+            <pre class="text"><code>区段树（Extent Tree）示例：
+
+                    [Header|Index0|Index1]         &lt;- 根节点（深度 2）
+                       /              \
+          [Header|Index|Index]    [Header|Index|Index]   &lt;- 中间节点（深度 1）
+            /        \               /        \
+    [Header|E0|E1] [Header|E2|E3] [Header|E4] [Header|E5|E6]  &lt;- 叶子节点（深度 0）</code></pre>
+            <p>根节点存储在索引节点的 <code>i_block</code> 字段中，占用
+            60 字节。减去 12 字节的区段头后， 剩余 48 字节可以容纳 4
+            个区段（每个 12 字节）或 4 个索引项（每个 12 字节）。</p>
+            <p>中间节点和叶子节点各占一个完整的磁盘块。使用 4 KiB
+            块大小时，减去 12 字节的区段头后， 可以容纳 340 个区段或 340
+            个索引项。</p>
+            <h3 id="区段树操作">3.4 区段树操作</h3>
+            <p><strong>查找（Lookup）</strong>：</p>
+            <p>从根节点开始，在每层中对索引项进行二分查找（Binary
+            Search），找到覆盖目标逻辑块号
+            的子节点，逐层向下直到叶子节点，最终在叶子节点中找到对应的区段。</p>
+            <p>查找的时间复杂度为 O(depth × log(fan-out))，其中 depth
+            通常不超过 3，fan-out 约为 340。对于深度为 2
+            的区段树，查找只需要两次磁盘读取。</p>
+            <p><strong>插入（Insert）</strong>：</p>
+            <p>当需要添加新的区段时：</p>
+            <ol type="1">
+            <li>首先尝试与相邻的已有区段合并（如果物理块连续且总长度不超过
+            32768）；</li>
+            <li>如果无法合并，在叶子节点中插入新的区段条目；</li>
+            <li>如果叶子节点已满，则进行节点分裂（Split），并在父节点中添加新的索引项；</li>
+            <li>分裂可能级联到根节点，导致树的深度增加。</li>
+            </ol>
+            <p><strong>删除（Truncate/Punch Hole）</strong>：</p>
+            <p>ext4 支持两种删除方式：</p>
+            <ul>
+            <li><strong>截断（Truncate）</strong>：缩小文件大小，移除尾部的区段；</li>
+            <li><strong>打洞（Hole
+            Punching）</strong>：释放文件中间的数据块，创建稀疏区域。</li>
+            </ul>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 在文件中打洞（释放 offset 1M 开始的 4M 数据）</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-p</span> <span class="at">-o</span> 1048576 <span class="at">-l</span> 4194304 /path/to/file</span></code></pre></div>
+            <h3 id="区段状态标志">3.5 区段状态标志</h3>
+            <p>区段的 <code>ee_len</code>
+            字段的最高位用作”未初始化”标志。当该位为 1
+            时，表示这个区段已经 分配了物理块，但尚未写入有效数据（通过
+            <code>fallocate</code> 预分配的空间）。读取未初始化的
+            区段时，文件系统返回零填充数据，而不是实际读取磁盘。</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 filefrag 查看文件的区段映射</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">filefrag</span> <span class="at">-v</span> /path/to/file</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>Filesystem type is: ef53
+File size of testfile is 1073741824 (262144 blocks of 4096 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..   32767:      34816..     67583:  32768:
+   1:    32768..   65535:      67584..    100351:  32768:
+   2:    65536..   98303:     100352..    133119:  32768:
+   ...</code></pre>
+            <hr />
+            <h2 id="四日志journaling">四、日志（Journaling）</h2>
+            <h3 id="日志的基本原理">4.1 日志的基本原理</h3>
+            <p>日志（Journaling）机制通过预写日志（Write-Ahead
+            Logging，WAL）保证文件系统的
+            一致性。基本思路是：在修改文件系统的实际数据结构之前，先将修改操作记录到一个独立的
+            日志区域中。如果在修改过程中发生崩溃，恢复时可以通过重放（Replay）日志来恢复到一致
+            状态。</p>
+            <p>日志的工作流程如下：</p>
+            <pre class="text"><code>1. 开始事务（Transaction Begin）
+2. 将元数据修改写入日志区域
+3. 提交事务（Transaction Commit）
+4. 将修改写回到文件系统实际位置（Checkpoint）
+5. 释放日志空间</code></pre>
+            <h3 id="jbd2-日志层">4.2 JBD2 日志层</h3>
+            <p>ext4 使用 JBD2（Journaling Block Device
+            2）作为日志后端，相比 ext3 使用的 JBD， 主要改进包括：</p>
+            <ul>
+            <li>支持 64 位块号；</li>
+            <li>支持日志校验和（Journal Checksum）；</li>
+            <li>提高了并发性能。</li>
+            </ul>
+            <p>JBD2 的核心概念：</p>
+            <ul>
+            <li><strong>事务（Transaction）</strong>：一组原子性的文件系统修改操作；</li>
+            <li><strong>句柄（Handle）</strong>：用户态操作对应的日志操作句柄，一个事务可以包含多个句柄；</li>
+            <li><strong>日志超级块（Journal
+            Superblock）</strong>：存储日志的全局信息；</li>
+            <li><strong>描述符块（Descriptor
+            Block）</strong>：记录事务中包含的数据块列表；</li>
+            <li><strong>提交块（Commit
+            Block）</strong>：标记事务提交完成；</li>
+            <li><strong>撤销块（Revoke
+            Block）</strong>：标记不需要重放的块。</li>
+            </ul>
+            <pre class="text"><code>日志区域布局：
++----------+------+------+------+--------+------+------+--------+---+
+| Journal  | Desc | Data | Data | Commit | Desc | Data | Commit |...|
+| Super    | Block| Block| Block| Block  | Block| Block| Block  |   |
++----------+------+------+------+--------+------+------+--------+---+
+           |&lt;--- Transaction 1 --------&gt;|&lt;--- Transaction 2 ---&gt;|</code></pre>
+            <h3 id="三种日志模式">4.3 三种日志模式</h3>
+            <p>ext4 沿用了 ext3
+            的三种日志模式，各有不同的性能与安全性权衡：</p>
+            <p><strong>journal 模式（数据日志模式）</strong>：</p>
+            <p>所有数据和元数据都先写入日志，然后再写回到实际位置。这是最安全的模式，但也是性能
+            最低的模式，因为所有数据实际上被写了两次。</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 以 journal 模式挂载</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> data=journal /dev/sda1 /mnt</span></code></pre></div>
+            <p>适用场景：对数据完整性要求极高的场景，例如金融交易数据库。</p>
+            <p><strong>ordered 模式（有序模式，默认）</strong>：</p>
+            <p>只有元数据写入日志。数据块在元数据提交到日志之前被写入到最终位置。这保证了如果
+            元数据更新可见，对应的数据一定已经写入磁盘。</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># ordered 为默认模式，等价于不指定</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> data=ordered /dev/sda1 /mnt</span></code></pre></div>
+            <p>适用场景：大多数通用工作负载。</p>
+            <p><strong>writeback 模式（回写模式）</strong>：</p>
+            <p>只有元数据写入日志，数据块可以在元数据提交之前或之后写入。这是性能最高的模式，但在
+            崩溃后可能出现文件内容与元数据不一致的情况——例如文件大小已增长但内容是旧数据或
+            垃圾数据。</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 以 writeback 模式挂载</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> data=writeback /dev/sda1 /mnt</span></code></pre></div>
+            <p>适用场景：对写入性能要求高且应用自身保证数据一致性的场景，例如使用
+            O_DIRECT 和 自有 WAL 的数据库。</p>
+            <h3 id="日志校验和">4.4 日志校验和</h3>
+            <p>ext4 引入了日志校验和（Journal
+            Checksum）功能，为每个日志事务计算 CRC32 或 CRC32C
+            校验和。恢复时，如果校验和不匹配，则跳过该事务，避免重放损坏的日志数据
+            导致二次损坏。</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用日志校验和</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-O</span> journal_checksum /dev/sda1</span></code></pre></div>
+            <p>在 Linux 3.6 及更高版本中，推荐使用
+            <code>journal_checksum</code> 替代早期的
+            <code>journal_async_commit</code> 选项。CRC32C
+            校验和的计算可以利用现代 CPU 的硬件加速指令 （如 Intel 的
+            SSE 4.2），几乎不会增加额外的性能开销。</p>
+            <h3 id="日志大小调优">4.5 日志大小调优</h3>
+            <p>日志的大小直接影响事务的吞吐量。默认情况下，<code>mkfs.ext4</code>
+            会根据文件系统的总大小 自动设置日志大小，范围通常在 64 MiB
+            到 256 MiB 之间。</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 指定日志大小为 256 MiB</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-J</span> size=256 /dev/sda1</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前日志大小</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> <span class="at">-h</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&quot;Journal size&quot;</span></span></code></pre></div>
+            <p>对于写入密集型工作负载，增大日志可以容纳更多的并发事务，减少日志空间不足导致的
+            阻塞。但日志过大也会增加恢复时间。经验法则是将日志大小设为文件系统总大小的
+            1% 左右， 但不超过 1 GiB。</p>
+            <h3 id="提交间隔">4.6 提交间隔</h3>
+            <p>日志事务的提交间隔（Commit
+            Interval）决定了日志缓冲区中的数据多久被强制刷写到
+            磁盘。默认值为 5 秒。</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置提交间隔为 30 秒</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> commit=30 /dev/sda1 /mnt</span></code></pre></div>
+            <p>增大提交间隔可以聚合更多的小写入操作，提高吞吐量，但也增加了崩溃时丢失数据的
+            时间窗口。对于可以容忍少量数据丢失的应用（如日志收集系统），可以将提交间隔设为
+            30-60 秒。</p>
+            <hr />
+            <h2 id="五延迟分配delayed-allocation">五、延迟分配（Delayed
+            Allocation）</h2>
+            <h3 id="传统分配方式的问题">5.1 传统分配方式的问题</h3>
+            <p>在 ext3 中，当应用程序调用 <code>write()</code>
+            将数据写入页缓存（Page Cache）时，文件系统
+            会立即为这些脏页（Dirty
+            Page）分配物理块号。这种”即时分配”的方式存在以下问题：</p>
+            <ul>
+            <li>在数据实际写回磁盘之前，文件系统无法预知文件的最终大小和写入模式，导致分配决策
+            不够优化；</li>
+            <li>对于短生命周期的临时文件，分配了物理块后又很快删除，造成不必要的开销；</li>
+            <li>元数据更新频繁，增加了日志压力。</li>
+            </ul>
+            <h3 id="延迟分配的工作机制">5.2 延迟分配的工作机制</h3>
+            <p>延迟分配（Delayed Allocation，delalloc）是 ext4
+            的默认行为。其核心思想是：当数据
+            写入页缓存时，不立即分配物理块，而是仅在内存中做标记（保留空间计数）；直到脏页
+            需要被写回磁盘时（由内核的回写（Writeback）机制触发），才真正调用块分配器分配物理块。</p>
+            <pre class="text"><code>传统分配流程：
+write() -&gt; 分配物理块 -&gt; 数据写入页缓存 -&gt; 回写到磁盘
+
+延迟分配流程：
+write() -&gt; 数据写入页缓存（不分配块） -&gt; 回写触发 -&gt; 分配物理块 -&gt; 写入磁盘</code></pre>
+            <h3 id="延迟分配的优势">5.3 延迟分配的优势</h3>
+            <ol type="1">
+            <li><p><strong>更好的连续性</strong>：回写时可以看到文件的完整写入范围，从而分配更大的连续区段，
+            减少碎片化（Fragmentation）；</p></li>
+            <li><p><strong>减少元数据开销</strong>：多个小写入可以合并为一个大区段，减少区段树的深度和复杂度；</p></li>
+            <li><p><strong>消除短生命周期文件的开销</strong>：如果一个临时文件在回写之前就被删除，则完全不需要
+            进行物理块分配和元数据更新；</p></li>
+            <li><p><strong>与 mballoc
+            协同</strong>：延迟分配为多块分配器提供了更大的分配请求，使其能做出更优
+            的分配决策。</p></li>
+            </ol>
+            <h3 id="延迟分配的风险">5.4 延迟分配的风险</h3>
+            <p>延迟分配引入了一个潜在的数据丢失风险：如果应用程序调用
+            <code>write()</code> 后没有调用 <code>fsync()</code>
+            就发生崩溃，由于物理块尚未分配，已写入页缓存的数据将完全丢失。在
+            ext3 的 ordered 模式下，虽然也不保证 <code>write()</code>
+            后的数据持久化，但至少文件不会出现”零长度” 的情况。</p>
+            <p>这一行为在 2009
+            年引发了广泛讨论。内核开发者随后引入了以下缓解措施：</p>
+            <ul>
+            <li>对于 <code>rename()</code> 和 <code>truncate()</code>
+            等关键操作，在操作前强制刷写相关文件的脏页；</li>
+            <li>应用程序应在关键数据写入后显式调用 <code>fsync()</code>
+            或使用 <code>O_SYNC</code> 标志。</li>
+            </ul>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用延迟分配（不推荐，仅用于调试）</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> nodelalloc /dev/sda1 /mnt</span></code></pre></div>
+            <h3 id="空间预留机制">5.5 空间预留机制</h3>
+            <p>延迟分配需要一个精确的空间预留（Space
+            Reservation）机制，以避免在回写时发现物理
+            空间不足的问题。ext4 在内存中维护了以下计数器：</p>
+            <ul>
+            <li><code>s_dirtyclusters_counter</code>：待分配的脏簇数量；</li>
+            <li><code>i_reserved_data_blocks</code>：每个索引节点预留的数据块数量。</li>
+            </ul>
+            <p>当预留空间不足时，<code>write()</code> 调用会返回
+            <code>ENOSPC</code>（磁盘空间不足）错误，而不是等到
+            回写时才报错。这种提前检测机制保证了延迟分配的可靠性。</p>
+            <hr />
+            <h2 id="六多块分配与预分配">六、多块分配与预分配</h2>
+            <h3 id="mballoc-分配器">6.1 mballoc 分配器</h3>
+            <p>ext4 的多块分配器（Multiblock
+            Allocator，mballoc）是一个复杂的块分配引擎，它能
+            在一次分配请求中分配多个连续的物理块。相比 ext3
+            的逐块分配方式，mballoc 大幅减少
+            了分配器的调用次数和锁竞争。</p>
+            <p>mballoc 的核心策略包括：</p>
+            <p><strong>伙伴系统（Buddy System）</strong>：</p>
+            <p>mballoc
+            为每个块组维护一个伙伴系统，用于快速查找指定大小的连续空闲块。伙伴系统
+            以 2 的幂次方为单位管理空闲空间：</p>
+            <pre class="text"><code>伙伴系统层级（4 KiB 块大小）：
+Order 0:  4 KiB 块
+Order 1:  8 KiB（2 个连续块）
+Order 2:  16 KiB（4 个连续块）
+...
+Order 13: 32 MiB（8192 个连续块）</code></pre>
+            <p><strong>预分配池（Preallocation Pool）</strong>：</p>
+            <p>mballoc 维护两种预分配池：</p>
+            <ul>
+            <li><strong>索引节点预分配（Inode
+            Preallocation，PA_INODE）</strong>：为单个文件预留连续空间，
+            后续写入可以直接使用预留的块，无需重新搜索；</li>
+            <li><strong>局部组预分配（Locality Group
+            Preallocation，PA_LGROUP）</strong>：为同一 CPU 上的
+            小文件分配提供局部性优化。</li>
+            </ul>
+            <pre class="text"><code>分配策略决策流程：
+
+分配请求
+    |
+    v
+是否为大请求（&gt;= 阈值）？
+    |           |
+    是          否
+    |           |
+    v           v
+  使用伙伴    使用局部组
+  系统分配    预分配池
+    |           |
+    v           v
+  搜索最佳    从预分配池
+  匹配块组    取出块</code></pre>
+            <h3 id="分配策略参数">6.2 分配策略参数</h3>
+            <p>mballoc 的行为可以通过 sysfs 参数调节：</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 mballoc 参数</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/fs/ext4/sda1/</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 流式分配的阈值（单位：块）</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/ext4/sda1/mb_stream_req</span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置流式分配阈值为 64 块</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 64 <span class="op">&gt;</span> /sys/fs/ext4/sda1/mb_stream_req</span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 分配器统计信息</span></span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/fs/ext4/sda1/mb_groups</span></code></pre></div>
+            <p>重要的 mballoc 参数：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>参数</th>
+            <th>默认值</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>mb_stream_req</code></td>
+            <td>16</td>
+            <td>小于此值的分配请求使用局部组预分配</td>
+            </tr>
+            <tr>
+            <td><code>mb_group_prealloc</code></td>
+            <td>512</td>
+            <td>局部组预分配的块数</td>
+            </tr>
+            <tr>
+            <td><code>mb_min_to_scan</code></td>
+            <td>10</td>
+            <td>搜索最佳匹配时最少扫描的块组数</td>
+            </tr>
+            <tr>
+            <td><code>mb_max_to_scan</code></td>
+            <td>200</td>
+            <td>搜索最佳匹配时最多扫描的块组数</td>
+            </tr>
+            <tr>
+            <td><code>mb_order2_req</code></td>
+            <td>2</td>
+            <td>2 的幂次方大小请求的最小阶数</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="fallocate-预分配">6.3 fallocate 预分配</h3>
+            <p><code>fallocate()</code> 系统调用（System
+            Call）允许应用程序预先分配文件空间，而无需实际写入
+            数据。这对于以下场景非常有用：</p>
+            <ul>
+            <li>数据库预分配数据文件和日志文件；</li>
+            <li>虚拟机磁盘镜像的创建；</li>
+            <li>避免写入过程中因空间不足而失败。</li>
+            </ul>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 预分配 1 GiB 的文件</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-l</span> 1G /path/to/file</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 打洞（释放文件中间的空间）</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-p</span> <span class="at">-o</span> 0 <span class="at">-l</span> 512M /path/to/file</span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 折叠（移除文件中间的数据）</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-c</span> <span class="at">-o</span> 0 <span class="at">-l</span> 512M /path/to/file</span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 插入空洞</span></span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-i</span> <span class="at">-o</span> 0 <span class="at">-l</span> 512M /path/to/file</span>
+<span id="cb31-12"><a href="#cb31-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-13"><a href="#cb31-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 零填充</span></span>
+<span id="cb31-14"><a href="#cb31-14" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-z</span> <span class="at">-o</span> 0 <span class="at">-l</span> 512M /path/to/file</span></code></pre></div>
+            <p>在 ext4 内部，<code>fallocate</code>
+            会创建标记为”未初始化（Uninitialized）“的区段。这些区段
+            在读取时返回零值，只有在首次写入后才标记为已初始化。</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 内核中的 fallocate 实现路径 */</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="co">/* fs/ext4/extents.c: ext4_fallocate() */</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ext4_fallocate<span class="op">(</span><span class="kw">struct</span> file <span class="op">*</span>file<span class="op">,</span> <span class="dt">int</span> mode<span class="op">,</span></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a>                   loff_t offset<span class="op">,</span> loff_t len<span class="op">)</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 分配未初始化区段 */</span></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 更新索引节点的 i_disksize（不改变 i_size） */</span></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb32-9"><a href="#cb32-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="分配对齐">6.4 分配对齐</h3>
+            <p>对于 SSD（Solid State Drive）和高级格式硬盘（Advanced
+            Format HDD），块分配的 对齐非常重要。<code>mkfs.ext4</code>
+            能自动检测设备的物理扇区大小和最优 I/O 大小，并据此
+            设置对齐参数：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动指定条带宽度和步长</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-E</span> stride=16,stripe-width=64 /dev/md0</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看对齐参数</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> <span class="at">-h</span> /dev/md0 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;stride|stripe&quot;</span></span></code></pre></div>
+            <p>对于 RAID（Redundant Array of Independent
+            Disks）阵列：</p>
+            <ul>
+            <li><code>stride</code>：单个磁盘的条带深度（以块为单位）；</li>
+            <li><code>stripe-width</code>：整个阵列的条带宽度（stride ×
+            数据盘数量）。</li>
+            </ul>
+            <hr />
+            <h2 id="七在线碎片整理">七、在线碎片整理</h2>
+            <h3 id="碎片化的成因">7.1 碎片化的成因</h3>
+            <p>即使 ext4
+            具备延迟分配和多块分配等先进的分配策略，文件系统在长期使用后仍然会
+            不可避免地产生碎片化：</p>
+            <ul>
+            <li><strong>文件修改与追加写入</strong>：在原有区段之后追加写入时，如果相邻空间已被其他文件占用，
+            新分配的块可能位于磁盘的其他位置；</li>
+            <li><strong>并发写入</strong>：多个文件同时写入，各自的数据块交替分配在磁盘上；</li>
+            <li><strong>删除与创建交替进行</strong>：频繁的文件删除在空闲空间中制造了大量不连续的空洞；</li>
+            <li><strong>文件系统接近满载</strong>：可用空间减少时，连续空间更难获得。</li>
+            </ul>
+            <h3 id="诊断碎片化">7.2 诊断碎片化</h3>
+            <p>使用 <code>filefrag</code>
+            工具可以查看单个文件的碎片情况：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件的区段数量</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="ex">filefrag</span> /path/to/file</span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看详细的区段映射</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="ex">filefrag</span> <span class="at">-v</span> /path/to/file</span></code></pre></div>
+            <p>使用 <code>e2freefrag</code>
+            可以查看文件系统的空闲空间碎片分布：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看空闲空间碎片</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="ex">e2freefrag</span> /dev/sda1</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>Device: /dev/sda1
+Blocksize: 4096 bytes
+Total blocks: 26214400
+Free blocks: 15728640 (60.0%)
+
+Min. free extent: 4 KB
+Max. free extent: 2048 MB
+Avg. free extent: 128 KB
+
+EXTENT SIZE RANGE :  FREE EXTENTS  FREE BLOCKS  PERCENT
+    4K...    8K-  :          1024         1024    0.01%
+    8K...   16K-  :           512         1024    0.01%
+   16K...   32K-  :           256          512    0.00%
+   ...</code></pre>
+            <h3 id="在线碎片整理e4defrag">7.3
+            在线碎片整理（e4defrag）</h3>
+            <p>ext4 支持在线碎片整理（Online
+            Defragmentation），可以在文件系统挂载的状态下进行，
+            无需停机。碎片整理通过 <code>e4defrag</code> 工具完成：</p>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 对整个文件系统进行碎片整理</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="ex">e4defrag</span> /mnt</span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 对单个文件进行碎片整理</span></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a><span class="ex">e4defrag</span> /path/to/file</span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 对目录下的所有文件进行碎片整理</span></span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a><span class="ex">e4defrag</span> /mnt/data/</span></code></pre></div>
+            <p><code>e4defrag</code> 的工作原理：</p>
+            <ol type="1">
+            <li>通过 <code>EXT4_IOC_MOVE_EXT</code> ioctl
+            将源文件的数据复制到一个临时的”供体文件” （Donor
+            File）的连续区段中；</li>
+            <li>原子地交换源文件与供体文件的区段映射；</li>
+            <li>删除供体文件。</li>
+            </ol>
+            <p>这种基于区段交换的方式保证了碎片整理过程的原子性——即使在整理过程中发生崩溃，
+            文件数据也不会丢失。</p>
+            <h3 id="碎片整理的实践建议">7.4 碎片整理的实践建议</h3>
+            <ul>
+            <li><strong>定期检查</strong>：通过定时任务（Cron
+            Job）定期运行 <code>filefrag</code>
+            统计关键文件的碎片程度；</li>
+            <li><strong>低峰期执行</strong>：碎片整理会产生大量
+            I/O，应在系统负载较低时执行；</li>
+            <li><strong>优先整理热点文件</strong>：对数据库文件、虚拟机磁盘镜像等频繁访问的大文件优先整理；</li>
+            <li><strong>保留足够空闲空间</strong>：文件系统使用率维持在
+            80% 以下可有效减缓碎片化。</li>
+            </ul>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 定时碎片整理的 cron 配置示例</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 每周日凌晨 3 点执行碎片整理</span></span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a><span class="ex">0</span> 3 <span class="pp">*</span> <span class="pp">*</span> 0 /usr/sbin/e4defrag /mnt/data <span class="op">&gt;&gt;</span> /var/log/e4defrag.log <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span></span></code></pre></div>
+            <hr />
+            <h2 id="八ext4-高级特性">八、ext4 高级特性</h2>
+            <h3 id="大块分配bigalloc">8.1 大块分配（bigalloc）</h3>
+            <p>大块分配（bigalloc）特性将多个磁盘块组合为一个”簇（Cluster）“，以簇为单位进行
+            分配。这减少了位图的大小和块分配器的开销，特别适用于超大文件系统。</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建使用 64 KiB 簇的文件系统</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-O</span> bigalloc <span class="at">-C</span> 65536 /dev/sda1</span></code></pre></div>
+            <p>bigalloc 的优势：</p>
+            <ul>
+            <li>位图变小（块位图变为簇位图），减少内存占用；</li>
+            <li>分配粒度增大，有利于大文件的连续分配；</li>
+            <li>减少区段数量，降低区段树的深度。</li>
+            </ul>
+            <p>注意事项：</p>
+            <ul>
+            <li>bigalloc 会增加小文件的空间浪费（内部碎片）；</li>
+            <li>与某些特性（如在线碎片整理）的兼容性需要验证；</li>
+            <li>建议仅在大文件主导的场景中使用。</li>
+            </ul>
+            <h3 id="项目配额project-quota">8.2 项目配额（Project
+            Quota）</h3>
+            <p>项目配额（Project
+            Quota）允许管理员为特定的”项目”设置磁盘空间和索引节点的使用限额。
+            与传统的用户配额（User Quota）和组配额（Group
+            Quota）不同，项目配额可以跨用户和组
+            进行空间管理，更适合多租户环境。</p>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用项目配额</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-O</span> project,quota /dev/sda1</span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 挂载时启用项目配额</span></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> prjquota /dev/sda1 /mnt</span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置目录的项目 ID</span></span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a><span class="fu">chattr</span> +P <span class="at">-p</span> 100 /mnt/project_a/</span>
+<span id="cb40-9"><a href="#cb40-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-10"><a href="#cb40-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置项目配额限制</span></span>
+<span id="cb40-11"><a href="#cb40-11" aria-hidden="true" tabindex="-1"></a><span class="ex">repquota</span> <span class="at">-Ps</span> /mnt</span>
+<span id="cb40-12"><a href="#cb40-12" aria-hidden="true" tabindex="-1"></a><span class="ex">edquota</span> <span class="at">-P</span> 100</span></code></pre></div>
+            <h3 id="内联数据inline-data">8.3 内联数据（Inline
+            Data）</h3>
+            <p>对于非常小的文件（通常小于 60 字节），ext4
+            可以将文件数据直接存储在索引节点中，
+            而不需要分配额外的数据块。这一特性称为内联数据（Inline
+            Data，inline_data）。</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建支持内联数据的文件系统</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-O</span> inline_data <span class="at">-I</span> 256 /dev/sda1</span></code></pre></div>
+            <p>内联数据的存储位置是索引节点中原本用于区段树 /
+            间接块指针的 <code>i_block</code> 字段（60 字节）
+            以及扩展属性（xattr）区域。对于包含大量小文件的场景（如邮件服务器的
+            Maildir 目录）， 内联数据可以显著减少磁盘 I/O
+            和空间浪费。</p>
+            <h3 id="文件系统级加密fscrypt">8.4
+            文件系统级加密（fscrypt）</h3>
+            <p>ext4 从 Linux 4.1
+            开始支持文件系统级加密（Filesystem-level
+            Encryption，fscrypt）。 加密以目录为单位进行，使用
+            AES-256-XTS 加密文件内容，使用 AES-256-CTS-CBC
+            加密文件名。</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用加密特性</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-O</span> encrypt /dev/sda1</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 生成加密密钥</span></span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a><span class="ex">fscryptctl</span> get_policy /mnt/encrypted_dir</span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置加密策略</span></span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a><span class="ex">fscrypt</span> encrypt /mnt/secret_dir</span></code></pre></div>
+            <p>fscrypt 的设计优势：</p>
+            <ul>
+            <li>加密在文件系统层完成，对应用透明；</li>
+            <li>不同目录可以使用不同的密钥；</li>
+            <li>支持硬件加速（AES-NI）；</li>
+            <li>与页缓存集成，加密/解密在 I/O 路径中完成。</li>
+            </ul>
+            <h3 id="元数据校验和metadata-checksums">8.5
+            元数据校验和（Metadata Checksums）</h3>
+            <p>ext4
+            支持对所有元数据（超级块、组描述符、位图、索引节点、区段、目录项）计算
+            CRC32C
+            校验和。一旦检测到校验和不匹配，文件系统会将受影响的块组标记为损坏并触发错误处理。</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建启用元数据校验和的文件系统</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-O</span> metadata_csum /dev/sda1</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 为已有文件系统启用校验和（需要离线）</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-O</span> metadata_csum /dev/sda1</span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a><span class="ex">e2fsck</span> <span class="at">-Df</span> /dev/sda1</span></code></pre></div>
+            <h3 id="快速提交fast-commit">8.6 快速提交（Fast
+            Commit）</h3>
+            <p>快速提交（Fast Commit）是 Linux 5.10
+            引入的日志优化特性。传统的 JBD2 日志以
+            完整的块为单位记录修改，即使只修改了块中的几个字节，也需要记录整个
+            4 KiB 块。 快速提交通过记录更细粒度的修改操作（如”在目录 X
+            中添加条目 Y”），减少了日志写入量。</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用快速提交</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-O</span> fast_commit /dev/sda1</span></code></pre></div>
+            <hr />
+            <h2 id="九ext4-调优实战">九、ext4 调优实战</h2>
+            <h3 id="mkfs-选项优化">9.1 mkfs 选项优化</h3>
+            <p>创建文件系统时的选项对后续性能影响深远，且大多数选项无法事后更改。</p>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 针对大文件场景的 mkfs 配置</span></span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="dt">\</span></span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">-O</span> 64bit,extent,flex_bg,metadata_csum,huge_file <span class="dt">\</span></span>
+<span id="cb45-4"><a href="#cb45-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">-b</span> 4096 <span class="dt">\</span></span>
+<span id="cb45-5"><a href="#cb45-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">-i</span> 1048576 <span class="dt">\</span></span>
+<span id="cb45-6"><a href="#cb45-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">-I</span> 256 <span class="dt">\</span></span>
+<span id="cb45-7"><a href="#cb45-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">-J</span> size=256 <span class="dt">\</span></span>
+<span id="cb45-8"><a href="#cb45-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">-E</span> stride=16,stripe-width=64,lazy_itable_init=1 <span class="dt">\</span></span>
+<span id="cb45-9"><a href="#cb45-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">-T</span> largefile <span class="dt">\</span></span>
+<span id="cb45-10"><a href="#cb45-10" aria-hidden="true" tabindex="-1"></a>    /dev/sda1</span></code></pre></div>
+            <p>参数说明：</p>
+            <table>
+            <colgroup>
+            <col style="width: 50%" />
+            <col style="width: 50%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>参数</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>-b 4096</code></td>
+            <td>块大小 4 KiB（默认值，适合大多数场景）</td>
+            </tr>
+            <tr>
+            <td><code>-i 1048576</code></td>
+            <td>每 1 MiB
+            分配一个索引节点（大文件场景，减少索引节点浪费）</td>
+            </tr>
+            <tr>
+            <td><code>-I 256</code></td>
+            <td>索引节点大小 256 字节（默认值）</td>
+            </tr>
+            <tr>
+            <td><code>-J size=256</code></td>
+            <td>日志大小 256 MiB</td>
+            </tr>
+            <tr>
+            <td><code>-E lazy_itable_init=1</code></td>
+            <td>延迟初始化索引节点表</td>
+            </tr>
+            <tr>
+            <td><code>-T largefile</code></td>
+            <td>使用大文件预设配置</td>
+            </tr>
+            </tbody>
+            </table>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 针对小文件场景的 mkfs 配置（如邮件服务器）</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="dt">\</span></span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">-O</span> inline_data,metadata_csum <span class="dt">\</span></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">-b</span> 4096 <span class="dt">\</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">-i</span> 4096 <span class="dt">\</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">-I</span> 512 <span class="dt">\</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">-J</span> size=128 <span class="dt">\</span></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">-T</span> news <span class="dt">\</span></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a>    /dev/sda1</span></code></pre></div>
+            <h3 id="挂载选项优化">9.2 挂载选项优化</h3>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 通用优化挂载选项</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime,nodiratime,barrier=1,commit=5 /dev/sda1 /mnt</span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 写入密集型工作负载</span></span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime,data=writeback,barrier=0,commit=30,delalloc /dev/sda1 /mnt</span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-7"><a href="#cb47-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据安全优先</span></span>
+<span id="cb47-8"><a href="#cb47-8" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime,data=journal,barrier=1,commit=1 /dev/sda1 /mnt</span></code></pre></div>
+            <p>关键挂载选项说明：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>选项</th>
+            <th>说明</th>
+            <th>建议</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>noatime</code></td>
+            <td>不更新访问时间</td>
+            <td>几乎所有场景都应启用</td>
+            </tr>
+            <tr>
+            <td><code>nodiratime</code></td>
+            <td>不更新目录访问时间</td>
+            <td><code>noatime</code> 已隐含此选项</td>
+            </tr>
+            <tr>
+            <td><code>barrier=1</code></td>
+            <td>启用写屏障（Write Barrier）</td>
+            <td>默认启用，保证数据安全</td>
+            </tr>
+            <tr>
+            <td><code>commit=N</code></td>
+            <td>日志提交间隔（秒）</td>
+            <td>默认 5 秒</td>
+            </tr>
+            <tr>
+            <td><code>delalloc</code></td>
+            <td>延迟分配</td>
+            <td>默认启用</td>
+            </tr>
+            <tr>
+            <td><code>discard</code></td>
+            <td>启用 TRIM 支持</td>
+            <td>SSD 场景应启用</td>
+            </tr>
+            <tr>
+            <td><code>max_batch_time</code></td>
+            <td>最大批处理时间（微秒）</td>
+            <td>写入密集型可增大</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="sysctl-参数调优">9.3 sysctl 参数调优</h3>
+            <p>内核的虚拟内存（Virtual Memory）子系统参数对 ext4
+            的性能有重要影响：</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整脏页回写参数</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 脏页占内存比例的阈值，超过后开始后台回写</span></span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=5</span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 脏页占内存比例的硬限制，超过后进程被阻塞</span></span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=20</span>
+<span id="cb48-7"><a href="#cb48-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-8"><a href="#cb48-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 脏页最长存留时间（厘秒，即 1/100 秒）</span></span>
+<span id="cb48-9"><a href="#cb48-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=3000</span>
+<span id="cb48-10"><a href="#cb48-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-11"><a href="#cb48-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 回写线程唤醒间隔（厘秒）</span></span>
+<span id="cb48-12"><a href="#cb48-12" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_writeback_centisecs=500</span></code></pre></div>
+            <p>对于不同的工作负载，建议如下：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据库服务器（减少脏页积累，降低突发写入延迟）</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=3</span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=10</span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=1500</span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_writeback_centisecs=100</span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 文件服务器（允许更多脏页积累，提高吞吐量）</span></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=10</span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=40</span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=6000</span>
+<span id="cb49-11"><a href="#cb49-11" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_writeback_centisecs=500</span></code></pre></div>
+            <h3 id="io-调度器调优">9.4 I/O 调度器调优</h3>
+            <p>I/O 调度器（I/O Scheduler）的选择对 ext4
+            在不同存储介质上的性能有显著影响：</p>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前 I/O 调度器</span></span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a><span class="co"># HDD 推荐使用 mq-deadline 或 bfq</span></span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> mq-deadline <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a><span class="co"># SSD/NVMe 推荐使用 none（直通模式）</span></span>
+<span id="cb50-8"><a href="#cb50-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> none <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span>
+<span id="cb50-9"><a href="#cb50-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-10"><a href="#cb50-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整队列深度</span></span>
+<span id="cb50-11"><a href="#cb50-11" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 128 <span class="op">&gt;</span> /sys/block/sda/queue/nr_requests</span></code></pre></div>
+            <h3 id="数据库工作负载调优">9.5 数据库工作负载调优</h3>
+            <p>数据库（如 MySQL/PostgreSQL）通常使用 O_DIRECT
+            绕过页缓存，并通过自有的缓冲池 （Buffer
+            Pool）管理数据缓存。针对数据库工作负载的 ext4 调优要点：</p>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据库场景的推荐挂载选项</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime,data=writeback,barrier=1,commit=5,nodelalloc /dev/sda1 /mnt/data</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据库的数据目录通常禁用延迟分配</span></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 因为数据库自行管理 fsync 语义，延迟分配的优势不明显</span></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 且可能导致 ENOSPC 错误的时机不可预测</span></span></code></pre></div>
+            <p>MySQL InnoDB 的推荐配置：</p>
+            <div class="sourceCode" id="cb52"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb52-1"><a href="#cb52-1" aria-hidden="true" tabindex="-1"></a><span class="co"># my.cnf</span></span>
+<span id="cb52-2"><a href="#cb52-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[mysqld]</span></span>
+<span id="cb52-3"><a href="#cb52-3" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_flush_method </span><span class="ot">=</span><span class="st"> O_DIRECT</span></span>
+<span id="cb52-4"><a href="#cb52-4" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_file_per_table </span><span class="ot">=</span><span class="st"> </span><span class="kw">ON</span></span>
+<span id="cb52-5"><a href="#cb52-5" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_flush_log_at_trx_commit </span><span class="ot">=</span><span class="st"> </span><span class="dv">1</span></span>
+<span id="cb52-6"><a href="#cb52-6" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_doublewrite </span><span class="ot">=</span><span class="st"> </span><span class="kw">ON</span></span></code></pre></div>
+            <p>PostgreSQL 的推荐配置：</p>
+            <div class="sourceCode" id="cb53"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a><span class="co"># postgresql.conf</span></span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_level </span><span class="ot">=</span><span class="st"> replica</span></span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a><span class="dt">fsync </span><span class="ot">=</span><span class="st"> </span><span class="kw">on</span></span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a><span class="dt">synchronous_commit </span><span class="ot">=</span><span class="st"> </span><span class="kw">on</span></span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a><span class="dt">full_page_writes </span><span class="ot">=</span><span class="st"> </span><span class="kw">on</span></span>
+<span id="cb53-6"><a href="#cb53-6" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_buffers </span><span class="ot">=</span><span class="st"> 64MB</span></span>
+<span id="cb53-7"><a href="#cb53-7" aria-hidden="true" tabindex="-1"></a><span class="dt">checkpoint_timeout </span><span class="ot">=</span><span class="st"> 15min</span></span></code></pre></div>
+            <h3 id="预分配数据库文件">9.6 预分配数据库文件</h3>
+            <p>对于数据库文件，使用 <code>fallocate</code>
+            预分配可以避免写入过程中的块分配开销和碎片化：</p>
+            <div class="sourceCode" id="cb54"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb54-1"><a href="#cb54-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 预分配 InnoDB 数据文件</span></span>
+<span id="cb54-2"><a href="#cb54-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-l</span> 10G /mnt/data/mysql/ibdata1</span>
+<span id="cb54-3"><a href="#cb54-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb54-4"><a href="#cb54-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 预分配 WAL 文件</span></span>
+<span id="cb54-5"><a href="#cb54-5" aria-hidden="true" tabindex="-1"></a><span class="ex">fallocate</span> <span class="at">-l</span> 1G /mnt/data/pg_wal/000000010000000000000001</span></code></pre></div>
+            <h3 id="ext4-日常维护">9.7 ext4 日常维护</h3>
+            <div class="sourceCode" id="cb55"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb55-1"><a href="#cb55-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查文件系统（需要卸载）</span></span>
+<span id="cb55-2"><a href="#cb55-2" aria-hidden="true" tabindex="-1"></a><span class="ex">e2fsck</span> <span class="at">-f</span> /dev/sda1</span>
+<span id="cb55-3"><a href="#cb55-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-4"><a href="#cb55-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 在线调整文件系统大小（扩容）</span></span>
+<span id="cb55-5"><a href="#cb55-5" aria-hidden="true" tabindex="-1"></a><span class="ex">resize2fs</span> /dev/sda1</span>
+<span id="cb55-6"><a href="#cb55-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-7"><a href="#cb55-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件系统特性</span></span>
+<span id="cb55-8"><a href="#cb55-8" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-l</span> /dev/sda1</span>
+<span id="cb55-9"><a href="#cb55-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-10"><a href="#cb55-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 修改文件系统标签</span></span>
+<span id="cb55-11"><a href="#cb55-11" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-L</span> <span class="st">&quot;data&quot;</span> /dev/sda1</span>
+<span id="cb55-12"><a href="#cb55-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-13"><a href="#cb55-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置挂载次数检查间隔</span></span>
+<span id="cb55-14"><a href="#cb55-14" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-c</span> 50 /dev/sda1</span>
+<span id="cb55-15"><a href="#cb55-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-16"><a href="#cb55-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置时间检查间隔</span></span>
+<span id="cb55-17"><a href="#cb55-17" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-i</span> 3m /dev/sda1</span>
+<span id="cb55-18"><a href="#cb55-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-19"><a href="#cb55-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用/禁用特性</span></span>
+<span id="cb55-20"><a href="#cb55-20" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-O</span> ^has_journal /dev/sda1</span>
+<span id="cb55-21"><a href="#cb55-21" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-O</span> has_journal /dev/sda1</span></code></pre></div>
+            <h3 id="性能基准测试方法">9.8 性能基准测试方法</h3>
+            <p>在进行调优时，建立可重复的基准测试（Benchmark）方法至关重要：</p>
+            <div class="sourceCode" id="cb56"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb56-1"><a href="#cb56-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 fio 进行基准测试</span></span>
+<span id="cb56-2"><a href="#cb56-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 顺序写入测试</span></span>
+<span id="cb56-3"><a href="#cb56-3" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>seq-write <span class="dt">\</span></span>
+<span id="cb56-4"><a href="#cb56-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb56-5"><a href="#cb56-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb56-6"><a href="#cb56-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>1M <span class="dt">\</span></span>
+<span id="cb56-7"><a href="#cb56-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>4G <span class="dt">\</span></span>
+<span id="cb56-8"><a href="#cb56-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb56-9"><a href="#cb56-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>write <span class="dt">\</span></span>
+<span id="cb56-10"><a href="#cb56-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--group_reporting</span> <span class="dt">\</span></span>
+<span id="cb56-11"><a href="#cb56-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/mnt/testfile</span>
+<span id="cb56-12"><a href="#cb56-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-13"><a href="#cb56-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 随机读写混合测试（模拟数据库）</span></span>
+<span id="cb56-14"><a href="#cb56-14" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>rand-rw <span class="dt">\</span></span>
+<span id="cb56-15"><a href="#cb56-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb56-16"><a href="#cb56-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb56-17"><a href="#cb56-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4K <span class="dt">\</span></span>
+<span id="cb56-18"><a href="#cb56-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>4G <span class="dt">\</span></span>
+<span id="cb56-19"><a href="#cb56-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb56-20"><a href="#cb56-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randrw <span class="dt">\</span></span>
+<span id="cb56-21"><a href="#cb56-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rwmixread</span><span class="op">=</span>70 <span class="dt">\</span></span>
+<span id="cb56-22"><a href="#cb56-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">--iodepth</span><span class="op">=</span>32 <span class="dt">\</span></span>
+<span id="cb56-23"><a href="#cb56-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">--group_reporting</span> <span class="dt">\</span></span>
+<span id="cb56-24"><a href="#cb56-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/mnt/testfile</span>
+<span id="cb56-25"><a href="#cb56-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-26"><a href="#cb56-26" aria-hidden="true" tabindex="-1"></a><span class="co"># 元数据密集测试（模拟邮件服务器）</span></span>
+<span id="cb56-27"><a href="#cb56-27" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>metadata <span class="dt">\</span></span>
+<span id="cb56-28"><a href="#cb56-28" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb56-29"><a href="#cb56-29" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>0 <span class="dt">\</span></span>
+<span id="cb56-30"><a href="#cb56-30" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4K <span class="dt">\</span></span>
+<span id="cb56-31"><a href="#cb56-31" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>64K <span class="dt">\</span></span>
+<span id="cb56-32"><a href="#cb56-32" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb56-33"><a href="#cb56-33" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randwrite <span class="dt">\</span></span>
+<span id="cb56-34"><a href="#cb56-34" aria-hidden="true" tabindex="-1"></a>    <span class="at">--nrfiles</span><span class="op">=</span>10000 <span class="dt">\</span></span>
+<span id="cb56-35"><a href="#cb56-35" aria-hidden="true" tabindex="-1"></a>    <span class="at">--group_reporting</span> <span class="dt">\</span></span>
+<span id="cb56-36"><a href="#cb56-36" aria-hidden="true" tabindex="-1"></a>    <span class="at">--directory</span><span class="op">=</span>/mnt/test/</span></code></pre></div>
+            <div class="sourceCode" id="cb57"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb57-1"><a href="#cb57-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 在测试前清除缓存</span></span>
+<span id="cb57-2"><a href="#cb57-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb57-3"><a href="#cb57-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 3 <span class="op">&gt;</span> /proc/sys/vm/drop_caches</span>
+<span id="cb57-4"><a href="#cb57-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb57-5"><a href="#cb57-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 iostat 监控磁盘 I/O</span></span>
+<span id="cb57-6"><a href="#cb57-6" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span></code></pre></div>
+            <hr />
+            <h2 id="十ext4-vs-xfs-对比">十、ext4 vs XFS 对比</h2>
+            <h3 id="架构差异概述">10.1 架构差异概述</h3>
+            <p>ext4 和 XFS 是 Linux
+            上最主要的两个本地文件系统。两者在架构理念上有根本性的差异：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>ext4</th>
+            <th>XFS</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>设计年代</td>
+            <td>2006 年（基于 ext2 1993 年的设计）</td>
+            <td>1993 年（SGI IRIX）</td>
+            </tr>
+            <tr>
+            <td>元数据组织</td>
+            <td>块组 + 位图</td>
+            <td>分配组（Allocation Group） + B+ 树</td>
+            </tr>
+            <tr>
+            <td>块映射</td>
+            <td>区段树（B+ 树）</td>
+            <td>B+ 树（bmbt）</td>
+            </tr>
+            <tr>
+            <td>空闲空间管理</td>
+            <td>位图</td>
+            <td>B+ 树</td>
+            </tr>
+            <tr>
+            <td>日志实现</td>
+            <td>JBD2（独立模块）</td>
+            <td>内建日志</td>
+            </tr>
+            <tr>
+            <td>目录组织</td>
+            <td>线性/HTree</td>
+            <td>B+ 树</td>
+            </tr>
+            <tr>
+            <td>索引节点分配</td>
+            <td>静态预分配</td>
+            <td>动态分配</td>
+            </tr>
+            <tr>
+            <td>引用链接（Reflink）</td>
+            <td>不支持</td>
+            <td>支持</td>
+            </tr>
+            <tr>
+            <td>在线缩容</td>
+            <td>不支持</td>
+            <td>不支持</td>
+            </tr>
+            <tr>
+            <td>在线扩容</td>
+            <td>支持</td>
+            <td>支持</td>
+            </tr>
+            <tr>
+            <td>反向映射（Reverse Mapping）</td>
+            <td>不支持</td>
+            <td>支持（rmap）</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="性能对比方法论">10.2 性能对比方法论</h3>
+            <p>进行有意义的性能对比需要严格的方法论：</p>
+            <ol type="1">
+            <li><strong>控制变量</strong>：使用相同的硬件、内核版本、挂载选项（在语义等价的范围内）；</li>
+            <li><strong>多次运行</strong>：每个测试至少运行 3
+            次取中位数，排除异常值；</li>
+            <li><strong>预热阶段</strong>：每次测试前执行一轮预热以消除冷启动效应；</li>
+            <li><strong>清除缓存</strong>：每次测试前清除页缓存和目录项缓存（dentry
+            cache）；</li>
+            <li><strong>监控系统状态</strong>：使用
+            <code>iostat</code>、<code>vmstat</code>、<code>perf</code>
+            记录测试期间的系统行为。</li>
+            </ol>
+            <h3 id="各工作负载对比">10.3 各工作负载对比</h3>
+            <p><strong>顺序大文件 I/O</strong>：</p>
+            <p>在顺序读写大文件的场景下，ext4 和 XFS
+            的性能差距很小，两者都能接近磁盘或 SSD 的 硬件带宽上限。XFS
+            在超大文件（&gt;1
+            TiB）场景下由于动态索引节点分配和更灵活的分配组
+            机制，可能略有优势。</p>
+            <pre class="text"><code>顺序写入 4 GiB 文件（NVMe SSD，fio，direct=1，bs=1M）：
+ext4:  2850 MiB/s
+XFS:   2870 MiB/s
+差异:  &lt; 1%</code></pre>
+            <p><strong>随机小 I/O</strong>：</p>
+            <p>在随机 4 KiB 读写场景下，两者性能也非常接近。XFS 的 B+
+            树空闲空间管理在高碎片化 环境下可能略优于 ext4
+            的位图扫描。</p>
+            <pre class="text"><code>随机 4K 读写（70/30，NVMe SSD，fio，direct=1，iodepth=32，16 线程）：
+ext4:  485K IOPS
+XFS:   490K IOPS
+差异:  ~1%</code></pre>
+            <p><strong>元数据密集操作</strong>：</p>
+            <p>在创建/删除大量小文件的场景下，ext4 通常表现优于
+            XFS。这是因为 ext4 的位图分配 在小文件场景下更高效，而 XFS
+            的 B+ 树维护开销相对较大。</p>
+            <pre class="text"><code>创建 100 万个 4 KiB 文件（HDD）：
+ext4:  12 分 30 秒
+XFS:   15 分 45 秒
+差异:  约 26%
+
+删除 100 万个文件（HDD）：
+ext4:  3 分 20 秒
+XFS:   4 分 10 秒
+差异:  约 25%</code></pre>
+            <p><strong>并发写入</strong>：</p>
+            <p>XFS 在高并发写入场景下通常优于 ext4。XFS
+            的分配组（Allocation Group）机制允许
+            不同线程在不同的分配组中并行分配空间，而 ext4
+            的块组锁竞争相对严重。</p>
+            <pre class="text"><code>16 线程并发顺序写入（各 1 GiB，NVMe SSD）：
+ext4:  2200 MiB/s（总计）
+XFS:   2750 MiB/s（总计）
+差异:  约 25%</code></pre>
+            <p><strong>混合工作负载（数据库）</strong>：</p>
+            <p>在模拟 OLTP（Online Transaction
+            Processing）数据库的混合工作负载下，两者的差距 取决于具体的
+            I/O 模式。对于 MySQL InnoDB，两者性能差距通常在 5%
+            以内。对于 PostgreSQL，XFS 在 WAL（Write-Ahead
+            Log）密集的场景下可能有 10-15% 的优势。</p>
+            <h3 id="选型建议">10.4 选型建议</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>场景</th>
+            <th>推荐文件系统</th>
+            <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>通用服务器</td>
+            <td>ext4</td>
+            <td>稳定成熟，工具链完善</td>
+            </tr>
+            <tr>
+            <td>大文件存储</td>
+            <td>XFS</td>
+            <td>动态索引节点，B+ 树分配</td>
+            </tr>
+            <tr>
+            <td>小文件海量存储</td>
+            <td>ext4</td>
+            <td>位图分配效率高</td>
+            </tr>
+            <tr>
+            <td>高并发写入</td>
+            <td>XFS</td>
+            <td>分配组并行分配</td>
+            </tr>
+            <tr>
+            <td>数据库（MySQL）</td>
+            <td>ext4 或 XFS</td>
+            <td>差距不大，选择熟悉的</td>
+            </tr>
+            <tr>
+            <td>数据库（PostgreSQL）</td>
+            <td>XFS</td>
+            <td>WAL 写入性能更好</td>
+            </tr>
+            <tr>
+            <td>容器存储</td>
+            <td>XFS + project quota</td>
+            <td>配额隔离更灵活</td>
+            </tr>
+            <tr>
+            <td>虚拟化存储</td>
+            <td>XFS</td>
+            <td>reflink 支持快速克隆</td>
+            </tr>
+            <tr>
+            <td>嵌入式/小型设备</td>
+            <td>ext4</td>
+            <td>代码简单，资源占用少</td>
+            </tr>
+            <tr>
+            <td>需要在线缩容</td>
+            <td>ext4</td>
+            <td>XFS 不支持在线缩容</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="迁移注意事项">10.5 迁移注意事项</h3>
+            <p>从 ext4 迁移到 XFS（或反向迁移）时需要注意：</p>
+            <ul>
+            <li>两者的挂载选项不完全相同，需要逐一对照转换；</li>
+            <li>XFS 不支持在线缩容，迁移前需确认容量规划；</li>
+            <li>备份和恢复工具不同：ext4 使用
+            <code>dump/restore</code>，XFS 使用
+            <code>xfsdump/xfsrestore</code>；</li>
+            <li>文件系统级加密（fscrypt）在两者上的行为一致；</li>
+            <li>ACL（Access Control
+            List）和扩展属性在两者上的语义相同。</li>
+            </ul>
+            <hr />
+            <h2 id="附录">附录</h2>
+            <h3 id="附录-aext4-特性标志速查表">附录 A：ext4
+            特性标志速查表</h3>
+            <div class="sourceCode" id="cb62"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb62-1"><a href="#cb62-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看已启用的特性标志</span></span>
+<span id="cb62-2"><a href="#cb62-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-l</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&quot;Filesystem features&quot;</span></span></code></pre></div>
+            <p>常用特性标志：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>标志</th>
+            <th>说明</th>
+            <th>默认</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>has_journal</code></td>
+            <td>日志支持</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td><code>extent</code></td>
+            <td>区段映射</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td><code>flex_bg</code></td>
+            <td>弹性块组</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td><code>64bit</code></td>
+            <td>64 位块号</td>
+            <td>是（新版 e2fsprogs）</td>
+            </tr>
+            <tr>
+            <td><code>metadata_csum</code></td>
+            <td>元数据校验和</td>
+            <td>是（新版 e2fsprogs）</td>
+            </tr>
+            <tr>
+            <td><code>dir_index</code></td>
+            <td>HTree 目录索引</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td><code>huge_file</code></td>
+            <td>大文件支持</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td><code>uninit_bg</code></td>
+            <td>延迟初始化块组</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td><code>bigalloc</code></td>
+            <td>大块分配</td>
+            <td>否</td>
+            </tr>
+            <tr>
+            <td><code>inline_data</code></td>
+            <td>内联数据</td>
+            <td>否</td>
+            </tr>
+            <tr>
+            <td><code>encrypt</code></td>
+            <td>文件系统加密</td>
+            <td>否</td>
+            </tr>
+            <tr>
+            <td><code>project</code></td>
+            <td>项目配额</td>
+            <td>否</td>
+            </tr>
+            <tr>
+            <td><code>fast_commit</code></td>
+            <td>快速提交</td>
+            <td>否</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="附录-b常用诊断命令">附录 B：常用诊断命令</h3>
+            <div class="sourceCode" id="cb63"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb63-1"><a href="#cb63-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看超级块信息</span></span>
+<span id="cb63-2"><a href="#cb63-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> <span class="at">-h</span> /dev/sda1</span>
+<span id="cb63-3"><a href="#cb63-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-4"><a href="#cb63-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看块组详情</span></span>
+<span id="cb63-5"><a href="#cb63-5" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> /dev/sda1 <span class="kw">|</span> <span class="fu">less</span></span>
+<span id="cb63-6"><a href="#cb63-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-7"><a href="#cb63-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 交互式调试</span></span>
+<span id="cb63-8"><a href="#cb63-8" aria-hidden="true" tabindex="-1"></a><span class="ex">debugfs</span> /dev/sda1</span>
+<span id="cb63-9"><a href="#cb63-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-10"><a href="#cb63-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 debugfs 中查看索引节点</span></span>
+<span id="cb63-11"><a href="#cb63-11" aria-hidden="true" tabindex="-1"></a><span class="ex">debugfs:</span> stat <span class="op">&lt;</span>inode_number<span class="op">&gt;</span></span>
+<span id="cb63-12"><a href="#cb63-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-13"><a href="#cb63-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 debugfs 中查看区段树</span></span>
+<span id="cb63-14"><a href="#cb63-14" aria-hidden="true" tabindex="-1"></a><span class="ex">debugfs:</span> extent_open <span class="op">&lt;</span>inode_number<span class="op">&gt;</span></span>
+<span id="cb63-15"><a href="#cb63-15" aria-hidden="true" tabindex="-1"></a><span class="ex">debugfs:</span> extent_dump</span>
+<span id="cb63-16"><a href="#cb63-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-17"><a href="#cb63-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件的区段映射</span></span>
+<span id="cb63-18"><a href="#cb63-18" aria-hidden="true" tabindex="-1"></a><span class="ex">filefrag</span> <span class="at">-v</span> /path/to/file</span>
+<span id="cb63-19"><a href="#cb63-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-20"><a href="#cb63-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看空闲空间碎片</span></span>
+<span id="cb63-21"><a href="#cb63-21" aria-hidden="true" tabindex="-1"></a><span class="ex">e2freefrag</span> /dev/sda1</span>
+<span id="cb63-22"><a href="#cb63-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-23"><a href="#cb63-23" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 mballoc 统计</span></span>
+<span id="cb63-24"><a href="#cb63-24" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/fs/ext4/sda1/mb_groups</span>
+<span id="cb63-25"><a href="#cb63-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-26"><a href="#cb63-26" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看延迟分配统计</span></span>
+<span id="cb63-27"><a href="#cb63-27" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/fs/ext4/sda1/delayed_allocation_blocks</span>
+<span id="cb63-28"><a href="#cb63-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-29"><a href="#cb63-29" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看日志状态</span></span>
+<span id="cb63-30"><a href="#cb63-30" aria-hidden="true" tabindex="-1"></a><span class="ex">dumpe2fs</span> <span class="at">-h</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> journal</span></code></pre></div>
+            <h3 id="附录-c故障排除">附录 C：故障排除</h3>
+            <p><strong>场景一：文件系统只读挂载</strong></p>
+            <div class="sourceCode" id="cb64"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看系统日志</span></span>
+<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> ext4</span>
+<span id="cb64-3"><a href="#cb64-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb64-4"><a href="#cb64-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 常见原因：检测到元数据错误，文件系统自动切换为只读</span></span>
+<span id="cb64-5"><a href="#cb64-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 解决方案：卸载后执行 e2fsck</span></span>
+<span id="cb64-6"><a href="#cb64-6" aria-hidden="true" tabindex="-1"></a><span class="fu">umount</span> /mnt</span>
+<span id="cb64-7"><a href="#cb64-7" aria-hidden="true" tabindex="-1"></a><span class="ex">e2fsck</span> <span class="at">-f</span> /dev/sda1</span>
+<span id="cb64-8"><a href="#cb64-8" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> /dev/sda1 /mnt</span></code></pre></div>
+            <p><strong>场景二：ENOSPC 但 df 显示有空间</strong></p>
+            <div class="sourceCode" id="cb65"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb65-1"><a href="#cb65-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 可能原因 1：索引节点用尽</span></span>
+<span id="cb65-2"><a href="#cb65-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /mnt</span>
+<span id="cb65-3"><a href="#cb65-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb65-4"><a href="#cb65-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 可能原因 2：预留块（Reserved Blocks）</span></span>
+<span id="cb65-5"><a href="#cb65-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认预留 5% 空间给 root 用户</span></span>
+<span id="cb65-6"><a href="#cb65-6" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-l</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&quot;Reserved block count&quot;</span></span>
+<span id="cb65-7"><a href="#cb65-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb65-8"><a href="#cb65-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 减少预留比例（生产环境建议保留 1-2%）</span></span>
+<span id="cb65-9"><a href="#cb65-9" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-m</span> 1 /dev/sda1</span>
+<span id="cb65-10"><a href="#cb65-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb65-11"><a href="#cb65-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 可能原因 3：延迟分配的空间预留</span></span>
+<span id="cb65-12"><a href="#cb65-12" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/fs/ext4/sda1/delayed_allocation_blocks</span></code></pre></div>
+            <p><strong>场景三：性能突降</strong></p>
+            <div class="sourceCode" id="cb66"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb66-1"><a href="#cb66-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查日志是否阻塞</span></span>
+<span id="cb66-2"><a href="#cb66-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/fs/ext4/sda1/journal_task</span>
+<span id="cb66-3"><a href="#cb66-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb66-4"><a href="#cb66-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查碎片化程度</span></span>
+<span id="cb66-5"><a href="#cb66-5" aria-hidden="true" tabindex="-1"></a><span class="ex">filefrag</span> /path/to/slow_file</span>
+<span id="cb66-6"><a href="#cb66-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb66-7"><a href="#cb66-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查 I/O 调度器</span></span>
+<span id="cb66-8"><a href="#cb66-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb66-9"><a href="#cb66-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb66-10"><a href="#cb66-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查磁盘健康状态</span></span>
+<span id="cb66-11"><a href="#cb66-11" aria-hidden="true" tabindex="-1"></a><span class="ex">smartctl</span> <span class="at">-a</span> /dev/sda</span></code></pre></div>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <ol type="1">
+            <li>ext4 官方 Wiki：<a href="https://ext4.wiki.kernel.org/"
+            class="uri">https://ext4.wiki.kernel.org/</a></li>
+            <li>内核文档 ext4 章节：<a
+            href="https://www.kernel.org/doc/html/latest/filesystems/ext4/"
+            class="uri">https://www.kernel.org/doc/html/latest/filesystems/ext4/</a></li>
+            <li>e2fsprogs 源代码：<a
+            href="https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git"
+            class="uri">https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git</a></li>
+            <li>Theodore Ts’o，“ext4: The Next Generation of the ext2/3
+            Filesystem”，Proceedings of the Linux Symposium，2008</li>
+            <li>Mathur A.，Cao M.，Bhattacharya S.，Dilger A.，Tomas
+            A.，Vivier L.，“The New ext4 filesystem: Current Status and
+            Future Plans”，Proceedings of the Linux Symposium，2007</li>
+            <li>内核源码 fs/ext4/ 目录：<a
+            href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/ext4"
+            class="uri">https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/ext4</a></li>
+            <li>JBD2 文档：<a
+            href="https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html"
+            class="uri">https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html</a></li>
+            <li>fio 官方文档：<a href="https://fio.readthedocs.io/"
+            class="uri">https://fio.readthedocs.io/</a></li>
+            <li>XFS 官方文档：<a href="https://xfs.wiki.kernel.org/"
+            class="uri">https://xfs.wiki.kernel.org/</a></li>
+            <li>Rik van Riel，“Virtual Memory in the Linux
+            Kernel”，内核虚拟内存子系统文档</li>
+            <li>LWN.net，“ext4 and data loss”，2009：<a
+            href="https://lwn.net/Articles/322823/"
+            class="uri">https://lwn.net/Articles/322823/</a></li>
+            <li>LWN.net，“Ext4 delayed allocation and the zero-length
+            file problem”，2009：<a
+            href="https://lwn.net/Articles/326471/"
+            class="uri">https://lwn.net/Articles/326471/</a></li>
+            <li>Linux 内核 Documentation/filesystems/ext4.txt：<a
+            href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/filesystems/ext4"
+            class="uri">https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/filesystems/ext4</a></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../13-filesystem-basics/filesystem-basics.html">文件系统基础：inode、目录与
+            VFS</a></p>
+            <p><strong>下一篇</strong>: <a
+            href="../15-xfs-architecture/xfs-architecture.html">XFS
+            架构：大文件与高并发</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/75-small-file-problem/small-file-problem.html">【存储工程】小文件问题：为什么文件数量比文件大小更致命</a></h3>
+                    <p>系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-28 · linux / storage</p>
+                    <h3><a href="/post/linux/fsync-error-truth/fsync-error-truth.html">fsync 失败的真相：当它返回错误，你的数据可能已经没了</a></h3>
+                    <p>fsync() 返回 EIO 后再调一次为什么会成功？为什么这反而是灾难？从 2018 fsyncgate 到 Linux errseq_t，再到本机内核 6.6 上用 dm-error 单块故障注入的实测，讲清 writeback 失败时脏页被标记 clean、数据静默丢失的真相，以及 PostgreSQL 为什么选择 PANIC。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/76-disk-full-behavior/disk-full-behavior.html">【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链</a></h3>
+                    <p>逐层拆解 ext4、XFS、Btrfs、ZFS 从 70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC 故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

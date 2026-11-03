@@ -1,0 +1,1728 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】存储与计算分离架构 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="深入分析存算分离架构——Shared-Nothing
+vs Shared-Disk vs Shared-Storage 的工程权衡，Snowflake/Aurora/TiDB
+的存算分离实践，本地缓存策略与网络带宽需求" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="compute-storage-separation, shared-nothing, snowflake, aurora, tidb, data-lake, local-cache, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/57-compute-storage-separation/compute-storage-separation.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】存储与计算分离架构" />
+    <meta property="og:description" content="深入分析存算分离架构——Shared-Nothing vs Shared-Disk vs Shared-Storage 的工程权衡，Snowflake/Aurora/TiDB 的存算分离实践，本地缓存策略与网络带宽需求" />
+    <meta property="og:url" content="https://quant67.com/post/storage/57-compute-storage-separation/compute-storage-separation.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="compute-storage-separation" />
+    <meta property="article:tag" content="shared-nothing" />
+    <meta property="article:tag" content="snowflake" />
+    <meta property="article:tag" content="aurora" />
+    <meta property="article:tag" content="tidb" />
+    <meta property="article:tag" content="data-lake" />
+    <meta property="article:tag" content="local-cache" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】存储与计算分离架构" />
+    <meta name="twitter:description" content="深入分析存算分离架构——Shared-Nothing vs Shared-Disk vs Shared-Storage 的工程权衡，Snowflake/Aurora/TiDB 的存算分离实践，本地缓存策略与网络带宽需求" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】存储与计算分离架构", "description": "深入分析存算分离架构——Shared-Nothing vs Shared-Disk vs Shared-Storage 的工程权衡，Snowflake/Aurora/TiDB 的存算分离实践，本地缓存策略与网络带宽需求", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/57-compute-storage-separation/compute-storage-separation.html"}, "datePublished": "2025-10-05T00:00:00+00:00", "dateModified": "2026-04-15T12:25:54+00:00", "keywords": ["compute-storage-separation", "shared-nothing", "snowflake", "aurora", "tidb", "data-lake", "local-cache"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】存储与计算分离架构</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-10-05</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#compute-storage-separation</span> <span>#shared-nothing</span> <span>#snowflake</span> <span>#aurora</span> <span>#tidb</span> <span>#data-lake</span> <span>#local-cache</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/56-multi-tenancy/multi-tenancy.html">上一篇：【存储工程】多租户存储隔离</a><a class="post-series-nav__link" href="/post/storage/58-data-durability/data-durability.html">下一篇：【存储工程】数据持久性工程</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/compute-storage-separation.html">#compute-storage-separation</a><a class="chip-link" href="/tags/shared-nothing.html">#shared-nothing</a><a class="chip-link" href="/tags/snowflake-b0c551.html">#snowflake</a><a class="chip-link" href="/tags/aurora-c8251d.html">#aurora</a><a class="chip-link" href="/tags/tidb-4df56f.html">#tidb</a><a class="chip-link" href="/tags/data-lake.html">#data-lake</a><a class="chip-link" href="/tags/local-cache.html">#local-cache</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一存算分离的工程动机"
+                id="toc-一存算分离的工程动机">一、存算分离的工程动机</a>
+                <ul>
+                <li><a href="#弹性伸缩的需求"
+                id="toc-弹性伸缩的需求">1.1 弹性伸缩的需求</a></li>
+                <li><a href="#成本优化" id="toc-成本优化">1.2
+                成本优化</a></li>
+                <li><a href="#运维独立性" id="toc-运维独立性">1.3
+                运维独立性</a></li>
+                </ul></li>
+                <li><a href="#二架构模式对比"
+                id="toc-二架构模式对比">二、架构模式对比</a>
+                <ul>
+                <li><a href="#三种模式的定义"
+                id="toc-三种模式的定义">2.1 三种模式的定义</a></li>
+                <li><a href="#架构对比表" id="toc-架构对比表">2.2
+                架构对比表</a></li>
+                <li><a href="#选择的工程判断"
+                id="toc-选择的工程判断">2.3 选择的工程判断</a></li>
+                </ul></li>
+                <li><a href="#三snowflake-的存算分离实践"
+                id="toc-三snowflake-的存算分离实践">三、Snowflake
+                的存算分离实践</a>
+                <ul>
+                <li><a href="#整体架构" id="toc-整体架构">3.1
+                整体架构</a></li>
+                <li><a href="#微分区" id="toc-微分区">3.2
+                微分区</a></li>
+                <li><a href="#virtual-warehouse-的弹性"
+                id="toc-virtual-warehouse-的弹性">3.3 Virtual Warehouse
+                的弹性</a></li>
+                <li><a href="#本地缓存机制" id="toc-本地缓存机制">3.4
+                本地缓存机制</a></li>
+                </ul></li>
+                <li><a href="#四aurora-的存算分离"
+                id="toc-四aurora-的存算分离">四、Aurora 的存算分离</a>
+                <ul>
+                <li><a href="#架构概览" id="toc-架构概览">4.1
+                架构概览</a></li>
+                <li><a href="#日志即数据库" id="toc-日志即数据库">4.2
+                日志即数据库</a></li>
+                <li><a href="#六副本-quorum-协议"
+                id="toc-六副本-quorum-协议">4.3 六副本 Quorum
+                协议</a></li>
+                <li><a href="#读副本的实现" id="toc-读副本的实现">4.4
+                读副本的实现</a></li>
+                <li><a href="#存储层的后台操作"
+                id="toc-存储层的后台操作">4.5 存储层的后台操作</a></li>
+                </ul></li>
+                <li><a href="#五tidb-的存算分离"
+                id="toc-五tidb-的存算分离">五、TiDB 的存算分离</a>
+                <ul>
+                <li><a href="#tidb-的基础架构"
+                id="toc-tidb-的基础架构">5.1 TiDB 的基础架构</a></li>
+                <li><a href="#tikv-tiflash-的-htap-实践"
+                id="toc-tikv-tiflash-的-htap-实践">5.2 TiKV + TiFlash 的
+                HTAP 实践</a></li>
+                <li><a href="#s3-冷存储" id="toc-s3-冷存储">5.3 S3
+                冷存储</a></li>
+                <li><a href="#tidb-存算分离的演进方向"
+                id="toc-tidb-存算分离的演进方向">5.4 TiDB
+                存算分离的演进方向</a></li>
+                </ul></li>
+                <li><a href="#六对象存储作为数据湖底座"
+                id="toc-六对象存储作为数据湖底座">六、对象存储作为数据湖底座</a>
+                <ul>
+                <li><a href="#从数据湖到湖仓一体"
+                id="toc-从数据湖到湖仓一体">6.1
+                从数据湖到湖仓一体</a></li>
+                <li><a href="#表格式对比" id="toc-表格式对比">6.2
+                表格式对比</a></li>
+                <li><a href="#lakehouse-架构的存算分离"
+                id="toc-lakehouse-架构的存算分离">6.3 Lakehouse
+                架构的存算分离</a></li>
+                <li><a href="#对象存储的性能特征"
+                id="toc-对象存储的性能特征">6.4
+                对象存储的性能特征</a></li>
+                <li><a href="#对象存储在存算分离中的工程约束"
+                id="toc-对象存储在存算分离中的工程约束">6.5
+                对象存储在存算分离中的工程约束</a></li>
+                </ul></li>
+                <li><a href="#七本地缓存策略"
+                id="toc-七本地缓存策略">七、本地缓存策略</a>
+                <ul>
+                <li><a href="#缓存的三个层次"
+                id="toc-缓存的三个层次">7.1 缓存的三个层次</a></li>
+                <li><a href="#读缓存策略" id="toc-读缓存策略">7.2
+                读缓存策略</a></li>
+                <li><a href="#缓存淘汰策略" id="toc-缓存淘汰策略">7.3
+                缓存淘汰策略</a></li>
+                <li><a href="#分层存储" id="toc-分层存储">7.4
+                分层存储</a></li>
+                </ul></li>
+                <li><a href="#八网络带宽需求计算"
+                id="toc-八网络带宽需求计算">八、网络带宽需求计算</a>
+                <ul>
+                <li><a href="#带宽需求估算模型"
+                id="toc-带宽需求估算模型">8.1 带宽需求估算模型</a></li>
+                <li><a href="#云环境的网络带宽限制"
+                id="toc-云环境的网络带宽限制">8.2
+                云环境的网络带宽限制</a></li>
+                <li><a href="#s3-的带宽特性" id="toc-s3-的带宽特性">8.3
+                S3 的带宽特性</a></li>
+                <li><a href="#带宽不足时的表现"
+                id="toc-带宽不足时的表现">8.4 带宽不足时的表现</a></li>
+                <li><a href="#网络延迟对事务性能的影响"
+                id="toc-网络延迟对事务性能的影响">8.5
+                网络延迟对事务性能的影响</a></li>
+                </ul></li>
+                <li><a href="#九存算一体-vs-分离的性能对比"
+                id="toc-九存算一体-vs-分离的性能对比">九、存算一体 vs
+                分离的性能对比</a>
+                <ul>
+                <li><a href="#对比框架" id="toc-对比框架">9.1
+                对比框架</a></li>
+                <li><a href="#一个实际的性能对比场景"
+                id="toc-一个实际的性能对比场景">9.2
+                一个实际的性能对比场景</a></li>
+                <li><a href="#什么时候选择存算分离"
+                id="toc-什么时候选择存算分离">9.3
+                什么时候选择存算分离</a></li>
+                <li><a href="#混合架构的工程实践"
+                id="toc-混合架构的工程实践">9.4
+                混合架构的工程实践</a></li>
+                </ul></li>
+                <li><a href="#十参考文献"
+                id="toc-十参考文献">十、参考文献</a>
+                <ul>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#技术博客与设计文档"
+                id="toc-技术博客与设计文档">技术博客与设计文档</a></li>
+                <li><a href="#书籍" id="toc-书籍">书籍</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>一台数据库服务器同时承担计算和存储两个职责，看似简单直接，但在弹性伸缩的场景下问题就暴露了：扩容时计算和存储只能一起加，缩容时也只能一起减。一个
+            OLAP 查询高峰需要 100 个 CPU 核，但数据只有 2
+            TB——按存算一体的做法，你不得不买 100
+            个核对应的存储容量，哪怕这些存储大部分时间是空的。反过来，一个冷数据归档场景需要
+            500 TB 存储但几乎不做计算，你也不得不配上与 500 TB
+            存储绑定的 CPU 和内存。</p>
+            <p>存算分离（Disaggregated Storage and
+            Compute）的核心思路就是打破这个绑定：让计算节点和存储节点各自独立伸缩。计算密集就加计算节点，存储不够就加存储节点，两者互不影响。这个思路听起来简单，但工程实现涉及架构模式选择、网络带宽、缓存策略、一致性协议等一系列权衡。</p>
+            <p>本文从存算分离的工程动机出发，对比三种主流架构模式，然后分别拆解
+            Snowflake、Aurora、TiDB
+            三个系统的存算分离实践，最后讨论对象存储作为数据湖底座、本地缓存策略、网络带宽需求计算，以及存算一体和分离的性能对比。</p>
+            <blockquote>
+            <p><strong>适用范围</strong>
+            本文讨论的存算分离主要针对数据库和数据仓库场景，不涉及
+            HPC/科学计算领域的存算分离。涉及的系统版本：Snowflake（公开论文及文档，截至
+            2024 年）、Amazon Aurora（公开论文及文档）、TiDB
+            7.x。不同版本的架构细节可能有差异。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一存算分离的工程动机">一、存算分离的工程动机</h2>
+            <h3 id="弹性伸缩的需求">1.1 弹性伸缩的需求</h3>
+            <p>传统存算一体（Shared-Nothing）架构下，数据按分片（Shard）分布在各个节点上，每个节点既负责存储自己的分片，也负责处理针对这些分片的查询。扩容意味着加节点、迁移分片、重新均衡数据；缩容同理。这个过程有两个问题：</p>
+            <p>第一，数据迁移代价高。一个 1 TB
+            的分片在千兆网络下迁移需要约 2.5 小时，在万兆网络下也需要约
+            15
+            分钟。在迁移期间，系统要么拒绝写入该分片，要么通过双写保证一致性，两者都增加复杂度。</p>
+            <p>第二，计算和存储的伸缩粒度不同。计算负载的波动通常以分钟级到小时级为周期——比如一个报表查询在每天早上
+            9
+            点达到峰值，下午就降下来。存储容量的增长则是天级到月级的趋势。把两者绑在一起，意味着计算的弹性被存储的数据迁移拖慢了。</p>
+            <p>存算分离之后，计算节点是无状态的（或只持有缓存），启动一个新计算节点只需要拉起进程、连接远端存储，不需要迁移任何数据。伸缩的时间从分钟级降到秒级。</p>
+            <h3 id="成本优化">1.2 成本优化</h3>
+            <p>云环境下的成本差异最能说明问题。以 AWS 为例（2024 年
+            us-east-1 公开定价）：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>资源类型</th>
+            <th>规格</th>
+            <th>月成本（近似）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>EC2 计算（c6i.xlarge）</td>
+            <td>4 vCPU / 8 GB 内存</td>
+            <td>约 124 美元</td>
+            </tr>
+            <tr>
+            <td>EBS gp3 存储</td>
+            <td>1 TB</td>
+            <td>约 80 美元</td>
+            </tr>
+            <tr>
+            <td>S3 标准存储</td>
+            <td>1 TB</td>
+            <td>约 23 美元</td>
+            </tr>
+            <tr>
+            <td>S3 低频访问</td>
+            <td>1 TB</td>
+            <td>约 12.5 美元</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>S3 的存储成本只有 EBS 的约 29%，低频访问更是只有
+            16%。如果一个系统有 100 TB 数据，其中 80%
+            是温冷数据，把温冷数据从 EBS 迁移到 S3 每月可节省约 (80 x
+            80) - (80 x 23) = 4560 美元。乘以 12 个月就是每年约 5.5
+            万美元。对于 PB 级存储集群，这个差异是百万美元级别的。</p>
+            <h3 id="运维独立性">1.3 运维独立性</h3>
+            <p>存算一体架构下，计算节点故障会导致该节点上的数据分片暂时不可用（除非有副本接管）。存算分离之后，计算节点故障只是丢失了缓存，存储层的数据完整性不受影响。重新拉起一个计算节点就能继续服务。</p>
+            <p>同样，存储层的扩容（比如给对象存储集群加磁盘）不需要重启任何计算节点。计算层的升级（比如更换查询引擎版本）也不需要动存储。两个团队可以按各自的节奏迭代。</p>
+            <hr />
+            <h2 id="二架构模式对比">二、架构模式对比</h2>
+            <p>存算分离不是一种单一的架构，而是一个方向。具体实现至少有三种主流模式：共享无关（Shared-Nothing）、共享磁盘（Shared-Disk）、共享存储（Shared-Storage）。</p>
+            <h3 id="三种模式的定义">2.1 三种模式的定义</h3>
+            <p><strong>Shared-Nothing（共享无关）</strong>：每个节点有自己的
+            CPU、内存和磁盘。数据按分片分布在各节点上，节点之间通过网络通信但不共享存储。传统的分布式数据库（如
+            MySQL 分库分表、早期的
+            Greenplum）属于这种模式。严格来说，Shared-Nothing
+            是存算一体的架构，但它是存算分离演进的起点。</p>
+            <p><strong>Shared-Disk（共享磁盘）</strong>：多个计算节点共享同一个存储层。计算节点可以读写存储层的任意数据，不需要数据分片。传统的
+            Oracle RAC、IBM DB2 pureScale 属于这种模式。现代的 Aurora
+            也可以归入这一类，只是把共享的磁盘从 SAN
+            换成了分布式存储层。</p>
+            <p><strong>Shared-Storage（共享存储）</strong>：这里特指以对象存储（如
+            S3）或分布式文件系统为共享存储层的架构。和 Shared-Disk
+            的区别在于，Shared-Storage
+            通常假设存储层是高延迟、高吞吐的（对象存储的延迟在毫秒级，远高于本地
+            SSD
+            的微秒级），因此计算节点必须依赖本地缓存来弥补延迟差距。Snowflake
+            是这种模式的代表。</p>
+            <h3 id="架构对比表">2.2 架构对比表</h3>
+            <pre class="text"><code>                    Shared-Nothing           Shared-Disk              Shared-Storage
+                 ┌─────────────────┐   ┌─────────────────────┐   ┌──────────────────────┐
+                 │  Node 1         │   │  Compute 1          │   │  Compute 1           │
+                 │  ┌───┐ ┌─────┐ │   │  ┌───┐              │   │  ┌───┐ ┌──────────┐  │
+                 │  │CPU│ │Disk │ │   │  │CPU│              │   │  │CPU│ │Local SSD │  │
+                 │  └───┘ └─────┘ │   │  └───┘              │   │  └───┘ │(Cache)   │  │
+                 ├─────────────────┤   ├─────────────────────┤   │       └──────────┘  │
+                 │  Node 2         │   │  Compute 2          │   ├──────────────────────┤
+                 │  ┌───┐ ┌─────┐ │   │  ┌───┐              │   │  Compute 2           │
+                 │  │CPU│ │Disk │ │   │  │CPU│              │   │  ┌───┐ ┌──────────┐  │
+                 │  └───┘ └─────┘ │   │  └───┘              │   │  │CPU│ │Local SSD │  │
+                 ├─────────────────┤   ├─────────────────────┤   │  └───┘ │(Cache)   │  │
+                 │  Node 3         │   │   共享存储层          │   │       └──────────┘  │
+                 │  ┌───┐ ┌─────┐ │   │  ┌─────────────────┐ │   ├──────────────────────┤
+                 │  │CPU│ │Disk │ │   │  │ SAN / 分布式存储 │ │   │   对象存储 (S3)       │
+                 │  └───┘ └─────┘ │   │  └─────────────────┘ │   │  ┌──────────────────┐ │
+                 └─────────────────┘   └─────────────────────┘   │  │ Bucket / Prefix  │ │
+                                                                  │  └──────────────────┘ │
+                                                                  └──────────────────────┘</code></pre>
+            <table>
+            <colgroup>
+            <col style="width: 12%" />
+            <col style="width: 30%" />
+            <col style="width: 26%" />
+            <col style="width: 32%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>Shared-Nothing</th>
+            <th>Shared-Disk</th>
+            <th>Shared-Storage</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>数据分布</td>
+            <td>分片到各节点</td>
+            <td>共享存储层，不分片</td>
+            <td>共享对象存储，按文件组织</td>
+            </tr>
+            <tr>
+            <td>计算伸缩速度</td>
+            <td>慢（需数据迁移）</td>
+            <td>快（秒级）</td>
+            <td>快（秒级）</td>
+            </tr>
+            <tr>
+            <td>存储伸缩速度</td>
+            <td>慢（需数据迁移）</td>
+            <td>中等（扩展存储层）</td>
+            <td>快（对象存储自动扩展）</td>
+            </tr>
+            <tr>
+            <td>存储成本</td>
+            <td>高（本地磁盘，含副本）</td>
+            <td>中（分布式存储）</td>
+            <td>低（对象存储）</td>
+            </tr>
+            <tr>
+            <td>读延迟</td>
+            <td>低（本地磁盘）</td>
+            <td>中（网络 + 分布式存储）</td>
+            <td>高（网络 + 对象存储，需缓存）</td>
+            </tr>
+            <tr>
+            <td>写延迟</td>
+            <td>低（本地磁盘）</td>
+            <td>中</td>
+            <td>高</td>
+            </tr>
+            <tr>
+            <td>缓存依赖度</td>
+            <td>低</td>
+            <td>中</td>
+            <td>高</td>
+            </tr>
+            <tr>
+            <td>故障影响</td>
+            <td>计算 + 数据都受影响</td>
+            <td>只影响计算</td>
+            <td>只影响计算</td>
+            </tr>
+            <tr>
+            <td>一致性复杂度</td>
+            <td>低（各节点独立）</td>
+            <td>高（需协调缓存一致性）</td>
+            <td>中（通常不可变文件）</td>
+            </tr>
+            <tr>
+            <td>代表系统</td>
+            <td>Greenplum、CockroachDB</td>
+            <td>Oracle RAC、Aurora</td>
+            <td>Snowflake、Databricks</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="选择的工程判断">2.3 选择的工程判断</h3>
+            <p>这三种模式不是简单的”新比旧好”。选择取决于工作负载特征：</p>
+            <ul>
+            <li>如果工作负载是
+            OLTP（高频小事务），对延迟敏感，且数据规模可预测，Shared-Nothing
+            仍然是合理的选择。CockroachDB、TiDB 的 OLTP 路径本质上仍是
+            Shared-Nothing。</li>
+            <li>如果工作负载需要频繁弹性伸缩（比如云数据库服务），且对一致性有强要求，Shared-Disk
+            是自然选择。Aurora 走的就是这条路。</li>
+            <li>如果工作负载是
+            OLAP（大规模分析查询），数据量大但查询频率不高，对延迟容忍度较高，Shared-Storage
+            的成本优势最明显。Snowflake 是典型代表。</li>
+            </ul>
+            <hr />
+            <h2 id="三snowflake-的存算分离实践">三、Snowflake
+            的存算分离实践</h2>
+            <p>Snowflake
+            是存算分离架构在云数据仓库领域最成功的实践之一。它的核心思路可以用一句话概括：把数据全部放在
+            S3 上，用本地 SSD 做缓存，让计算节点（Virtual
+            Warehouse）按需启停。</p>
+            <h3 id="整体架构">3.1 整体架构</h3>
+            <p>Snowflake 的架构分为三层：</p>
+            <pre class="text"><code>┌──────────────────────────────────────────────────────────────┐
+│                    Cloud Services 层                         │
+│  ┌──────────┐  ┌──────────────┐  ┌───────────┐  ┌────────┐  │
+│  │查询优化器 │  │元数据管理     │  │访问控制    │  │事务管理│  │
+│  └──────────┘  └──────────────┘  └───────────┘  └────────┘  │
+├──────────────────────────────────────────────────────────────┤
+│                    Virtual Warehouse 层（计算层）              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │ VW-1 (XS)   │  │ VW-2 (L)    │  │ VW-3 (XL)   │          │
+│  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │          │
+│  │ │EC2 节点 │ │  │ │EC2 节点 │ │  │ │EC2 节点 │ │          │
+│  │ │本地 SSD │ │  │ │本地 SSD │ │  │ │本地 SSD │ │          │
+│  │ └─────────┘ │  │ ├─────────┤ │  │ ├─────────┤ │          │
+│  │             │  │ │EC2 节点 │ │  │ │EC2 节点 │ │          │
+│  │             │  │ │本地 SSD │ │  │ │ ...     │ │          │
+│  │             │  │ └─────────┘ │  │ └─────────┘ │          │
+│  └─────────────┘  └─────────────┘  └─────────────┘          │
+├──────────────────────────────────────────────────────────────┤
+│                    Storage 层（S3）                           │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  数据文件（微分区，列式存储，PAX 格式，压缩加密）        │    │
+│  └──────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────┘</code></pre>
+            <p><strong>Cloud Services
+            层</strong>：全局共享的服务层，负责查询解析与优化、元数据管理（哪些表、哪些分区、统计信息）、访问控制、事务管理。这一层本身也是多租户（Multi-Tenant）的，多个客户共享同一套
+            Cloud Services。</p>
+            <p><strong>Virtual Warehouse（VW）层</strong>：计算层。每个
+            VW 是一组 EC2 实例，按 T-shirt
+            规格划分（XS/S/M/L/XL/2XL/3XL/4XL），每个尺寸对应固定数量的节点。VW
+            之间完全隔离——不同 VW 读取同一张表时，各自从 S3
+            拉取数据或从各自的本地缓存读取，互不干扰。</p>
+            <p><strong>Storage
+            层</strong>：所有数据以不可变文件的形式存储在 S3
+            上。这个设计选择至关重要——文件不可变意味着不需要缓存一致性协议（Cache
+            Coherence Protocol）。一个文件写入 S3
+            后就不会被修改，只会被删除并替换为新文件。</p>
+            <h3 id="微分区">3.2 微分区</h3>
+            <p>Snowflake
+            把每张表的数据切分成微分区（Micro-Partition），每个微分区是一个不可变的列式存储文件，大小在
+            50 MB 到 500 MB 之间（压缩后通常在 16 MB 左右）。</p>
+            <p>微分区的关键特性：</p>
+            <ol type="1">
+            <li><strong>不可变</strong>：数据一旦写入微分区就不会修改。UPDATE
+            操作实际上是创建新的微分区、删除旧的微分区。</li>
+            <li><strong>列式存储</strong>：每个微分区内部按列存储（PAX
+            格式），支持列裁剪（Column Pruning）。如果查询只需要 3
+            列，只读取这 3 列的数据。</li>
+            <li><strong>自动聚簇</strong>：Snowflake
+            会根据查询模式自动对微分区做聚簇（Clustering），把相关数据放到同一个微分区，减少查询需要扫描的分区数。</li>
+            <li><strong>分区裁剪</strong>：Cloud Services
+            层维护每个微分区的元数据，包括每列的最小值/最大值、空值计数等。查询时根据
+            WHERE 条件裁剪掉不需要扫描的分区。</li>
+            </ol>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 示例：分区裁剪的效果</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 假设 orders 表有 10000 个微分区，按 order_date 自然排序</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- Cloud Services 层维护了每个分区的 order_date 最小值和最大值</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">SUM</span>(amount)</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> order_date <span class="kw">BETWEEN</span> <span class="st">&#39;2024-01-01&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2024-01-31&#39;</span>;</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果只有 300 个分区的 order_date 范围与查询条件重叠</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 则只需要从 S3 读取 300 个分区，裁剪掉了 97% 的数据</span></span></code></pre></div>
+            <h3 id="virtual-warehouse-的弹性">3.3 Virtual Warehouse
+            的弹性</h3>
+            <p>VW 的启停速度是 Snowflake
+            存算分离架构的核心优势之一。启动一个 VW 通常在 1 到 2
+            秒内完成（不含 EC2 实例的冷启动时间，因为 Snowflake
+            维护了预热实例池）。</p>
+            <p>几个关键的弹性特性：</p>
+            <ul>
+            <li><strong>多集群（Multi-Cluster）</strong>：一个 VW
+            可以配置为多集群模式，当并发查询数超过单集群容量时自动扩展到多个集群，空闲时自动缩减。</li>
+            <li><strong>自动暂停与恢复</strong>：VW
+            在空闲一段时间后自动暂停（不计费），有新查询时自动恢复。</li>
+            <li><strong>查询隔离</strong>：不同 VW 之间完全隔离。一个 VW
+            上的重负载查询不会影响另一个 VW 的性能。这允许 ETL
+            作业和交互式查询使用不同的 VW。</li>
+            </ul>
+            <h3 id="本地缓存机制">3.4 本地缓存机制</h3>
+            <p>VW 节点的本地 SSD 作为 S3
+            数据的缓存。缓存策略是基于文件的（File-Level
+            Caching）——以微分区文件为单位缓存，不做行级或页级缓存。</p>
+            <pre class="text"><code>查询执行路径：
+
+1. Cloud Services 确定需要扫描的微分区列表
+2. VW 节点检查本地 SSD 缓存
+   ├── 缓存命中 → 直接从本地 SSD 读取（延迟 ~0.1ms）
+   └── 缓存未命中 → 从 S3 读取（延迟 ~10-50ms）
+                   └── 同时写入本地 SSD 缓存
+3. 列裁剪：只读取查询需要的列
+4. 在节点本地执行过滤、聚合等操作
+5. 结果汇总返回</code></pre>
+            <p>缓存的一致性依赖微分区的不可变性——如果一个微分区文件在 S3
+            上存在，它的内容永远不会变。如果表发生了 DML
+            操作（INSERT/UPDATE/DELETE），旧的微分区被删除、新的微分区被创建，缓存中的旧文件自然失效。Cloud
+            Services
+            层通过版本化的表元数据来判断哪些缓存文件仍然有效。</p>
+            <hr />
+            <h2 id="四aurora-的存算分离">四、Aurora 的存算分离</h2>
+            <p>Amazon Aurora 走了一条不同于 Snowflake
+            的存算分离路线。它不是把存储放到对象存储上，而是构建了一个专用的分布式存储层，核心设计理念是”日志即数据库”（The
+            Log Is the Database）。</p>
+            <h3 id="架构概览">4.1 架构概览</h3>
+            <pre class="text"><code>┌─────────────────────────────────────────────────────┐
+│                  计算层                               │
+│  ┌──────────────┐              ┌──────────────┐     │
+│  │ Writer 实例   │              │ Reader 实例   │     │
+│  │ (Primary)    │              │ (Read Replica)│     │
+│  │ ┌──────────┐ │              │ ┌──────────┐ │     │
+│  │ │Buffer Pool│ │  ── 日志流 →  │ │Buffer Pool│ │     │
+│  │ └──────────┘ │              │ └──────────┘ │     │
+│  └──────┬───────┘              └──────┬───────┘     │
+│         │ 只写 Redo Log                │ 只读         │
+├─────────┼──────────────────────────────┼─────────────┤
+│         ▼          存储层               ▼             │
+│  ┌────────────────────────────────────────────────┐  │
+│  │  分布式存储服务                                   │  │
+│  │  ┌──────┐  ┌──────┐  ┌──────┐                 │  │
+│  │  │ PG 1 │  │ PG 2 │  │ PG 3 │  ...            │  │
+│  │  │6 副本 │  │6 副本 │  │6 副本 │                 │  │
+│  │  │3 AZ  │  │3 AZ  │  │3 AZ  │                 │  │
+│  │  └──────┘  └──────┘  └──────┘                 │  │
+│  └────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘</code></pre>
+            <h3 id="日志即数据库">4.2 日志即数据库</h3>
+            <p>传统 MySQL 的写入路径是：先写 Redo Log
+            到本地磁盘，再把脏页刷到数据文件。在主从复制场景下，还要把
+            Binlog 发送给从库，从库重放 Binlog 后再写自己的 Redo Log
+            和数据文件。整个路径有大量的 I/O 放大。</p>
+            <p>Aurora 的做法是：计算层只往存储层发送 Redo Log
+            记录，不发送数据页。存储层在后台异步地把 Redo Log
+            应用到数据页上（即”日志应用”操作）。这把计算层的写 I/O
+            减少到只剩日志写入，消除了数据页的网络传输。</p>
+            <p>根据 Aurora 论文（Verbitski et al., SIGMOD
+            2017）的数据，这种设计把网络 I/O 减少了约 7/8。传统 MySQL
+            写一个事务可能需要传输 Redo Log、Binlog、数据页、Double
+            Write Buffer 等多份数据，而 Aurora 只需要传输 Redo Log。</p>
+            <pre class="text"><code>传统 MySQL 主从复制的网络写入路径：
+  ┌──────────┐
+  │ Primary  │──── Redo Log ──────→ 本地磁盘
+  │          │──── Binlog ────────→ 本地磁盘
+  │          │──── 数据页 ─────────→ 本地磁盘 (Double Write)
+  │          │──── Binlog ────────→ Replica（网络）
+  └──────────┘
+  Replica 收到 Binlog 后：
+  ┌──────────┐
+  │ Replica  │──── Relay Log ─────→ 本地磁盘
+  │          │──── Redo Log ──────→ 本地磁盘
+  │          │──── 数据页 ─────────→ 本地磁盘
+  └──────────┘
+
+Aurora 的网络写入路径：
+  ┌──────────┐
+  │ Primary  │──── Redo Log ──────→ 存储层（网络，6 副本）
+  └──────────┘
+  存储层在后台完成：
+  ┌──────────┐
+  │ Storage  │──── 日志应用 ──────→ 生成数据页（本地操作）
+  └──────────┘</code></pre>
+            <h3 id="六副本-quorum-协议">4.3 六副本 Quorum 协议</h3>
+            <p>Aurora 的存储层把数据切分为 10 GB
+            大小的保护组（Protection Group），每个保护组有 6
+            个副本，分布在 3 个可用区（Availability Zone，AZ），每个 AZ
+            放 2 个副本。</p>
+            <p>Quorum 协议的参数设定为：</p>
+            <ul>
+            <li>写需要 4/6 确认（Write Quorum = 4）</li>
+            <li>读需要 3/6 确认（Read Quorum = 3）</li>
+            </ul>
+            <p>这个参数设定满足 Quorum 条件：W + R &gt; N（4 + 3 &gt;
+            6），保证读操作一定能读到最新写入的数据。</p>
+            <p>设计目标是容忍以下故障场景：</p>
+            <ol type="1">
+            <li><strong>单 AZ 故障 + 单节点故障</strong>：一个 AZ
+            挂掉丢失 2 个副本，再加上另一个 AZ 的 1 个节点故障，总共丢失
+            3 个副本。剩余 3 个副本仍然满足 Read Quorum =
+            3，可以继续读取。写入需要 4/6 确认，此时只剩 3
+            个副本不满足写 Quorum，写入会暂停直到故障恢复。</li>
+            <li><strong>单 AZ 故障</strong>：丢失 2 个副本，剩余 4
+            个副本同时满足 Write Quorum = 4 和 Read Quorum =
+            3，读写均不受影响。</li>
+            </ol>
+            <pre class="text"><code>保护组的副本分布：
+
+  AZ-1          AZ-2          AZ-3
+┌────────┐  ┌────────┐  ┌────────┐
+│副本 1   │  │副本 3   │  │副本 5   │
+│副本 2   │  │副本 4   │  │副本 6   │
+└────────┘  └────────┘  └────────┘
+
+写 Quorum = 4：任意写入必须获得 4 个副本确认
+读 Quorum = 3：任意读取从 3 个副本获取数据
+
+场景分析：
+  AZ-1 整体故障（丢失副本 1、2）→ 剩余 4 副本 → 读写正常
+  AZ-1 故障 + 副本 3 故障（丢失 3 副本）→ 剩余 3 副本 → 只读
+  任意 2 个副本故障（不跨 AZ 全挂）→ 剩余 4 副本 → 读写正常</code></pre>
+            <h3 id="读副本的实现">4.4 读副本的实现</h3>
+            <p>Aurora 的读副本和传统 MySQL
+            从库的区别在于：读副本不需要重放完整的事务日志。Primary
+            实例把 Redo Log
+            流式发送给读副本，读副本只需要把日志应用到自己的 Buffer Pool
+            中的缓存页上。如果某个被修改的页不在读副本的 Buffer Pool
+            中，读副本直接丢弃这条日志——反正下次需要读取该页时，可以从存储层读取最新版本。</p>
+            <p>这种设计让读副本的延迟非常低。根据 Aurora
+            论文，读副本的复制延迟通常在 10 到 20 毫秒。相比之下，传统
+            MySQL
+            从库的复制延迟在高写入负载下可能达到秒级甚至分钟级。</p>
+            <h3 id="存储层的后台操作">4.5 存储层的后台操作</h3>
+            <p>Aurora 的存储层不仅仅是一个”能存 Redo Log
+            的磁盘”，它还承担了大量的后台任务：</p>
+            <ul>
+            <li><strong>日志应用</strong>：把 Redo Log
+            应用到数据页上，生成最新的数据页。</li>
+            <li><strong>垃圾回收</strong>：清理不再需要的旧版本数据页和旧的日志记录。</li>
+            <li><strong>备份</strong>：持续备份到
+            S3，提供时间点恢复（Point-in-Time
+            Recovery，PITR）能力。</li>
+            <li><strong>校验和修复</strong>：后台持续校验数据完整性，发现损坏的副本时自动从其他副本修复。</li>
+            </ul>
+            <p>这些操作都在存储层完成，不消耗计算层的 CPU
+            和内存。这也是存算分离带来的运维收益之一。</p>
+            <hr />
+            <h2 id="五tidb-的存算分离">五、TiDB 的存算分离</h2>
+            <p>TiDB 的存算分离路线和 Snowflake、Aurora
+            都不同。它不是一开始就按存算分离设计的，而是从一个
+            Shared-Nothing 架构逐步演进，通过 TiKV 和 TiFlash
+            的分离、以及 S3 冷存储的引入，实现了部分的存算分离。</p>
+            <h3 id="tidb-的基础架构">5.1 TiDB 的基础架构</h3>
+            <pre class="text"><code>┌──────────────────────────────────────────────────────────────┐
+│                        TiDB Server（计算层，无状态）           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
+│  │ TiDB-1   │  │ TiDB-2   │  │ TiDB-3   │                   │
+│  │ SQL 解析  │  │ SQL 解析  │  │ SQL 解析  │                   │
+│  │ 查询优化  │  │ 查询优化  │  │ 查询优化  │                   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                   │
+│       │             │             │                          │
+├───────┼─────────────┼─────────────┼──────────────────────────┤
+│       ▼             ▼             ▼                          │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │                   PD（调度层）                        │     │
+│  │     时间戳分配 / Region 调度 / 负载均衡                │     │
+│  └─────────────────────────────────────────────────────┘     │
+│       │             │             │                          │
+│       ▼             ▼             ▼                          │
+│  ┌──────────────────────────┬────────────────────────┐       │
+│  │     TiKV（行存储）        │    TiFlash（列存储）     │       │
+│  │  ┌──────┐ ┌──────┐      │  ┌──────┐ ┌──────┐    │       │
+│  │  │Store1│ │Store2│ ...  │  │Node1 │ │Node2 │ .. │       │
+│  │  │Region│ │Region│      │  │列副本 │ │列副本 │    │       │
+│  │  └──────┘ └──────┘      │  └──────┘ └──────┘    │       │
+│  └──────────────────────────┴────────────────────────┘       │
+└──────────────────────────────────────────────────────────────┘</code></pre>
+            <p>TiDB 的存算分离体现在以下几个层面：</p>
+            <p><strong>TiDB Server 无状态</strong>：TiDB Server
+            是纯计算层，负责 SQL
+            解析、查询优化、执行计划生成。它不存储任何用户数据，可以随时水平扩展。这一层已经实现了计算的弹性伸缩。</p>
+            <p><strong>TiKV 是存算一体</strong>：TiKV 节点既存储数据（以
+            Region 为单位，每个 Region 默认 96
+            MB），也执行下推的计算（协处理器，Coprocessor）。TiKV
+            层本身是 Shared-Nothing 的。</p>
+            <p><strong>TiFlash 作为列存副本</strong>：TiFlash 通过 Raft
+            Learner 协议从 TiKV
+            异步复制数据，把行存格式转换为列存格式。OLAP 查询可以路由到
+            TiFlash，利用列存的扫描优势。TiDB 的优化器可以自动选择从
+            TiKV 还是 TiFlash 读取数据。</p>
+            <h3 id="tikv-tiflash-的-htap-实践">5.2 TiKV + TiFlash 的
+            HTAP 实践</h3>
+            <p>TiDB 的 HTAP（Hybrid Transactional/Analytical
+            Processing，混合事务分析处理）架构通过 TiKV 和 TiFlash
+            的配合实现：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 示例：配置 TiFlash 副本</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 为 orders 表创建 1 个 TiFlash 副本</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">SET</span> TIFLASH REPLICA <span class="dv">1</span>;</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- TiDB 的优化器会根据查询特征自动选择引擎</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 点查和短事务走 TiKV（行存）</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> order_id <span class="op">=</span> <span class="dv">12345</span>;</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 大范围扫描和聚合走 TiFlash（列存）</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="dt">DATE</span>(order_date), <span class="fu">SUM</span>(amount), <span class="fu">COUNT</span>(<span class="op">*</span>)</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> order_date <span class="op">&gt;=</span> <span class="st">&#39;2024-01-01&#39;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dt">DATE</span>(order_date);</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 也可以通过 Hint 强制指定引擎</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="co">/*+ READ_FROM_STORAGE(TIFLASH[orders]) */</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    product_id, <span class="fu">SUM</span>(amount)</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> product_id;</span></code></pre></div>
+            <p>TiFlash 的数据一致性通过 Raft Learner 保证。TiFlash
+            节点作为 Raft Group 的 Learner，接收 TiKV Leader
+            的日志但不参与投票。当 TiFlash 收到一条查询请求时，它会向
+            TiKV Leader 请求当前的 Raft Index，等待自己的日志应用到该
+            Index
+            后再返回结果，从而保证读到的数据不落后于事务提交点。</p>
+            <h3 id="s3-冷存储">5.3 S3 冷存储</h3>
+            <p>TiDB 从 7.0 版本开始支持将冷数据转储到 S3
+            等对象存储。这进一步推进了存算分离，把存储分为热层（TiKV
+            本地 SSD）和冷层（S3）。</p>
+            <p>配置示例：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建使用 S3 存储的 Placement Policy</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 注意：以下为 TiDB 7.x 的配置方式，具体语法请参考对应版本文档</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> PLACEMENT POLICY cold_storage</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">CONSTRAINTS</span><span class="op">=</span><span class="ot">&quot;[+disk=s3]&quot;</span>;</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对历史分区应用冷存储策略</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">PARTITION</span> p202301</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    PLACEMENT POLICY <span class="op">=</span> cold_storage;</span></code></pre></div>
+            <p>冷存储的核心权衡：</p>
+            <ul>
+            <li><strong>存储成本</strong>：S3 标准存储约 0.023
+            美元/GB/月，相比 EBS gp3 的 0.08 美元/GB/月，降低约
+            70%。</li>
+            <li><strong>访问延迟</strong>：S3 的首字节延迟在 50 到 100
+            毫秒级别，远高于本地 SSD 的 0.1
+            毫秒。对于冷数据的偶尔查询，这个延迟通常可以接受。</li>
+            <li><strong>数据生命周期管理</strong>：通过分区 + Placement
+            Policy，可以按时间维度自动把老数据迁移到冷存储，新数据仍然保留在
+            TiKV 的本地 SSD 上。</li>
+            </ul>
+            <h3 id="tidb-存算分离的演进方向">5.4 TiDB
+            存算分离的演进方向</h3>
+            <p>TiDB 的存算分离是渐进式的，和 Snowflake、Aurora
+            一开始就按存算分离设计不同。这种演进路线有其现实原因：TiDB
+            最初的核心定位是 OLTP 数据库，而 OLTP
+            对延迟的要求决定了它不能简单地把存储层换成对象存储。</p>
+            <p>TiDB 的存算分离可以分为三个阶段来理解：</p>
+            <pre class="text"><code>阶段一：TiDB Server 无状态化（已完成）
+  TiDB Server 只做 SQL 解析和查询优化，不持有用户数据。
+  计算层可以独立水平扩展。
+  但 TiKV 层仍然是存算一体的 Shared-Nothing 架构。
+
+阶段二：HTAP 分离——TiKV + TiFlash（已完成）
+  OLTP 负载走 TiKV（行存），OLAP 负载走 TiFlash（列存）。
+  读写路径分离，减少 OLTP 和 OLAP 之间的互相干扰。
+  但 TiKV 节点仍然绑定了存储和计算。
+
+阶段三：冷热分层——TiKV + S3（进行中）
+  热数据保留在 TiKV 本地 SSD 上，冷数据下沉到 S3。
+  降低大数据量场景下的存储成本。
+  面向未来的方向是让 TiKV 的存储层可以完全托管到云存储上。</code></pre>
+            <p>从工程实践的角度看，TiDB 的渐进路线比 Snowflake
+            的一步到位路线更适合 OLTP 场景。OLTP
+            的延迟敏感性意味着完全依赖远端存储是不可接受的，必须在本地保留热数据的副本。这本质上是在存算分离和访问延迟之间做权衡。</p>
+            <hr />
+            <h2
+            id="六对象存储作为数据湖底座">六、对象存储作为数据湖底座</h2>
+            <h3 id="从数据湖到湖仓一体">6.1 从数据湖到湖仓一体</h3>
+            <p>数据湖（Data
+            Lake）的核心思想是把所有原始数据以文件形式存储在一个集中的、低成本的存储层上，不做预先的
+            Schema 定义。对象存储（如 S3、MinIO、阿里云
+            OSS）因为其无限扩展、低成本、高持久性的特性，成为数据湖的默认选择。</p>
+            <p>但早期数据湖有一个根本问题：缺乏事务支持。一个写入 S3 的
+            Parquet
+            文件如果写到一半失败了，读者可能读到不完整的数据。多个写者同时更新同一个目录的文件时，也没有原子性保证。</p>
+            <p>湖仓一体（Lakehouse）架构试图解决这个问题，在对象存储之上加一层表格式（Table
+            Format）来提供事务语义。目前主流的三个表格式是 Delta
+            Lake、Apache Iceberg 和 Apache Hudi。</p>
+            <h3 id="表格式对比">6.2 表格式对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 13%" />
+            <col style="width: 23%" />
+            <col style="width: 34%" />
+            <col style="width: 28%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>特性</th>
+            <th>Delta Lake</th>
+            <th>Apache Iceberg</th>
+            <th>Apache Hudi</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>发起方</td>
+            <td>Databricks</td>
+            <td>Netflix / Apple</td>
+            <td>Uber</td>
+            </tr>
+            <tr>
+            <td>元数据管理</td>
+            <td>事务日志（JSON/Parquet）</td>
+            <td>快照（Manifest 文件）</td>
+            <td>时间线（Timeline）</td>
+            </tr>
+            <tr>
+            <td>ACID 事务</td>
+            <td>支持</td>
+            <td>支持</td>
+            <td>支持</td>
+            </tr>
+            <tr>
+            <td>Schema 演进</td>
+            <td>支持</td>
+            <td>支持（列级）</td>
+            <td>支持</td>
+            </tr>
+            <tr>
+            <td>时间旅行（Time Travel）</td>
+            <td>支持</td>
+            <td>支持</td>
+            <td>支持</td>
+            </tr>
+            <tr>
+            <td>分区演进</td>
+            <td>有限</td>
+            <td>支持（隐式分区）</td>
+            <td>有限</td>
+            </tr>
+            <tr>
+            <td>生态绑定度</td>
+            <td>较高（Spark / Databricks）</td>
+            <td>较低（多引擎兼容）</td>
+            <td>中等</td>
+            </tr>
+            <tr>
+            <td>存储格式</td>
+            <td>Parquet</td>
+            <td>Parquet / ORC / Avro</td>
+            <td>Parquet / Avro</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="lakehouse-架构的存算分离">6.3 Lakehouse
+            架构的存算分离</h3>
+            <p>Lakehouse 架构天然就是存算分离的：数据以开放格式（Parquet
+            /
+            ORC）存储在对象存储上，计算引擎（Spark、Trino、Flink、DuckDB
+            等）按需启动并直接读取对象存储的数据。</p>
+            <pre class="text"><code>┌───────────────────────────────────────────────────────┐
+│                    计算引擎层                           │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  │
+│  │ Spark   │  │ Trino   │  │ Flink   │  │ DuckDB  │  │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  │
+│       │            │            │            │        │
+├───────┼────────────┼────────────┼────────────┼────────┤
+│       ▼            ▼            ▼            ▼        │
+│  ┌────────────────────────────────────────────────┐   │
+│  │         表格式层（Iceberg / Delta / Hudi）       │   │
+│  │         事务管理 / 元数据 / Schema 演进           │   │
+│  └────────────────────┬───────────────────────────┘   │
+│                       │                               │
+├───────────────────────┼───────────────────────────────┤
+│                       ▼                               │
+│  ┌────────────────────────────────────────────────┐   │
+│  │         对象存储层（S3 / MinIO / OSS）           │   │
+│  │         Parquet / ORC 文件                      │   │
+│  └────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────┘</code></pre>
+            <p>这种架构的核心优势是存储与计算引擎的解耦。同一份数据可以被
+            Spark 做批处理、被 Trino 做交互式查询、被 Flink
+            做流处理，而不需要在不同系统之间拷贝数据。数据只有一份，存储在对象存储上，成本最低。</p>
+            <h3 id="对象存储的性能特征">6.4 对象存储的性能特征</h3>
+            <p>对象存储作为数据湖底座，其性能特征决定了上层系统的设计约束：</p>
+            <table>
+            <colgroup>
+            <col style="width: 12%" />
+            <col style="width: 26%" />
+            <col style="width: 44%" />
+            <col style="width: 18%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>S3（典型值）</th>
+            <th>本地 NVMe SSD（典型值）</th>
+            <th>差距倍数</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>首字节延迟（GET）</td>
+            <td>10-50 ms</td>
+            <td>0.05-0.1 ms</td>
+            <td>100-500x</td>
+            </tr>
+            <tr>
+            <td>顺序读吞吐（单连接）</td>
+            <td>50-100 MB/s</td>
+            <td>3000-7000 MB/s</td>
+            <td>30-70x</td>
+            </tr>
+            <tr>
+            <td>顺序读吞吐（多连接并行）</td>
+            <td>数十 GB/s（聚合）</td>
+            <td>受限于单盘</td>
+            <td>可通过并行弥补</td>
+            </tr>
+            <tr>
+            <td>PUT 延迟</td>
+            <td>10-100 ms</td>
+            <td>0.01-0.05 ms</td>
+            <td>200-2000x</td>
+            </tr>
+            <tr>
+            <td>每秒请求数（单前缀）</td>
+            <td>5500 GET / 3500 PUT</td>
+            <td>数十万 IOPS</td>
+            <td>50-100x</td>
+            </tr>
+            <tr>
+            <td>存储成本</td>
+            <td>0.023 美元/GB/月</td>
+            <td>约 0.08-0.15 美元/GB/月</td>
+            <td>3-6x 更便宜</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>关键结论：对象存储的单次延迟远高于本地
+            SSD，但吞吐可以通过大量并行请求来弥补。这决定了存算分离系统必须采用大块读取
+            + 并行化 + 本地缓存的策略，而不是小块随机读写。</p>
+            <h3 id="对象存储在存算分离中的工程约束">6.5
+            对象存储在存算分离中的工程约束</h3>
+            <p>对象存储不是万能的。在实际工程中，使用对象存储作为数据湖底座需要处理以下约束：</p>
+            <p><strong>最终一致性问题</strong>：S3 从 2020 年 12
+            月起对新对象的 PUT 操作提供强一致性保证（Read-after-Write
+            Consistency）。但在此之前，S3 的 LIST
+            操作是最终一致的，可能遗漏刚写入的对象。这也是 Delta
+            Lake、Iceberg
+            等表格式出现的原因之一——它们通过自己管理文件列表来避免依赖
+            S3 LIST 操作的一致性。</p>
+            <p><strong>小文件问题</strong>：对象存储对每次请求都有固定的延迟开销（10-50
+            ms）。如果数据被拆分成大量小文件（每个文件几 KB 到几十
+            KB），读取 10000
+            个小文件的总延迟远高于读取一个等大的大文件。这就是为什么
+            Snowflake 的微分区大小在 50-500 MB，Iceberg
+            推荐的目标文件大小是 128-512
+            MB——都是为了摊薄每次请求的固定开销。</p>
+            <p><strong>重命名不是原子操作</strong>：对象存储没有原子重命名（Atomic
+            Rename）操作。很多传统文件系统依赖 rename
+            的原子性来实现写入的原子提交（先写临时文件，再 rename
+            为目标文件）。在对象存储上，表格式通过事务日志或元数据文件来实现提交的原子性，而不是依赖
+            rename。</p>
+            <p><strong>没有目录概念</strong>：对象存储是扁平的键值存储，“目录”只是通过键的前缀模拟出来的。LIST
+            操作按前缀过滤，不是真正的目录遍历。这影响了文件组织方式和分区发现（Partition
+            Discovery）机制的设计。</p>
+            <hr />
+            <h2 id="七本地缓存策略">七、本地缓存策略</h2>
+            <p>存算分离架构的性能关键在于本地缓存。计算节点的本地 SSD
+            或内存用于缓存从远端存储读取的数据，缓存命中率直接决定了查询延迟。</p>
+            <h3 id="缓存的三个层次">7.1 缓存的三个层次</h3>
+            <pre class="text"><code>┌───────────────────────────────────────────┐
+│              计算节点                      │
+│  ┌─────────────────────────────────────┐  │
+│  │  L1: 内存缓存（Buffer Pool / Page） │  │
+│  │  容量: 数十 GB                       │  │
+│  │  延迟: ~0.0001 ms（100 ns）          │  │
+│  ├─────────────────────────────────────┤  │
+│  │  L2: 本地 SSD 缓存                  │  │
+│  │  容量: 数百 GB ~ 数 TB               │  │
+│  │  延迟: ~0.05-0.1 ms                 │  │
+│  ├─────────────────────────────────────┤  │
+│  │  L3: 远端存储（S3 / 分布式存储）      │  │
+│  │  容量: 无限                          │  │
+│  │  延迟: ~10-50 ms                    │  │
+│  └─────────────────────────────────────┘  │
+└───────────────────────────────────────────┘</code></pre>
+            <h3 id="读缓存策略">7.2 读缓存策略</h3>
+            <p><strong>按需缓存（Demand
+            Paging）</strong>：最简单的策略。缓存未命中时从远端存储读取，读取后写入缓存。淘汰策略通常用
+            LRU（Least Recently Used，最近最少使用）或 LRU-K。</p>
+            <p><strong>预取（Prefetch）</strong>：在查询执行计划确定后，预测即将需要的数据块，提前从远端存储拉取到本地缓存。预取的关键是准确性——预取了不需要的数据浪费带宽和缓存空间，预取不到需要的数据又退化为按需缓存。</p>
+            <p>Snowflake
+            的预取策略基于查询计划。查询优化器知道需要扫描哪些微分区，可以在查询开始执行前就发起对这些分区的预取请求。由于微分区是不可变的且有明确的文件路径，预取的准确率接近
+            100%。</p>
+            <p><strong>一致性哈希分配</strong>：在多节点的计算集群中，把不同的数据分区分配给不同的节点缓存，避免重复缓存同一份数据。Snowflake
+            使用一致性哈希（Consistent Hashing）把微分区分配给 VW
+            中的各个节点——每个节点负责缓存特定的微分区集合。查询时，如果某个微分区分配给了节点
+            A，那么需要读取该分区的扫描任务也会被调度到节点 A
+            上执行。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 一致性哈希分配微分区到计算节点（简化示意）</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> assign_partition_to_node(partition_id: <span class="bu">str</span>, node_list: <span class="bu">list</span>[<span class="bu">str</span>]) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;将微分区分配到特定的计算节点，最大化缓存命中率&quot;&quot;&quot;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    hash_val <span class="op">=</span> <span class="bu">int</span>(hashlib.md5(partition_id.encode()).hexdigest(), <span class="dv">16</span>)</span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    node_index <span class="op">=</span> hash_val <span class="op">%</span> <span class="bu">len</span>(node_list)</span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> node_list[node_index]</span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 假设 VW 有 4 个节点</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>nodes <span class="op">=</span> [<span class="st">&quot;node-0&quot;</span>, <span class="st">&quot;node-1&quot;</span>, <span class="st">&quot;node-2&quot;</span>, <span class="st">&quot;node-3&quot;</span>]</span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 分配微分区</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>partitions <span class="op">=</span> [<span class="st">&quot;orders/micro_part_0001.parquet&quot;</span>,</span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>              <span class="st">&quot;orders/micro_part_0002.parquet&quot;</span>,</span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a>              <span class="st">&quot;orders/micro_part_0003.parquet&quot;</span>,</span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>              <span class="st">&quot;orders/micro_part_0004.parquet&quot;</span>,</span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a>              <span class="st">&quot;orders/micro_part_0005.parquet&quot;</span>]</span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p <span class="kw">in</span> partitions:</span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a>    assigned <span class="op">=</span> assign_partition_to_node(p, nodes)</span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>p<span class="sc">}</span><span class="ss"> -&gt; </span><span class="sc">{</span>assigned<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a><span class="co"># 当 VW 扩展到 8 个节点时，约 50% 的分区分配会改变</span></span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 一致性哈希可以把这个比例降到更低，减少缓存失效</span></span></code></pre></div>
+            <h3 id="缓存淘汰策略">7.3 缓存淘汰策略</h3>
+            <p>当本地缓存空间不足时，需要淘汰一部分缓存数据。常见的淘汰策略：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>策略</th>
+            <th>原理</th>
+            <th>优点</th>
+            <th>缺点</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>LRU</td>
+            <td>淘汰最近最少使用的数据</td>
+            <td>实现简单</td>
+            <td>扫描查询会污染缓存</td>
+            </tr>
+            <tr>
+            <td>LRU-K</td>
+            <td>根据最近第 K 次访问时间淘汰</td>
+            <td>抗扫描污染</td>
+            <td>实现复杂度高</td>
+            </tr>
+            <tr>
+            <td>LFU</td>
+            <td>淘汰访问频率最低的数据</td>
+            <td>保护高频数据</td>
+            <td>历史频率会阻碍新数据</td>
+            </tr>
+            <tr>
+            <td>ARC</td>
+            <td>自适应平衡 LRU 和 LFU</td>
+            <td>自适应，无需调参</td>
+            <td>实现复杂</td>
+            </tr>
+            <tr>
+            <td>FIFO</td>
+            <td>按进入顺序淘汰</td>
+            <td>极简实现</td>
+            <td>不考虑访问模式</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Snowflake 在实践中使用的是文件级别的 LRU
+            策略。由于微分区的粒度在 16 MB
+            左右（压缩后），缓存的管理粒度和淘汰粒度都比传统数据库的页级缓存（4
+            KB 到 16 KB）要粗得多，但这反而降低了元数据管理的开销。</p>
+            <h3 id="分层存储">7.4 分层存储</h3>
+            <p>分层存储（Tiered
+            Storage）把数据按访问频率分为多个层次：</p>
+            <pre class="text"><code>热数据 ──→ 内存 / 本地 NVMe SSD
+           访问频率高，延迟要求严格
+           成本：最高
+
+温数据 ──→ 本地 HDD / 近线存储
+           访问频率中等，延迟容忍度中等
+           成本：中等
+
+冷数据 ──→ 对象存储（S3 标准）
+           偶尔访问，延迟容忍度高
+           成本：低
+
+归档数据 ──→ 对象存储（S3 Glacier）
+            极少访问，取回需要数小时
+            成本：极低</code></pre>
+            <p>分层的触发条件通常基于访问频率或时间。例如，30
+            天未访问的数据从热层降级到温层，90
+            天未访问的数据降级到冷层。TiDB 的冷存储和 Snowflake
+            的存储层本质上都是分层存储的应用。</p>
+            <hr />
+            <h2 id="八网络带宽需求计算">八、网络带宽需求计算</h2>
+            <p>存算分离架构把计算和存储之间的通信从本地总线（PCIe、NVMe）变成了网络通信。网络带宽成为系统吞吐量的上限。</p>
+            <h3 id="带宽需求估算模型">8.1 带宽需求估算模型</h3>
+            <p>一个简单的估算公式：</p>
+            <pre class="text"><code>所需网络带宽 = (查询扫描数据量 x (1 - 缓存命中率)) / 查询执行时间目标
+
+示例 1：OLAP 全表扫描
+  表大小：1 TB（压缩后 300 GB）
+  缓存命中率：0%（冷查询）
+  执行时间目标：60 秒
+  所需带宽 = 300 GB / 60 s = 5 GB/s = 40 Gbps
+
+示例 2：OLAP 热数据查询
+  表大小：1 TB（压缩后 300 GB）
+  缓存命中率：80%
+  执行时间目标：10 秒
+  所需带宽 = 300 GB x 0.2 / 10 s = 6 GB/s = 48 Gbps
+  （注意：虽然数据量少了，但执行时间目标也更短了）
+
+示例 3：OLTP 高并发点查
+  每秒查询数：10000 QPS
+  每次查询读取数据量：8 KB（单页）
+  缓存命中率：95%
+  所需带宽 = 10000 x 8 KB x 0.05 = 4 MB/s ≈ 32 Mbps
+  （OLTP 点查对带宽需求很低，瓶颈在延迟而非带宽）</code></pre>
+            <h3 id="云环境的网络带宽限制">8.2 云环境的网络带宽限制</h3>
+            <p>不同 EC2 实例类型的网络带宽差异很大：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>实例类型</th>
+            <th>vCPU</th>
+            <th>内存</th>
+            <th>网络带宽</th>
+            <th>月成本（近似）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>c6i.xlarge</td>
+            <td>4</td>
+            <td>8 GB</td>
+            <td>最高 12.5 Gbps</td>
+            <td>约 124 美元</td>
+            </tr>
+            <tr>
+            <td>c6i.4xlarge</td>
+            <td>16</td>
+            <td>32 GB</td>
+            <td>最高 12.5 Gbps</td>
+            <td>约 496 美元</td>
+            </tr>
+            <tr>
+            <td>c6i.8xlarge</td>
+            <td>32</td>
+            <td>64 GB</td>
+            <td>12.5 Gbps</td>
+            <td>约 992 美元</td>
+            </tr>
+            <tr>
+            <td>c6i.16xlarge</td>
+            <td>64</td>
+            <td>128 GB</td>
+            <td>25 Gbps</td>
+            <td>约 1984 美元</td>
+            </tr>
+            <tr>
+            <td>c6i.24xlarge</td>
+            <td>96</td>
+            <td>192 GB</td>
+            <td>37.5 Gbps</td>
+            <td>约 2976 美元</td>
+            </tr>
+            <tr>
+            <td>c6i.metal</td>
+            <td>128</td>
+            <td>256 GB</td>
+            <td>50 Gbps</td>
+            <td>约 3968 美元</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>关键观察：对于中等规格的实例（如
+            c6i.4xlarge），网络带宽上限是 12.5 Gbps，约 1.56
+            GB/s。如果一个 OLAP 查询需要从 S3 读取 100 GB
+            的数据（缓存未命中），单个实例需要约 64
+            秒才能把数据拉完。这就是为什么 Snowflake 的 VW
+            由多个实例组成——通过并行化来分摊带宽需求。</p>
+            <h3 id="s3-的带宽特性">8.3 S3 的带宽特性</h3>
+            <p>S3
+            的带宽不是由单个连接决定的，而是由并行连接数和请求方式决定的：</p>
+            <ul>
+            <li>单个 GET 请求的吞吐：约 50-100 MB/s</li>
+            <li>通过分段下载（Range
+            GET）并行拉取同一个对象：可以聚合到数 GB/s</li>
+            <li>单个前缀的请求数限制：5500 GET/s、3500 PUT/s</li>
+            <li>通过使用多个前缀可以线性扩展请求数</li>
+            </ul>
+            <p>实践中的带宽优化手段：</p>
+            <pre class="text"><code>1. 并行化读取
+   不要一次读一个文件，而是同时发起多个文件的读取请求。
+   Snowflake 的每个计算节点会同时发起数十个并行 S3 GET 请求。
+
+2. Range GET
+   对于大文件（如 256 MB 的微分区），使用 HTTP Range 请求并行拉取
+   不同的字节范围，然后在本地拼接。
+
+3. 前缀打散
+   S3 按前缀限流。把文件分散到多个前缀下可以提高总请求数上限。
+   例如，用文件哈希的前几位作为前缀：
+     s3://bucket/a1/data_001.parquet
+     s3://bucket/b2/data_002.parquet
+     s3://bucket/c3/data_003.parquet
+
+4. 列裁剪
+   列式存储格式（Parquet / ORC）支持只读取需要的列。
+   一个 100 列的表只查 3 列，实际读取的数据量可能只有总数据量的 3%。</code></pre>
+            <h3 id="带宽不足时的表现">8.4 带宽不足时的表现</h3>
+            <p>当网络带宽成为瓶颈时，存算分离系统的典型表现：</p>
+            <ul>
+            <li><strong>查询延迟线性增长</strong>：扫描 10 GB 数据和扫描
+            100 GB
+            数据的延迟接近线性关系（在缓存未命中的情况下），因为瓶颈在数据传输而非计算。</li>
+            <li><strong>CPU 利用率低</strong>：计算节点的 CPU
+            大部分时间在等待数据从网络到达，利用率可能只有 20% 到
+            30%。</li>
+            <li><strong>多查询之间争抢带宽</strong>：同一个计算节点上并发执行多个查询时，它们共享网络带宽，每个查询分到的带宽减少。</li>
+            </ul>
+            <p>解决带宽瓶颈的工程手段：</p>
+            <ol type="1">
+            <li>提高缓存命中率（最有效）</li>
+            <li>增加计算节点数（分摊带宽需求）</li>
+            <li>使用更大规格的实例（更高的网络带宽上限）</li>
+            <li>优化查询，减少扫描数据量（分区裁剪、列裁剪、谓词下推）</li>
+            </ol>
+            <h3 id="网络延迟对事务性能的影响">8.5
+            网络延迟对事务性能的影响</h3>
+            <p>带宽之外，延迟是存算分离在 OLTP
+            场景下的另一个关键约束。本地 NVMe SSD 的读延迟在 50 到 100
+            微秒，而 S3 的首字节延迟在 10 到 50 毫秒——差距在 100 到 1000
+            倍。</p>
+            <p>对于 OLTP 事务，一个典型的读写事务可能包含 5 到 10
+            次读操作。如果每次读操作都需要访问远端存储，事务延迟会从 0.5
+            毫秒（本地 SSD）膨胀到 50 到 500
+            毫秒（远端存储），完全不可接受。</p>
+            <p>这就是为什么 Aurora 选择了”Shared-Disk +
+            专用存储层”而非”Shared-Storage + 对象存储”的路线。Aurora
+            的存储层延迟在亚毫秒级别，比 S3 低两个数量级，但比本地 SSD
+            高一个数量级。Aurora
+            通过”日志即数据库”的设计，把写路径上的网络往返次数降到最低——只发送
+            Redo Log，不发送数据页。</p>
+            <p>对于 Snowflake 这种 OLAP 系统，单次查询扫描的数据量大（GB
+            到 TB 级），即使首次请求有 50
+            毫秒的延迟，分摊到整个查询的执行时间中影响很小。这就是为什么
+            Snowflake 可以直接使用 S3
+            作为存储层，而不需要一个低延迟的专用存储层。</p>
+            <pre class="text"><code>延迟对不同工作负载的影响：
+
+OLTP（每事务 5-10 次 I/O）：
+  本地 SSD：5 x 0.1ms = 0.5ms
+  Aurora 存储层：5 x 0.5ms = 2.5ms（可接受）
+  S3：5 x 30ms = 150ms（不可接受）
+
+OLAP（单查询扫描 1000 个文件）：
+  本地 SSD：并行读取，受吞吐限制，约 10-30s
+  S3：并行读取，首次延迟 30ms + 吞吐时间，约 30-60s
+  延迟占比：30ms / 30s = 0.1%（可忽略）</code></pre>
+            <hr />
+            <h2 id="九存算一体-vs-分离的性能对比">九、存算一体 vs
+            分离的性能对比</h2>
+            <h3 id="对比框架">9.1 对比框架</h3>
+            <p>存算一体和分离的性能对比不能用一个简单的”谁快谁慢”来概括，需要区分不同的工作负载类型。</p>
+            <table>
+            <colgroup>
+            <col style="width: 31%" />
+            <col style="width: 34%" />
+            <col style="width: 34%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>工作负载特征</th>
+            <th>存算一体的优势</th>
+            <th>存算分离的优势</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>低延迟点查（OLTP）</td>
+            <td>本地 SSD 延迟 ~0.1ms，确定性高</td>
+            <td>依赖缓存命中，未命中时延迟高 10-100x</td>
+            </tr>
+            <tr>
+            <td>高吞吐扫描（OLAP）</td>
+            <td>受限于单机存储容量</td>
+            <td>可并行从对象存储拉取，聚合吞吐更高</td>
+            </tr>
+            <tr>
+            <td>突发查询负载</td>
+            <td>扩容慢，需数据迁移</td>
+            <td>秒级扩容计算节点</td>
+            </tr>
+            <tr>
+            <td>多租户隔离</td>
+            <td>需物理隔离或复杂的资源管控</td>
+            <td>天然隔离（不同 VW）</td>
+            </tr>
+            <tr>
+            <td>混合读写（HTAP）</td>
+            <td>读写在同一节点，可能互相干扰</td>
+            <td>读写可以路由到不同计算集群</td>
+            </tr>
+            <tr>
+            <td>冷数据查询</td>
+            <td>本地磁盘空间有限</td>
+            <td>对象存储无限扩展</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="一个实际的性能对比场景">9.2
+            一个实际的性能对比场景</h3>
+            <p>下面是一个假设场景的性能估算，用于说明存算一体和存算分离在不同条件下的表现差异。数据基于公开的系统特性做定性分析，不是实测数据。</p>
+            <p><strong>场景</strong>：一个 10 TB
+            的订单表，执行一个聚合查询，扫描 1 个月的数据（约 1
+            TB，压缩后 300 GB），计算每天的订单总额。</p>
+            <pre class="text"><code>方案 A：存算一体（4 节点 Shared-Nothing 集群）
+  每个节点存储 2.5 TB（约 750 GB 压缩数据）
+  本地 NVMe SSD 顺序读吞吐：3 GB/s
+  需要扫描的数据分布在 4 个节点上：每个节点约 75 GB
+  单节点扫描时间：75 GB / 3 GB/s = 25 秒
+  并行扫描，整体时间：约 25 秒
+
+方案 B：存算分离（4 节点计算集群 + S3 存储）
+  情况 B1：缓存全部命中
+    本地 SSD 缓存顺序读吞吐：约 2 GB/s（受缓存管理开销影响）
+    每个节点扫描 75 GB：75 GB / 2 GB/s = 37.5 秒
+    整体时间：约 38 秒
+
+  情况 B2：缓存命中率 80%
+    缓存读取：60 GB / 2 GB/s = 30 秒
+    S3 读取：15 GB，每节点 32 个并行连接，每连接 80 MB/s
+      聚合吞吐：32 x 80 MB/s = 2.56 GB/s
+      S3 读取时间：15 GB / 2.56 GB/s ≈ 6 秒
+    但 S3 读取和缓存读取可以交错进行
+    整体时间：约 32-35 秒
+
+  情况 B3：缓存完全未命中（冷查询）
+    S3 读取：75 GB，每节点 32 个并行连接
+    聚合吞吐：2.56 GB/s
+    S3 读取时间：75 GB / 2.56 GB/s ≈ 29 秒
+    加上 S3 首次请求延迟和元数据查找：约 30-35 秒
+    但受限于实例网络带宽上限（12.5 Gbps ≈ 1.56 GB/s）
+    实际时间：75 GB / 1.56 GB/s ≈ 48 秒</code></pre>
+            <p>从这个估算可以看出：</p>
+            <ol type="1">
+            <li>存算一体在本地数据访问场景下有明显的延迟优势。</li>
+            <li>存算分离在缓存命中率高时，性能接近存算一体。</li>
+            <li>存算分离在冷查询场景下，性能受网络带宽制约，可能慢 50%
+            到 100%。</li>
+            <li>存算分离的核心优势不在于单查询性能，而在于弹性伸缩和成本优化。</li>
+            </ol>
+            <h3 id="什么时候选择存算分离">9.3 什么时候选择存算分离</h3>
+            <p>基于以上分析，存算分离在以下场景中收益最大：</p>
+            <ol type="1">
+            <li><strong>负载波动大</strong>：白天高峰需要 64
+            核计算，夜间只需要 4
+            核。存算一体必须按峰值配置，存算分离可以按需伸缩。</li>
+            <li><strong>数据量大但查询稀疏</strong>：100 TB
+            数据，每天只查几次。存算一体需要为 100 TB
+            数据配满计算资源，存算分离只需要在查询时启动计算节点。</li>
+            <li><strong>多租户/多团队共享数据</strong>：不同团队需要用不同的计算资源查询同一份数据。存算分离天然支持多个计算集群挂载同一份存储。</li>
+            <li><strong>冷热数据分层需求明确</strong>：大部分数据是冷数据，只有少量热数据需要低延迟访问。存算分离可以把冷数据放到低成本存储，热数据通过缓存保持低延迟。</li>
+            <li><strong>云原生环境</strong>：云环境下按使用量付费的模型天然适合存算分离——计算不用时可以完全停止计费，存储按容量付费。</li>
+            </ol>
+            <p>反过来，以下场景存算一体可能更合适：</p>
+            <ol type="1">
+            <li><strong>延迟敏感的 OLTP</strong>：对 P99
+            延迟有严格要求（如 &lt;
+            5ms），不能承受缓存未命中带来的延迟抖动。</li>
+            <li><strong>数据量小但计算密集</strong>：数据只有几十 GB，但
+            QPS 很高。这种场景下数据完全可以放在本地 SSD
+            甚至内存中，网络通信是纯开销。</li>
+            <li><strong>网络环境不可靠</strong>：在网络质量不稳定的环境中，存算分离的可用性依赖网络可用性。</li>
+            </ol>
+            <h3 id="混合架构的工程实践">9.4 混合架构的工程实践</h3>
+            <p>实际生产环境中，很少有系统是纯粹的存算一体或纯粹的存算分离。更常见的是混合架构——根据数据的访问模式，在不同的层次上做不同程度的分离。</p>
+            <p>一个典型的混合架构设计：</p>
+            <pre class="text"><code>┌───────────────────────────────────────────────────────────┐
+│                      应用层                                │
+│  ┌──────────────┐   ┌─────────────────┐                   │
+│  │ OLTP 请求     │   │ OLAP / 报表请求  │                   │
+│  └──────┬───────┘   └───────┬─────────┘                   │
+│         │                   │                              │
+├─────────┼───────────────────┼──────────────────────────────┤
+│         ▼                   ▼                              │
+│  ┌──────────────┐   ┌─────────────────┐                   │
+│  │ OLTP 集群     │   │ OLAP 集群       │                   │
+│  │ (存算一体)    │   │ (存算分离)       │                   │
+│  │ 本地 SSD     │   │ 计算节点 + S3    │                   │
+│  │ 低延迟       │   │ 弹性伸缩         │                   │
+│  └──────┬───────┘   └───────┬─────────┘                   │
+│         │                   │                              │
+│         │     CDC / ETL     │                              │
+│         └─────────→─────────┘                              │
+│                                                            │
+│  OLTP 集群的数据通过 CDC（Change Data Capture）              │
+│  实时同步到 OLAP 集群的对象存储层                             │
+└───────────────────────────────────────────────────────────┘</code></pre>
+            <p>这种混合架构在实践中很常见：</p>
+            <ul>
+            <li>OLTP 部分使用 MySQL / PostgreSQL / TiDB 的 TiKV
+            层，保证低延迟事务处理。</li>
+            <li>OLAP 部分使用 Snowflake / ClickHouse /
+            Trino，从对象存储读取数据，提供弹性的分析查询能力。</li>
+            <li>两者之间通过 CDC 工具（如 Debezium、TiCDC、AWS
+            DMS）实时同步数据。</li>
+            </ul>
+            <p>混合架构的核心挑战是数据一致性。CDC
+            管道引入了同步延迟，OLAP 集群看到的数据总是比 OLTP
+            集群滞后几秒到几分钟。对于大多数分析场景，这个延迟是可以接受的。但如果业务要求
+            OLAP 查询和 OLTP
+            事务看到完全一致的数据，就需要引入更复杂的一致性机制，或者使用
+            TiDB 这种原生 HTAP 架构。</p>
+            <hr />
+            <h2 id="十参考文献">十、参考文献</h2>
+            <h3 id="论文">论文</h3>
+            <ol type="1">
+            <li><p>Dageville, B., et al. (2016). <em>The Snowflake
+            Elastic Data Warehouse</em>. SIGMOD 2016. Snowflake
+            的核心架构论文，详细描述了三层架构、微分区和 Virtual
+            Warehouse 设计。</p></li>
+            <li><p>Verbitski, A., et al. (2017). <em>Amazon Aurora:
+            Design Considerations for High Throughput Cloud-Native
+            Relational Databases</em>. SIGMOD 2017. Aurora
+            的核心论文，提出”日志即数据库”的设计理念和 Quorum
+            协议。</p></li>
+            <li><p>Verbitski, A., et al. (2018). <em>Amazon Aurora: On
+            Avoiding Distributed Consensus for I/Os, Commits, and
+            Membership Changes</em>. SIGMOD 2018. Aurora
+            的后续论文，深入讨论如何避免分布式共识的开销。</p></li>
+            <li><p>Huang, D., et al. (2020). <em>TiDB: A Raft-based HTAP
+            Database</em>. VLDB 2020. TiDB 的架构论文，描述了 TiKV +
+            TiFlash 的 HTAP 设计。</p></li>
+            <li><p>Armbrust, M., et al. (2021). <em>Lakehouse: A New
+            Generation of Open Platforms that Unify Data Warehousing and
+            Advanced Analytics</em>. CIDR 2021. Databricks 提出的
+            Lakehouse 架构论文。</p></li>
+            </ol>
+            <h3 id="官方文档">官方文档</h3>
+            <ol start="6" type="1">
+            <li><p>Snowflake Documentation. <em>Understanding Snowflake
+            Table Structures</em>. <a
+            href="https://docs.snowflake.com/en/user-guide/tables-micro-partitions"
+            class="uri">https://docs.snowflake.com/en/user-guide/tables-micro-partitions</a>.
+            微分区的官方说明。</p></li>
+            <li><p>Snowflake Documentation. <em>Virtual Warehouses</em>.
+            <a
+            href="https://docs.snowflake.com/en/user-guide/warehouses"
+            class="uri">https://docs.snowflake.com/en/user-guide/warehouses</a>.
+            VW 的配置和管理文档。</p></li>
+            <li><p>Amazon Aurora Documentation. <em>Amazon Aurora
+            Storage and Reliability</em>. <a
+            href="https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.StorageReliability.html"
+            class="uri">https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.StorageReliability.html</a>.
+            Aurora 存储层的官方文档。</p></li>
+            <li><p>TiDB Documentation. <em>TiFlash Overview</em>. <a
+            href="https://docs.pingcap.com/tidb/stable/tiflash-overview"
+            class="uri">https://docs.pingcap.com/tidb/stable/tiflash-overview</a>.
+            TiFlash 的官方架构说明。</p></li>
+            <li><p>TiDB Documentation. <em>TiDB Cloud Serverless</em>.
+            <a
+            href="https://docs.pingcap.com/tidbcloud/select-cluster-tier#tidb-cloud-serverless"
+            class="uri">https://docs.pingcap.com/tidbcloud/select-cluster-tier#tidb-cloud-serverless</a>.
+            TiDB 云原生存算分离的实践。</p></li>
+            </ol>
+            <h3 id="技术博客与设计文档">技术博客与设计文档</h3>
+            <ol start="11" type="1">
+            <li><p>AWS Architecture Blog. <em>Amazon Aurora Under the
+            Hood: Quorum and Correlated Failure</em>. <a
+            href="https://aws.amazon.com/blogs/database/amazon-aurora-under-the-hood-quorum-and-correlated-failure/"
+            class="uri">https://aws.amazon.com/blogs/database/amazon-aurora-under-the-hood-quorum-and-correlated-failure/</a>.
+            Aurora Quorum 协议的工程解读。</p></li>
+            <li><p>Snowflake Engineering Blog. <em>How Snowflake Handles
+            Caching</em>. Snowflake 缓存策略的工程说明。</p></li>
+            <li><p>Apache Iceberg Documentation. <a
+            href="https://iceberg.apache.org/docs/latest/"
+            class="uri">https://iceberg.apache.org/docs/latest/</a>.
+            Iceberg 表格式的官方文档。</p></li>
+            <li><p>Delta Lake Documentation. <a
+            href="https://docs.delta.io/latest/index.html"
+            class="uri">https://docs.delta.io/latest/index.html</a>.
+            Delta Lake 表格式的官方文档。</p></li>
+            </ol>
+            <h3 id="书籍">书籍</h3>
+            <ol start="15" type="1">
+            <li><p>Kleppmann, M. (2017). <em>Designing Data-Intensive
+            Applications</em>. O’Reilly.
+            数据密集型系统设计的经典教材，第六章对分区与复制有深入讨论。</p></li>
+            <li><p>Hellerstein, J. M., Stonebraker, M., &amp; Hamilton,
+            J. (2007). <em>Architecture of a Database System</em>.
+            Foundations and Trends in Databases, 1(2).
+            数据库系统架构的综述论文，对 Shared-Nothing 和 Shared-Disk
+            的历史演进有详细梳理。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../56-multi-tenancy/multi-tenancy.html">多租户存储隔离</a>
+            <strong>下一篇</strong>: <a
+            href="../58-data-durability/data-durability.html">数据持久性工程</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-20 · storage</p>
+                    <h3><a href="/post/storage/72-compute-storage-practice/compute-storage-practice.html">【存储工程】计算存储分离实践</a></h3>
+                    <p>深入剖析计算存储分离——Aurora日志即存储、TiDB的TiKV+TiFlash分层、Snowflake对象存储+缓存、ClickHouse存算分离模式的架构对比与选型指南</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/01-lakehouse-overview/01-lakehouse-overview.html">【数据湖与开放表格式】Lakehouse 全景：从 Hive 表到开放表格式</a></h3>
+                    <p>Hive 目录式分区表把『表』等同于『一组目录加 metastore 里的分区行』，于是没有原子提交、planning 要 LIST 目录、schema 与分区演进常要重写。本文用这三个硬伤切入，讲清 lakehouse 把表拆成『不可变数据文件 + 可变元数据指针 + catalog』三层后各自解决了什么，并给出全系列的分层地图。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-18 · storage</p>
+                    <h3><a href="/post/storage/40-data-lake-formats/data-lake-formats.html">【存储工程】数据湖存储格式：Delta Lake、Iceberg 与 Hudi</a></h3>
+                    <p>数据湖（Data Lake）的核心思想是把海量异构数据以开放格式存储在廉价的对象存储（Object Storage）上，用计算引擎按需查询。Apache Parquet 解决了列式编码（Columnar Encoding）问题，让分析查询的 I/O 效率提升了一个数量级。但 Parquet 只是一个文件格式，它不管事务…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

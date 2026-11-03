@@ -1,0 +1,1853 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】备份策略工程 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="系统剖析存储备份策略——全量/差异/增量备份、逻辑
+vs 物理备份、WAL 连续归档、备份验证与恢复测试、MySQL 与 PostgreSQL
+备份方案实战" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="backup, full-backup, incremental-backup, wal-archiving, xtrabackup, pg-basebackup, pitr, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/60-backup-strategies/backup-strategies.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】备份策略工程" />
+    <meta property="og:description" content="系统剖析存储备份策略——全量/差异/增量备份、逻辑 vs 物理备份、WAL 连续归档、备份验证与恢复测试、MySQL 与 PostgreSQL 备份方案实战" />
+    <meta property="og:url" content="https://quant67.com/post/storage/60-backup-strategies/backup-strategies.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="backup" />
+    <meta property="article:tag" content="full-backup" />
+    <meta property="article:tag" content="incremental-backup" />
+    <meta property="article:tag" content="wal-archiving" />
+    <meta property="article:tag" content="xtrabackup" />
+    <meta property="article:tag" content="pg-basebackup" />
+    <meta property="article:tag" content="pitr" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】备份策略工程" />
+    <meta name="twitter:description" content="系统剖析存储备份策略——全量/差异/增量备份、逻辑 vs 物理备份、WAL 连续归档、备份验证与恢复测试、MySQL 与 PostgreSQL 备份方案实战" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】备份策略工程", "description": "系统剖析存储备份策略——全量/差异/增量备份、逻辑 vs 物理备份、WAL 连续归档、备份验证与恢复测试、MySQL 与 PostgreSQL 备份方案实战", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/60-backup-strategies/backup-strategies.html"}, "datePublished": "2025-10-08T00:00:00+00:00", "dateModified": "2026-04-15T12:39:15+00:00", "keywords": ["backup", "full-backup", "incremental-backup", "wal-archiving", "xtrabackup", "pg-basebackup", "pitr"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】备份策略工程</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-10-08</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#backup</span> <span>#full-backup</span> <span>#incremental-backup</span> <span>#wal-archiving</span> <span>#xtrabackup</span> <span>#pg-basebackup</span> <span>#pitr</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/59-storage-failures/storage-failures.html">上一篇：【存储工程】存储故障模式</a><a class="post-series-nav__link" href="/post/storage/61-disaster-recovery/disaster-recovery.html">下一篇：【存储工程】灾难恢复设计</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/backup.html">#backup</a><a class="chip-link" href="/tags/full-backup.html">#full-backup</a><a class="chip-link" href="/tags/incremental-backup.html">#incremental-backup</a><a class="chip-link" href="/tags/wal-archiving.html">#wal-archiving</a><a class="chip-link" href="/tags/xtrabackup.html">#xtrabackup</a><a class="chip-link" href="/tags/pg-basebackup.html">#pg-basebackup</a><a class="chip-link" href="/tags/pitr.html">#pitr</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一备份的工程动机"
+                id="toc-一备份的工程动机">一、备份的工程动机</a>
+                <ul>
+                <li><a href="#数据丢失的典型场景"
+                id="toc-数据丢失的典型场景">1.1
+                数据丢失的典型场景</a></li>
+                <li><a href="#恢复目标的两个指标"
+                id="toc-恢复目标的两个指标">1.2
+                恢复目标的两个指标</a></li>
+                <li><a href="#备份的成本" id="toc-备份的成本">1.3
+                备份的成本</a></li>
+                </ul></li>
+                <li><a href="#二备份策略分类"
+                id="toc-二备份策略分类">二、备份策略分类</a>
+                <ul>
+                <li><a href="#全量备份" id="toc-全量备份">2.1
+                全量备份</a></li>
+                <li><a href="#差异备份" id="toc-差异备份">2.2
+                差异备份</a></li>
+                <li><a href="#增量备份" id="toc-增量备份">2.3
+                增量备份</a></li>
+                <li><a href="#三种策略对比" id="toc-三种策略对比">2.4
+                三种策略对比</a></li>
+                </ul></li>
+                <li><a href="#三逻辑备份-vs-物理备份"
+                id="toc-三逻辑备份-vs-物理备份">三、逻辑备份 vs
+                物理备份</a>
+                <ul>
+                <li><a href="#逻辑备份" id="toc-逻辑备份">3.1
+                逻辑备份</a></li>
+                <li><a href="#物理备份" id="toc-物理备份">3.2
+                物理备份</a></li>
+                <li><a href="#对比总结" id="toc-对比总结">3.3
+                对比总结</a></li>
+                </ul></li>
+                <li><a href="#四连续备份与-wal-归档"
+                id="toc-四连续备份与-wal-归档">四、连续备份与 WAL
+                归档</a>
+                <ul>
+                <li><a href="#wal-的基本原理"
+                id="toc-wal-的基本原理">4.1 WAL 的基本原理</a></li>
+                <li><a href="#连续归档的工作方式"
+                id="toc-连续归档的工作方式">4.2
+                连续归档的工作方式</a></li>
+                <li><a href="#postgresql-wal-归档配置"
+                id="toc-postgresql-wal-归档配置">4.3 PostgreSQL WAL
+                归档配置</a></li>
+                <li><a href="#mysql-binlog-的连续归档"
+                id="toc-mysql-binlog-的连续归档">4.4 MySQL binlog
+                的连续归档</a></li>
+                </ul></li>
+                <li><a href="#五mysql-备份方案"
+                id="toc-五mysql-备份方案">五、MySQL 备份方案</a>
+                <ul>
+                <li><a href="#mysqldump" id="toc-mysqldump">5.1
+                mysqldump</a></li>
+                <li><a href="#percona-xtrabackup"
+                id="toc-percona-xtrabackup">5.2 Percona
+                XtraBackup</a></li>
+                <li><a href="#mysql-时间点恢复"
+                id="toc-mysql-时间点恢复">5.3 MySQL 时间点恢复</a></li>
+                <li><a href="#mysql-备份方案选型"
+                id="toc-mysql-备份方案选型">5.4 MySQL
+                备份方案选型</a></li>
+                </ul></li>
+                <li><a href="#六postgresql-备份方案"
+                id="toc-六postgresql-备份方案">六、PostgreSQL
+                备份方案</a>
+                <ul>
+                <li><a href="#pg_dump" id="toc-pg_dump">6.1
+                pg_dump</a></li>
+                <li><a href="#pg_basebackup" id="toc-pg_basebackup">6.2
+                pg_basebackup</a></li>
+                <li><a href="#postgresql-pitr"
+                id="toc-postgresql-pitr">6.3 PostgreSQL PITR</a></li>
+                <li><a href="#第三方工具" id="toc-第三方工具">6.4
+                第三方工具</a></li>
+                <li><a href="#postgresql-备份方案选型"
+                id="toc-postgresql-备份方案选型">6.5 PostgreSQL
+                备份方案选型</a></li>
+                </ul></li>
+                <li><a href="#七备份验证与恢复测试"
+                id="toc-七备份验证与恢复测试">七、备份验证与恢复测试</a>
+                <ul>
+                <li><a href="#备份验证的层次"
+                id="toc-备份验证的层次">7.1 备份验证的层次</a></li>
+                <li><a href="#自动化恢复测试"
+                id="toc-自动化恢复测试">7.2 自动化恢复测试</a></li>
+                <li><a href="#验证清单" id="toc-验证清单">7.3
+                验证清单</a></li>
+                </ul></li>
+                <li><a href="#八备份加密与压缩"
+                id="toc-八备份加密与压缩">八、备份加密与压缩</a>
+                <ul>
+                <li><a href="#压缩" id="toc-压缩">8.1 压缩</a></li>
+                <li><a href="#加密" id="toc-加密">8.2 加密</a></li>
+                <li><a href="#加密密钥管理" id="toc-加密密钥管理">8.3
+                加密密钥管理</a></li>
+                </ul></li>
+                <li><a href="#九3-2-1-备份规则与最佳实践"
+                id="toc-九3-2-1-备份规则与最佳实践">九、3-2-1
+                备份规则与最佳实践</a>
+                <ul>
+                <li><a href="#规则" id="toc-规则">9.1 3-2-1
+                规则</a></li>
+                <li><a href="#扩展3-2-1-1-0-规则"
+                id="toc-扩展3-2-1-1-0-规则">9.2 扩展：3-2-1-1-0
+                规则</a></li>
+                <li><a href="#备份保留策略" id="toc-备份保留策略">9.3
+                备份保留策略</a></li>
+                <li><a href="#最佳实践清单" id="toc-最佳实践清单">9.4
+                最佳实践清单</a></li>
+                </ul></li>
+                <li><a href="#十备份监控与告警"
+                id="toc-十备份监控与告警">十、备份监控与告警</a>
+                <ul>
+                <li><a href="#需要监控的指标"
+                id="toc-需要监控的指标">10.1 需要监控的指标</a></li>
+                <li><a href="#postgresql-wal-归档监控"
+                id="toc-postgresql-wal-归档监控">10.2 PostgreSQL WAL
+                归档监控</a></li>
+                <li><a href="#备份任务监控脚本"
+                id="toc-备份任务监控脚本">10.3 备份任务监控脚本</a></li>
+                <li><a href="#告警分级" id="toc-告警分级">10.4
+                告警分级</a></li>
+                </ul></li>
+                <li><a href="#十一参考文献"
+                id="toc-十一参考文献">十一、参考文献</a>
+                <ul>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#工具文档"
+                id="toc-工具文档">工具文档</a></li>
+                <li><a href="#事故复盘"
+                id="toc-事故复盘">事故复盘</a></li>
+                <li><a href="#书籍与论文"
+                id="toc-书籍与论文">书籍与论文</a></li>
+                <li><a href="#行业规范"
+                id="toc-行业规范">行业规范</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>一个数据库集群运行了三年没出过事，运维团队逐渐把备份当成”例行公事”——每天凌晨跑一次全量备份，脚本跑完就算结束，从来没人验证过备份文件能不能真正恢复。直到某天一个
+            DBA 误执行了
+            <code>DROP DATABASE</code>，团队才发现：最近三个月的备份文件全部损坏，因为磁盘空间不足导致
+            <code>mysqldump</code>
+            中途退出，但脚本没有检查退出码，监控系统也没有告警。</p>
+            <p>这不是虚构的场景。GitLab 在 2017 年 1 月 31
+            日的事故中，五种备份机制全部失效——pg_dump
+            版本不匹配导致备份为空、LVM 快照从未配置、S3
+            备份因错误跳过、Azure 备份未启用、WAL
+            归档目录中只有空文件。最终靠一个 DBA
+            六小时前偶然做的一次手动备份才恢复了大部分数据，但仍然丢失了约
+            6 小时的生产数据。</p>
+            <p>备份不是一个”配置完就不用管”的功能，而是一项需要持续投入的工程实践。本文从备份的工程动机出发，逐一拆解全量/差异/增量三种策略、逻辑与物理备份的权衡、WAL
+            连续归档的原理，然后分别讨论 MySQL 和 PostgreSQL
+            的备份方案，最后覆盖备份验证、加密压缩、3-2-1
+            规则和监控告警。</p>
+            <blockquote>
+            <p><strong>适用范围</strong>
+            本文讨论的备份策略主要针对关系型数据库（MySQL
+            8.0、PostgreSQL
+            16）和通用文件系统备份场景。不涉及分布式数据库（如
+            TiDB、CockroachDB）的多副本机制——多副本是高可用手段，不能替代备份。不同版本的工具行为可能有差异，文中会标注版本。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一备份的工程动机">一、备份的工程动机</h2>
+            <h3 id="数据丢失的典型场景">1.1 数据丢失的典型场景</h3>
+            <p>数据丢失不只是硬盘坏了这一种情况。按照触发原因分类，至少有以下几种场景：</p>
+            <table>
+            <colgroup>
+            <col style="width: 20%" />
+            <col style="width: 20%" />
+            <col style="width: 31%" />
+            <col style="width: 27%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>场景类别</th>
+            <th>典型案例</th>
+            <th>多副本能否防护</th>
+            <th>备份能否防护</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>硬件故障</td>
+            <td>磁盘损坏、控制器故障、整机宕机</td>
+            <td>能（副本接管）</td>
+            <td>能</td>
+            </tr>
+            <tr>
+            <td>人为误操作</td>
+            <td><code>DROP TABLE</code>、<code>DELETE</code> 不带
+            <code>WHERE</code>、误删数据目录</td>
+            <td>不能（误操作会同步到副本）</td>
+            <td>能（恢复到误操作前的时间点）</td>
+            </tr>
+            <tr>
+            <td>软件缺陷</td>
+            <td>数据库 bug 导致数据写坏、升级脚本错误</td>
+            <td>不能（损坏数据同样会复制）</td>
+            <td>能（恢复到 bug 触发前）</td>
+            </tr>
+            <tr>
+            <td>安全事件</td>
+            <td>勒索软件加密数据文件、恶意删库</td>
+            <td>不能（攻击者通常会同时破坏副本）</td>
+            <td>能（前提是备份和生产环境隔离）</td>
+            </tr>
+            <tr>
+            <td>逻辑错误</td>
+            <td>应用层 bug 导致大量脏数据写入</td>
+            <td>不能（脏数据正常复制）</td>
+            <td>能（时间点恢复）</td>
+            </tr>
+            <tr>
+            <td>自然灾害</td>
+            <td>机房火灾、洪水、地震</td>
+            <td>取决于副本是否跨地域</td>
+            <td>能（前提是异地备份）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这张表说明一个核心问题：<strong>多副本解决的是可用性（Availability），备份解决的是可恢复性（Recoverability）</strong>。副本保证系统不停机，备份保证数据不丢失。两者必须同时存在。</p>
+            <h3 id="恢复目标的两个指标">1.2 恢复目标的两个指标</h3>
+            <p>备份策略的设计围绕两个核心指标展开：</p>
+            <p><strong>恢复点目标（Recovery Point
+            Objective，RPO）</strong>：系统发生故障后，最多允许丢失多长时间的数据。RPO
+            = 0 表示不允许丢失任何数据；RPO = 1 小时表示最多丢失 1
+            小时内的写入。</p>
+            <p><strong>恢复时间目标（Recovery Time
+            Objective，RTO）</strong>：从故障发生到系统恢复服务，最多允许多长时间。RTO
+            = 15 分钟表示必须在 15 分钟内完成恢复。</p>
+            <p>RPO 决定了备份频率和备份方式——要实现 RPO = 0
+            通常需要同步复制，RPO = 几分钟可以用 WAL 连续归档，RPO = 24
+            小时用每日全量备份就够了。RTO
+            决定了备份格式和恢复流程——物理备份的恢复速度通常远快于逻辑备份。</p>
+            <h3 id="备份的成本">1.3 备份的成本</h3>
+            <p>备份不是免费的。需要考虑的成本包括：</p>
+            <ul>
+            <li><strong>存储成本</strong>：备份文件需要占用存储空间，全量备份尤其如此。一个
+            1 TB 的数据库，每天做一次全量备份并保留 30
+            天，不考虑压缩就需要 30 TB 存储。</li>
+            <li><strong>性能影响</strong>：备份过程需要读取数据，会占用磁盘
+            I/O 和 CPU。逻辑备份（如
+            <code>mysqldump</code>）需要加锁或使用一致性快照，可能影响在线业务。</li>
+            <li><strong>网络带宽</strong>：异地备份需要通过网络传输备份文件，1
+            TB 数据在 1 Gbps 带宽下传输约需 2.5 小时。</li>
+            <li><strong>运维成本</strong>：备份脚本的开发、调试、监控、验证，以及定期的恢复演练，都需要人力投入。</li>
+            </ul>
+            <p>备份策略的核心就是在 RPO/RTO
+            要求与这些成本之间找到平衡。</p>
+            <hr />
+            <h2 id="二备份策略分类">二、备份策略分类</h2>
+            <p>备份策略按照每次备份的数据范围分为三种：全量备份（Full
+            Backup）、差异备份（Differential
+            Backup）和增量备份（Incremental Backup）。</p>
+            <h3 id="全量备份">2.1 全量备份</h3>
+            <p>全量备份（Full
+            Backup）每次复制数据集的完整副本。优点是恢复简单——只需要一份备份文件就能还原完整数据。缺点是时间长、占用空间大。</p>
+            <pre class="text"><code>时间轴：
+Day 1      Day 2      Day 3      Day 4      Day 5
+┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐
+│ Full │   │ Full │   │ Full │   │ Full │   │ Full │
+│100 GB│   │102 GB│   │105 GB│   │107 GB│   │110 GB│
+└──────┘   └──────┘   └──────┘   └──────┘   └──────┘
+
+恢复 Day 4 的数据：只需要 Day 4 的全量备份。
+总存储量：100 + 102 + 105 + 107 + 110 = 524 GB</code></pre>
+            <h3 id="差异备份">2.2 差异备份</h3>
+            <p>差异备份（Differential
+            Backup）每次只备份自上一次全量备份以来发生变化的数据。恢复时需要最近一次全量备份加上最近一次差异备份，共两份文件。</p>
+            <pre class="text"><code>时间轴：
+Day 1      Day 2      Day 3      Day 4      Day 5
+┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐
+│ Full │   │ Diff │   │ Diff │   │ Diff │   │ Diff │
+│100 GB│   │  2 GB│   │  5 GB│   │  7 GB│   │ 10 GB│
+└──────┘   └──────┘   └──────┘   └──────┘   └──────┘
+               │           │           │           │
+               └───────────┴───────────┴───────────┘
+                 都相对 Day 1 的全量备份
+
+恢复 Day 4 的数据：需要 Day 1 全量 + Day 4 差异 = 2 份文件。
+总存储量：100 + 2 + 5 + 7 + 10 = 124 GB</code></pre>
+            <p>差异备份的特点是：随着距离上次全量备份越远，差异备份的体积越大（因为累积的变化越多）。但恢复只需要两步，比增量备份简单。</p>
+            <h3 id="增量备份">2.3 增量备份</h3>
+            <p>增量备份（Incremental
+            Backup）每次只备份自上一次备份（不管是全量还是增量）以来发生变化的数据。恢复时需要最近一次全量备份加上之后所有的增量备份，按顺序依次应用。</p>
+            <pre class="text"><code>时间轴：
+Day 1      Day 2      Day 3      Day 4      Day 5
+┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐
+│ Full │   │ Incr │   │ Incr │   │ Incr │   │ Incr │
+│100 GB│   │  2 GB│   │  3 GB│   │  2 GB│   │  3 GB│
+└──────┘   └──────┘   └──────┘   └──────┘   └──────┘
+               │           │           │           │
+               │     相对 Day 2  相对 Day 3  相对 Day 4
+          相对 Day 1
+
+恢复 Day 4 的数据：需要 Day 1 全量 + Day 2 增量 + Day 3 增量 + Day 4 增量 = 4 份文件。
+总存储量：100 + 2 + 3 + 2 + 3 = 110 GB</code></pre>
+            <h3 id="三种策略对比">2.4 三种策略对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 18%" />
+            <col style="width: 27%" />
+            <col style="width: 27%" />
+            <col style="width: 27%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>全量备份</th>
+            <th>差异备份</th>
+            <th>增量备份</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>每次备份数据量</td>
+            <td>大（完整数据集）</td>
+            <td>中（累积变化）</td>
+            <td>小（最近一次变化）</td>
+            </tr>
+            <tr>
+            <td>备份速度</td>
+            <td>慢</td>
+            <td>中等</td>
+            <td>快</td>
+            </tr>
+            <tr>
+            <td>存储占用</td>
+            <td>大</td>
+            <td>中等</td>
+            <td>小</td>
+            </tr>
+            <tr>
+            <td>恢复复杂度</td>
+            <td>低（1 份文件）</td>
+            <td>中（2 份文件）</td>
+            <td>高（1 + N 份文件）</td>
+            </tr>
+            <tr>
+            <td>恢复速度</td>
+            <td>快</td>
+            <td>中等</td>
+            <td>慢（需逐个应用）</td>
+            </tr>
+            <tr>
+            <td>单份备份损坏的影响</td>
+            <td>只丢失该份</td>
+            <td>丢失该差异周期</td>
+            <td>该份之后的所有增量都无法使用</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>实际生产环境中最常见的做法是混合策略：<strong>每周一次全量备份
+            + 每天一次增量备份</strong>，或者<strong>每周一次全量备份 +
+            每天一次差异备份</strong>。增量备份的链条越长，恢复越慢且风险越高——中间任何一份损坏，后续的增量就全部失效。因此全量备份的频率不能太低。</p>
+            <hr />
+            <h2 id="三逻辑备份-vs-物理备份">三、逻辑备份 vs
+            物理备份</h2>
+            <p>按照备份内容的表示方式，备份还可以分为逻辑备份（Logical
+            Backup）和物理备份（Physical Backup）。</p>
+            <h3 id="逻辑备份">3.1 逻辑备份</h3>
+            <p>逻辑备份导出的是数据库的逻辑内容——表结构（DDL）和行数据（DML）。典型工具包括
+            MySQL 的
+            <code>mysqldump</code>、<code>mysqlpump</code>、<code>mydumper</code>，PostgreSQL
+            的 <code>pg_dump</code>、<code>pg_dumpall</code>。</p>
+            <p>逻辑备份的输出通常是 SQL
+            语句或特定格式的文本文件，例如：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- mysqldump 输出片段</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> `orders` (</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  `id` bigint <span class="kw">NOT</span> <span class="kw">NULL</span> AUTO_INCREMENT,</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  `user_id` bigint <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  `amount` <span class="dt">decimal</span>(<span class="dv">10</span>,<span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  `created_at` datetime <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="kw">PRIMARY</span> <span class="kw">KEY</span> (`id`),</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="kw">KEY</span> `idx_user_id` (`user_id`)</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>InnoDB <span class="kw">DEFAULT</span> CHARSET<span class="op">=</span>utf8mb4;</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> `orders` <span class="kw">VALUES</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>(<span class="dv">1</span>, <span class="dv">1001</span>, <span class="fl">99.99</span>, <span class="st">&#39;2025-01-15 10:30:00&#39;</span>),</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>(<span class="dv">2</span>, <span class="dv">1002</span>, <span class="fl">149.50</span>, <span class="st">&#39;2025-01-15 11:00:00&#39;</span>),</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>(<span class="dv">3</span>, <span class="dv">1001</span>, <span class="fl">29.99</span>, <span class="st">&#39;2025-01-15 11:30:00&#39;</span>);</span></code></pre></div>
+            <p>逻辑备份的优点：</p>
+            <ul>
+            <li><strong>可读性好</strong>：输出是人类可读的 SQL
+            或文本，可以用文本工具检查、编辑、过滤。</li>
+            <li><strong>跨版本兼容</strong>：可以在不同版本甚至不同数据库之间迁移数据（需要适配
+            SQL 方言）。</li>
+            <li><strong>粒度灵活</strong>：可以只备份特定的库、表，甚至通过
+            <code>WHERE</code> 条件备份部分行。</li>
+            <li><strong>不依赖存储引擎</strong>：逻辑备份与底层存储引擎无关，InnoDB
+            和 MyISAM 的备份方式相同。</li>
+            </ul>
+            <p>逻辑备份的缺点：</p>
+            <ul>
+            <li><strong>速度慢</strong>：需要将数据库的内部格式转换成
+            SQL 文本，备份和恢复都涉及大量解析工作。一个 100 GB
+            的数据库用 <code>mysqldump</code>
+            单线程备份可能需要数小时。</li>
+            <li><strong>恢复慢</strong>：恢复时需要逐条执行 SQL
+            语句，重新建表、插入数据、创建索引。索引重建尤其耗时。</li>
+            <li><strong>一致性获取有代价</strong>：为了获得一致性快照，<code>mysqldump --single-transaction</code>
+            会开启一个长事务（使用 MVCC），长时间运行可能导致 undo log
+            膨胀。</li>
+            </ul>
+            <h3 id="物理备份">3.2 物理备份</h3>
+            <p>物理备份直接复制数据库的底层数据文件——数据文件、索引文件、WAL/redo
+            log 文件。典型工具包括 MySQL 的 Percona XtraBackup、MySQL
+            Enterprise Backup，PostgreSQL 的
+            <code>pg_basebackup</code>，以及文件系统级别的 LVM 快照、ZFS
+            快照。</p>
+            <p>物理备份的优点：</p>
+            <ul>
+            <li><strong>速度快</strong>：直接复制文件，不需要 SQL
+            解析。备份速度接近磁盘顺序读的吞吐量。</li>
+            <li><strong>恢复快</strong>：恢复时只需要把文件放回数据目录，再回放
+            WAL/redo log 达到一致状态。不需要重建索引。</li>
+            <li><strong>对在线业务影响小</strong>：XtraBackup 和
+            <code>pg_basebackup</code> 都支持在线热备，不需要停机。</li>
+            </ul>
+            <p>物理备份的缺点：</p>
+            <ul>
+            <li><strong>不可读</strong>：备份文件是二进制格式，无法用文本工具查看内容。</li>
+            <li><strong>跨版本兼容差</strong>：物理备份通常只能恢复到相同大版本的数据库实例。MySQL
+            8.0 的物理备份不能直接恢复到 MySQL 5.7。</li>
+            <li><strong>粒度粗</strong>：通常是整个实例级别的备份，无法只备份单张表（InnoDB
+            部分表空间备份除外）。</li>
+            <li><strong>依赖存储引擎</strong>：不同存储引擎的数据文件格式不同，备份方式也不同。</li>
+            </ul>
+            <h3 id="对比总结">3.3 对比总结</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>逻辑备份</th>
+            <th>物理备份</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>备份内容</td>
+            <td>SQL 语句 / 文本数据</td>
+            <td>数据文件 / WAL 文件</td>
+            </tr>
+            <tr>
+            <td>备份速度</td>
+            <td>慢</td>
+            <td>快</td>
+            </tr>
+            <tr>
+            <td>恢复速度</td>
+            <td>慢（需执行 SQL、重建索引）</td>
+            <td>快（文件复制 + WAL 回放）</td>
+            </tr>
+            <tr>
+            <td>备份粒度</td>
+            <td>库 / 表 / 行</td>
+            <td>实例 / 表空间</td>
+            </tr>
+            <tr>
+            <td>跨版本恢复</td>
+            <td>支持</td>
+            <td>通常不支持</td>
+            </tr>
+            <tr>
+            <td>可读性</td>
+            <td>高</td>
+            <td>低</td>
+            </tr>
+            <tr>
+            <td>对业务影响</td>
+            <td>中（长事务 / 锁）</td>
+            <td>低（热备）</td>
+            </tr>
+            <tr>
+            <td>支持 PITR</td>
+            <td>不直接支持</td>
+            <td>支持（配合 WAL）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>实际生产环境中，常见的做法是<strong>物理备份为主、逻辑备份为辅</strong>：</p>
+            <ul>
+            <li>用物理备份满足日常的快速恢复需求；</li>
+            <li>用逻辑备份做跨版本迁移、单表恢复、或者作为物理备份的补充验证。</li>
+            </ul>
+            <hr />
+            <h2 id="四连续备份与-wal-归档">四、连续备份与 WAL 归档</h2>
+            <p>全量备份和增量备份都有一个共同的局限：备份之间的时间窗口内，数据变更没有被捕获。如果在两次备份之间发生故障，窗口内的数据就丢失了。WAL
+            连续归档（Write-Ahead Log Continuous
+            Archiving）解决的就是这个问题。</p>
+            <h3 id="wal-的基本原理">4.1 WAL 的基本原理</h3>
+            <p>预写日志（Write-Ahead
+            Log，WAL）是数据库保证持久性的核心机制：任何数据修改在写入数据文件之前，必须先写入
+            WAL。WAL
+            记录了每一次数据变更的细节，理论上可以用来将数据库从任意一个一致状态”回放”到后续的任意时间点。</p>
+            <p>MySQL 中对应的概念是二进制日志（Binary Log，binlog）和
+            InnoDB 重做日志（Redo Log）。PostgreSQL 中就叫
+            WAL。两者的机制有差异，但核心思路一致。</p>
+            <h3 id="连续归档的工作方式">4.2 连续归档的工作方式</h3>
+            <p>连续归档的思路是：在做周期性全量备份的基础上，把所有 WAL
+            文件持续地复制到归档存储中。恢复时，先恢复最近一次全量备份，然后从归档中按顺序回放
+            WAL，就能将数据库恢复到任意时间点。这就是时间点恢复（Point-in-Time
+            Recovery，PITR）。</p>
+            <pre class="text"><code>连续归档工作流：
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                          时间轴                                     │
+├──────────┬──────────┬──────────┬──────────┬──────────┬──────────────┤
+│  Day 1   │  Day 2   │  Day 3   │  Day 4   │  Day 5   │  Day 6      │
+│          │          │          │          │          │              │
+│ ┌──────┐ │          │          │          │ ┌──────┐ │              │
+│ │ Full │ │          │          │          │ │ Full │ │              │
+│ │Backup│ │          │          │          │ │Backup│ │              │
+│ └──────┘ │          │          │          │ └──────┘ │              │
+│          │          │          │          │          │              │
+│ ─────────┼──WAL─────┼──WAL─────┼──WAL─────┼──WAL─────┼──WAL──────▶ │
+│  归档     │  归档     │  归档     │  归档     │  归档     │  归档       │
+├──────────┴──────────┴──────────┴──────────┴──────────┴──────────────┤
+│                                                                     │
+│  恢复到 Day 3 下午 14:30：                                           │
+│  1. 还原 Day 1 的全量备份                                            │
+│  2. 回放 Day 1 → Day 3 14:30 的所有 WAL                             │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘</code></pre>
+            <p>连续归档的 RPO 取决于 WAL 归档的频率。如果 WAL
+            文件一写满就立即归档（PostgreSQL 默认 WAL 段大小 16
+            MB），RPO 取决于未归档的最后一个 WAL
+            段的数据量。通过流复制归档（<code>pg_receivewal</code>）或
+            WAL 流式传输，可以将 RPO 降低到接近零。</p>
+            <h3 id="postgresql-wal-归档配置">4.3 PostgreSQL WAL
+            归档配置</h3>
+            <p>PostgreSQL 的 WAL
+            归档通过以下参数控制（<code>postgresql.conf</code>）：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode conf"><code class="sourceCode toml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 开启归档模式</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="dt">archive_mode</span> <span class="op">=</span> <span class="dt">on</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 归档命令：每个 WAL 段文件完成后执行</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co"># %p = WAL 文件的完整路径，%f = WAL 文件名</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="dt">archive_command</span> <span class="op">=</span> <span class="st">&#39;</span><span class="vs">cp %p /backup/wal_archive/%f</span><span class="st">&#39;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># WAL 级别必须设为 replica 或 logical</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_level</span> <span class="op">=</span> <span class="dt">replica</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 保留的 WAL 段数量（用于流复制和恢复）</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_keep_size</span> <span class="op">=</span> <span class="dv">1</span><span class="dt">GB</span></span></code></pre></div>
+            <p>更可靠的归档命令应该包含校验和错误处理：</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># archive_wal.sh —— PostgreSQL WAL 归档脚本</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 用法：archive_command = &#39;/path/to/archive_wal.sh %p %f&#39;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="va">WAL_SOURCE</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$1</span><span class="st">&quot;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="va">WAL_FILENAME</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$2</span><span class="st">&quot;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="va">ARCHIVE_DIR</span><span class="op">=</span><span class="st">&quot;/backup/wal_archive&quot;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="va">DEST</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${ARCHIVE_DIR}</span><span class="st">/</span><span class="va">${WAL_FILENAME}</span><span class="st">&quot;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 避免覆盖已有的归档文件</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="ot">-f</span> <span class="st">&quot;</span><span class="va">${DEST}</span><span class="st">&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;WAL file </span><span class="va">${WAL_FILENAME}</span><span class="st"> already exists in archive&quot;</span> <span class="op">&gt;&amp;</span><span class="dv">2</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">exit</span> 0</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 复制并验证</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="st">&quot;</span><span class="va">${WAL_SOURCE}</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">${DEST}</span><span class="st">.tmp&quot;</span> <span class="dt">\</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">&amp;&amp;</span> <span class="fu">sync</span> <span class="st">&quot;</span><span class="va">${DEST}</span><span class="st">.tmp&quot;</span> <span class="dt">\</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">&amp;&amp;</span> <span class="fu">mv</span> <span class="st">&quot;</span><span class="va">${DEST}</span><span class="st">.tmp&quot;</span> <span class="st">&quot;</span><span class="va">${DEST}</span><span class="st">&quot;</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="bu">exit</span> <span class="va">$?</span></span></code></pre></div>
+            <h3 id="mysql-binlog-的连续归档">4.4 MySQL binlog
+            的连续归档</h3>
+            <p>MySQL 没有像 PostgreSQL 那样内置的
+            <code>archive_command</code> 机制，但 binlog
+            本身就是按文件顺序写入的日志流。连续归档的做法是通过
+            <code>mysqlbinlog --read-from-remote-server --raw</code>
+            或专用工具（如
+            <code>mysqlbinlog --read-from-remote-server</code>
+            的守护进程模式）实时拉取 binlog 文件：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 从 MySQL 主库实时拉取 binlog 到本地归档目录</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mysqlbinlog</span> <span class="dt">\</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--read-from-remote-server</span> <span class="dt">\</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>db-primary.example.com <span class="dt">\</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--user</span><span class="op">=</span>repl_user <span class="dt">\</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--password</span> <span class="dt">\</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--raw</span> <span class="dt">\</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--stop-never</span> <span class="dt">\</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--result-file</span><span class="op">=</span>/backup/binlog_archive/ <span class="dt">\</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    mysql-bin.000123</span></code></pre></div>
+            <p><code>--stop-never</code> 参数让 <code>mysqlbinlog</code>
+            持续运行，像从库一样不断拉取新的 binlog 事件。这种方式的 RPO
+            接近于主库写入 binlog
+            到备份端接收之间的延迟，通常在秒级。</p>
+            <hr />
+            <h2 id="五mysql-备份方案">五、MySQL 备份方案</h2>
+            <p>MySQL
+            生态中的备份工具可以按逻辑/物理维度和在线/离线维度分类。本节讨论三个最常用的工具：<code>mysqldump</code>、Percona
+            XtraBackup 和 binlog 归档。</p>
+            <h3 id="mysqldump">5.1 mysqldump</h3>
+            <p><code>mysqldump</code> 是 MySQL 自带的逻辑备份工具，输出
+            SQL 文本。对于 InnoDB 表，推荐使用
+            <code>--single-transaction</code> 获取一致性快照：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 全库逻辑备份（InnoDB 表，一致性快照）</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mysqldump</span> <span class="dt">\</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--user</span><span class="op">=</span>backup_user <span class="dt">\</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--password</span> <span class="dt">\</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--single-transaction</span> <span class="dt">\</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--routines</span> <span class="dt">\</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--triggers</span> <span class="dt">\</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--events</span> <span class="dt">\</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--set-gtid-purged</span><span class="op">=</span>ON <span class="dt">\</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--all-databases</span> <span class="dt">\</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="fu">gzip</span> <span class="op">&gt;</span> /backup/full_<span class="va">$(</span><span class="fu">date</span> +%Y%m%d_%H%M%S<span class="va">)</span>.sql.gz</span></code></pre></div>
+            <p>关键参数说明：</p>
+            <ul>
+            <li><code>--single-transaction</code>：在
+            <code>REPEATABLE READ</code> 隔离级别下开启一个事务，利用
+            InnoDB 的 MVCC
+            获取一致性快照。不加锁，不阻塞写入。但该事务会持续到备份结束，长时间运行会导致
+            undo log 增长。</li>
+            <li><code>--set-gtid-purged=ON</code>：记录 GTID
+            信息，方便在基于 GTID 复制的环境中恢复。</li>
+            <li><code>--routines --triggers --events</code>：同时备份存储过程、触发器和事件调度器。默认不备份这些对象。</li>
+            </ul>
+            <p><code>mysqldump</code> 的恢复就是执行 SQL 文件：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 恢复</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">gunzip</span> <span class="op">&lt;</span> /backup/full_20250108_020000.sql.gz <span class="kw">|</span> <span class="ex">mysql</span> <span class="dt">\</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--user</span><span class="op">=</span>root <span class="dt">\</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--password</span></span></code></pre></div>
+            <p><code>mysqldump</code> 适合数据量在几十 GB
+            以下的场景。超过 100 GB 后，备份和恢复时间通常不可接受。</p>
+            <h3 id="percona-xtrabackup">5.2 Percona XtraBackup</h3>
+            <p>Percona XtraBackup 是 MySQL/InnoDB
+            的开源物理热备工具。它直接复制 InnoDB 的数据文件和 redo
+            log，备份期间不需要锁表（对 InnoDB
+            表），不影响在线业务。</p>
+            <p>XtraBackup 的备份过程分两个阶段：</p>
+            <ol type="1">
+            <li><strong>复制阶段</strong>：在后台持续复制 InnoDB
+            数据文件（<code>.ibd</code> 文件），同时持续监控并复制 redo
+            log 的变化。</li>
+            <li><strong>完成阶段</strong>：执行
+            <code>FLUSH TABLES WITH READ LOCK</code>（FTWRL）获取一致性位点，记录
+            binlog 位置和
+            GTID，然后释放锁。这个锁持续的时间很短（通常在秒级），远比
+            <code>mysqldump</code> 的长事务影响小。</li>
+            </ol>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 全量物理备份</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--backup</span> <span class="dt">\</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--target-dir</span><span class="op">=</span>/backup/full_20250108 <span class="dt">\</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--user</span><span class="op">=</span>backup_user <span class="dt">\</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--password</span><span class="op">=</span>xxx <span class="dt">\</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--parallel</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--compress</span> <span class="dt">\</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--compress-threads</span><span class="op">=</span>4</span></code></pre></div>
+            <p>恢复分两步——先 prepare（应用 redo log
+            达到一致状态），再复制到数据目录：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 第一步：prepare（应用 redo log）</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--prepare</span> <span class="at">--target-dir</span><span class="op">=</span>/backup/full_20250108</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 第二步：复制到 MySQL 数据目录（需要先停止 MySQL）</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> stop mysqld</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> /var/lib/mysql/<span class="pp">*</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--move-back</span> <span class="at">--target-dir</span><span class="op">=</span>/backup/full_20250108</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="fu">chown</span> <span class="at">-R</span> mysql:mysql /var/lib/mysql</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start mysqld</span></code></pre></div>
+            <p>XtraBackup 还支持增量备份：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 增量备份（基于之前的全量备份）</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="dt">\</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--backup</span> <span class="dt">\</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--target-dir</span><span class="op">=</span>/backup/incr_20250109 <span class="dt">\</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--incremental-basedir</span><span class="op">=</span>/backup/full_20250108 <span class="dt">\</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--user</span><span class="op">=</span>backup_user <span class="dt">\</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--password</span><span class="op">=</span>xxx</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 恢复增量备份：先 prepare 全量，再逐个应用增量</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--prepare</span> <span class="at">--apply-log-only</span> <span class="at">--target-dir</span><span class="op">=</span>/backup/full_20250108</span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--prepare</span> <span class="at">--apply-log-only</span> <span class="dt">\</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">--target-dir</span><span class="op">=</span>/backup/full_20250108 <span class="dt">\</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">--incremental-dir</span><span class="op">=</span>/backup/incr_20250109</span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 最后一次 prepare 不加 --apply-log-only</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--prepare</span> <span class="at">--target-dir</span><span class="op">=</span>/backup/full_20250108</span></code></pre></div>
+            <h3 id="mysql-时间点恢复">5.3 MySQL 时间点恢复</h3>
+            <p>MySQL 的时间点恢复（PITR）依赖 binlog。流程如下：</p>
+            <ol type="1">
+            <li>从 XtraBackup 的全量备份恢复数据库。</li>
+            <li>查看备份记录中的 binlog 位置（在
+            <code>xtrabackup_binlog_info</code> 文件中）。</li>
+            <li>用 <code>mysqlbinlog</code> 将该位置之后的 binlog
+            回放到目标时间点。</li>
+            </ol>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看备份的 binlog 位置</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /backup/full_20250108/xtrabackup_binlog_info</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：mysql-bin.000042    15423    a1b2c3d4-...:1-12345</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 回放 binlog 到指定时间点</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="ex">mysqlbinlog</span> <span class="dt">\</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--start-position</span><span class="op">=</span>15423 <span class="dt">\</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--stop-datetime</span><span class="op">=</span><span class="st">&quot;2025-01-08 14:30:00&quot;</span> <span class="dt">\</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    /var/lib/mysql/mysql-bin.000042 <span class="dt">\</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>    /var/lib/mysql/mysql-bin.000043 <span class="dt">\</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="ex">mysql</span> <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="at">--port</span><span class="op">=</span>3306 <span class="at">--user</span><span class="op">=</span>root <span class="at">--password</span></span></code></pre></div>
+            <h3 id="mysql-备份方案选型">5.4 MySQL 备份方案选型</h3>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 9%" />
+            <col style="width: 9%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            <col style="width: 15%" />
+            <col style="width: 12%" />
+            <col style="width: 13%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>方案</th>
+            <th>类型</th>
+            <th>备份速度</th>
+            <th>恢复速度</th>
+            <th>支持增量</th>
+            <th>支持 PITR</th>
+            <th>锁影响</th>
+            <th>适用规模</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>mysqldump</td>
+            <td>逻辑</td>
+            <td>慢</td>
+            <td>慢</td>
+            <td>不支持</td>
+            <td>配合 binlog</td>
+            <td>长事务</td>
+            <td>&lt; 50 GB</td>
+            </tr>
+            <tr>
+            <td>mydumper</td>
+            <td>逻辑</td>
+            <td>中等（多线程）</td>
+            <td>中等</td>
+            <td>不支持</td>
+            <td>配合 binlog</td>
+            <td>短锁</td>
+            <td>&lt; 200 GB</td>
+            </tr>
+            <tr>
+            <td>XtraBackup</td>
+            <td>物理</td>
+            <td>快</td>
+            <td>快</td>
+            <td>支持</td>
+            <td>配合 binlog</td>
+            <td>极短锁</td>
+            <td>TB 级</td>
+            </tr>
+            <tr>
+            <td>MySQL Enterprise Backup</td>
+            <td>物理</td>
+            <td>快</td>
+            <td>快</td>
+            <td>支持</td>
+            <td>配合 binlog</td>
+            <td>极短锁</td>
+            <td>TB 级</td>
+            </tr>
+            <tr>
+            <td>LVM 快照</td>
+            <td>物理</td>
+            <td>极快</td>
+            <td>极快</td>
+            <td>不支持</td>
+            <td>配合 binlog</td>
+            <td>短锁</td>
+            <td>TB 级</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="六postgresql-备份方案">六、PostgreSQL 备份方案</h2>
+            <p>PostgreSQL 的备份工具体系和 MySQL 有所不同，核心工具包括
+            <code>pg_dump</code>、<code>pg_basebackup</code>，以及基于
+            WAL 归档的 PITR。</p>
+            <h3 id="pg_dump">6.1 pg_dump</h3>
+            <p><code>pg_dump</code> 是 PostgreSQL 自带的逻辑备份工具。与
+            <code>mysqldump</code> 不同，<code>pg_dump</code> 天然基于
+            MVCC 快照，不需要显式加锁就能获取一致性视图：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 单库逻辑备份（自定义格式，支持并行恢复）</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_dump</span> <span class="dt">\</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>5432 <span class="dt">\</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--username</span><span class="op">=</span>backup_user <span class="dt">\</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--dbname</span><span class="op">=</span>mydb <span class="dt">\</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--format</span><span class="op">=</span>custom <span class="dt">\</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--compress</span><span class="op">=</span>6 <span class="dt">\</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--jobs</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--file</span><span class="op">=</span>/backup/mydb_<span class="va">$(</span><span class="fu">date</span> +%Y%m%d_%H%M%S<span class="va">)</span>.dump</span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 全实例备份（所有数据库 + 全局对象）</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_dumpall</span> <span class="dt">\</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>5432 <span class="dt">\</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">--username</span><span class="op">=</span>postgres <span class="dt">\</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="fu">gzip</span> <span class="op">&gt;</span> /backup/all_<span class="va">$(</span><span class="fu">date</span> +%Y%m%d_%H%M%S<span class="va">)</span>.sql.gz</span></code></pre></div>
+            <p><code>pg_dump</code> 的 <code>--format=custom</code>
+            格式（<code>-Fc</code>）是推荐的备份格式，因为它支持：</p>
+            <ul>
+            <li>并行恢复（<code>pg_restore --jobs=N</code>）；</li>
+            <li>选择性恢复（只恢复特定的表或 schema）；</li>
+            <li>内置压缩。</li>
+            </ul>
+            <p>恢复示例：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 从自定义格式备份恢复（并行，4 个作业）</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_restore</span> <span class="dt">\</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>5432 <span class="dt">\</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--username</span><span class="op">=</span>postgres <span class="dt">\</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--dbname</span><span class="op">=</span>mydb <span class="dt">\</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--jobs</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--clean</span> <span class="dt">\</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--if-exists</span> <span class="dt">\</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>    /backup/mydb_20250108_020000.dump</span></code></pre></div>
+            <h3 id="pg_basebackup">6.2 pg_basebackup</h3>
+            <p><code>pg_basebackup</code> 是 PostgreSQL
+            自带的物理备份工具，通过流复制协议直接从运行中的 PostgreSQL
+            实例复制整个数据目录：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 物理备份（流式传输 WAL，压缩输出）</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_basebackup</span> <span class="dt">\</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>5432 <span class="dt">\</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--username</span><span class="op">=</span>repl_user <span class="dt">\</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--pgdata</span><span class="op">=</span>/backup/base_20250108 <span class="dt">\</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--wal-method</span><span class="op">=</span>stream <span class="dt">\</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--checkpoint</span><span class="op">=</span>fast <span class="dt">\</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--progress</span> <span class="dt">\</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--verbose</span></span></code></pre></div>
+            <p>关键参数说明：</p>
+            <ul>
+            <li><code>--wal-method=stream</code>：在备份数据文件的同时，通过第二条流复制连接实时传输
+            WAL。保证备份自包含，不需要单独配置 WAL 归档就能恢复。</li>
+            <li><code>--checkpoint=fast</code>：立即触发检查点，而不是等待下一个自然检查点。减少备份开始前的等待时间。</li>
+            </ul>
+            <p><code>pg_basebackup</code> 从 PostgreSQL 15
+            开始支持增量备份（需要启用
+            <code>summarize_wal</code>）：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL 17 增量备份</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 先确保配置了 summarize_wal = on</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 全量备份（作为增量基线）</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_basebackup</span> <span class="dt">\</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>5432 <span class="dt">\</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--username</span><span class="op">=</span>repl_user <span class="dt">\</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--pgdata</span><span class="op">=</span>/backup/base_full <span class="dt">\</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--wal-method</span><span class="op">=</span>stream <span class="dt">\</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--checkpoint</span><span class="op">=</span>fast</span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 增量备份（基于前一次备份的 manifest）</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_basebackup</span> <span class="dt">\</span></span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span>5432 <span class="dt">\</span></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">--username</span><span class="op">=</span>repl_user <span class="dt">\</span></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--pgdata</span><span class="op">=</span>/backup/base_incr_day2 <span class="dt">\</span></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--incremental</span><span class="op">=</span>/backup/base_full/backup_manifest <span class="dt">\</span></span>
+<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--wal-method</span><span class="op">=</span>stream <span class="dt">\</span></span>
+<span id="cb18-21"><a href="#cb18-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--checkpoint</span><span class="op">=</span>fast</span></code></pre></div>
+            <h3 id="postgresql-pitr">6.3 PostgreSQL PITR</h3>
+            <p>PostgreSQL 的 PITR 基于全量物理备份加 WAL
+            归档。恢复流程如下：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 第一步：从 pg_basebackup 恢复数据目录</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> stop postgresql</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> /var/lib/postgresql/16/main/<span class="pp">*</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">-a</span> /backup/base_20250108/<span class="pp">*</span> /var/lib/postgresql/16/main/</span></code></pre></div>
+            <p>然后创建恢复配置。PostgreSQL 12 及以后版本使用
+            <code>postgresql.conf</code> 中的恢复参数：</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode conf"><code class="sourceCode toml"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># postgresql.conf 中添加恢复参数</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="dt">restore_command</span> <span class="op">=</span> <span class="st">&#39;</span><span class="vs">cp /backup/wal_archive/%f %p</span><span class="st">&#39;</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="dt">recovery_target_time</span> <span class="op">=</span> <span class="st">&#39;</span><span class="vs">2025-01-08 14:30:00</span><span class="st">&#39;</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="dt">recovery_target_action</span> <span class="op">=</span> <span class="st">&#39;</span><span class="vs">promote</span><span class="st">&#39;</span></span></code></pre></div>
+            <p>并创建恢复信号文件：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建恢复信号文件</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">touch</span> /var/lib/postgresql/16/main/recovery.signal</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="fu">chown</span> postgres:postgres /var/lib/postgresql/16/main/recovery.signal</span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 启动 PostgreSQL，开始恢复</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start postgresql</span></code></pre></div>
+            <p>PostgreSQL 会自动从归档中获取 WAL
+            文件，按顺序回放，直到达到 <code>recovery_target_time</code>
+            指定的时间点，然后提升为主库。</p>
+            <h3 id="第三方工具">6.4 第三方工具</h3>
+            <p>PostgreSQL 生态中还有多个成熟的备份管理工具：</p>
+            <ul>
+            <li><strong>pgBackRest</strong>：功能最全面的 PostgreSQL
+            备份工具，支持全量/差异/增量备份、并行备份与恢复、本地与远程（S3/GCS/Azure）存储、备份校验、WAL
+            归档管理。生产环境推荐。</li>
+            <li><strong>Barman</strong>（Backup and Recovery
+            Manager）：由 EDB 维护，支持远程备份、WAL
+            归档、PITR、备份目录管理。</li>
+            <li><strong>WAL-G</strong>：由
+            Citus（Microsoft）维护，轻量级的 WAL
+            归档和备份工具，原生支持云存储。</li>
+            </ul>
+            <p>pgBackRest 的使用示例：</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># pgBackRest 配置（/etc/pgbackrest/pgbackrest.conf）</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="co"># [global]</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="co"># repo1-path=/backup/pgbackrest</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="co"># repo1-retention-full=2</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="co"># repo1-cipher-type=aes-256-cbc</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a><span class="co"># repo1-cipher-pass=backup-encryption-key</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="co"># process-max=4</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a><span class="co"># compress-type=zst</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a><span class="co"># compress-level=3</span></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a><span class="co"># [mydb]</span></span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a><span class="co"># pg1-path=/var/lib/postgresql/16/main</span></span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-14"><a href="#cb22-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 全量备份</span></span>
+<span id="cb22-15"><a href="#cb22-15" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbackrest</span> <span class="at">--stanza</span><span class="op">=</span>mydb <span class="at">--type</span><span class="op">=</span>full backup</span>
+<span id="cb22-16"><a href="#cb22-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-17"><a href="#cb22-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 增量备份</span></span>
+<span id="cb22-18"><a href="#cb22-18" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbackrest</span> <span class="at">--stanza</span><span class="op">=</span>mydb <span class="at">--type</span><span class="op">=</span>incr backup</span>
+<span id="cb22-19"><a href="#cb22-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-20"><a href="#cb22-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 差异备份</span></span>
+<span id="cb22-21"><a href="#cb22-21" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbackrest</span> <span class="at">--stanza</span><span class="op">=</span>mydb <span class="at">--type</span><span class="op">=</span>diff backup</span>
+<span id="cb22-22"><a href="#cb22-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-23"><a href="#cb22-23" aria-hidden="true" tabindex="-1"></a><span class="co"># 恢复到指定时间点</span></span>
+<span id="cb22-24"><a href="#cb22-24" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbackrest</span> <span class="at">--stanza</span><span class="op">=</span>mydb <span class="at">--type</span><span class="op">=</span>time <span class="dt">\</span></span>
+<span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a>    <span class="at">--target</span><span class="op">=</span><span class="st">&quot;2025-01-08 14:30:00&quot;</span> <span class="dt">\</span></span>
+<span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a>    restore</span></code></pre></div>
+            <h3 id="postgresql-备份方案选型">6.5 PostgreSQL
+            备份方案选型</h3>
+            <table>
+            <colgroup>
+            <col style="width: 8%" />
+            <col style="width: 8%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            <col style="width: 14%" />
+            <col style="width: 13%" />
+            <col style="width: 13%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>方案</th>
+            <th>类型</th>
+            <th>备份速度</th>
+            <th>恢复速度</th>
+            <th>支持增量</th>
+            <th>支持 PITR</th>
+            <th>远程存储</th>
+            <th>适用规模</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>pg_dump</td>
+            <td>逻辑</td>
+            <td>慢</td>
+            <td>慢（可并行）</td>
+            <td>不支持</td>
+            <td>不支持</td>
+            <td>手动</td>
+            <td>&lt; 100 GB</td>
+            </tr>
+            <tr>
+            <td>pg_basebackup</td>
+            <td>物理</td>
+            <td>快</td>
+            <td>快</td>
+            <td>PG 17 支持</td>
+            <td>配合 WAL</td>
+            <td>手动</td>
+            <td>TB 级</td>
+            </tr>
+            <tr>
+            <td>pgBackRest</td>
+            <td>物理</td>
+            <td>快（并行）</td>
+            <td>快（并行）</td>
+            <td>支持</td>
+            <td>内置</td>
+            <td>S3/GCS/Azure</td>
+            <td>TB 级</td>
+            </tr>
+            <tr>
+            <td>Barman</td>
+            <td>物理</td>
+            <td>快</td>
+            <td>快</td>
+            <td>支持</td>
+            <td>内置</td>
+            <td>S3/GCS</td>
+            <td>TB 级</td>
+            </tr>
+            <tr>
+            <td>WAL-G</td>
+            <td>物理</td>
+            <td>快</td>
+            <td>快</td>
+            <td>支持</td>
+            <td>内置</td>
+            <td>S3/GCS/Azure</td>
+            <td>TB 级</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="七备份验证与恢复测试">七、备份验证与恢复测试</h2>
+            <p>备份文件存在不等于备份可用。未经验证的备份和没有备份本质上没有区别。</p>
+            <h3 id="备份验证的层次">7.1 备份验证的层次</h3>
+            <p>备份验证可以分为四个层次，从低到高：</p>
+            <p><strong>第一层：文件完整性校验</strong>。检查备份文件是否完整、未损坏。最基本的做法是计算校验和（如
+            SHA-256）并与备份时记录的校验和对比。</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 备份时记录校验和</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> /backup/full_20250108.tar.gz <span class="op">&gt;</span> /backup/full_20250108.sha256</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 验证时比对</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="at">-c</span> /backup/full_20250108.sha256</span></code></pre></div>
+            <p><strong>第二层：格式有效性校验</strong>。检查备份文件是否符合预期格式。对于
+            XtraBackup，可以用 <code>--validate</code> 选项；对于
+            pg_dump 的自定义格式，可以用 <code>pg_restore --list</code>
+            检查目录结构。</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># XtraBackup 验证</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--validate</span> <span class="at">--target-dir</span><span class="op">=</span>/backup/full_20250108</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># pg_dump 自定义格式验证</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_restore</span> <span class="at">--list</span> /backup/mydb_20250108.dump <span class="op">&gt;</span> /dev/null</span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;pg_restore --list exit code: </span><span class="va">$?</span><span class="st">&quot;</span></span></code></pre></div>
+            <p><strong>第三层：恢复可行性验证</strong>。将备份恢复到一个独立的测试实例，确认数据库能正常启动。</p>
+            <p><strong>第四层：数据正确性验证</strong>。恢复后检查关键表的行数、校验和或业务逻辑是否正确。这是最可靠但也最耗时的验证方式。</p>
+            <h3 id="自动化恢复测试">7.2 自动化恢复测试</h3>
+            <p>生产环境中应该定期（建议至少每周一次）执行自动化恢复测试。以下是一个
+            MySQL XtraBackup 恢复测试脚本的核心逻辑：</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="co"># restore_test.sh —— XtraBackup 自动化恢复测试</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 在独立的测试实例上恢复最新备份并验证</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a><span class="va">BACKUP_DIR</span><span class="op">=</span><span class="st">&quot;/backup/latest&quot;</span></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a><span class="va">TEST_DATADIR</span><span class="op">=</span><span class="st">&quot;/var/lib/mysql-restore-test&quot;</span></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a><span class="va">TEST_PORT</span><span class="op">=</span>3307</span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a><span class="va">LOG_FILE</span><span class="op">=</span><span class="st">&quot;/var/log/backup-restore-test.log&quot;</span></span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-12"><a href="#cb25-12" aria-hidden="true" tabindex="-1"></a><span class="fu">log()</span> <span class="kw">{</span></span>
+<span id="cb25-13"><a href="#cb25-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">date</span> <span class="st">&#39;+%Y-%m-%d %H:%M:%S&#39;</span><span class="va">)</span><span class="st"> </span><span class="va">$*</span><span class="st">&quot;</span> <span class="op">&gt;&gt;</span> <span class="st">&quot;</span><span class="va">${LOG_FILE}</span><span class="st">&quot;</span></span>
+<span id="cb25-14"><a href="#cb25-14" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb25-15"><a href="#cb25-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-16"><a href="#cb25-16" aria-hidden="true" tabindex="-1"></a><span class="fu">cleanup()</span> <span class="kw">{</span></span>
+<span id="cb25-17"><a href="#cb25-17" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 停止测试实例</span></span>
+<span id="cb25-18"><a href="#cb25-18" aria-hidden="true" tabindex="-1"></a>    <span class="ex">mysqladmin</span> <span class="at">--port</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TEST_PORT}</span><span class="st">&quot;</span> <span class="at">--socket</span><span class="op">=</span>/run/mysqld/mysqld-test.sock <span class="dt">\</span></span>
+<span id="cb25-19"><a href="#cb25-19" aria-hidden="true" tabindex="-1"></a>        shutdown <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb25-20"><a href="#cb25-20" aria-hidden="true" tabindex="-1"></a>    <span class="fu">rm</span> <span class="at">-rf</span> <span class="st">&quot;</span><span class="va">${TEST_DATADIR}</span><span class="st">&quot;</span></span>
+<span id="cb25-21"><a href="#cb25-21" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb25-22"><a href="#cb25-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-23"><a href="#cb25-23" aria-hidden="true" tabindex="-1"></a><span class="bu">trap</span> cleanup EXIT</span>
+<span id="cb25-24"><a href="#cb25-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-25"><a href="#cb25-25" aria-hidden="true" tabindex="-1"></a><span class="ex">log</span> <span class="st">&quot;开始恢复测试&quot;</span></span>
+<span id="cb25-26"><a href="#cb25-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-27"><a href="#cb25-27" aria-hidden="true" tabindex="-1"></a><span class="co"># 第一步：准备数据目录</span></span>
+<span id="cb25-28"><a href="#cb25-28" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> <span class="st">&quot;</span><span class="va">${TEST_DATADIR}</span><span class="st">&quot;</span></span>
+<span id="cb25-29"><a href="#cb25-29" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">${TEST_DATADIR}</span><span class="st">&quot;</span></span>
+<span id="cb25-30"><a href="#cb25-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-31"><a href="#cb25-31" aria-hidden="true" tabindex="-1"></a><span class="co"># 第二步：解压并 prepare</span></span>
+<span id="cb25-32"><a href="#cb25-32" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--decompress</span> <span class="at">--target-dir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">&quot;</span></span>
+<span id="cb25-33"><a href="#cb25-33" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--prepare</span> <span class="at">--target-dir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">&quot;</span></span>
+<span id="cb25-34"><a href="#cb25-34" aria-hidden="true" tabindex="-1"></a><span class="ex">xtrabackup</span> <span class="at">--move-back</span> <span class="at">--target-dir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">&quot;</span> <span class="at">--datadir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TEST_DATADIR}</span><span class="st">&quot;</span></span>
+<span id="cb25-35"><a href="#cb25-35" aria-hidden="true" tabindex="-1"></a><span class="fu">chown</span> <span class="at">-R</span> mysql:mysql <span class="st">&quot;</span><span class="va">${TEST_DATADIR}</span><span class="st">&quot;</span></span>
+<span id="cb25-36"><a href="#cb25-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-37"><a href="#cb25-37" aria-hidden="true" tabindex="-1"></a><span class="co"># 第三步：启动测试实例</span></span>
+<span id="cb25-38"><a href="#cb25-38" aria-hidden="true" tabindex="-1"></a><span class="ex">mysqld_safe</span> <span class="dt">\</span></span>
+<span id="cb25-39"><a href="#cb25-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">--datadir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TEST_DATADIR}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb25-40"><a href="#cb25-40" aria-hidden="true" tabindex="-1"></a>    <span class="at">--port</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TEST_PORT}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb25-41"><a href="#cb25-41" aria-hidden="true" tabindex="-1"></a>    <span class="at">--socket</span><span class="op">=</span>/run/mysqld/mysqld-test.sock <span class="dt">\</span></span>
+<span id="cb25-42"><a href="#cb25-42" aria-hidden="true" tabindex="-1"></a>    <span class="at">--skip-slave-start</span> <span class="kw">&amp;</span></span>
+<span id="cb25-43"><a href="#cb25-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-44"><a href="#cb25-44" aria-hidden="true" tabindex="-1"></a><span class="co"># 等待启动</span></span>
+<span id="cb25-45"><a href="#cb25-45" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 30<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb25-46"><a href="#cb25-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="ex">mysqladmin</span> <span class="at">--port</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TEST_PORT}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb25-47"><a href="#cb25-47" aria-hidden="true" tabindex="-1"></a>        <span class="at">--socket</span><span class="op">=</span>/run/mysqld/mysqld-test.sock ping <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb25-48"><a href="#cb25-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span></span>
+<span id="cb25-49"><a href="#cb25-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">fi</span></span>
+<span id="cb25-50"><a href="#cb25-50" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sleep</span> 1</span>
+<span id="cb25-51"><a href="#cb25-51" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb25-52"><a href="#cb25-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-53"><a href="#cb25-53" aria-hidden="true" tabindex="-1"></a><span class="co"># 第四步：数据验证</span></span>
+<span id="cb25-54"><a href="#cb25-54" aria-hidden="true" tabindex="-1"></a><span class="va">RESULT</span><span class="op">=</span><span class="va">$(</span><span class="ex">mysql</span> <span class="at">--port</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TEST_PORT}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb25-55"><a href="#cb25-55" aria-hidden="true" tabindex="-1"></a>    <span class="at">--socket</span><span class="op">=</span>/run/mysqld/mysqld-test.sock <span class="dt">\</span></span>
+<span id="cb25-56"><a href="#cb25-56" aria-hidden="true" tabindex="-1"></a>    <span class="at">-N</span> <span class="at">-e</span> <span class="st">&quot;SELECT COUNT(*) FROM mydb.orders&quot;</span><span class="va">)</span></span>
+<span id="cb25-57"><a href="#cb25-57" aria-hidden="true" tabindex="-1"></a><span class="ex">log</span> <span class="st">&quot;orders 表行数：</span><span class="va">${RESULT}</span><span class="st">&quot;</span></span>
+<span id="cb25-58"><a href="#cb25-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-59"><a href="#cb25-59" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">${RESULT}</span><span class="st">&quot;</span> <span class="ot">-gt</span> 0 <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb25-60"><a href="#cb25-60" aria-hidden="true" tabindex="-1"></a>    <span class="ex">log</span> <span class="st">&quot;恢复测试通过&quot;</span></span>
+<span id="cb25-61"><a href="#cb25-61" aria-hidden="true" tabindex="-1"></a>    <span class="bu">exit</span> 0</span>
+<span id="cb25-62"><a href="#cb25-62" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span></span>
+<span id="cb25-63"><a href="#cb25-63" aria-hidden="true" tabindex="-1"></a>    <span class="ex">log</span> <span class="st">&quot;恢复测试失败：orders 表为空&quot;</span></span>
+<span id="cb25-64"><a href="#cb25-64" aria-hidden="true" tabindex="-1"></a>    <span class="bu">exit</span> 1</span>
+<span id="cb25-65"><a href="#cb25-65" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span></code></pre></div>
+            <h3 id="验证清单">7.3 验证清单</h3>
+            <p>每次恢复测试至少应该检查以下项目：</p>
+            <ol type="1">
+            <li>备份文件校验和是否匹配。</li>
+            <li>恢复过程是否无报错完成。</li>
+            <li>数据库能否正常启动并接受连接。</li>
+            <li>关键表的行数是否在预期范围内。</li>
+            <li>最近写入的数据是否存在（验证备份的时效性）。</li>
+            <li>恢复所用时间是否在 RTO 要求内。</li>
+            </ol>
+            <hr />
+            <h2 id="八备份加密与压缩">八、备份加密与压缩</h2>
+            <h3 id="压缩">8.1 压缩</h3>
+            <p>备份压缩的目的是减少存储占用和传输时间。常用的压缩算法及其特点：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>算法</th>
+            <th>压缩比（典型）</th>
+            <th>压缩速度</th>
+            <th>解压速度</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>gzip</td>
+            <td>中（3-5x）</td>
+            <td>中</td>
+            <td>中</td>
+            <td>通用，兼容性最好</td>
+            </tr>
+            <tr>
+            <td>pigz</td>
+            <td>中（3-5x）</td>
+            <td>快（多线程 gzip）</td>
+            <td>中</td>
+            <td>gzip 的并行替代</td>
+            </tr>
+            <tr>
+            <td>zstd</td>
+            <td>中高（3-6x）</td>
+            <td>快</td>
+            <td>极快</td>
+            <td>推荐的现代替代方案</td>
+            </tr>
+            <tr>
+            <td>lz4</td>
+            <td>低（2-3x）</td>
+            <td>极快</td>
+            <td>极快</td>
+            <td>对速度敏感的场景</td>
+            </tr>
+            <tr>
+            <td>xz / lzma</td>
+            <td>高（5-8x）</td>
+            <td>极慢</td>
+            <td>慢</td>
+            <td>长期归档，不推荐日常备份</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>对于数据库备份，推荐使用
+            zstd。它在压缩比和速度之间取得了较好的平衡，且支持多线程：</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 zstd 压缩备份（4 线程，压缩级别 3）</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_basebackup</span> <span class="at">--pgdata</span><span class="op">=</span>- <span class="at">--wal-method</span><span class="op">=</span>stream <span class="at">--checkpoint</span><span class="op">=</span>fast <span class="dt">\</span></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="ex">zstd</span> <span class="at">-T4</span> <span class="at">-3</span> <span class="at">-o</span> /backup/base_20250108.tar.zst</span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 解压</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a><span class="ex">zstd</span> <span class="at">-d</span> <span class="at">-T4</span> /backup/base_20250108.tar.zst <span class="at">-o</span> /backup/base_20250108.tar</span></code></pre></div>
+            <h3 id="加密">8.2 加密</h3>
+            <p>备份文件包含完整的业务数据，一旦泄露等同于数据库被拖库。备份加密是安全基线的一部分。</p>
+            <p>加密分为两种方式：</p>
+            <p><strong>传输加密（Encryption in
+            Transit）</strong>：备份数据在网络传输过程中加密。<code>pg_basebackup</code>
+            通过 SSL 连接自动实现。XtraBackup 传输到远程存储时可以通过
+            SSH 隧道或 TLS 加密。</p>
+            <p><strong>静态加密（Encryption at
+            Rest）</strong>：备份文件在存储介质上加密。有两种常见做法：</p>
+            <p>方式一：工具内置加密。pgBackRest 内置支持 AES-256-CBC
+            加密：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode conf"><code class="sourceCode toml"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># pgBackRest 加密配置</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[global]</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="dt">repo1-cipher-type</span><span class="op">=</span><span class="dt">aes-256-cbc</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="dt">repo1-cipher-pass</span><span class="op">=</span><span class="dt">your-encryption-passphrase</span></span></code></pre></div>
+            <p>方式二：用 <code>openssl</code> 或 <code>gpg</code>
+            在备份管道中加密：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 openssl 加密备份</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_dump</span> <span class="at">--format</span><span class="op">=</span>custom <span class="at">--dbname</span><span class="op">=</span>mydb <span class="dt">\</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="ex">openssl</span> enc <span class="at">-aes-256-cbc</span> <span class="at">-salt</span> <span class="at">-pbkdf2</span> <span class="dt">\</span></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a>        <span class="at">-pass</span> file:/etc/backup/encryption.key <span class="dt">\</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">&gt;</span> /backup/mydb_encrypted.dump</span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 解密恢复</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> enc <span class="at">-d</span> <span class="at">-aes-256-cbc</span> <span class="at">-pbkdf2</span> <span class="dt">\</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">-pass</span> file:/etc/backup/encryption.key <span class="dt">\</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">-in</span> /backup/mydb_encrypted.dump <span class="dt">\</span></span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="ex">pg_restore</span> <span class="at">--dbname</span><span class="op">=</span>mydb</span></code></pre></div>
+            <p>方式三：用 GPG 非对称加密，支持密钥管理和多接收者：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 GPG 加密</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_dump</span> <span class="at">--format</span><span class="op">=</span>custom <span class="at">--dbname</span><span class="op">=</span>mydb <span class="dt">\</span></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="ex">gpg</span> <span class="at">--encrypt</span> <span class="at">--recipient</span> backup-team@example.com <span class="dt">\</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">&gt;</span> /backup/mydb_encrypted.dump.gpg</span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 解密</span></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="ex">gpg</span> <span class="at">--decrypt</span> /backup/mydb_encrypted.dump.gpg <span class="dt">\</span></span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="ex">pg_restore</span> <span class="at">--dbname</span><span class="op">=</span>mydb</span></code></pre></div>
+            <h3 id="加密密钥管理">8.3 加密密钥管理</h3>
+            <p>加密的难点不在加密本身，而在密钥管理。几个原则：</p>
+            <ul>
+            <li>加密密钥不能和备份文件放在同一个存储位置。否则攻击者拿到备份文件的同时就能拿到密钥。</li>
+            <li>密钥应该通过密钥管理服务（KMS）管理，如 AWS
+            KMS、HashiCorp Vault。</li>
+            <li>至少要有一份密钥的离线副本（如纸质打印或保险柜中的
+            USB），以防 KMS 本身不可用。</li>
+            <li>定期轮换密钥。旧密钥不能立即销毁，因为旧备份仍然用旧密钥加密。</li>
+            </ul>
+            <hr />
+            <h2 id="九3-2-1-备份规则与最佳实践">九、3-2-1
+            备份规则与最佳实践</h2>
+            <h3 id="规则">9.1 3-2-1 规则</h3>
+            <p>3-2-1
+            规则是备份领域最广泛引用的基本准则。它的含义是：</p>
+            <ul>
+            <li><strong>3 份副本</strong>：至少保留 3 份数据副本（1
+            份生产数据 + 2 份备份）。</li>
+            <li><strong>2 种介质</strong>：备份存储在至少 2
+            种不同类型的存储介质上（如本地磁盘 + 对象存储，或磁盘 +
+            磁带）。</li>
+            <li><strong>1 份异地</strong>：至少 1
+            份备份存放在异地（不同的物理机房或不同的云区域）。</li>
+            </ul>
+            <pre class="text"><code>3-2-1 规则示意：
+
+┌────────────────────────────────────────────────────────────────┐
+│                         3 份副本                                │
+│                                                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │  生产数据库    │  │  本地备份      │  │  异地备份（S3）       │  │
+│  │  （副本 1）    │  │  （副本 2）    │  │  （副本 3）           │  │
+│  │              │  │              │  │                      │  │
+│  │  本地 SSD    │  │  本地 HDD    │  │  另一区域的对象存储    │  │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
+│       介质 1             介质 2              介质 2              │
+│     （同城）           （同城）             （异地）             │
+│                                                                │
+│  2 种介质 ✓     1 份异地 ✓                                      │
+└────────────────────────────────────────────────────────────────┘</code></pre>
+            <p>3-2-1
+            规则的核心逻辑是降低关联故障的概率。同一台服务器上的生产数据和备份可能同时被磁盘阵列故障摧毁；同一个机房的数据可能同时被火灾或断电影响。只有物理隔离和介质隔离才能真正降低同时丢失所有副本的概率。</p>
+            <h3 id="扩展3-2-1-1-0-规则">9.2 扩展：3-2-1-1-0 规则</h3>
+            <p>在 3-2-1 的基础上，一些组织提出了 3-2-1-1-0
+            的扩展规则：</p>
+            <ul>
+            <li><strong>1 份离线或不可变</strong>：至少 1
+            份备份是离线的（air-gapped，物理断开网络连接）或不可变的（immutable，写入后无法修改或删除）。这是防范勒索软件的关键——如果攻击者能通过网络访问到所有备份，加密后的备份等于没有。S3
+            的 Object Lock 功能可以实现对象的不可变存储。</li>
+            <li><strong>0
+            个未验证的备份</strong>：所有备份都必须经过恢复验证。</li>
+            </ul>
+            <h3 id="备份保留策略">9.3 备份保留策略</h3>
+            <p>备份不可能无限保留，需要定义保留策略。常见的策略是
+            GFS（Grandfather-Father-Son，祖父-父-子）：</p>
+            <ul>
+            <li><strong>Son（每日备份）</strong>：保留最近 7 天。</li>
+            <li><strong>Father（每周备份）</strong>：保留最近 4
+            周的周日全量备份。</li>
+            <li><strong>Grandfather（每月备份）</strong>：保留最近 12
+            个月的每月 1 号全量备份。</li>
+            </ul>
+            <p>具体的保留时长取决于业务合规要求和存储成本。金融行业通常要求保留
+            7 年以上的备份；一般互联网业务保留 30-90 天可能就够了。</p>
+            <h3 id="最佳实践清单">9.4 最佳实践清单</h3>
+            <ol type="1">
+            <li><strong>备份与生产环境隔离</strong>：备份存储使用独立的账号、独立的网络。生产环境的管理员凭证不应该能直接删除备份。</li>
+            <li><strong>备份脚本必须检查退出码</strong>：任何备份命令执行后必须检查返回值，非零退出码必须触发告警。GitLab
+            事故的直接原因之一就是脚本没有检查 <code>pg_dump</code>
+            的退出码。</li>
+            <li><strong>定期恢复演练</strong>：至少每季度做一次完整的恢复演练，验证从备份恢复到可用状态的全流程。记录恢复耗时，确认
+            RTO 是否达标。</li>
+            <li><strong>备份文件加密</strong>：参见第八节。</li>
+            <li><strong>使用不可变存储</strong>：对云存储上的备份启用
+            Object Lock 或等效功能，防止备份被恶意或意外删除。</li>
+            <li><strong>监控备份的时效性</strong>：不仅监控备份任务是否成功，还要监控最近一次成功备份的时间。如果距离上次成功备份超过预期间隔（如
+            24 小时 + 缓冲），立即告警。</li>
+            <li><strong>文档化恢复流程</strong>：恢复流程不能只存在于某个
+            DBA 的脑子里。写成
+            runbook，放在团队共享文档中，定期更新。</li>
+            </ol>
+            <hr />
+            <h2 id="十备份监控与告警">十、备份监控与告警</h2>
+            <h3 id="需要监控的指标">10.1 需要监控的指标</h3>
+            <p>备份监控应覆盖以下指标：</p>
+            <table>
+            <colgroup>
+            <col style="width: 24%" />
+            <col style="width: 24%" />
+            <col style="width: 52%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>含义</th>
+            <th>告警条件示例</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>备份任务状态</td>
+            <td>最近一次备份任务是成功还是失败</td>
+            <td>任务失败立即告警</td>
+            </tr>
+            <tr>
+            <td>最近一次成功备份时间</td>
+            <td>距离现在多久</td>
+            <td>超过 RPO 的 2 倍时告警</td>
+            </tr>
+            <tr>
+            <td>备份文件大小</td>
+            <td>本次备份文件的大小</td>
+            <td>与前一次相比偏差超过 30% 时告警</td>
+            </tr>
+            <tr>
+            <td>备份耗时</td>
+            <td>备份任务执行了多长时间</td>
+            <td>超过历史平均值的 2 倍时告警</td>
+            </tr>
+            <tr>
+            <td>备份存储剩余空间</td>
+            <td>备份目标存储的可用空间</td>
+            <td>可用空间低于 20% 时告警</td>
+            </tr>
+            <tr>
+            <td>WAL 归档延迟</td>
+            <td>最新归档的 WAL 与最新生成的 WAL 之间的差距</td>
+            <td>延迟超过 N 个 WAL 段时告警</td>
+            </tr>
+            <tr>
+            <td>恢复测试结果</td>
+            <td>最近一次恢复测试是否通过</td>
+            <td>失败立即告警</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="postgresql-wal-归档监控">10.2 PostgreSQL WAL
+            归档监控</h3>
+            <p>PostgreSQL 提供了系统视图来监控 WAL 归档状态：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看归档状态</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pg_stat_archiver;</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 关键字段：</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- archived_count：已成功归档的 WAL 文件数</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- failed_count：归档失败的次数</span></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- last_archived_wal：最后一个成功归档的 WAL 文件名</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- last_archived_time：最后一次成功归档的时间</span></span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- last_failed_wal：最后一个归档失败的 WAL 文件名</span></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- last_failed_time：最后一次归档失败的时间</span></span></code></pre></div>
+            <p>基于这些指标，可以构建 Prometheus 监控查询：</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Prometheus 告警规则示例（需要配合 postgres_exporter）</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="fu">groups</span><span class="kw">:</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> backup_alerts</span></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">rules</span><span class="kw">:</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> WALArchiveFailing</span></span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">expr</span><span class="kw">:</span><span class="at"> pg_stat_archiver_failed_count &gt; 0</span></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 5m</span></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb32-9"><a href="#cb32-9" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> critical</span></span>
+<span id="cb32-10"><a href="#cb32-10" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb32-11"><a href="#cb32-11" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;PostgreSQL WAL 归档失败&quot;</span></span>
+<span id="cb32-12"><a href="#cb32-12" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">description</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;WAL 归档失败次数：{{ $value }}，最后失败的文件：{{ $labels.last_failed_wal }}&quot;</span></span>
+<span id="cb32-13"><a href="#cb32-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-14"><a href="#cb32-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> WALArchiveStale</span></span>
+<span id="cb32-15"><a href="#cb32-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">expr</span><span class="kw">:</span><span class="at"> time() - pg_stat_archiver_last_archive_time &gt; 3600</span></span>
+<span id="cb32-16"><a href="#cb32-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 5m</span></span>
+<span id="cb32-17"><a href="#cb32-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb32-18"><a href="#cb32-18" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> warning</span></span>
+<span id="cb32-19"><a href="#cb32-19" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb32-20"><a href="#cb32-20" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;PostgreSQL WAL 归档停滞&quot;</span></span>
+<span id="cb32-21"><a href="#cb32-21" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">description</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;距离上次成功归档已超过 1 小时&quot;</span></span></code></pre></div>
+            <h3 id="备份任务监控脚本">10.3 备份任务监控脚本</h3>
+            <p>以下脚本展示了一个基于文件时间戳的备份时效性检查逻辑：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="co"># check_backup_freshness.sh —— 检查备份文件的时效性</span></span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 通过 Prometheus node_exporter 的 textfile collector 暴露指标</span></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a><span class="va">BACKUP_DIR</span><span class="op">=</span><span class="st">&quot;/backup&quot;</span></span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a><span class="va">METRICS_FILE</span><span class="op">=</span><span class="st">&quot;/var/lib/node_exporter/textfile/backup_freshness.prom&quot;</span></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="va">MAX_AGE_SECONDS</span><span class="op">=</span>90000  <span class="co"># 25 小时（给 24 小时备份周期留 1 小时缓冲）</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 查找最新的备份文件</span></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a><span class="va">LATEST_BACKUP</span><span class="op">=</span><span class="va">$(</span><span class="fu">find</span> <span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">&quot;</span> <span class="at">-name</span> <span class="st">&quot;*.dump&quot;</span> <span class="at">-o</span> <span class="at">-name</span> <span class="st">&quot;*.tar.zst&quot;</span> <span class="dt">\</span></span>
+<span id="cb33-11"><a href="#cb33-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-t_</span> <span class="at">-k2</span> <span class="at">-r</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-1</span><span class="va">)</span></span>
+<span id="cb33-12"><a href="#cb33-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-13"><a href="#cb33-13" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="ot">-z</span> <span class="st">&quot;</span><span class="va">${LATEST_BACKUP}</span><span class="st">&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb33-14"><a href="#cb33-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;# HELP backup_last_success_timestamp_seconds 最近一次成功备份的 Unix 时间戳&quot;</span> <span class="dt">\</span></span>
+<span id="cb33-15"><a href="#cb33-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">${METRICS_FILE}</span><span class="st">&quot;</span></span>
+<span id="cb33-16"><a href="#cb33-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;backup_last_success_timestamp_seconds 0&quot;</span> <span class="op">&gt;&gt;</span> <span class="st">&quot;</span><span class="va">${METRICS_FILE}</span><span class="st">&quot;</span></span>
+<span id="cb33-17"><a href="#cb33-17" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;backup_freshness_ok 0&quot;</span> <span class="op">&gt;&gt;</span> <span class="st">&quot;</span><span class="va">${METRICS_FILE}</span><span class="st">&quot;</span></span>
+<span id="cb33-18"><a href="#cb33-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">exit</span> 0</span>
+<span id="cb33-19"><a href="#cb33-19" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb33-20"><a href="#cb33-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-21"><a href="#cb33-21" aria-hidden="true" tabindex="-1"></a><span class="va">BACKUP_TIMESTAMP</span><span class="op">=</span><span class="va">$(</span><span class="fu">stat</span> <span class="at">-c</span> %Y <span class="st">&quot;</span><span class="va">${LATEST_BACKUP}</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb33-22"><a href="#cb33-22" aria-hidden="true" tabindex="-1"></a><span class="va">CURRENT_TIME</span><span class="op">=</span><span class="va">$(</span><span class="fu">date</span> +%s<span class="va">)</span></span>
+<span id="cb33-23"><a href="#cb33-23" aria-hidden="true" tabindex="-1"></a><span class="va">AGE</span><span class="op">=</span><span class="va">$((CURRENT_TIME</span> <span class="op">-</span> <span class="va">BACKUP_TIMESTAMP))</span></span>
+<span id="cb33-24"><a href="#cb33-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-25"><a href="#cb33-25" aria-hidden="true" tabindex="-1"></a><span class="kw">{</span></span>
+<span id="cb33-26"><a href="#cb33-26" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;# HELP backup_last_success_timestamp_seconds 最近一次成功备份的 Unix 时间戳&quot;</span></span>
+<span id="cb33-27"><a href="#cb33-27" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;backup_last_success_timestamp_seconds </span><span class="va">${BACKUP_TIMESTAMP}</span><span class="st">&quot;</span></span>
+<span id="cb33-28"><a href="#cb33-28" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;# HELP backup_age_seconds 最近一次备份距今的秒数&quot;</span></span>
+<span id="cb33-29"><a href="#cb33-29" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;backup_age_seconds </span><span class="va">${AGE}</span><span class="st">&quot;</span></span>
+<span id="cb33-30"><a href="#cb33-30" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;# HELP backup_freshness_ok 备份时效性是否正常（1=正常，0=过期）&quot;</span></span>
+<span id="cb33-31"><a href="#cb33-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">${AGE}</span><span class="st">&quot;</span> <span class="ot">-lt</span> <span class="st">&quot;</span><span class="va">${MAX_AGE_SECONDS}</span><span class="st">&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb33-32"><a href="#cb33-32" aria-hidden="true" tabindex="-1"></a>        <span class="bu">echo</span> <span class="st">&quot;backup_freshness_ok 1&quot;</span></span>
+<span id="cb33-33"><a href="#cb33-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span></span>
+<span id="cb33-34"><a href="#cb33-34" aria-hidden="true" tabindex="-1"></a>        <span class="bu">echo</span> <span class="st">&quot;backup_freshness_ok 0&quot;</span></span>
+<span id="cb33-35"><a href="#cb33-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">fi</span></span>
+<span id="cb33-36"><a href="#cb33-36" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">${METRICS_FILE}</span><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="告警分级">10.4 告警分级</h3>
+            <p>备份告警建议按以下分级处理：</p>
+            <ul>
+            <li><strong>P0（立即响应）</strong>：备份任务连续失败超过 2
+            次、恢复测试失败、WAL 归档连续失败。</li>
+            <li><strong>P1（4
+            小时内响应）</strong>：备份文件大小异常偏差、备份耗时超过阈值、备份存储空间不足。</li>
+            <li><strong>P2（下一个工作日响应）</strong>：单次备份任务失败（但有之前的成功备份可用）、备份保留策略未按预期清理过期文件。</li>
+            </ul>
+            <p>告警必须发送到实际有人值守的通道——如果备份告警被静默了或发到一个没人看的邮件列表，等于没有告警。</p>
+            <hr />
+            <h2 id="十一参考文献">十一、参考文献</h2>
+            <h3 id="官方文档">官方文档</h3>
+            <ol type="1">
+            <li><p>PostgreSQL 16 Documentation. <em>Chapter 26: Backup
+            and Restore</em>. <a
+            href="https://www.postgresql.org/docs/16/backup.html"
+            class="uri">https://www.postgresql.org/docs/16/backup.html</a>.
+            PostgreSQL 官方的备份与恢复文档，覆盖 SQL
+            dump、文件系统级备份和连续归档。</p></li>
+            <li><p>PostgreSQL 16 Documentation. <em>Chapter 27: Recovery
+            Configuration</em>. <a
+            href="https://www.postgresql.org/docs/16/runtime-config-wal.html"
+            class="uri">https://www.postgresql.org/docs/16/runtime-config-wal.html</a>.
+            WAL 配置参数的官方说明。</p></li>
+            <li><p>MySQL 8.0 Reference Manual. <em>Chapter 9: Backup and
+            Recovery</em>. <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/backup-and-recovery.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/backup-and-recovery.html</a>.
+            MySQL 官方的备份与恢复文档。</p></li>
+            <li><p>MySQL 8.0 Reference Manual. <em>mysqldump — A
+            Database Backup Program</em>. <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/mysqldump.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/mysqldump.html</a>.
+            <code>mysqldump</code> 的完整参数说明。</p></li>
+            <li><p>Percona XtraBackup 8.0 Documentation. <a
+            href="https://docs.percona.com/percona-xtrabackup/8.0/"
+            class="uri">https://docs.percona.com/percona-xtrabackup/8.0/</a>.
+            XtraBackup 的官方文档，覆盖全量/增量备份、prepare
+            和恢复流程。</p></li>
+            </ol>
+            <h3 id="工具文档">工具文档</h3>
+            <ol start="6" type="1">
+            <li><p>pgBackRest Documentation. <a
+            href="https://pgbackrest.org/"
+            class="uri">https://pgbackrest.org/</a>. pgBackRest
+            的官方文档，覆盖配置、使用和架构。</p></li>
+            <li><p>Barman Documentation. <a
+            href="https://docs.pgbarman.org/"
+            class="uri">https://docs.pgbarman.org/</a>. Barman
+            的官方使用文档。</p></li>
+            <li><p>WAL-G Documentation. <a
+            href="https://github.com/wal-g/wal-g"
+            class="uri">https://github.com/wal-g/wal-g</a>. WAL-G 项目的
+            GitHub 仓库和文档。</p></li>
+            </ol>
+            <h3 id="事故复盘">事故复盘</h3>
+            <ol start="9" type="1">
+            <li><p>GitLab. <em>GitLab.com Database Incident —
+            2017-01-31</em>. <a
+            href="https://about.gitlab.com/blog/2017/02/01/gitlab-dot-com-database-incident/"
+            class="uri">https://about.gitlab.com/blog/2017/02/01/gitlab-dot-com-database-incident/</a>.
+            GitLab 2017
+            年数据库事故的官方复盘报告，详细记录了五种备份机制如何同时失效。</p></li>
+            <li><p>GitLab. <em>Postmortem of database outage of January
+            31</em>. <a
+            href="https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/"
+            class="uri">https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/</a>.
+            事故的完整事后分析。</p></li>
+            </ol>
+            <h3 id="书籍与论文">书籍与论文</h3>
+            <ol start="11" type="1">
+            <li><p>Kleppmann, M. (2017). <em>Designing Data-Intensive
+            Applications</em>. O’Reilly.
+            第七章”事务”讨论了持久性保证与备份的关系。</p></li>
+            <li><p>Obe, R., Hsu, L. (2024). <em>PostgreSQL: Up and
+            Running</em>, 4th Edition. O’Reilly. PostgreSQL
+            管理和备份的实践指南。</p></li>
+            <li><p>Schwartz, B., et al. (2012). <em>High Performance
+            MySQL</em>, 3rd Edition. O’Reilly. MySQL
+            备份策略的深入讨论见第十五章。</p></li>
+            </ol>
+            <h3 id="行业规范">行业规范</h3>
+            <ol start="14" type="1">
+            <li><p>NIST SP 800-184. <em>Guide for Cybersecurity Event
+            Recovery</em>. <a
+            href="https://csrc.nist.gov/publications/detail/sp/800-184/final"
+            class="uri">https://csrc.nist.gov/publications/detail/sp/800-184/final</a>.
+            NIST
+            关于网络安全事件恢复的指南，包含备份策略的安全要求。</p></li>
+            <li><p>ISO 22301:2019. <em>Security and resilience —
+            Business continuity management systems — Requirements</em>.
+            业务连续性管理的国际标准，定义了 RPO 和 RTO
+            的框架。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../59-storage-failures/storage-failures.html">存储故障模式</a>
+            <strong>下一篇</strong>: <a
+            href="../61-disaster-recovery/disaster-recovery.html">灾难恢复设计</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/78-storage-incident-postmortems/storage-incident-postmortems.html">【存储工程】存储事故复盘：经典生产故障的根因与教训</a></h3>
+                    <p>深度复盘 GitLab 2017 数据库事故和 GitHub 2018 存储故障的完整时间线与根因分析，提取跨事故的通用模式，给出构建抗事故存储实践的工程建议。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / kernel</p>
+                    <h3><a href="/post/db/mysql-innodb/19-ha-recovery/19-ha-recovery.html">【MySQL InnoDB 内核】主从切换与数据恢复：PITR 与 xtrabackup 边界</a></h3>
+                    <p>mysqldump 与 xtrabackup 机制差异、binlog PITR、GTID failover 与误删恢复边界。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/01-lakehouse-overview/01-lakehouse-overview.html">【数据湖与开放表格式】Lakehouse 全景：从 Hive 表到开放表格式</a></h3>
+                    <p>Hive 目录式分区表把『表』等同于『一组目录加 metastore 里的分区行』，于是没有原子提交、planning 要 LIST 目录、schema 与分区演进常要重写。本文用这三个硬伤切入，讲清 lakehouse 把表拆成『不可变数据文件 + 可变元数据指针 + catalog』三层后各自解决了什么，并给出全系列的分层地图。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

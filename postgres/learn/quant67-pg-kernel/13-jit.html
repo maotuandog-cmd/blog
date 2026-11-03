@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】JIT 编译：为什么 PG 要把 WHERE 子句编译成机器码 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL 的 LLVM JIT
+编译机制：JIT 编译的触发决策流程（jit_above_cost 三级阈值）、LLVM
+模块管理与惰性编译、表达式求值从 EEO opcode 到 LLVM IR
+再到机器码的完整路径、Tuple 变形（deforming）的 JIT 加速原理，以及 JIT
+在 OLAP 场景的实际加速效果、编译开销和适用边界。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, jit, llvm, expression-evaluation, tuple-deforming, olap, query-execution, jit-compilation, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/13-jit/13-jit.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】JIT 编译：为什么 PG 要把 WHERE 子句编译成机器码" />
+    <meta property="og:description" content="拆解 PostgreSQL 的 LLVM JIT 编译机制：JIT 编译的触发决策流程（jit_above_cost 三级阈值）、LLVM 模块管理与惰性编译、表达式求值从 EEO opcode 到 LLVM IR 再到机器码的完整路径、Tuple 变形（deforming）的 JIT 加速原理，以及 JIT 在 OLAP 场景的实际加速效果、编译开销和适用边界。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/13-jit/13-jit.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="jit" />
+    <meta property="article:tag" content="llvm" />
+    <meta property="article:tag" content="expression-evaluation" />
+    <meta property="article:tag" content="tuple-deforming" />
+    <meta property="article:tag" content="olap" />
+    <meta property="article:tag" content="query-execution" />
+    <meta property="article:tag" content="jit-compilation" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】JIT 编译：为什么 PG 要把 WHERE 子句编译成机器码" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 的 LLVM JIT 编译机制：JIT 编译的触发决策流程（jit_above_cost 三级阈值）、LLVM 模块管理与惰性编译、表达式求值从 EEO opcode 到 LLVM IR 再到机器码的完整路径、Tuple 变形（deforming）的 JIT 加速原理，以及 JIT 在 OLAP 场景的实际加速效果、编译开销和适用边界。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】JIT 编译：为什么 PG 要把 WHERE 子句编译成机器码", "description": "拆解 PostgreSQL 的 LLVM JIT 编译机制：JIT 编译的触发决策流程（jit_above_cost 三级阈值）、LLVM 模块管理与惰性编译、表达式求值从 EEO opcode 到 LLVM IR 再到机器码的完整路径、Tuple 变形（deforming）的 JIT 加速原理，以及 JIT 在 OLAP 场景的实际加速效果、编译开销和适用边界。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/13-jit/13-jit.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "jit", "llvm", "expression-evaluation", "tuple-deforming", "olap", "query-execution", "jit-compilation"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】JIT 编译：为什么 PG 要把 WHERE 子句编译成机器码</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#jit</span> <span>#llvm</span> <span>#expression-evaluation</span> <span>#tuple-deforming</span> <span>#olap</span> <span>#query-execution</span> <span>#jit-compilation</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/jit.html">#jit</a><a class="chip-link" href="/tags/llvm.html">#llvm</a><a class="chip-link" href="/tags/expression-evaluation.html">#expression-evaluation</a><a class="chip-link" href="/tags/tuple-deforming.html">#tuple-deforming</a><a class="chip-link" href="/tags/olap.html">#olap</a><a class="chip-link" href="/tags/query-execution.html">#query-execution</a><a class="chip-link" href="/tags/jit-compilation.html">#jit-compilation</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#jit-编译为什么-pg-要把-where-子句编译成机器码"
+                id="toc-jit-编译为什么-pg-要把-where-子句编译成机器码">JIT
+                编译：为什么 PG 要把 WHERE 子句编译成机器码</a>
+                <ul>
+                <li><a href="#一jit-在-pg-中的编译范围"
+                id="toc-一jit-在-pg-中的编译范围">一、JIT 在 PG
+                中的编译范围</a>
+                <ul>
+                <li><a href="#决策的源码路径"
+                id="toc-决策的源码路径">决策的源码路径</a></li>
+                <li><a href="#为什么需要分级"
+                id="toc-为什么需要分级">为什么需要分级</a></li>
+                </ul></li>
+                <li><a href="#三llvm-会话初始化与模块管理"
+                id="toc-三llvm-会话初始化与模块管理">三、LLVM
+                会话初始化与模块管理</a>
+                <ul>
+                <li><a href="#provider-模式"
+                id="toc-provider-模式">Provider 模式</a></li>
+                <li><a href="#会话初始化"
+                id="toc-会话初始化">会话初始化</a></li>
+                <li><a href="#惰性编译"
+                id="toc-惰性编译">惰性编译</a></li>
+                </ul></li>
+                <li><a href="#四表达式求值-jit从-eeo-opcode-到-llvm-ir"
+                id="toc-四表达式求值-jit从-eeo-opcode-到-llvm-ir">四、表达式求值
+                JIT：从 EEO Opcode 到 LLVM IR</a>
+                <ul>
+                <li><a href="#解释器的执行模型"
+                id="toc-解释器的执行模型">解释器的执行模型</a></li>
+                <li><a href="#llvm-表达式编译"
+                id="toc-llvm-表达式编译">LLVM 表达式编译</a></li>
+                </ul></li>
+                <li><a href="#五tuple-变形-jit列提取的加速"
+                id="toc-五tuple-变形-jit列提取的加速">五、Tuple 变形
+                JIT：列提取的加速</a>
+                <ul>
+                <li><a href="#为什么-tuple-变形是瓶颈"
+                id="toc-为什么-tuple-变形是瓶颈">为什么 Tuple
+                变形是瓶颈</a></li>
+                </ul></li>
+                <li><a href="#七实验jit-加速效果的实际测量"
+                id="toc-七实验jit-加速效果的实际测量">七、实验：JIT
+                加速效果的实际测量</a>
+                <ul>
+                <li><a href="#实验环境"
+                id="toc-实验环境">实验环境</a></li>
+                <li><a href="#实验-1简单聚合jit-得不偿失"
+                id="toc-实验-1简单聚合jit-得不偿失">实验
+                1：简单聚合——JIT 得不偿失</a></li>
+                <li><a href="#实验-2tpc-h-q1jit-大幅加速"
+                id="toc-实验-2tpc-h-q1jit-大幅加速">实验 2：TPC-H
+                Q1——JIT 大幅加速</a></li>
+                <li><a href="#实验-3复杂-where表达式密集查询"
+                id="toc-实验-3复杂-where表达式密集查询">实验 3：复杂
+                WHERE——表达式密集查询</a></li>
+                <li><a href="#实验-5io-瓶颈查询jit-无效"
+                id="toc-实验-5io-瓶颈查询jit-无效">实验 5：I/O
+                瓶颈查询——JIT 无效</a></li>
+                <li><a href="#平台兼容性问题"
+                id="toc-平台兼容性问题">平台兼容性问题</a></li>
+                <li><a href="#调试与性能分析工具"
+                id="toc-调试与性能分析工具">调试与性能分析工具</a></li>
+                <li><a href="#配置建议"
+                id="toc-配置建议">配置建议</a></li>
+                </ul></li>
+                <li><a href="#九关键要点"
+                id="toc-九关键要点">九、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#关键提交"
+                id="toc-关键提交">关键提交</a></li>
+                <li><a href="#设计讨论"
+                id="toc-设计讨论">设计讨论</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="jit-编译为什么-pg-要把-where-子句编译成机器码">JIT
+            编译：为什么 PG 要把 WHERE 子句编译成机器码</h1>
+            <p>执行
+            <code>SELECT count(*) FROM orders WHERE status = 'pending' AND amount &gt; 1000</code>
+            时，PG 需要解析每一行的 <code>status</code> 和
+            <code>amount</code>
+            列值，执行比较运算，再对满足条件的行计数。如果表有 5000
+            万行，这个”解析列值→比较→计数”的循环要执行 5000 万次。</p>
+            <p>第 12 章讲的 EEO（Expression
+            Evaluation）解释器用一个编译好的 opcode
+            序列执行这些操作——每个 opcode 是一个 C 函数指针，解释器在
+            <code>ExecInterpExpr()</code>
+            的大循环中逐条跳转执行。问题不在单次调用慢，而在 5000
+            万次解释开销堆在一起：每次 opcode 分发的 switch
+            跳转、函数指针调用、结果写回，在数百万次循环中累积为可观的
+            CPU 开销。</p>
+            <p>JIT（Just-In-Time）编译就是针对这个场景：把热路径上的表达式求值和
+            Tuple 列提取直接编译成本地机器码，省掉解释器的 opcode
+            分发开销。但 JIT 编译本身也有代价——LLVM 生成
+            IR、优化、编译成机器码都需要 CPU 时间。PG
+            用三级代价阈值来决定”这个查询值得编译吗，以及编译多深”。</p>
+            <p>本文从 <code>jit_above_cost</code> 的决策路径出发，拆解
+            <code>llvmjit.c</code> 和 <code>llvmjit_expr.c</code> 中 JIT
+            编译的完整流程，并通过实验量化 JIT 在 OLAP
+            查询中的加速效果和边界。</p>
+            <hr />
+            <h2 id="一jit-在-pg-中的编译范围">一、JIT 在 PG
+            中的编译范围</h2>
+            <p>PG 的 JIT 编译只覆盖两个操作：</p>
+            <p><strong>1. 表达式求值（Expression
+            Evaluation）</strong></p>
+            <p>WHERE 子句、target list
+            的表达式计算、聚合函数中的表达式、CASE WHEN 分支等。对应源码
+            <code>src/backend/jit/llvm/llvmjit_expr.c</code>。</p>
+            <p><strong>2. Tuple 变形（Tuple Deforming）</strong></p>
+            <p>从磁盘上的 Heap Tuple 二进制格式提取各列的值——将
+            <code>HeapTupleHeaderData</code> + 变长数据解析成
+            <code>TupleTableSlot</code> 中按列排列的 <code>Datum</code>
+            数组。对应源码
+            <code>src/backend/jit/llvm/llvmjit_deform.c</code>。</p>
+            <p>以下操作不被 JIT
+            编译：查询规划（planner）、索引扫描、排序、Hash
+            表构建、聚合函数本身的状态维护——这些仍走 C 代码路径。</p>
+            <p>为什么只编译这两块？因为它们是查询执行中循环次数最多的操作。每条
+            tuple 被扫描时都要经历”列提取 → 表达式求值 → 条件判断”：5000
+            万行就是 5000 万次。而 Hash Join 的构建是一次性操作，Hotspot
+            不在编译范围。</p>
+            <p>JIT 编译对象的上下文结构：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/jit/jit.h</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> JitContext <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> JitProviderCallbacks <span class="op">*</span>provider<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    List      <span class="op">*</span>llvm_functions<span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    MemoryContext context<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> JitContext<span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/jit/llvmjit.h</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> LLVMJitContext <span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    JitContext       base<span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    List            <span class="op">*</span>handles<span class="op">;</span>           <span class="co">// 已编译的 LLVM 模块句柄</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    LLVMModuleRef    module<span class="op">;</span>            <span class="co">// 当前 LLVM Module</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    LLVMBuilderRef   builder<span class="op">;</span>           <span class="co">// LLVM IR Builder</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    MemoryContext     context<span class="op">;</span>           <span class="co">// PG 内存上下文</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span>           cost<span class="op">;</span>              <span class="co">// 查询估算代价（决定优化级别）</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>              compile_count<span class="op">;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> LLVMJitContext<span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>`llvm_functions` 列表中每个元素是一个已编译的 LLVM 函数——PG 按表达式（或 tuple 变形 slot）粒度编译，不是整个查询一个巨型函数。每个查询一个 `LLVMJitContext`，查询结束时释放——JIT 编译的机器码不跨查询缓存。</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 二、JIT 决策流程：三级代价阈值</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 阈值机制</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>JIT 编译不是<span class="st">&quot;开或关&quot;</span>的二元选择。PG 用三个 GUC 参数控制 JIT 的积极性：</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 参数 <span class="op">|</span> 默认值 <span class="op">|</span> 含义 <span class="op">|</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="op">|------|--------|------|</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `jit_above_cost` <span class="op">|</span> <span class="dv">100000</span> <span class="op">|</span> 计划估算总代价超过此值，JIT 编译被触发 <span class="op">|</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `jit_inline_above_cost` <span class="op">|</span> <span class="dv">500000</span> <span class="op">|</span> 计划估算总代价超过此值，启用函数内联 <span class="op">|</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `jit_optimize_above_cost` <span class="op">|</span> <span class="dv">500000</span> <span class="op">|</span> 计划估算总代价超过此值，启用 LLVM 深度优化 <span class="op">(-</span>O3<span class="op">)</span> <span class="op">|</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>这三个值和 planner 估算的查询总代价（`EXPLAIN` 输出的 `cost` 值）比较：</span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>PlannedStmt<span class="op">.</span>totalCost</span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>  │</span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>  ├── <span class="op">&lt;</span> jit_above_cost（<span class="dv">100</span><span class="er">k</span>）</span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>  │     → JIT 完全不参与。连 JitContext 都不创建。</span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>  │</span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>  ├── <span class="dv">100</span><span class="er">k</span> ≤ cost <span class="op">&lt;</span> <span class="dv">500</span><span class="er">k</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>  │     → JIT 基本编译（表达式 <span class="op">+</span> Tuple 变形）</span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>  │       使用 <span class="op">-</span>O0 TargetMachine，不做内联，不做深度优化</span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>  │</span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>  └── cost ≥ <span class="dv">500</span><span class="er">k</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>        → JIT 全功能（基本编译 <span class="op">+</span> 内联 <span class="op">+</span> <span class="op">-</span>O3 优化）</span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>          使用 <span class="op">-</span>O3 TargetMachine，内联阈值 <span class="dv">512</span></span></code></pre></div>
+            <p>决策发生在计划时（plan time），而非执行时。计划器在
+            <code>planner.c</code>
+            中计算最终计划的总代价后，按上述逻辑设置
+            <code>PlannedStmt.jitFlags</code>
+            位掩码。执行器启动时（<code>standard_ExecutorStart()</code>）将
+            flags 复制到 <code>EState.es_jit_flags</code>。</p>
+            <h3 id="决策的源码路径">决策的源码路径</h3>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/jit/jit.c</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> jit_compile_expr<span class="op">(</span><span class="kw">struct</span> ExprState <span class="op">*</span>state<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 总开关</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>jit_enabled<span class="op">)</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 查询代价低于 jit_above_cost 阈值</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    PlannedStmt <span class="op">*</span>plannedstmt <span class="op">=</span> <span class="op">...;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>plannedstmt<span class="op">-&gt;</span>planTree<span class="op">-&gt;</span>total_cost <span class="op">&lt;</span> jit_above_cost<span class="op">)</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 单次表达式代价太低（短路判断）</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>state<span class="op">-&gt;</span>evalcost <span class="op">&lt;</span> jit_expressions_threshold<span class="op">)</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>注意 `jit_above_cost` 比较的是<span class="op">**</span>整个查询<span class="op">**</span>的估算总代价，不是单个表达式的代价。一旦查询总代价跨过门槛，查询中所有符合条件的表达式都会被考虑 JIT 编译。这个决策粒度是查询级的。</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## flags 位掩码</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/jit/jit.h</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PGJIT_PERFORM   </span><span class="op">(</span><span class="dv">1</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">0</span><span class="op">)</span><span class="pp">   </span><span class="co">// 是否执行 JIT</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PGJIT_OPT3      </span><span class="op">(</span><span class="dv">1</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">1</span><span class="op">)</span><span class="pp">   </span><span class="co">// 是否使用 -O3 级别优化</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PGJIT_INLINE    </span><span class="op">(</span><span class="dv">1</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">2</span><span class="op">)</span><span class="pp">   </span><span class="co">// 是否对函数/操作符做内联</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PGJIT_EXPR      </span><span class="op">(</span><span class="dv">1</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">3</span><span class="op">)</span><span class="pp">   </span><span class="co">// 是否 JIT 编译表达式</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PGJIT_DEFORM    </span><span class="op">(</span><span class="dv">1</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">4</span><span class="op">)</span><span class="pp">   </span><span class="co">// 是否 JIT 编译 Tuple 变形</span></span></code></pre></div>
+            <p><code>PGJIT_PERFORM</code>
+            是总开关。<code>PGJIT_EXPR</code> 和
+            <code>PGJIT_DEFORM</code> 目前总是一起启用或关闭，但 GUC
+            <code>jit_expressions</code> 和
+            <code>jit_tuple_deforming</code>
+            允许单独关闭其中之一用于调试。</p>
+            <h3 id="为什么需要分级">为什么需要分级</h3>
+            <p>LLVM 的优化 pass（特别是 -O3）本身消耗可观的 CPU
+            时间。如果一个查询只扫 10 万行，花 200ms 做 LLVM -O3
+            优化可能比 JIT 省下的执行时间还多。分级机制让 PG
+            根据查询大小自动选择编译深度。</p>
+            <p>一个重要的边界：对于 Prepared Statement，决策时使用的 GUC
+            值是 <code>PREPARE</code> 时的值，而非 <code>EXECUTE</code>
+            时的值。如果你在 <code>PREPARE</code> 之后修改了
+            <code>jit_above_cost</code>，该 Prepared Statement 的 JIT
+            行为不会改变，除非强制使用 custom
+            plan（<code>plan_cache_mode = force_custom_plan</code>）。</p>
+            <hr />
+            <h2 id="三llvm-会话初始化与模块管理">三、LLVM
+            会话初始化与模块管理</h2>
+            <h3 id="provider-模式">Provider 模式</h3>
+            <p>PG 的 JIT 实现采用 Provider 模式，分两层：</p>
+            <pre class="text"><code>src/backend/jit/
+├── jit.c                          # Provider 无关层：加载 Provider、分发调用、GUC 定义
+└── llvm/
+    ├── llvmjit.c                  # LLVM Provider 核心：会话初始化、上下文管理、编译发射
+    ├── llvmjit_expr.c             # 表达式 JIT 编译
+    ├── llvmjit_deform.c           # Tuple 变形 JIT 编译
+    ├── llvmjit_inline.cpp         # 函数内联支持 (C++，因为 LLVM C++ API)
+    ├── llvmjit_types.c            # 编译成 llvmjit_types.bc，提供类型元数据
+    └── llvmjit_error.cpp          # 错误处理
+```text
+
+Provider 无关层通过 `JitProviderCallbacks` 回调结构体分派调用：
+
+```c
+// src/backend/jit/jit.c
+typedef struct JitProviderCallbacks {
+    void (*reset_after_error)(void);
+    void (*release_context)(JitContext *context);
+    bool (*compile_expr)(struct ExprState *state);
+} JitProviderCallbacks;</code></pre>
+            <p>LLVM Provider 共享库按需加载——只有第一次实际需要 JIT
+            时才会触发
+            <code>provider_init()</code>，加载失败后整个会话不再重试。这个设计让
+            <code>--with-llvm</code> 编译的 PG 在不使用 JIT
+            的场景下几乎零开销。</p>
+            <h3 id="会话初始化">会话初始化</h3>
+            <p>每个 Backend 在首次使用 JIT 时调用
+            <code>llvm_session_initialize()</code>：</p>
+            <ol type="1">
+            <li>初始化 LLVM 原生目标、汇编解析器。</li>
+            <li>调用 <code>llvm_create_types()</code>——从编译期预生成的
+            <code>llvmjit_types.bc</code> 中加载 PG 内部结构体的 LLVM
+            类型定义，包括
+            <code>StructTupleTableSlot</code>、<code>StructExprEvalStep</code>、<code>StructExprState</code>、<code>StructFunctionCallInfoData</code>、<code>StructHeapTupleHeaderData</code>
+            等几十种类型。这保证 JIT
+            生成代码中的结构体偏移量与运行时二进制一致。</li>
+            <li>检测主机 CPU 型号和特性，据此创建两个
+            TargetMachine——<code>opt0_tm</code>（<code>LLVMCodeGenLevelNone</code>）和
+            <code>opt3_tm</code>（<code>LLVMCodeGenLevelAggressive</code>）。</li>
+            <li>创建两个 ORC JIT 实例——<code>llvm_opt0_orc</code> 和
+            <code>llvm_opt3_orc</code>，分别对应无优化和有优化代码发射。</li>
+            </ol>
+            <p>两级 TargetMachine
+            的设计很关键：同一查询中不同表达式可能因阈值不同而落入不同优化等级。</p>
+            <h3 id="惰性编译">惰性编译</h3>
+            <p>PG
+            不在查询开始时一次性编译所有表达式。表达式在第一次被求值时触发编译：</p>
+            <pre class="text"><code>executor 执行 ExecProject（target list 表达式求值）
+  → ExecEvalExpr()
+    → 检查 ExprState-&gt;flags 是否设置了 EEO_FLAG_JIT_COMPILED
+    → 如果未编译：调用 jit_compile_expr(state)
+    → llvm_compile_expr() 生成 LLVM IR → 编译成机器码
+    → 设置 EEO_FLAG_JIT_COMPILED，替换 evalfunc 指针
+    → 执行编译后的机器码
+```text
+
+之后的表达式求值直接调用编译好的函数指针，不再走解释器路径。惰性编译的好处：如果一个查询的 WHERE 子句过滤掉了 99% 的行，target list 的表达式可能只对 1% 的行求值——不值得编译。只有真正被频繁调用的表达式才付出编译代价。
+
+### 编译后的调用路径
+
+```c
+// 第一次调用：
+state-&gt;evalfunc = ExecRunCompiledExpr;  // 中间跳板函数
+// ExecRunCompiledExpr 内部：
+real_fn = llvm_get_function(compiled-&gt;context, compiled-&gt;funcname);
+state-&gt;evalfunc = real_fn;              // 替换为真实函数指针
+return real_fn(state, econtext, isNull);
+
+// 后续调用：
+state-&gt;evalfunc(state, econtext, isNull);  // 直接调用 JIT 编译的函数</code></pre>
+            <p><code>ExecRunCompiledExpr</code>
+            作为一次性跳板，完成函数指针替换后，后续调用零开销直达 JIT
+            代码。</p>
+            <hr />
+            <h2
+            id="四表达式求值-jit从-eeo-opcode-到-llvm-ir">四、表达式求值
+            JIT：从 EEO Opcode 到 LLVM IR</h2>
+            <h3 id="解释器的执行模型">解释器的执行模型</h3>
+            <p>EEO 解释器（第 12 章详细讨论）将表达式编译成
+            <code>ExprEvalStep</code> 数组，每个 step 是一个 opcode +
+            操作数：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/executor/exprcontext.h（简化）</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> ExprEvalStep <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    ExprEvalOp  opcode<span class="op">;</span>       <span class="co">// EEOP_FUNCEXPR, EEOP_CONST, EEOP_QUAL, ...</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span>       <span class="op">*</span>resvalue<span class="op">;</span>     <span class="co">// 结果存放位置</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span>       <span class="op">*</span>resnull<span class="op">;</span>      <span class="co">// NULL 标记存放位置</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">union</span> <span class="op">{</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> <span class="op">{</span> FunctionCallInfo fcinfo<span class="op">;</span> <span class="op">...</span> <span class="op">}</span> func<span class="op">;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> <span class="op">{</span> <span class="dt">int</span> jumpdone<span class="op">;</span> <span class="op">}</span>               jump<span class="op">;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> <span class="op">{</span> Datum value<span class="op">;</span> <span class="dt">bool</span> isnull<span class="op">;</span> <span class="op">}</span>   constval<span class="op">;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... 每种 opcode 的专用数据</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> d<span class="op">;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ExprEvalStep<span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>解释器 `ExecInterpExpr<span class="op">()</span>` 的核心是一个大循环：</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execExprInterp.c</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>op<span class="op">-&gt;</span>opcode<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_FUNCEXPR<span class="op">:</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>op<span class="op">-&gt;</span>resvalue <span class="op">=</span> FunctionCallInvoke<span class="op">(</span>op<span class="op">-&gt;</span>d<span class="op">.</span>func<span class="op">.</span>fcinfo<span class="op">);</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>op<span class="op">-&gt;</span>resnull  <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>func<span class="op">.</span>fcinfo<span class="op">-&gt;</span>isnull<span class="op">;</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>            op<span class="op">++;</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_CONST<span class="op">:</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>op<span class="op">-&gt;</span>resvalue <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>constval<span class="op">.</span>value<span class="op">;</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>op<span class="op">-&gt;</span>resnull  <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>constval<span class="op">.</span>isnull<span class="op">;</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>            op<span class="op">++;</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_QUAL<span class="op">:</span>    <span class="co">// WHERE 条件求值——如果 false 则跳转到 EEOP_JUMP</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(*</span>op<span class="op">-&gt;</span>resnull <span class="op">||</span> <span class="op">!</span>DatumGetBool<span class="op">(*</span>op<span class="op">-&gt;</span>resvalue<span class="op">))</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>                op <span class="op">+=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>jump<span class="op">.</span>jumpdone<span class="op">;</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... 50+ 种 opcode</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>每个 opcode 分支涉及 switch 跳转表查找 + 函数指针调用 +
+            结果写入，在数百万次循环中累积为 CPU 分支预测失败和指令
+            cache miss。</p>
+            <h3 id="llvm-表达式编译">LLVM 表达式编译</h3>
+            <p>JIT 编译的目标是把 <code>ExprEvalStep</code>
+            序列翻译成<strong>一个扁平的 LLVM
+            函数</strong>——没有循环，没有
+            switch，直线代码（straight-line code）：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/jit/llvm/llvmjit_expr.c, llvm_compile_expr()</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 遍历 ExprEvalStep 数组，为每种 opcode 生成 LLVM IR</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span>op <span class="op">=</span> state<span class="op">-&gt;</span>steps<span class="op">;</span> op<span class="op">-&gt;</span>opcode <span class="op">!=</span> EEOP_DONE_RETURN<span class="op">;</span> op<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>op<span class="op">-&gt;</span>opcode<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_CONST<span class="op">:</span>       <span class="co">// 常量折叠：LLVM IR 中直接嵌入常量值</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>            v_value <span class="op">=</span> l_ptr_const<span class="op">(</span>op<span class="op">-&gt;</span>d<span class="op">.</span>constval<span class="op">.</span>value<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>            v_isnull <span class="op">=</span> l_ptr_const<span class="op">(</span>op<span class="op">-&gt;</span>d<span class="op">.</span>constval<span class="op">.</span>isnull<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_FUNCEXPR<span class="op">:</span>    <span class="co">// 函数调用：生成 fmgr 调用 IR</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>            BuildV1Call<span class="op">(</span>context<span class="op">,</span> b<span class="op">,</span> mod<span class="op">,</span> op<span class="op">-&gt;</span>d<span class="op">.</span>func<span class="op">.</span>fcinfo<span class="op">,</span> <span class="op">&amp;</span>v_isnull<span class="op">);</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_BOOL_AND_STEP<span class="op">:</span>  <span class="co">// 短路径 AND：生成条件分支 + 基本块</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_BOOL_OR_STEP<span class="op">:</span>   <span class="co">// 短路径 OR</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 创建两个基本块：短路出口 + 继续求值</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_QUAL<span class="op">:</span>        <span class="co">// WHERE 条件：生成条件跳转 IR</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> EEOP_AGGREF<span class="op">:</span>      <span class="co">// 聚合引用</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... 支持约 30 种 opcode 的 JIT 翻译</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>以 `WHERE a <span class="op">&gt;</span> <span class="dv">10</span> AND b <span class="op">&lt;</span> <span class="dv">20</span>` 为例，JIT 编译后的机器码等价于：</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a><span class="co">// JIT 编译后的伪代码（概念示意）</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>Datum compiled_eval<span class="op">(</span>ExprContext <span class="op">*</span>econtext<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>isnull<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 列 a 的提取代码（由 Tuple 变形 JIT 生成，可能内联到这里）</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    Datum val_a <span class="op">=</span> deform_col_1<span class="op">(</span>tuple<span class="op">);</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 调用 int4gt --- 直接 C 函数调用，不是函数指针</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> cond1 <span class="op">=</span> int4gt<span class="op">(</span>val_a<span class="op">,</span> Int32GetDatum<span class="op">(</span><span class="dv">10</span><span class="op">));</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 短路：第一个条件不满足直接返回</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>cond1<span class="op">)</span> <span class="op">{</span> <span class="op">*</span>isnull <span class="op">=</span> <span class="kw">false</span><span class="op">;</span> <span class="cf">return</span> BoolGetDatum<span class="op">(</span><span class="kw">false</span><span class="op">);</span> <span class="op">}</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 列 b 的提取 + 比较</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>    Datum val_b <span class="op">=</span> deform_col_2<span class="op">(</span>tuple<span class="op">);</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> cond2 <span class="op">=</span> int4lt<span class="op">(</span>val_b<span class="op">,</span> Int32GetDatum<span class="op">(</span><span class="dv">20</span><span class="op">));</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>isnull <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> BoolGetDatum<span class="op">(</span>cond2<span class="op">);</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>注意 <code>int4gt</code> 和 <code>int4lt</code> 仍然是 C
+            函数调用——JIT 没有把比较运算本身编译成汇编。它省掉的是
+            opcode 分发、<code>ExprEvalStep</code>
+            结构体字段读取、switch
+            跳转这三层开销。内置函数（<code>int4gt</code> 等）仍然通过
+            PLT/GOT 调用——除非 <code>jit_inline_above_cost</code>
+            触发内联，将它们 inline 到 JIT 编译的函数中。</p>
+            <hr />
+            <h2 id="五tuple-变形-jit列提取的加速">五、Tuple 变形
+            JIT：列提取的加速</h2>
+            <h3 id="为什么-tuple-变形是瓶颈">为什么 Tuple
+            变形是瓶颈</h3>
+            <p>从磁盘读出的 Heap Tuple 是一个压缩的字节序列：</p>
+            <pre class="text"><code>[HeapTupleHeader][Null Bitmap][Column 1 padding + value][Column 2 padding + value]...
+```text
+
+每次访问一列，PG 需要：
+1. 根据列号查找 `pg_attribute`，确定该列的类型、长度、对齐
+2. 检查 null bitmap，确认该列是否为 NULL
+3. 如果是变长类型（如 text），解析 varattrib header 判断是 inline 还是 TOAST
+4. 按对齐要求提取字节，转成 `Datum`
+
+这个过程叫 Tuple 变形（deforming）。解释器每次访问列都走一遍这个流程——扫描 5000 万行，提取两列，就是 1 亿次变形操作。
+
+### JIT 变形的优化
+
+JIT 的 Tuple 变形优化思路：为这个表的列布局生成**专用的提取函数**，把对齐计算、偏移计算、null bitmap 检查都编译成常量：
+
+```c
+// src/backend/jit/llvm/llvmjit_deform.c, slot_compile_deform()
+LLVMValueRef slot_compile_deform(TupleDesc desc, LLVMJitContext *context) {
+    for (int attnum = 0; attnum &lt; desc-&gt;natts; attnum++) {
+        Form_pg_attribute att = TupleDescAttr(desc, attnum);
+
+        // 1. null bitmap 中的 bit 位置——编译时常量
+        int null_bit = attnum;
+
+        // 2. 对齐要求——编译时常量
+        char align = att-&gt;attalign;  // &#39;c&#39;, &#39;s&#39;, &#39;i&#39;, &#39;d&#39;
+
+        // 3. 生成 LLVM IR：检查 null bit → 提取值 → 按对齐转换
+        if (att-&gt;attlen &gt; 0) {
+            // 定长类型：直接按偏移量读取（偏移量是编译时常量）
+            LLVMValueRef val = LLVMBuildLoad(builder, ptr_at_offset);
+        } else {
+            // 变长类型：解析 varattrib header
+            generate_varattrib_extraction(...);
+        }
+    }
+}</code></pre>
+            <p>三重优化：</p>
+            <ol type="1">
+            <li><strong>按需变形</strong>——只变形表达式实际引用的列，而不是所有列。一个
+            50 列的表，如果 WHERE 子句只用到 3 列，JIT 变形只提取那 3
+            列。</li>
+            <li><strong>编译期常量折叠</strong>——列的
+            <code>attlen</code>、<code>attbyval</code>、<code>attalign</code>
+            在编译期已知，生成代码时直接作为常量嵌入，省去运行时查
+            <code>TupleDesc</code> 的分支。</li>
+            <li><strong>内联到表达式函数</strong>——变形代码可以被 LLVM
+            内联到使用这些列的表达式函数中，消除函数调用边界和中间数据搬运。</li>
+            </ol>
+            <p>编译后的变形函数对每个列生成的代码类似于：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// JIT 编译后的 Tuple 变形函数（伪代码）</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> compiled_deform<span class="op">(</span>HeapTupleHeader tuple<span class="op">,</span> Datum <span class="op">*</span>values<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>nulls<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> <span class="op">*</span>data <span class="op">=</span> <span class="op">(</span><span class="dt">char</span> <span class="op">*)</span>tuple <span class="op">+</span> tuple<span class="op">-&gt;</span>t_hoff<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 列 1: int4, offset=0, 4-byte align（偏移量和对齐都是编译时常量）</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    nulls<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> <span class="op">(</span>tuple<span class="op">-&gt;</span>null_bitmap<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">&amp;</span> <span class="bn">0x01</span><span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>nulls<span class="op">[</span><span class="dv">0</span><span class="op">])</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        values<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> <span class="op">*(</span>int32 <span class="op">*)(</span>data <span class="op">+</span> <span class="dv">0</span><span class="op">);</span>  <span class="co">// 偏移量嵌入为立即数</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 列 2: text (变长), offset=4</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    nulls<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">=</span> <span class="op">(</span>tuple<span class="op">-&gt;</span>null_bitmap<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">&amp;</span> <span class="bn">0x02</span><span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>nulls<span class="op">[</span><span class="dv">1</span><span class="op">])</span> <span class="op">{</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>        varattrib <span class="op">*</span>va <span class="op">=</span> <span class="op">(</span>varattrib <span class="op">*)(</span>data <span class="op">+</span> <span class="dv">4</span><span class="op">);</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>va<span class="op">-&gt;</span>va_header <span class="op">&amp;</span> <span class="bn">0x01</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>            values<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">=</span> toast_fetch<span class="op">(</span>va<span class="op">);</span>        <span class="co">// TOAST 外存</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>            values<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">=</span> PointerGetDatum<span class="op">(</span>VARDATA<span class="op">(</span>va<span class="op">));</span>  <span class="co">// inline 变长数据</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>关键优化在于<span class="op">**</span>偏移量是编译时常量<span class="op">**</span>。解释器每次做 `att_align_offset<span class="op">(</span>offset<span class="op">,</span> attalign<span class="op">)</span> <span class="op">+</span> attlen` 的动态计算，JIT 版本在 LLVM IR 生成时就把结果算好了，嵌入到机器指令中。</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 六、编译管线：Inline → Optimize → Emit</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>`llvm_compile_module<span class="op">()</span>` 是编译管线的核心，分三个阶段。</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 阶段 1：Inline（内联）</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>只在 `PGJIT_INLINE` flag 设置时执行。`llvm_inline<span class="op">()</span>` 将当前 module 中的函数调用替换为被调用函数的具体实现。内联由指令预算控制（默认 <span class="dv">150</span> 条指令），防止过度膨胀。PG 支持两种内联来源：</span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 内部函数的 bitcode（PG 核心中的 `int4eq`、`int4pl` 等操作符）。</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 扩展（Extension）提供的 bitcode（扩展需在编译时将 `<span class="op">.</span>c` 编译为 `<span class="op">.</span>bc` 并安装）。</span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>内联后的 bitcode 在 `jit_dump_bitcode <span class="op">=</span> on` 时写入文件 `<span class="op">&lt;</span>pid<span class="op">&gt;.&lt;</span>generation<span class="op">&gt;.</span>bc`。</span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 阶段 2：Optimize（优化）</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>`llvm_optimize_module<span class="op">()</span>` 根据 flags 选择优化管线：</span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `PGJIT_OPT3` 设置：运行 LLVM <span class="op">-</span>O3 管线，包括循环展开、向量化、全局值编号、指令合并等全套 pass。</span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `PGJIT_OPT3` 未设置：最小优化——仅运行 `mem2reg`（alloca 提升为 SSA 寄存器，这是 LLVM IR 必须的转换）和 Always<span class="op">-</span>Inliner pass。如果 `PGJIT_INLINE` 单独设置了但 `PGJIT_OPT3` 未设置，额外加上正常内联 pass。</span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>`mem2reg` 是必须运行的基础 pass——PG 生成的 LLVM IR 大量使用 `alloca` <span class="op">+</span> `store`<span class="op">/</span>`load` 模式（因为这样生成代码简单），`mem2reg` 将其转换为 LLVM 优化器能够理解的 SSA 形式。</span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>优化后的 bitcode 写入 `<span class="op">&lt;</span>pid<span class="op">&gt;.&lt;</span>generation<span class="op">&gt;.</span>optimized<span class="op">.</span>bc`。</span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 阶段 3：Emit（发射）</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a>优化完成后，module 被添加到 ORC JIT 的 JITDylib 中。在 LLVM <span class="op">&gt;</span> <span class="dv">11</span> 的 ORCv2 API 下，`LLVMOrcLLJITAddLLVMIRModule<span class="op">()</span>` 不会立即发射代码——真正的发射发生在第一次符号查找（`llvm_get_function<span class="op">()</span>` → `LLVMOrcLLJITLookup<span class="op">()</span>`）时。这意味着冷函数只生成 IR 但不发射机器码。</span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>发射阶段使用哪个 ORC 实例取决于 `PGJIT_OPT3`：opt3 路径使用 `llvm_opt3_orc`，否则使用 `llvm_opt0_orc`。</span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## LLVMContext 内存泄漏与对策</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>LLVM 的内联 pass 存在一个已知问题：结构等价但定义重复的类型会在 `LLVMContext` 中累积，导致多次编译后内存持续增长。PG <span class="dv">15</span> 通过一个启发式对策缓解：</span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LLVMJIT_LLVM_CONTEXT_REUSE_MAX </span><span class="dv">100</span></span></code></pre></div>
+            <p>每约 100 次查询后，PG 丢弃当前的
+            <code>LLVMContextRef</code>
+            并创建一个新实例，释放累积的类型引用。重新创建时需要重载
+            <code>llvmjit_types.bc</code>，有一定开销，但相比 OOM
+            风险是可以接受的。</p>
+            <hr />
+            <h2 id="七实验jit-加速效果的实际测量">七、实验：JIT
+            加速效果的实际测量</h2>
+            <h3 id="实验环境">实验环境</h3>
+            <table>
+            <colgroup>
+            <col style="width: 50%" />
+            <col style="width: 50%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>项目</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>PG 版本</td>
+            <td>17，<code>--with-llvm</code> 编译，LLVM 18</td>
+            </tr>
+            <tr>
+            <td>关键配置</td>
+            <td><code>shared_buffers=8GB</code>,
+            <code>work_mem=256MB</code></td>
+            </tr>
+            <tr>
+            <td>数据集</td>
+            <td>pgbench scale factor 100（约 1.5GB）、TPC-H scale factor
+            10（约 10GB）</td>
+            </tr>
+            <tr>
+            <td>CPU</td>
+            <td>Intel Xeon Gold 6338, 32 核</td>
+            </tr>
+            <tr>
+            <td>OS</td>
+            <td>Linux 6.8, ext4 on NVMe SSD</td>
+            </tr>
+            <tr>
+            <td>采样</td>
+            <td>预热后跑 5 轮取中位数</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="实验-1简单聚合jit-得不偿失">实验 1：简单聚合——JIT
+            得不偿失</h3>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 强制降低阈值以观察 JIT 开销</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> jit_above_cost <span class="op">=</span> <span class="dv">10</span>;</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">ON</span>)</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> pgbench_accounts;</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>输出：</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>JIT:</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>  <span class="kw">Functions</span>: <span class="dv">3</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  Options: Inlining <span class="kw">false</span>, Optimization <span class="kw">false</span>, Expressions <span class="kw">true</span>, Deforming <span class="kw">true</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>  Timing: Generation <span class="fl">1.259</span> ms, Inlining <span class="fl">0.000</span> ms, Optimization <span class="fl">0.797</span> ms,</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>          Emission <span class="fl">5.048</span> ms, Total <span class="fl">7.104</span> ms</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>Execution <span class="dt">Time</span>: <span class="fl">7.416</span> ms</span></code></pre></div>
+            <p>JIT 编译自身耗时 7.1ms，而查询本身的 SeqScan 只需要约
+            0.3ms。JIT 编译开销远超执行节省。这也解释了为什么默认
+            <code>jit_above_cost=100000</code>——绝大多数 OLTP
+            查询的计划代价远小于 10 万，不会触发 JIT。</p>
+            <h3 id="实验-2tpc-h-q1jit-大幅加速">实验 2：TPC-H Q1——JIT
+            大幅加速</h3>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- TPC-H Q1：多列聚合、复杂表达式、大量行扫描</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING) <span class="kw">SELECT</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    l_returnflag, l_linestatus,</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sum</span>(l_quantity), <span class="fu">sum</span>(l_extendedprice),</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sum</span>(l_extendedprice <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> l_discount)),</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sum</span>(l_extendedprice <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> l_discount) <span class="op">*</span> (<span class="dv">1</span> <span class="op">+</span> l_tax)),</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">avg</span>(l_quantity), <span class="fu">avg</span>(l_extendedprice), <span class="fu">avg</span>(l_discount),</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">count</span>(<span class="op">*</span>)</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> lineitem</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> l_shipdate <span class="op">&lt;=</span> <span class="dt">DATE</span> <span class="st">&#39;1998-12-01&#39;</span> <span class="op">-</span> <span class="dt">INTERVAL</span> <span class="st">&#39;90&#39;</span> <span class="dt">DAY</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> l_returnflag, l_linestatus</span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> l_returnflag, l_linestatus;</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>| 配置 | 执行时间 | JIT 编译时间 |</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|---------|-------------|</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>| `jit <span class="op">=</span> off` | <span class="fl">8.2</span>s | <span class="co">-- |</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>| `jit <span class="op">=</span> on`（默认阈值） | <span class="fl">4.1</span>s | ~<span class="dv">480</span>ms |</span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>JIT <span class="kw">EXPLAIN</span> 段：</span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>JIT:</span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>  <span class="kw">Functions</span>: <span class="dv">11</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>  Options: Inlining <span class="kw">true</span>, Optimization <span class="kw">true</span>, Expressions <span class="kw">true</span>, Deforming <span class="kw">true</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>  Timing: Generation <span class="fl">23.514</span> ms, Inlining <span class="fl">157.432</span> ms, Optimization <span class="fl">187.547</span> ms,</span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>          Emission <span class="fl">113.728</span> ms, Total <span class="fl">482.221</span> ms</span></code></pre></div>
+            <p>TPC-H Q1 有 6 个聚合表达式和 1 个 WHERE
+            过滤条件，扫描超过 500 万行。JIT 编译投入约 480ms，节省约
+            4.1s 的执行时间——加速约 2 倍。</p>
+            <h3 id="实验-3复杂-where表达式密集查询">实验 3：复杂
+            WHERE——表达式密集查询</h3>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> lineitem</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> l_extendedprice <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> l_discount) <span class="op">*</span> (<span class="dv">1</span> <span class="op">+</span> l_tax) <span class="op">&gt;</span> <span class="dv">50000</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l_quantity <span class="op">&gt;</span> <span class="dv">20</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l_shipdate <span class="kw">BETWEEN</span> <span class="st">&#39;1997-01-01&#39;</span> <span class="kw">AND</span> <span class="st">&#39;1997-12-31&#39;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l_linestatus <span class="op">=</span> <span class="st">&#39;O&#39;</span>;</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>| 配置 | 执行时间 | JIT 编译时间 |</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|---------|-------------|</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>| `jit <span class="op">=</span> off` | <span class="fl">1.8</span>s | <span class="co">-- |</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>| `jit <span class="op">=</span> on` | <span class="fl">0.9</span>s | ~<span class="dv">120</span>ms |</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>主要收益来自 <span class="kw">WHERE</span> 子句的表达式求值——`l_extendedprice <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> l_discount) <span class="op">*</span> (<span class="dv">1</span> <span class="op">+</span> l_tax)` 被编译成紧凑的运算序列，省去多次 `fmgr` 调用和 <span class="kw">opcode</span> 分发。</span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>### 实验 <span class="dv">4</span>：宽表 Tuple 变形</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建 50 列的表</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> wide_table <span class="kw">AS</span> <span class="kw">SELECT</span> <span class="op">..</span>.; <span class="co">-- 500 万行</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询只访问其中 10 列</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> col1, col2, col5, col10, col20, col30, col40</span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> wide_table <span class="kw">WHERE</span> col2 <span class="op">&gt;</span> <span class="dv">5000</span>;</span></code></pre></div>
+            <table>
+            <thead>
+            <tr>
+            <th>配置</th>
+            <th>执行时间</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>jit = off</code></td>
+            <td>1.24s</td>
+            </tr>
+            <tr>
+            <td><code>jit = on</code></td>
+            <td>0.89s</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>宽表的收益来自 Tuple 变形 JIT：50 列的表，即使只访问 10
+            列，解释器也要检查所有 50 列的 null bitmap 和偏移。JIT
+            版本直接生成”只变形访问到的 10 列”的专用函数。加速约
+            28%。</p>
+            <h3 id="实验-5io-瓶颈查询jit-无效">实验 5：I/O 瓶颈查询——JIT
+            无效</h3>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 从磁盘读取大量冷数据</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> large_table <span class="kw">WHERE</span> non_indexed_col <span class="op">=</span> <span class="st">&#39;rare_value&#39;</span>;</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- Buffers: shared read=45832  ← 数据不在 shared_buffers</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>当 <span class="dv">90</span>% 的执行时间花在 `IO<span class="op">/</span>DataFileRead` 等待上时，启用 JIT 不会有任何收益。CPU 在等 I<span class="op">/</span>O 完成，表达式求值不是瓶颈。</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>### JIT 收益总结</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>| 场景 | JIT 收益 | 原因 |</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|---------|------|</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>| 简单 OLTP 查询 | 负收益 | JIT 编译开销 <span class="op">&gt;</span> 执行时间的数倍 |</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>| 中等复杂度 <span class="op">+</span> 数据全在内存 | 适中（<span class="fl">1.2</span><span class="op">-</span><span class="fl">1.5</span>x） | JIT 缩短表达式求值时间 |</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>| 复杂表达式 <span class="op">+</span> 大量行 | 显著（<span class="fl">1.5</span><span class="op">-</span><span class="fl">2.5</span>x） | 编译优化的红利在大量迭代中摊薄 |</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>| I<span class="op">/</span>O 瓶颈查询 | 无收益 | CPU 在等磁盘，表达式求值不是瓶颈 |</span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>| 宽表扫描 | 明显（<span class="fl">1.2</span><span class="op">-</span><span class="fl">1.4</span>x） | Tuple 变形 JIT 消除列提取开销 |</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>## 八、运维考量：JIT 的适用边界与排查</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>### 何时应该关闭 JIT</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>OLTP 负载。<span class="op">**</span> 单次查询扫描几百到几千行，planner 估算代价通常在 <span class="dv">1000</span><span class="op">-</span><span class="dv">10000</span> 之间。默认 `jit_above_cost<span class="op">=</span><span class="dv">100000</span>` 已经让 JIT 不触发，不需要手动关闭。如果你把 `jit_above_cost` 设得过低（如 <span class="dv">100</span>），每个 OLTP 查询都触发 JIT，编译开销（<span class="dv">5</span><span class="op">-</span><span class="dv">50</span>ms）比执行时间还长。</span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>Prepared Statement 高频重复执行。<span class="op">**</span> JIT 编译的代码不跨查询缓存。如果同一个 prepared statement 每分钟执行 <span class="dv">1000</span> 次，每次都是新查询，每次都要重新 JIT 编译——编译开销重复发生。对这样的 <span class="kw">session</span> 设 `SET jit <span class="op">=</span> off` 更合理。</span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>内存受限环境。<span class="op">**</span> 每个查询的 JIT 编译产物在查询结束时释放，但编译过程中 LLVM 的 IR 生成和优化需要临时内存（通常几十 MB）。高并发下编译内存的叠加分配可能触发内存压力。每个 Backend 的 LLVM 静态开销（类型元数据、ORC JIT 实例）通常在 <span class="dv">2</span><span class="op">-</span><span class="dv">5</span>MB。</span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>### 确认 JIT 是否在工作</span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 方法 1：EXPLAIN 输出</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, VERBOSE) <span class="kw">SELECT</span> <span class="op">..</span>.;</span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a><span class="co">-- JIT 生效时，输出底部会有：</span></span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a><span class="co">-- JIT:</span></span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a><span class="co">--   Functions: 8</span></span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a><span class="co">--   Options: Inlining true, Optimization true, Expressions true, Deforming true</span></span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a><span class="co">--   Timing: Generation 12.345 ms, Inlining 3.456 ms, Optimization 45.678 ms,</span></span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a><span class="co">--           Emission 23.456 ms, Total 85.000 ms</span></span></code></pre></div>
+            <p><code>Functions</code> 表示本次查询编译了多少个 LLVM
+            函数。<code>Timing</code> 的 Total 如果超过执行时间的
+            20%，JIT 可能在这个查询上是净开销。</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 方法 2：对比 JIT on/off 的同一查询</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> jit <span class="op">=</span> <span class="kw">off</span>;</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">..</span>.;</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> jit <span class="op">=</span> <span class="kw">on</span>;</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, TIMING <span class="kw">OFF</span>) <span class="kw">SELECT</span> <span class="op">..</span>.;</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>如果 JIT<span class="op">=</span><span class="kw">on</span> 时间大于 JIT<span class="op">=</span><span class="kw">off</span> 时间，且负载以类似查询为主，考虑针对这类查询关闭 JIT。</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 方法 3：检查 JIT 是否可用</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> jit_available;  <span class="co">-- 返回 t/f</span></span></code></pre></div>
+            <h3 id="平台兼容性问题">平台兼容性问题</h3>
+            <p>LLVM JIT 依赖可执行内存映射（<code>mmap</code> with
+            <code>PROT_EXEC</code>）。以下环境中 JIT 可能不可用：</p>
+            <ul>
+            <li><strong>SELinux/AppArmor
+            限制</strong>：<code>execmem</code> 权限被禁止。PG
+            启动日志中会有
+            <code>could not allocate executable memory</code> 的
+            WARNING。</li>
+            <li><strong>Docker 默认 seccomp profile</strong>：某些默认
+            profile 禁用了 <code>mprotect</code> 的
+            <code>PROT_EXEC</code>，表现为 JIT
+            静默不工作（<code>jit=on</code> 但不产生
+            <code>Functions</code>）。</li>
+            <li><strong>ARM64 架构</strong>：PG 17 在 ARM64 上的 LLVM
+            JIT 已较成熟，但较早版本可能存在代码生成 bug。PG 12-14 在
+            ARM64 上的 JIT 稳定性有限，建议先在非生产环境验证。</li>
+            </ul>
+            <p>排查方法：检查 PG 启动日志中是否有 LLVM 相关的 WARNING 或
+            ERROR，以及在 EXPLAIN 输出中是否出现 <code>JIT:</code>
+            段。</p>
+            <h3 id="调试与性能分析工具">调试与性能分析工具</h3>
+            <table>
+            <colgroup>
+            <col style="width: 45%" />
+            <col style="width: 54%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>GUC</th>
+            <th>作用</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>jit = off</code></td>
+            <td>完全关闭 JIT，用于确认 JIT 是否带来了收益</td>
+            </tr>
+            <tr>
+            <td><code>jit_expressions = off</code></td>
+            <td>仅关闭表达式 JIT，保留 Tuple 变形 JIT</td>
+            </tr>
+            <tr>
+            <td><code>jit_tuple_deforming = off</code></td>
+            <td>仅关闭 Tuple 变形 JIT，保留表达式 JIT</td>
+            </tr>
+            <tr>
+            <td><code>jit_dump_bitcode = on</code></td>
+            <td>将 JIT 的 bitcode 写入文件，用于调试编译结果</td>
+            </tr>
+            <tr>
+            <td><code>jit_debugging_support = on</code></td>
+            <td>注册 GDB JIT 事件监听器，允许 GDB 理解 JIT 代码</td>
+            </tr>
+            <tr>
+            <td><code>jit_profiling_support = on</code></td>
+            <td>注册 perf JIT 事件监听器，允许 <code>perf</code> 解析
+            JIT 代码符号</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>jit_dump_bitcode</code> 生成的 <code>.bc</code>
+            文件可以用 <code>llvm-dis</code> 反汇编为文本 LLVM IR：</p>
+            <p><code>bash # 将 bitcode 反汇编为可读文本 llvm-dis 12345.0.bc -o 12345.0.ll</code>bash</p>
+            <h3 id="配置建议">配置建议</h3>
+            <table>
+            <colgroup>
+            <col style="width: 24%" />
+            <col style="width: 52%" />
+            <col style="width: 24%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>场景</th>
+            <th>推荐 JIT 配置</th>
+            <th>理由</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>纯 OLTP（如 Web 应用后端）</td>
+            <td><code>jit = off</code></td>
+            <td>JIT 几乎不会触发，关闭省下 LLVM 库加载的内存</td>
+            </tr>
+            <tr>
+            <td>混合负载（OLTP + 报表）</td>
+            <td>默认配置</td>
+            <td>报表查询会自动触发 JIT，OLTP 查询不会</td>
+            </tr>
+            <tr>
+            <td>纯 OLAP（数据仓库）</td>
+            <td>默认配置，或降低 <code>jit_above_cost</code> 到
+            50000</td>
+            <td>让更多中等查询受益</td>
+            </tr>
+            <tr>
+            <td>Prepared statement 高频重复执行</td>
+            <td>Session 级别 <code>SET jit = off</code></td>
+            <td>避免重复编译开销</td>
+            </tr>
+            <tr>
+            <td>内存 &lt; 4GB 的小实例</td>
+            <td><code>jit = off</code></td>
+            <td>LLVM 库本身占用 ~50MB + 编译临时内存</td>
+            </tr>
+            <tr>
+            <td>复杂表达式查询多但 I/O 不重</td>
+            <td>降低 <code>jit_above_cost</code> 到 50000</td>
+            <td>扩大 JIT 覆盖范围</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="九关键要点">九、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>JIT 是 OLAP 加速器，不是通用优化。</strong>
+            它把表达式求值和 Tuple
+            变形的热点路径从解释执行编译成原生机器码。对 CPU-bound
+            的长查询（计划代价 &gt; 100k，数据缓存在内存中）有 1.5x-2.5x
+            的加速；对 I/O-bound 查询或短查询有负收益。</p></li>
+            <li><p><strong>三级阈值独立控制编译深度。</strong>
+            <code>jit_above_cost</code> 是 JIT
+            的准入线，<code>jit_inline_above_cost</code>
+            控制函数内联，<code>jit_optimize_above_cost</code> 控制 LLVM
+            -O3 优化。决策发生在计划时，阈值与 planner
+            估算的总代价比较。</p></li>
+            <li><p><strong>惰性编译 + 一次性跳板。</strong>
+            表达式在第一次被求值时才触发 LLVM
+            编译，<code>ExecRunCompiledExpr</code>
+            作为跳板函数在第一次调用后替换为真实的编译函数指针。不提前编译未执行到的表达式。</p></li>
+            <li><p><strong>Tuple 变形 JIT 的价值常被低估。</strong>
+            它只变形实际需要的列，并且将列的固定属性（<code>attlen</code>、<code>attbyval</code>、<code>attalign</code>）折叠为编译时常量。宽表（多列）场景下加速明显。</p></li>
+            <li><p><strong>编译管线分三个阶段：Inline → Optimize →
+            Emit。</strong> 内联消除函数调用边界，优化将解释器风格的
+            <code>alloca</code>/<code>store</code>/<code>load</code>
+            转换为 SSA 形式，发射阶段使用 LLVM ORCv2 做 lazy
+            emission。</p></li>
+            <li><p><strong>LLVMContext 内存泄漏是已知陷阱。</strong> PG
+            通过约每 100 次查询后重建 <code>LLVMContextRef</code> 来应对
+            LLVM 内联 pass 中类型累积的问题，但高并发下 JIT
+            内存增长仍需关注。</p></li>
+            <li><p><strong>JIT 不缓存。</strong>
+            每个查询编译的机器码在查询结束时释放。Prepared statement
+            的高频重复执行需要关注重复编译开销，可考虑 session 级别关闭
+            JIT。</p></li>
+            </ol>
+            <p>上一章：<a
+            href="../12-executor/12-executor.html">执行器与表达式求值</a>
+            下一章：<a href="../14-btree/14-btree.html">B-Tree
+            索引</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/jit/jit.c</code>：Provider
+            无关基础设施，<code>jit_compile_expr()</code>，<code>provider_init()</code></li>
+            <li><code>src/backend/jit/llvm/llvmjit.c</code>：LLVM
+            Provider
+            核心——<code>llvm_session_initialize()</code>，<code>llvm_create_context()</code>，<code>llvm_compile_module()</code>，<code>llvm_optimize_module()</code>，<code>llvm_get_function()</code></li>
+            <li><code>src/backend/jit/llvm/llvmjit_expr.c</code>：表达式
+            JIT
+            编译——<code>llvm_compile_expr()</code>，<code>ExecRunCompiledExpr()</code>，<code>BuildV1Call()</code></li>
+            <li><code>src/backend/jit/llvm/llvmjit_deform.c</code>：Tuple
+            变形 JIT 编译——<code>slot_compile_deform()</code></li>
+            <li><code>src/backend/jit/llvm/llvmjit_inline.cpp</code>：函数内联支持</li>
+            <li><code>src/backend/jit/llvm/llvmjit_types.c</code>：类型元数据源文件，编译为
+            <code>llvmjit_types.bc</code></li>
+            <li><code>src/include/jit/jit.h</code>：<code>JitContext</code>、<code>JitProviderCallbacks</code>、PGJIT_*
+            flags</li>
+            <li><code>src/include/jit/llvmjit.h</code>：<code>LLVMJitContext</code>、所有类型声明</li>
+            <li><code>src/backend/executor/execExprInterp.c</code>：EEO
+            解释器 <code>ExecInterpExpr()</code></li>
+            <li><code>src/backend/executor/execMain.c</code>：<code>standard_ExecutorStart()</code>
+            中的 JIT 初始化</li>
+            <li><code>src/backend/utils/misc/guc_tables.c</code>：<code>jit_above_cost</code>、<code>jit_inline_above_cost</code>、<code>jit_optimize_above_cost</code>
+            的 GUC 定义</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 32: Just-in-Time
+            Compilation (JIT)（决策逻辑、配置参数、EXPLAIN 示例）</li>
+            <li>PostgreSQL Documentation, Section 19.17: Developer
+            Options（<code>jit_debugging_support</code>、<code>jit_dump_bitcode</code>
+            等调试 GUC）</li>
+            </ul>
+            <h3 id="关键提交">关键提交</h3>
+            <ul>
+            <li><code>2a0faed9d7</code> (Andres Freund, 2018-03):
+            Expression JIT compilation for LLVM JIT provider</li>
+            <li><code>32af96b2b1</code> (Andres Freund, 2018-03): JIT
+            tuple deforming in LLVM JIT provider</li>
+            <li><code>cc415a56d0</code> (Andres Freund, 2018-03): Basic
+            planner and executor integration for JIT</li>
+            <li><code>9dce22033d5</code> (Daniel Gustafsson, 2023-09):
+            Fix LLVMContext memory leak by periodically recreating
+            context</li>
+            </ul>
+            <h3 id="设计讨论">设计讨论</h3>
+            <ul>
+            <li>pgsql-hackers: “WIP: Faster Expression Processing and
+            Tuple Deforming (including JIT)” — Andres Freund
+            的原始设计提案</li>
+            <li>PGCon 2018: “JIT in PostgreSQL” (Andres Freund) — JIT
+            架构的整体介绍与性能评估</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/12-executor/12-executor.html">【PG 内核】执行器与表达式求值：从计划树到行数据的一趟流水</a></h3>
+                    <p>拆解 PostgreSQL 执行器的火山模型（ExecInitNode→ExecProcNode→ExecEndNode）、Hash Join 内存化实现、EEO 表达式求值的 opcode 编译与解释执行机制、TupleTableSlot 的三种数据承载方式（virtual/heap/minimal）。附带查询 hang 住的完整诊断路径：pg_stat_activity 的 wait_event + pg_blocking_pids() 追踪锁等待链 + EXPLAIN ANALYZE 计划行数与实际行数差异定位。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html">【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性</a></h3>
+                    <p>在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

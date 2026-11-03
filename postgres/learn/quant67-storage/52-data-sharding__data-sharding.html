@@ -1,0 +1,1586 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】数据分片策略 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="系统剖析分布式存储中的数据分片——哈希分片与范围分片的工程权衡、一致性哈希与虚拟节点、跳跃一致性哈希，以及分片策略在实际系统中的应用" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="data-sharding, consistent-hashing, range-partitioning, virtual-node, jump-hash, rendezvous-hash, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/52-data-sharding/data-sharding.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】数据分片策略" />
+    <meta property="og:description" content="系统剖析分布式存储中的数据分片——哈希分片与范围分片的工程权衡、一致性哈希与虚拟节点、跳跃一致性哈希，以及分片策略在实际系统中的应用" />
+    <meta property="og:url" content="https://quant67.com/post/storage/52-data-sharding/data-sharding.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="data-sharding" />
+    <meta property="article:tag" content="consistent-hashing" />
+    <meta property="article:tag" content="range-partitioning" />
+    <meta property="article:tag" content="virtual-node" />
+    <meta property="article:tag" content="jump-hash" />
+    <meta property="article:tag" content="rendezvous-hash" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】数据分片策略" />
+    <meta name="twitter:description" content="系统剖析分布式存储中的数据分片——哈希分片与范围分片的工程权衡、一致性哈希与虚拟节点、跳跃一致性哈希，以及分片策略在实际系统中的应用" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】数据分片策略", "description": "系统剖析分布式存储中的数据分片——哈希分片与范围分片的工程权衡、一致性哈希与虚拟节点、跳跃一致性哈希，以及分片策略在实际系统中的应用", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/52-data-sharding/data-sharding.html"}, "datePublished": "2025-09-30T00:00:00+00:00", "dateModified": "2026-04-15T12:25:54+00:00", "keywords": ["data-sharding", "consistent-hashing", "range-partitioning", "virtual-node", "jump-hash", "rendezvous-hash"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】数据分片策略</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-30</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#data-sharding</span> <span>#consistent-hashing</span> <span>#range-partitioning</span> <span>#virtual-node</span> <span>#jump-hash</span> <span>#rendezvous-hash</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/51-object-performance/object-performance.html">上一篇：【存储工程】对象存储性能工程</a><a class="post-series-nav__link" href="/post/storage/53-replication/replication.html">下一篇：【存储工程】副本与复制策略</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/data-sharding.html">#data-sharding</a><a class="chip-link" href="/tags/consistent-hashing.html">#consistent-hashing</a><a class="chip-link" href="/tags/range-partitioning.html">#range-partitioning</a><a class="chip-link" href="/tags/virtual-node.html">#virtual-node</a><a class="chip-link" href="/tags/jump-hash.html">#jump-hash</a><a class="chip-link" href="/tags/rendezvous-hash.html">#rendezvous-hash</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一分片的工程动机"
+                id="toc-一分片的工程动机">一、分片的工程动机</a>
+                <ul>
+                <li><a href="#为什么需要分片"
+                id="toc-为什么需要分片">1.1 为什么需要分片</a></li>
+                <li><a href="#分片的核心问题"
+                id="toc-分片的核心问题">1.2 分片的核心问题</a></li>
+                <li><a href="#分片与分区的术语约定"
+                id="toc-分片与分区的术语约定">1.3
+                分片与分区的术语约定</a></li>
+                </ul></li>
+                <li><a href="#二哈希分片"
+                id="toc-二哈希分片">二、哈希分片</a>
+                <ul>
+                <li><a href="#取模哈希" id="toc-取模哈希">2.1
+                取模哈希</a></li>
+                <li><a href="#取模哈希的扩容灾难"
+                id="toc-取模哈希的扩容灾难">2.2
+                取模哈希的扩容灾难</a></li>
+                <li><a href="#热点问题" id="toc-热点问题">2.3
+                热点问题</a></li>
+                </ul></li>
+                <li><a href="#三范围分片"
+                id="toc-三范围分片">三、范围分片</a>
+                <ul>
+                <li><a href="#基本原理" id="toc-基本原理">3.1
+                基本原理</a></li>
+                <li><a href="#分片边界的选择"
+                id="toc-分片边界的选择">3.2 分片边界的选择</a></li>
+                <li><a href="#分裂与合并的工程细节"
+                id="toc-分裂与合并的工程细节">3.3
+                分裂与合并的工程细节</a></li>
+                <li><a href="#范围分片的热点"
+                id="toc-范围分片的热点">3.4 范围分片的热点</a></li>
+                </ul></li>
+                <li><a href="#四一致性哈希与虚拟节点"
+                id="toc-四一致性哈希与虚拟节点">四、一致性哈希与虚拟节点</a>
+                <ul>
+                <li><a href="#一致性哈希的基本思想"
+                id="toc-一致性哈希的基本思想">4.1
+                一致性哈希的基本思想</a></li>
+                <li><a href="#扩容时的迁移量"
+                id="toc-扩容时的迁移量">4.2 扩容时的迁移量</a></li>
+                <li><a href="#数据倾斜与虚拟节点"
+                id="toc-数据倾斜与虚拟节点">4.3
+                数据倾斜与虚拟节点</a></li>
+                <li><a href="#一致性哈希的工程局限"
+                id="toc-一致性哈希的工程局限">4.4
+                一致性哈希的工程局限</a></li>
+                </ul></li>
+                <li><a href="#五跳跃一致性哈希jump-consistent-hash"
+                id="toc-五跳跃一致性哈希jump-consistent-hash">五、跳跃一致性哈希（Jump
+                Consistent Hash）</a>
+                <ul>
+                <li><a href="#算法原理" id="toc-算法原理">5.1
+                算法原理</a></li>
+                <li><a href="#核心特性" id="toc-核心特性">5.2
+                核心特性</a></li>
+                <li><a href="#局限与适用场景"
+                id="toc-局限与适用场景">5.3 局限与适用场景</a></li>
+                </ul></li>
+                <li><a href="#六会合哈希rendezvous-hashing"
+                id="toc-六会合哈希rendezvous-hashing">六、会合哈希（Rendezvous
+                Hashing）</a>
+                <ul>
+                <li><a href="#算法思想" id="toc-算法思想">6.1
+                算法思想</a></li>
+                <li><a href="#核心特性-1" id="toc-核心特性-1">6.2
+                核心特性</a></li>
+                <li><a href="#性能代价与优化"
+                id="toc-性能代价与优化">6.3 性能代价与优化</a></li>
+                </ul></li>
+                <li><a href="#七crush-算法ceph-的分片策略"
+                id="toc-七crush-算法ceph-的分片策略">七、CRUSH
+                算法（Ceph 的分片策略）</a>
+                <ul>
+                <li><a href="#crush-的设计目标"
+                id="toc-crush-的设计目标">7.1 CRUSH 的设计目标</a></li>
+                <li><a href="#crush-map-与集群拓扑"
+                id="toc-crush-map-与集群拓扑">7.2 CRUSH Map
+                与集群拓扑</a></li>
+                <li><a href="#crush-放置规则"
+                id="toc-crush-放置规则">7.3 CRUSH 放置规则</a></li>
+                <li><a href="#crush-的哈希选择过程"
+                id="toc-crush-的哈希选择过程">7.4 CRUSH
+                的哈希选择过程</a></li>
+                <li><a href="#crush-的工程代价"
+                id="toc-crush-的工程代价">7.5 CRUSH 的工程代价</a></li>
+                </ul></li>
+                <li><a href="#八分片在实际系统中的应用"
+                id="toc-八分片在实际系统中的应用">八、分片在实际系统中的应用</a>
+                <ul>
+                <li><a href="#cassandra一致性哈希-虚拟节点"
+                id="toc-cassandra一致性哈希-虚拟节点">8.1
+                Cassandra：一致性哈希 + 虚拟节点</a></li>
+                <li><a href="#tikv范围分片-raft-组"
+                id="toc-tikv范围分片-raft-组">8.2 TiKV：范围分片 + Raft
+                组</a></li>
+                <li><a href="#kafka固定分区-键哈希"
+                id="toc-kafka固定分区-键哈希">8.3 Kafka：固定分区 +
+                键哈希</a></li>
+                <li><a href="#mongodb范围分片与哈希分片并存"
+                id="toc-mongodb范围分片与哈希分片并存">8.4
+                MongoDB：范围分片与哈希分片并存</a></li>
+                <li><a href="#实际系统分片策略对比"
+                id="toc-实际系统分片策略对比">8.5
+                实际系统分片策略对比</a></li>
+                </ul></li>
+                <li><a href="#九分片策略选型指南"
+                id="toc-九分片策略选型指南">九、分片策略选型指南</a>
+                <ul>
+                <li><a href="#决策树" id="toc-决策树">9.1
+                决策树</a></li>
+                <li><a href="#关键权衡维度" id="toc-关键权衡维度">9.2
+                关键权衡维度</a></li>
+                <li><a href="#工程建议" id="toc-工程建议">9.3
+                工程建议</a></li>
+                <li><a href="#一个完整的实践案例为订单系统选择分片策略"
+                id="toc-一个完整的实践案例为订单系统选择分片策略">9.4
+                一个完整的实践案例：为订单系统选择分片策略</a></li>
+                </ul></li>
+                <li><a href="#十参考文献"
+                id="toc-十参考文献">十、参考文献</a>
+                <ul>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#官方文档与技术资料"
+                id="toc-官方文档与技术资料">官方文档与技术资料</a></li>
+                <li><a href="#源码参考"
+                id="toc-源码参考">源码参考</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>当单节点的存储容量或吞吐量无法满足需求时，数据分片（Data
+            Sharding）是最基本的横向扩展手段。分片的核心问题只有一个：给定一条数据，它应该放到哪个节点上？这个问题看似简单，但不同的回答方式会导致截然不同的工程后果——数据倾斜（Data
+            Skew）、扩容时的数据迁移量、范围查询的支持能力、故障恢复的复杂度，全部取决于分片策略的选择。</p>
+            <p>本文从分片的工程动机出发，逐一剖析哈希分片、范围分片、一致性哈希（Consistent
+            Hashing）、跳跃一致性哈希（Jump Consistent
+            Hash）、会合哈希（Rendezvous Hashing）和 CRUSH
+            算法，最后对比这些策略在 Cassandra、TiKV、Kafka、MongoDB
+            等实际系统中的应用。讨论的重点不是算法推导，而是每种策略在工程实践中的取舍和陷阱。</p>
+            <hr />
+            <h2 id="一分片的工程动机">一、分片的工程动机</h2>
+            <h3 id="为什么需要分片">1.1 为什么需要分片</h3>
+            <p>分布式存储系统面临三个基本矛盾：</p>
+            <p><strong>容量矛盾</strong>。单块磁盘的容量上限是确定的——一块企业级
+            SSD 通常在 4-16 TB，即使使用 HDD 也不过 20-24
+            TB。当数据量增长到 PB
+            级别时，单节点无法承载全部数据，必须将数据分散到多个节点上。</p>
+            <p><strong>吞吐矛盾</strong>。即使容量够用，单节点的 IOPS
+            和带宽也有上限。一块 NVMe SSD 的随机读 IOPS 大约在 100
+            万左右，顺序写吞吐约 3-6
+            GB/s。当并发请求量超过单节点能力时，必须将负载分散。</p>
+            <p><strong>可用性矛盾</strong>。单节点是单点故障（Single
+            Point of
+            Failure）。分片本身不直接解决可用性问题——那是副本（Replication）的工作——但分片是副本策略的前提。没有分片就没有数据单元的边界，副本也无从谈起。</p>
+            <h3 id="分片的核心问题">1.2 分片的核心问题</h3>
+            <p>分片策略需要回答以下问题：</p>
+            <ol type="1">
+            <li><strong>映射函数</strong>：给定一个键（Key），如何计算它所属的分片编号？</li>
+            <li><strong>负载均衡</strong>：数据和请求是否能均匀分布到各个节点？</li>
+            <li><strong>扩缩容成本</strong>：增加或移除节点时，需要迁移多少数据？</li>
+            <li><strong>查询支持</strong>：是否支持范围查询（Range
+            Query）和有序扫描（Ordered Scan）？</li>
+            <li><strong>元数据开销</strong>：分片映射表需要多大的存储空间？客户端如何获取最新映射？</li>
+            </ol>
+            <p>没有一种分片策略能在所有维度上都最优。哈希分片天然均匀但丧失数据局部性（Data
+            Locality），范围分片保留有序性但容易产生热点（Hotspot），一致性哈希减少扩容迁移量但引入了虚拟节点（Virtual
+            Node）的管理复杂度。后续各节逐一展开。</p>
+            <h3 id="分片与分区的术语约定">1.3 分片与分区的术语约定</h3>
+            <p>“分片”和”分区（Partitioning）“在不同系统中的含义不完全一致。本文采用以下约定：</p>
+            <table>
+            <colgroup>
+            <col style="width: 33%" />
+            <col style="width: 33%" />
+            <col style="width: 33%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>术语</th>
+            <th>含义</th>
+            <th>举例</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>分片（Shard）</td>
+            <td>数据被拆分后的一个逻辑子集</td>
+            <td>MongoDB 的 shard</td>
+            </tr>
+            <tr>
+            <td>分区（Partition）</td>
+            <td>与分片含义相同，侧重逻辑划分</td>
+            <td>Kafka 的 partition</td>
+            </tr>
+            <tr>
+            <td>节点（Node）</td>
+            <td>物理或虚拟的存储服务器</td>
+            <td>一台服务器或一个容器</td>
+            </tr>
+            <tr>
+            <td>副本（Replica）</td>
+            <td>同一分片的冗余拷贝</td>
+            <td>Cassandra 的 replica</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>在本文中，“分片”和”分区”可以互换使用，不做语义区分。</p>
+            <hr />
+            <h2 id="二哈希分片">二、哈希分片</h2>
+            <h3 id="取模哈希">2.1 取模哈希</h3>
+            <p>最朴素的哈希分片策略是取模哈希（Modular Hashing）：</p>
+            <pre class="text"><code>shard_id = hash(key) % N</code></pre>
+            <p>其中 <code>N</code> 是节点数量，<code>hash</code>
+            是一个哈希函数。给定相同的 <code>key</code> 和
+            <code>N</code>，映射结果是确定的，客户端可以独立计算目标节点，不依赖中心化的路由表。</p>
+            <p>用 Python 实现一个简单的取模分片：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> modular_shard(key: <span class="bu">str</span>, num_nodes: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;取模哈希分片：返回分片编号&quot;&quot;&quot;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    digest <span class="op">=</span> hashlib.md5(key.encode()).hexdigest()</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    hash_value <span class="op">=</span> <span class="bu">int</span>(digest, <span class="dv">16</span>)</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> hash_value <span class="op">%</span> num_nodes</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 10 个节点，观察 key 的分布</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>num_nodes <span class="op">=</span> <span class="dv">10</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>keys <span class="op">=</span> [<span class="ss">f&quot;user:</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">10000</span>)]</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>distribution <span class="op">=</span> [<span class="dv">0</span>] <span class="op">*</span> num_nodes</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> k <span class="kw">in</span> keys:</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    shard <span class="op">=</span> modular_shard(k, num_nodes)</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    distribution[shard] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i, count <span class="kw">in</span> <span class="bu">enumerate</span>(distribution):</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Node </span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">: </span><span class="sc">{</span>count<span class="sc">}</span><span class="ss"> keys (</span><span class="sc">{</span>count<span class="op">/</span><span class="dv">100</span><span class="sc">:.1f}</span><span class="ss">%)&quot;</span>)</span></code></pre></div>
+            <pre class="text"><code>Node 0: 1007 keys (10.1%)
+Node 1: 1015 keys (10.2%)
+Node 2: 988 keys (9.9%)
+Node 3: 1006 keys (10.1%)
+Node 4: 983 keys (9.8%)
+Node 5: 1012 keys (10.1%)
+Node 6: 999 keys (10.0%)
+Node 7: 990 keys (9.9%)
+Node 8: 1003 keys (10.0%)
+Node 9: 997 keys (10.0%)</code></pre>
+            <p>数据分布非常均匀。取模哈希的优势在于实现极简、计算快、分布均匀。但它有一个致命缺陷。</p>
+            <h3 id="取模哈希的扩容灾难">2.2 取模哈希的扩容灾难</h3>
+            <p>当节点数从 <code>N</code> 变为 <code>N+1</code>
+            时，几乎所有 key 的分片归属都会改变。考虑 <code>N=10</code>
+            扩容到 <code>N=11</code>：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> migration_ratio(num_keys: <span class="bu">int</span>, old_n: <span class="bu">int</span>, new_n: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">float</span>:</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;计算扩容时需要迁移的数据比例&quot;&quot;&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    migrated <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(num_keys):</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>        key <span class="op">=</span> <span class="ss">f&quot;key:</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>        old_shard <span class="op">=</span> modular_shard(key, old_n)</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        new_shard <span class="op">=</span> modular_shard(key, new_n)</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> old_shard <span class="op">!=</span> new_shard:</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>            migrated <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> migrated <span class="op">/</span> num_keys</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>ratio <span class="op">=</span> migration_ratio(<span class="dv">100000</span>, <span class="dv">10</span>, <span class="dv">11</span>)</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;迁移比例: </span><span class="sc">{</span>ratio<span class="sc">:.1%}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+            <pre class="text"><code>迁移比例: 90.9%</code></pre>
+            <p>增加一个节点就要迁移约 90% 的数据。理论上，取模哈希从
+            <code>N</code> 扩容到 <code>N+1</code> 时的迁移比例约为
+            <code>N/(N+1)</code>，节点越多，迁移比例越接近
+            100%。这在生产环境中是不可接受的——迁移期间的网络带宽消耗、服务降级和数据不一致风险都会被放大。</p>
+            <h3 id="热点问题">2.3 热点问题</h3>
+            <p>即使哈希函数能把 key
+            均匀分散，也不代表负载是均匀的。热点问题来源于两个层面：</p>
+            <p><strong>数据量倾斜</strong>。某些 key 对应的数据比其他
+            key
+            大得多。例如在社交网络中，一个拥有千万粉丝的用户的粉丝列表和一个普通用户的粉丝列表，数据量可能差几个数量级。哈希分片只保证
+            key 的数量均匀，不保证数据量均匀。</p>
+            <p><strong>访问量倾斜</strong>。某些 key
+            的访问频率远高于其他
+            key。一条爆款新闻的阅读量可能是普通新闻的一万倍。即使这条新闻的数据只有几
+            KB，集中的访问也会把对应节点打满。</p>
+            <p>哈希分片对热点问题没有内在的解决机制。常见的缓解手段包括：在热点
+            key 后面追加随机后缀（Key
+            Salting）将负载分散到多个分片，或者在分片之上增加缓存层。但这些都是应用层的补丁，不是分片策略本身的能力。</p>
+            <hr />
+            <h2 id="三范围分片">三、范围分片</h2>
+            <h3 id="基本原理">3.1 基本原理</h3>
+            <p>范围分片（Range Partitioning）将 key
+            空间按照某种有序规则切分为连续的区间，每个区间对应一个分片。典型的做法是维护一张分片映射表：</p>
+            <pre class="text"><code>分片 1: [&quot;&quot;       , &quot;customer:00500&quot;)
+分片 2: [&quot;customer:00500&quot;, &quot;customer:01000&quot;)
+分片 3: [&quot;customer:01000&quot;, &quot;customer:01500&quot;)
+分片 4: [&quot;customer:01500&quot;, &quot;customer:02000&quot;)
+分片 5: [&quot;customer:02000&quot;, +∞)</code></pre>
+            <p>给定一个
+            key，在映射表中做一次二分查找就能确定它属于哪个分片。</p>
+            <p>范围分片的最大优势是<strong>保留了 key
+            的有序性</strong>。以下查询可以高效执行：</p>
+            <ul>
+            <li>范围查询：<code>SELECT * FROM orders WHERE order_date BETWEEN '2025-01-01' AND '2025-01-31'</code></li>
+            <li>前缀扫描：获取某个用户的所有订单</li>
+            <li>有序遍历：按 key 顺序导出全部数据</li>
+            </ul>
+            <p>这些操作在哈希分片中要么需要扫描所有节点（Scatter-Gather），要么根本无法高效执行。</p>
+            <h3 id="分片边界的选择">3.2 分片边界的选择</h3>
+            <p>范围分片的关键难点在于如何确定分片边界（Split
+            Point）。常见的策略有三种：</p>
+            <p><strong>预设固定边界</strong>。在建表时就确定分片边界，之后不再变化。HBase
+            的预分区（Pre-splitting）就是这种做法。优点是简单，缺点是必须提前了解数据分布，选错了就会导致严重倾斜。</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode java"><code class="sourceCode java"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// HBase 预分区示例</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="dt">byte</span><span class="op">[][]</span> splitKeys <span class="op">=</span> <span class="kw">new</span> <span class="dt">byte</span><span class="op">[][]</span> <span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    Bytes<span class="op">.</span><span class="fu">toBytes</span><span class="op">(</span><span class="st">&quot;customer:00500&quot;</span><span class="op">),</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    Bytes<span class="op">.</span><span class="fu">toBytes</span><span class="op">(</span><span class="st">&quot;customer:01000&quot;</span><span class="op">),</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    Bytes<span class="op">.</span><span class="fu">toBytes</span><span class="op">(</span><span class="st">&quot;customer:01500&quot;</span><span class="op">),</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    Bytes<span class="op">.</span><span class="fu">toBytes</span><span class="op">(</span><span class="st">&quot;customer:02000&quot;</span><span class="op">)</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>admin<span class="op">.</span><span class="fu">createTable</span><span class="op">(</span>tableDesc<span class="op">,</span> splitKeys<span class="op">);</span></span></code></pre></div>
+            <p><strong>自动分裂与合并</strong>。当一个分片的数据量超过阈值时自动分裂（Split）为两个分片，数据量过小时与相邻分片合并（Merge）。TiKV
+            采用这种策略，默认的分片（Region）大小上限是 144
+            MB（从早期的 96 MB 调整而来），超过就触发分裂。</p>
+            <p><strong>采样驱动</strong>。系统定期对数据进行采样，根据采样结果重新计算分片边界。MongoDB
+            的 Balancer 使用类似机制，通过统计每个分片的数据量和 chunk
+            数来决定是否迁移。</p>
+            <h3 id="分裂与合并的工程细节">3.3 分裂与合并的工程细节</h3>
+            <p>以 TiKV 的 Region
+            分裂为例，整个流程涉及多个组件协调：</p>
+            <pre class="text"><code>                     PD（调度中心）
+                    ┌──────────┐
+                    │ 分片映射表  │
+                    │ 调度决策   │
+                    └────┬─────┘
+                         │ 更新映射
+            ┌────────────┼────────────┐
+            ▼            ▼            ▼
+       ┌────────┐  ┌────────┐  ┌────────┐
+       │ TiKV-1 │  │ TiKV-2 │  │ TiKV-3 │
+       │Region A│  │Region B│  │Region C│
+       │[a, m)  │  │[m, t)  │  │[t, +∞) │
+       └────────┘  └────────┘  └────────┘
+
+Region B 超过大小阈值，触发分裂：
+
+       ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
+       │ TiKV-1 │  │ TiKV-2 │  │ TiKV-2 │  │ TiKV-3 │
+       │Region A│  │Region B│  │Region D│  │Region C│
+       │[a, m)  │  │[m, p)  │  │[p, t)  │  │[t, +∞) │
+       └────────┘  └────────┘  └────────┘  └────────┘</code></pre>
+            <p>分裂过程中有几个关键的工程约束：</p>
+            <ol type="1">
+            <li><strong>分裂点的选择</strong>。TiKV 不是简单地取中间
+            key，而是根据实际数据分布选择分裂点，避免分裂后两个 Region
+            大小差异过大。</li>
+            <li><strong>分裂期间的写入</strong>。分裂操作通过 Raft
+            日志同步到所有副本，在此过程中对 Region
+            的写入会短暂阻塞（通常在毫秒级）。</li>
+            <li><strong>元数据更新</strong>。分裂完成后需要向
+            PD（Placement Driver）上报新的 Region
+            信息，客户端会在下次请求时刷新路由缓存。</li>
+            </ol>
+            <p>合并的反向流程更复杂——需要确保两个相邻 Region
+            的所有副本都在同一组节点上，否则还需要先做副本迁移，这会引入额外的调度延迟。</p>
+            <h3 id="范围分片的热点">3.4 范围分片的热点</h3>
+            <p>范围分片最容易产生热点的场景是<strong>单调递增的
+            key</strong>。典型案例：</p>
+            <ul>
+            <li>时间戳作为 key 前缀：所有新写入都集中在最后一个分片</li>
+            <li>自增 ID：效果和时间戳类似</li>
+            <li>用户 ID 按注册顺序分配：新用户的写入集中在尾部分片</li>
+            </ul>
+            <p>解决思路通常是对 key 做变换。例如 HBase
+            中常见的做法是对行键（Row Key）做反转或加盐：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode java"><code class="sourceCode java"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 原始 key：时间戳在前，写入集中</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="bu">String</span> rowKey <span class="op">=</span> timestamp <span class="op">+</span> <span class="st">&quot;:&quot;</span> <span class="op">+</span> userId<span class="op">;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 优化方案 1：哈希前缀打散</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="bu">String</span> salt <span class="op">=</span> <span class="bu">String</span><span class="op">.</span><span class="fu">valueOf</span><span class="op">(</span>userId<span class="op">.</span><span class="fu">hashCode</span><span class="op">()</span> <span class="op">%</span> <span class="dv">16</span><span class="op">);</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="bu">String</span> rowKey <span class="op">=</span> salt <span class="op">+</span> <span class="st">&quot;:&quot;</span> <span class="op">+</span> timestamp <span class="op">+</span> <span class="st">&quot;:&quot;</span> <span class="op">+</span> userId<span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="co">// 优化方案 2：反转时间戳</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="bu">String</span> reversedTs <span class="op">=</span> <span class="bu">String</span><span class="op">.</span><span class="fu">valueOf</span><span class="op">(</span><span class="bu">Long</span><span class="op">.</span><span class="fu">MAX_VALUE</span> <span class="op">-</span> timestamp<span class="op">);</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="bu">String</span> rowKey <span class="op">=</span> reversedTs <span class="op">+</span> <span class="st">&quot;:&quot;</span> <span class="op">+</span> userId<span class="op">;</span></span></code></pre></div>
+            <p>但这些变换都以牺牲范围查询能力为代价——加盐之后，按时间范围查询就必须对所有盐值的分片做并行扫描。</p>
+            <hr />
+            <h2
+            id="四一致性哈希与虚拟节点">四、一致性哈希与虚拟节点</h2>
+            <h3 id="一致性哈希的基本思想">4.1 一致性哈希的基本思想</h3>
+            <p>一致性哈希（Consistent Hashing）由 Karger 等人在 1997
+            年的论文 <em>Consistent Hashing and Random Trees</em>
+            中提出。核心思想是将哈希空间组织为一个环（Hash
+            Ring），节点和数据都映射到环上的某个位置，数据归属于环上顺时针方向遇到的第一个节点。</p>
+            <pre class="text"><code>                    0
+                    │
+           Node D ──┤
+                    │
+        270 ────────┼──────── 90
+                    │
+                    ├── Node B
+                    │
+                   180
+                    │
+           Node A ──┤        Node C ──┤
+                    │                 │</code></pre>
+            <p>映射规则：从数据的哈希位置出发，沿顺时针方向找到的第一个节点就是它的归属节点。</p>
+            <p>用 Python 实现一致性哈希的核心逻辑：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> bisect</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> typing <span class="im">import</span> List, Optional</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> ConsistentHash:</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;一致性哈希环&quot;&quot;&quot;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>):</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>._ring: List[<span class="bu">int</span>] <span class="op">=</span> []       <span class="co"># 排序的哈希位置列表</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>._nodes: <span class="bu">dict</span>[<span class="bu">int</span>, <span class="bu">str</span>] <span class="op">=</span> {} <span class="co"># 哈希位置 -&gt; 节点名称</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> _hash(<span class="va">self</span>, key: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>        digest <span class="op">=</span> hashlib.sha256(key.encode()).hexdigest()</span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">int</span>(digest, <span class="dv">16</span>) <span class="op">%</span> (<span class="dv">2</span> <span class="op">**</span> <span class="dv">32</span>)</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> add_node(<span class="va">self</span>, node: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="va">None</span>:</span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>._hash(node)</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> h <span class="kw">not</span> <span class="kw">in</span> <span class="va">self</span>._nodes:</span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>._nodes[h] <span class="op">=</span> node</span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>            bisect.insort(<span class="va">self</span>._ring, h)</span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> remove_node(<span class="va">self</span>, node: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="va">None</span>:</span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>._hash(node)</span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> h <span class="kw">in</span> <span class="va">self</span>._nodes:</span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>            <span class="kw">del</span> <span class="va">self</span>._nodes[h]</span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>._ring.remove(h)</span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> get_node(<span class="va">self</span>, key: <span class="bu">str</span>) <span class="op">-&gt;</span> Optional[<span class="bu">str</span>]:</span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">not</span> <span class="va">self</span>._ring:</span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="va">None</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>._hash(key)</span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a>        idx <span class="op">=</span> bisect.bisect_right(<span class="va">self</span>._ring, h)</span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> idx <span class="op">==</span> <span class="bu">len</span>(<span class="va">self</span>._ring):</span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>            idx <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">self</span>._nodes[<span class="va">self</span>._ring[idx]]</span></code></pre></div>
+            <h3 id="扩容时的迁移量">4.2 扩容时的迁移量</h3>
+            <p>一致性哈希的关键优势在于扩缩容时只影响相邻节点。当新增一个节点
+            E 时，只有 E 的逆时针方向前一个节点的部分数据需要迁移到
+            E，其他节点完全不受影响。</p>
+            <p>理论上，<code>N</code> 个节点新增一个节点时的迁移比例约为
+            <code>1/(N+1)</code>——远好于取模哈希的
+            <code>N/(N+1)</code>。</p>
+            <p>对于同样从 10 个节点扩容到 11
+            个节点的场景，两种策略的迁移量差异如下：</p>
+            <pre class="text"><code>扩容迁移量对比（10000 个 key）：
+
+节点数变化    取模哈希迁移比例    一致性哈希迁移比例
+10 → 11      ~90.9%             ~9.1%
+100 → 101    ~99.0%             ~1.0%
+1000 → 1001  ~99.9%             ~0.1%</code></pre>
+            <p>节点数越多，一致性哈希的迁移量优势越明显。在千节点规模的集群中，新增一个节点只需迁移约
+            0.1% 的数据，而取模哈希则需要几乎全量重分布。</p>
+            <h3 id="数据倾斜与虚拟节点">4.3 数据倾斜与虚拟节点</h3>
+            <p>原始一致性哈希有一个严重的实际问题：当节点数较少时，数据分布极不均匀。三个节点可能出现一个节点承载
+            50% 数据、另一个只承载 15%
+            的情况。原因是每个节点只在环上占一个点，点的间距取决于哈希值的随机性，节点越少，偏差越大。</p>
+            <p>虚拟节点（Virtual Node，简称
+            vnode）是解决方案：每个物理节点在环上映射为多个虚拟节点。如果每个物理节点有
+            150 个虚拟节点，环上就有 <code>N * 150</code>
+            个点，统计均匀性大幅改善。</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> ConsistentHashWithVNodes:</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;带虚拟节点的一致性哈希&quot;&quot;&quot;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>, num_vnodes: <span class="bu">int</span> <span class="op">=</span> <span class="dv">150</span>):</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>._num_vnodes <span class="op">=</span> num_vnodes</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>._ring: List[<span class="bu">int</span>] <span class="op">=</span> []</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>._nodes: <span class="bu">dict</span>[<span class="bu">int</span>, <span class="bu">str</span>] <span class="op">=</span> {}</span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> _hash(<span class="va">self</span>, key: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>        digest <span class="op">=</span> hashlib.sha256(key.encode()).hexdigest()</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">int</span>(digest, <span class="dv">16</span>) <span class="op">%</span> (<span class="dv">2</span> <span class="op">**</span> <span class="dv">32</span>)</span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> add_node(<span class="va">self</span>, node: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="va">None</span>:</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="va">self</span>._num_vnodes):</span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>            vnode_key <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss">#vnode</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>            h <span class="op">=</span> <span class="va">self</span>._hash(vnode_key)</span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>._nodes[h] <span class="op">=</span> node</span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>            bisect.insort(<span class="va">self</span>._ring, h)</span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> remove_node(<span class="va">self</span>, node: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="va">None</span>:</span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="va">self</span>._num_vnodes):</span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>            vnode_key <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss">#vnode</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>            h <span class="op">=</span> <span class="va">self</span>._hash(vnode_key)</span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> h <span class="kw">in</span> <span class="va">self</span>._nodes:</span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>                <span class="kw">del</span> <span class="va">self</span>._nodes[h]</span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>                <span class="va">self</span>._ring.remove(h)</span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> get_node(<span class="va">self</span>, key: <span class="bu">str</span>) <span class="op">-&gt;</span> Optional[<span class="bu">str</span>]:</span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">not</span> <span class="va">self</span>._ring:</span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="va">None</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>._hash(key)</span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>        idx <span class="op">=</span> bisect.bisect_right(<span class="va">self</span>._ring, h)</span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> idx <span class="op">==</span> <span class="bu">len</span>(<span class="va">self</span>._ring):</span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a>            idx <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">self</span>._nodes[<span class="va">self</span>._ring[idx]]</span></code></pre></div>
+            <p>虚拟节点数量的选择需要权衡：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>虚拟节点数</th>
+            <th>负载标准差（5 节点）</th>
+            <th>环上总点数</th>
+            <th>查找时间复杂度</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>1</td>
+            <td>~40%</td>
+            <td>5</td>
+            <td>O(log 5)</td>
+            </tr>
+            <tr>
+            <td>10</td>
+            <td>~15%</td>
+            <td>50</td>
+            <td>O(log 50)</td>
+            </tr>
+            <tr>
+            <td>50</td>
+            <td>~7%</td>
+            <td>250</td>
+            <td>O(log 250)</td>
+            </tr>
+            <tr>
+            <td>150</td>
+            <td>~4%</td>
+            <td>750</td>
+            <td>O(log 750)</td>
+            </tr>
+            <tr>
+            <td>500</td>
+            <td>~2%</td>
+            <td>2500</td>
+            <td>O(log 2500)</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Cassandra 在早期版本中默认使用 256
+            个虚拟节点（<code>num_tokens: 256</code>），后来在 4.0
+            版本将默认值调整为
+            16，原因是虚拟节点数过多会导致流式修复（Streaming
+            Repair）和启动时间增加。这说明虚拟节点数不是越多越好——需要在负载均衡和运维成本之间找到平衡点。</p>
+            <h3 id="一致性哈希的工程局限">4.4 一致性哈希的工程局限</h3>
+            <p>虽然一致性哈希在理论上很优雅，但在实际系统中存在几个工程层面的不足：</p>
+            <p><strong>异构节点处理不自然</strong>。如果集群中有的节点配备了
+            NVMe SSD、有的还在用
+            HDD，我们希望高性能节点承担更多数据。虚拟节点可以通过给高性能节点分配更多
+            vnode
+            来实现，但调整比例时需要重新计算和迁移，操作不够灵活。</p>
+            <p><strong>元数据开销</strong>。每个虚拟节点都需要在环上记录一条映射关系。当集群有
+            1000 个物理节点、每个节点 256 个 vnode 时，环上有 256000
+            个条目。虽然内存占用不大（几
+            MB），但在节点变更时需要同步这些映射到所有客户端，增加了元数据管理的复杂度。</p>
+            <p><strong>副本放置约束难以表达</strong>。一致性哈希的顺时针选择规则无法直接表达”三个副本必须分布在不同机架”或”必须在不同可用区”这类拓扑感知（Topology-aware）的放置策略。虽然可以在选择时跳过不满足约束的节点，但实现起来不够优雅，且可能破坏负载均衡。</p>
+            <hr />
+            <h2
+            id="五跳跃一致性哈希jump-consistent-hash">五、跳跃一致性哈希（Jump
+            Consistent Hash）</h2>
+            <h3 id="算法原理">5.1 算法原理</h3>
+            <p>跳跃一致性哈希（Jump Consistent Hash）由 Google 的 John
+            Lamping 和 Eric Veach 在 2014 年的论文 <em>A Fast, Minimal
+            Memory, Consistent Hash Algorithm</em>
+            中提出。整个算法只有几行代码：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int32_t</span> jump_consistent_hash<span class="op">(</span><span class="dt">uint64_t</span> key<span class="op">,</span> <span class="dt">int32_t</span> num_buckets<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> b <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>j <span class="op">&lt;</span> num_buckets<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>        b <span class="op">=</span> j<span class="op">;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>        key <span class="op">=</span> key <span class="op">*</span> <span class="dv">2862933555777941757</span><span class="bu">ULL</span> <span class="op">+</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>        j <span class="op">=</span> <span class="op">(</span><span class="dt">int64_t</span><span class="op">)((</span>b <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> <span class="op">((</span><span class="dt">double</span><span class="op">)(</span><span class="dv">1</span><span class="bu">LL</span> <span class="op">&lt;&lt;</span> <span class="dv">31</span><span class="op">)</span> <span class="op">/</span> <span class="op">(</span><span class="dt">double</span><span class="op">)((</span>key <span class="op">&gt;&gt;</span> <span class="dv">33</span><span class="op">)</span> <span class="op">+</span> <span class="dv">1</span><span class="op">)));</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">(</span><span class="dt">int32_t</span><span class="op">)</span>b<span class="op">;</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>用 Python 实现同样的逻辑：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> jump_consistent_hash(key: <span class="bu">int</span>, num_buckets: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;跳跃一致性哈希：返回桶编号&quot;&quot;&quot;</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    b, j <span class="op">=</span> <span class="op">-</span><span class="dv">1</span>, <span class="dv">0</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> j <span class="op">&lt;</span> num_buckets:</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>        b <span class="op">=</span> j</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>        key <span class="op">=</span> ((key <span class="op">*</span> <span class="dv">2862933555777941757</span>) <span class="op">+</span> <span class="dv">1</span>) <span class="op">&amp;</span> <span class="bn">0xFFFFFFFFFFFFFFFF</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>        j <span class="op">=</span> <span class="bu">int</span>((b <span class="op">+</span> <span class="dv">1</span>) <span class="op">*</span> (<span class="bu">float</span>(<span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">31</span>) <span class="op">/</span> <span class="bu">float</span>((key <span class="op">&gt;&gt;</span> <span class="dv">33</span>) <span class="op">+</span> <span class="dv">1</span>)))</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> b</span></code></pre></div>
+            <h3 id="核心特性">5.2 核心特性</h3>
+            <p>跳跃一致性哈希有三个突出的优点：</p>
+            <p><strong>零内存开销</strong>。不需要维护任何数据结构——没有哈希环，没有虚拟节点表，只有一个纯函数。内存占用为
+            O(1)。</p>
+            <p><strong>完美均匀</strong>。不是”近似均匀”，是数学意义上的完美均匀。每个桶（Bucket）分到的
+            key 数量差异在统计噪声范围内。</p>
+            <p><strong>最小迁移</strong>。从 <code>N</code> 个桶扩容到
+            <code>N+1</code> 个桶时，恰好有 <code>1/(N+1)</code> 的 key
+            被迁移到新桶，这是理论最优值。</p>
+            <p>性能方面，<code>jump_consistent_hash</code>
+            的时间复杂度是 O(ln N)，在 1000 个桶的情况下大约需要 7
+            次循环迭代。</p>
+            <h3 id="局限与适用场景">5.3 局限与适用场景</h3>
+            <p>跳跃一致性哈希有两个硬限制：</p>
+            <p><strong>只支持尾部扩缩容</strong>。桶的编号必须是 0 到
+            N-1
+            的连续整数，只能从尾部添加或移除桶。不能移除中间的某个桶——比如你不能说”把
+            3
+            号桶下线”，只能移除编号最大的桶。这意味着它不适合需要任意节点上下线的场景。</p>
+            <p><strong>桶没有名称</strong>。算法返回的是一个整数编号，不是节点标识。需要额外维护编号到节点的映射。如果某个节点故障需要下线，不能直接移除对应的桶编号，只能替换该编号对应的节点。</p>
+            <p>这些特性决定了跳跃一致性哈希适合<strong>节点拓扑相对稳定、主要需求是横向扩容</strong>的场景：</p>
+            <ul>
+            <li>数据库代理层（Proxy）的路由：后端节点编号固定，主要操作是加新节点</li>
+            <li>缓存集群的分片：节点故障时用替代节点填充，而不是缩减桶数</li>
+            <li>负载均衡器的后端选择：Google
+            在内部的负载均衡中使用了这个算法</li>
+            </ul>
+            <hr />
+            <h2
+            id="六会合哈希rendezvous-hashing">六、会合哈希（Rendezvous
+            Hashing）</h2>
+            <h3 id="算法思想">6.1 算法思想</h3>
+            <p>会合哈希（Rendezvous
+            Hashing），也叫最高随机权重哈希（Highest Random
+            Weight，HRW），由 Thaler 和 Ravishankar 在 1998
+            年提出。思路很直接：对于每个
+            key，计算它与每个节点的”亲和度分数”，选择分数最高的节点。</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> rendezvous_hash(key: <span class="bu">str</span>, nodes: <span class="bu">list</span>[<span class="bu">str</span>]) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;会合哈希：返回亲和度最高的节点&quot;&quot;&quot;</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    best_node <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    best_score <span class="op">=</span> <span class="op">-</span><span class="dv">1</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> node <span class="kw">in</span> nodes:</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>        score_input <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>        digest <span class="op">=</span> hashlib.sha256(score_input.encode()).hexdigest()</span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>        score <span class="op">=</span> <span class="bu">int</span>(digest, <span class="dv">16</span>)</span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> score <span class="op">&gt;</span> best_score:</span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>            best_score <span class="op">=</span> score</span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>            best_node <span class="op">=</span> node</span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best_node</span></code></pre></div>
+            <h3 id="核心特性-1">6.2 核心特性</h3>
+            <p><strong>节点增删只影响最小范围</strong>。移除一个节点时，只有原本映射到该节点的
+            key 需要重新分配——它们会各自找到自己的次高分节点。其他 key
+            的归属完全不变。增加一个节点时，只有新节点成为某些 key
+            的最高分节点时，那些 key 才会迁移过来。迁移量是理论最优的
+            <code>1/(N+1)</code>。</p>
+            <p><strong>节点可以任意增删</strong>。不像跳跃一致性哈希要求桶编号连续，会合哈希的节点列表可以任意增减。移除中间的某个节点完全没有问题。</p>
+            <p><strong>天然支持权重</strong>。可以通过对不同节点的分数乘以权重系数来实现异构节点的负载分配：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> weighted_rendezvous_hash(key: <span class="bu">str</span>, nodes: <span class="bu">dict</span>[<span class="bu">str</span>, <span class="bu">float</span>]) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;加权会合哈希：nodes 是 {节点名: 权重} 的字典&quot;&quot;&quot;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>    best_node <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>    best_score <span class="op">=</span> <span class="op">-</span><span class="fl">1.0</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> node, weight <span class="kw">in</span> nodes.items():</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>        score_input <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>        digest <span class="op">=</span> hashlib.sha256(score_input.encode()).hexdigest()</span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>        raw_score <span class="op">=</span> <span class="bu">int</span>(digest, <span class="dv">16</span>) <span class="op">/</span> (<span class="dv">2</span> <span class="op">**</span> <span class="dv">256</span>)  <span class="co"># 归一化到 [0, 1)</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 用对数变换实现加权：-weight / ln(score)</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>        <span class="im">import</span> math</span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> raw_score <span class="op">&gt;</span> <span class="dv">0</span>:</span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>            weighted_score <span class="op">=</span> weight <span class="op">/</span> (<span class="op">-</span>math.log(raw_score))</span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>:</span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>            weighted_score <span class="op">=</span> <span class="bu">float</span>(<span class="st">&#39;inf&#39;</span>)</span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> weighted_score <span class="op">&gt;</span> best_score:</span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>            best_score <span class="op">=</span> weighted_score</span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a>            best_node <span class="op">=</span> node</span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best_node</span></code></pre></div>
+            <h3 id="性能代价与优化">6.3 性能代价与优化</h3>
+            <p>会合哈希的最大缺点是计算复杂度为
+            O(N)——每次查找都要遍历所有节点。当节点数量较小（几十到几百）时，这不是问题；但当节点数达到数千时，每次路由都要计算数千次哈希，开销不可忽略。</p>
+            <p>优化方向有两个：</p>
+            <p><strong>骨架哈希（Skeleton-based Rendezvous
+            Hashing）</strong>。将节点组织成树形结构，在每一层做会合哈希选择，将复杂度降低到
+            O(log N)。但实现复杂度大幅增加。</p>
+            <p><strong>分层会合哈希</strong>。先用一次哈希选择分组，再在组内做会合哈希。例如
+            1000 个节点分成 32 组，第一层在 32 个组中选择（32
+            次哈希），第二层在约 31 个节点中选择（31 次哈希），总共约 63
+            次哈希，远小于 1000 次。</p>
+            <p>在实践中，会合哈希最常见的应用场景是分布式缓存和 CDN
+            的节点选择——节点数量通常在几十到几百的范围内，O(N)
+            的复杂度完全可以接受。GitHub 的负载均衡系统 GLB
+            就使用了会合哈希。</p>
+            <hr />
+            <h2 id="七crush-算法ceph-的分片策略">七、CRUSH 算法（Ceph
+            的分片策略）</h2>
+            <h3 id="crush-的设计目标">7.1 CRUSH 的设计目标</h3>
+            <p>CRUSH（Controlled Replication Under Scalable Hashing）是
+            Ceph 存储系统的核心数据放置算法，由 Sage Weil 在 2006
+            年的论文 <em>CRUSH: Controlled, Scalable, Decentralized
+            Placement of Replicated Data</em> 中提出。</p>
+            <p>CRUSH
+            要解决的问题比单纯的分片更复杂：它不仅要决定数据放在哪个节点，还要同时处理副本放置、故障域隔离和异构硬件权重。具体来说，CRUSH
+            需要满足以下目标：</p>
+            <ol type="1">
+            <li><strong>去中心化</strong>。任何客户端都能独立计算数据位置，不依赖中心化的查表服务。</li>
+            <li><strong>拓扑感知</strong>。副本必须分布在不同的故障域（Failure
+            Domain）——不同机架、不同机柜、不同数据中心。</li>
+            <li><strong>权重支持</strong>。不同容量和性能的存储设备应该承担不同的数据量。</li>
+            <li><strong>稳定性</strong>。增减节点时，数据迁移量应该接近理论最小值。</li>
+            </ol>
+            <h3 id="crush-map-与集群拓扑">7.2 CRUSH Map 与集群拓扑</h3>
+            <p>CRUSH 用一棵层次化的树——CRUSH
+            Map——来描述集群的物理拓扑。树的叶子节点是 OSD（Object
+            Storage
+            Daemon，即实际的存储进程），非叶子节点表示故障域层次：</p>
+            <pre class="text"><code>root default
+├── datacenter dc1
+│   ├── rack rack1
+│   │   ├── host node1
+│   │   │   ├── osd.0  (weight: 3.64)
+│   │   │   └── osd.1  (weight: 3.64)
+│   │   └── host node2
+│   │       ├── osd.2  (weight: 7.28)
+│   │       └── osd.3  (weight: 7.28)
+│   └── rack rack2
+│       ├── host node3
+│       │   ├── osd.4  (weight: 3.64)
+│       │   └── osd.5  (weight: 3.64)
+│       └── host node4
+│           ├── osd.6  (weight: 7.28)
+│           └── osd.7  (weight: 7.28)
+└── datacenter dc2
+    └── ...</code></pre>
+            <p>权重（Weight）通常以 TB 为单位设定——一块 4 TB
+            的磁盘权重为 3.64（格式化后可用容量），一块 8 TB
+            的磁盘权重为 7.28。CRUSH
+            会按权重比例分配数据，确保大容量磁盘承担更多数据。</p>
+            <h3 id="crush-放置规则">7.3 CRUSH 放置规则</h3>
+            <p>CRUSH 通过放置规则（Placement
+            Rule）定义数据的放置策略。一条典型规则如下：</p>
+            <pre class="text"><code>rule replicated_rack {
+    id 0
+    type replicated
+    step take default
+    step chooseleaf firstn 0 type rack
+    step emit
+}</code></pre>
+            <p>这条规则的含义是：</p>
+            <ol type="1">
+            <li><code>take default</code>：从根节点 <code>default</code>
+            开始。</li>
+            <li><code>chooseleaf firstn 0 type rack</code>：选择 N
+            个不同的机架（<code>type rack</code>），在每个机架中选择一个叶子节点（OSD）。<code>firstn 0</code>
+            表示选择的数量等于副本数（由存储池配置决定）。</li>
+            <li><code>emit</code>：输出选择结果。</li>
+            </ol>
+            <p>如果副本数为 3，这条规则就会在三个不同机架中各选一个
+            OSD，保证任何一个机架整体故障都不会丢失数据。</p>
+            <h3 id="crush-的哈希选择过程">7.4 CRUSH 的哈希选择过程</h3>
+            <p>CRUSH
+            在每一层选择节点时使用的是一种确定性的伪随机算法。以
+            <code>straw2</code>（Ceph Hammer
+            版本后的默认桶类型）为例，选择过程如下：</p>
+            <pre class="text"><code>对于每个候选节点 i：
+    draw(i) = hash(pgid, attempt, i) * weight(i) 的对数变换
+选择 draw 值最大的节点</code></pre>
+            <p><code>straw2</code>
+            的名称来源于”抽签”比喻——每个候选节点抽一根”签”，签的长度由哈希值和权重共同决定，签最长的节点胜出。这种方式保证了：</p>
+            <ul>
+            <li>增减某个节点时，只有与该节点直接竞争的 key
+            会被重新分配</li>
+            <li>权重越大的节点”抽到长签”的概率越高，从而承担更多数据</li>
+            </ul>
+            <p>用 Python 演示 <code>straw2</code> 的选择逻辑：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> math</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> crush_straw2_select(pgid: <span class="bu">int</span>, candidates: <span class="bu">dict</span>[<span class="bu">str</span>, <span class="bu">float</span>]) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="co">    模拟 CRUSH straw2 选择算法</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="co">    candidates: {节点名: 权重}</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a><span class="co">    &quot;&quot;&quot;</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>    best_node <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>    best_draw <span class="op">=</span> <span class="op">-</span><span class="bu">float</span>(<span class="st">&#39;inf&#39;</span>)</span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> node, weight <span class="kw">in</span> candidates.items():</span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 计算哈希值</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a>        hash_input <span class="op">=</span> <span class="ss">f&quot;</span><span class="sc">{</span>pgid<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a>        digest <span class="op">=</span> hashlib.sha256(hash_input.encode()).hexdigest()</span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a>        hash_val <span class="op">=</span> <span class="bu">int</span>(digest, <span class="dv">16</span>) <span class="op">%</span> (<span class="dv">2</span> <span class="op">**</span> <span class="dv">32</span>)</span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 归一化到 (0, 1] 并做对数变换</span></span>
+<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a>        normalized <span class="op">=</span> (hash_val <span class="op">+</span> <span class="dv">1</span>) <span class="op">/</span> (<span class="dv">2</span> <span class="op">**</span> <span class="dv">32</span> <span class="op">+</span> <span class="dv">1</span>)</span>
+<span id="cb21-20"><a href="#cb21-20" aria-hidden="true" tabindex="-1"></a>        draw <span class="op">=</span> math.log(normalized) <span class="op">/</span> weight <span class="cf">if</span> weight <span class="op">&gt;</span> <span class="dv">0</span> <span class="cf">else</span> <span class="op">-</span><span class="bu">float</span>(<span class="st">&#39;inf&#39;</span>)</span>
+<span id="cb21-21"><a href="#cb21-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-22"><a href="#cb21-22" aria-hidden="true" tabindex="-1"></a>        <span class="co"># draw 值最大（最接近 0）的节点胜出</span></span>
+<span id="cb21-23"><a href="#cb21-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> draw <span class="op">&gt;</span> best_draw:</span>
+<span id="cb21-24"><a href="#cb21-24" aria-hidden="true" tabindex="-1"></a>            best_draw <span class="op">=</span> draw</span>
+<span id="cb21-25"><a href="#cb21-25" aria-hidden="true" tabindex="-1"></a>            best_node <span class="op">=</span> node</span>
+<span id="cb21-26"><a href="#cb21-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-27"><a href="#cb21-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> best_node</span></code></pre></div>
+            <h3 id="crush-的工程代价">7.5 CRUSH 的工程代价</h3>
+            <p>CRUSH
+            的强大来自于它的灵活性，但这也带来了工程复杂度：</p>
+            <p><strong>CRUSH Map 维护</strong>。每次增减
+            OSD、调整权重或修改故障域结构，都需要更新 CRUSH Map
+            并广播到所有客户端和 OSD。在大规模集群（数千个
+            OSD）中，CRUSH Map 本身可能有数十
+            KB，更新频率过高会增加网络开销。</p>
+            <p><strong>PG 数量规划</strong>。Ceph 在 CRUSH
+            之上还有一层放置组（Placement
+            Group，PG）的概念。数据先映射到 PG（通过哈希取模），再由
+            CRUSH 将 PG 映射到 OSD 组。PG
+            数量的选择直接影响负载均衡的粒度和恢复时的并行度。PG
+            过少导致数据倾斜，PG 过多导致内存和 peering 开销增大。Ceph
+            官方建议每个 OSD 承载 100-200 个 PG。</p>
+            <p><strong>数据迁移的可控性</strong>。虽然 CRUSH
+            的理论迁移量接近最优，但实际操作中，调整 CRUSH Map
+            可能触发大量 PG 的重新映射。Ceph 提供了
+            <code>osd_max_backfills</code>（默认值 1）和
+            <code>osd_recovery_max_active</code>（默认值
+            3）等参数来限制并发回填速率，避免恢复流量影响前台 I/O。</p>
+            <hr />
+            <h2
+            id="八分片在实际系统中的应用">八、分片在实际系统中的应用</h2>
+            <h3 id="cassandra一致性哈希-虚拟节点">8.1
+            Cassandra：一致性哈希 + 虚拟节点</h3>
+            <p>Cassandra
+            是一致性哈希在生产系统中最典型的应用。数据根据分区键（Partition
+            Key）的哈希值映射到 token 环上。每个节点负责环上一段连续的
+            token 范围。</p>
+            <p>关键设计决策：</p>
+            <ul>
+            <li><p><strong>分区器</strong>（Partitioner）。默认使用
+            <code>Murmur3Partitioner</code>，将 key 哈希为一个 64
+            位整数，token 范围是
+            <code>[-2^63, 2^63)</code>。早期版本使用的
+            <code>RandomPartitioner</code> 基于
+            MD5，性能较差，已不推荐使用。</p></li>
+            <li><p><strong>虚拟节点</strong>。Cassandra 3.x 默认
+            <code>num_tokens: 256</code>，每个节点在环上占 256
+            段。Cassandra 4.0 将默认值降低为
+            <code>num_tokens: 16</code>，并引入了一种新的 token
+            分配算法，在更少的 vnode
+            数下实现更好的均衡。这个调整的动机是减少跨节点的数据流式传输量和降低启动时间。</p></li>
+            <li><p><strong>副本放置</strong>。副本策略（Replication
+            Strategy）定义在 keyspace
+            层面。<code>NetworkTopologyStrategy</code>
+            支持多数据中心部署，在每个数据中心内沿 token
+            环顺时针选择不同机架上的节点作为副本。</p></li>
+            </ul>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># cassandra.yaml 中虚拟节点配置</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">num_tokens</span><span class="kw">:</span><span class="at"> </span><span class="dv">16</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="fu">allocate_tokens_for_local_replication_factor</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span></code></pre></div>
+            <h3 id="tikv范围分片-raft-组">8.2 TiKV：范围分片 + Raft
+            组</h3>
+            <p>TiKV 采用范围分片，将 key 空间划分为连续的 Region。每个
+            Region 默认大小上限 144 MB。Region
+            是调度和副本的基本单位——每个 Region 独立组成一个 Raft
+            组（Raft Group），通过 Raft 协议在多个 TiKV
+            节点上维护副本一致性。</p>
+            <p>关键设计决策：</p>
+            <ul>
+            <li><p><strong>Region 分裂</strong>。当一个 Region
+            的数据量超过阈值（<code>region-split-size</code>，默认 144
+            MB）或 key
+            数量超过阈值（<code>region-split-keys</code>，默认
+            1440000）时，自动从中间位置分裂为两个
+            Region。分裂点通过采样实际 key
+            分布来选择，而非简单取中点。</p></li>
+            <li><p><strong>Region 合并</strong>。当相邻的两个 Region
+            都小于 <code>region-merge-size</code>（默认 20 MB）且 key
+            数量少于 <code>region-merge-keys</code>（默认 200000）时，PD
+            会调度合并操作。合并操作需要两个 Region
+            的所有副本都在健康状态。</p></li>
+            <li><p><strong>热点调度</strong>。PD 会监控每个 Region
+            的读写流量，当检测到热点 Region 时，可以通过 Region
+            分裂（将热点 Region 拆成更细的粒度）和 Leader
+            转移（将读热点的 Leader 分散到不同节点）来缓解。</p></li>
+            </ul>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode toml"><code class="sourceCode toml"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># tikv.toml 中 Region 分片相关配置</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[coprocessor]</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a><span class="dt">region-split-size</span> <span class="op">=</span> <span class="st">&quot;144MB&quot;</span></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="dt">region-split-keys</span> <span class="op">=</span> <span class="dv">1440000</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="dt">region-max-size</span> <span class="op">=</span> <span class="st">&quot;144MB&quot;</span></span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a><span class="dt">region-max-keys</span> <span class="op">=</span> <span class="dv">1440000</span></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a><span class="kw">[raftstore]</span></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a><span class="dt">region-merge-size-diff</span> <span class="op">=</span> <span class="st">&quot;20MB&quot;</span></span></code></pre></div>
+            <h3 id="kafka固定分区-键哈希">8.3 Kafka：固定分区 +
+            键哈希</h3>
+            <p>Kafka
+            的分片策略相对简单：每个主题（Topic）在创建时指定分区（Partition）数量，之后分区数量通常不变（虽然可以增加，但不推荐，因为会破坏
+            key 到分区的映射关系）。</p>
+            <p>关键设计决策：</p>
+            <ul>
+            <li><p><strong>分区策略</strong>。默认的
+            <code>DefaultPartitioner</code> 行为：如果消息有 key，使用
+            <code>murmur2(key) % numPartitions</code>
+            决定目标分区；如果消息没有 key，使用粘性分区策略（Sticky
+            Partitioner），在一个批次内将消息发送到同一个分区，减少请求数。</p></li>
+            <li><p><strong>分区数不可减少</strong>。Kafka
+            不支持减少分区数，因为这会导致消费者组（Consumer
+            Group）的偏移量（Offset）语义混乱。只能增加分区数，但增加后带
+            key 的消息的路由会改变，可能导致同一个 key
+            的消息分散到不同分区，破坏顺序保证。</p></li>
+            <li><p><strong>分区再均衡</strong>。分区在 Broker
+            之间的分配由控制器（Controller）管理。当 Broker
+            增减时，需要手动或通过工具（如
+            <code>kafka-reassign-partitions.sh</code>）重新分配分区。KRaft
+            模式下的分区迁移流程与 ZooKeeper 模式基本一致。</p></li>
+            </ul>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode java"><code class="sourceCode java"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Kafka 生产者自定义分区器示例</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">class</span> OrderPartitioner <span class="kw">implements</span> Partitioner <span class="op">{</span></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">@Override</span></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">int</span> <span class="fu">partition</span><span class="op">(</span><span class="bu">String</span> topic<span class="op">,</span> <span class="bu">Object</span> key<span class="op">,</span> <span class="dt">byte</span><span class="op">[]</span> keyBytes<span class="op">,</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a>                         <span class="bu">Object</span> value<span class="op">,</span> <span class="dt">byte</span><span class="op">[]</span> valueBytes<span class="op">,</span> Cluster cluster<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a>        <span class="bu">List</span><span class="op">&lt;</span>PartitionInfo<span class="op">&gt;</span> partitions <span class="op">=</span> cluster<span class="op">.</span><span class="fu">partitionsForTopic</span><span class="op">(</span>topic<span class="op">);</span></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> numPartitions <span class="op">=</span> partitions<span class="op">.</span><span class="fu">size</span><span class="op">();</span></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>keyBytes <span class="op">==</span> <span class="kw">null</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb24-9"><a href="#cb24-9" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 无 key 时轮询</span></span>
+<span id="cb24-10"><a href="#cb24-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> ThreadLocalRandom<span class="op">.</span><span class="fu">current</span><span class="op">().</span><span class="fu">nextInt</span><span class="op">(</span>numPartitions<span class="op">);</span></span>
+<span id="cb24-11"><a href="#cb24-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-12"><a href="#cb24-12" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 有 key 时用 murmur2 哈希</span></span>
+<span id="cb24-13"><a href="#cb24-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> Utils<span class="op">.</span><span class="fu">toPositive</span><span class="op">(</span>Utils<span class="op">.</span><span class="fu">murmur2</span><span class="op">(</span>keyBytes<span class="op">))</span> <span class="op">%</span> numPartitions<span class="op">;</span></span>
+<span id="cb24-14"><a href="#cb24-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb24-15"><a href="#cb24-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="mongodb范围分片与哈希分片并存">8.4
+            MongoDB：范围分片与哈希分片并存</h3>
+            <p>MongoDB
+            同时支持范围分片和哈希分片，由用户在创建分片集合时选择。</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode javascript"><code class="sourceCode javascript"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 范围分片</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a>sh<span class="op">.</span><span class="fu">shardCollection</span>(<span class="st">&quot;mydb.orders&quot;</span><span class="op">,</span> { <span class="st">&quot;order_date&quot;</span><span class="op">:</span> <span class="dv">1</span> })</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 哈希分片</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a>sh<span class="op">.</span><span class="fu">shardCollection</span>(<span class="st">&quot;mydb.users&quot;</span><span class="op">,</span> { <span class="st">&quot;user_id&quot;</span><span class="op">:</span> <span class="st">&quot;hashed&quot;</span> })</span></code></pre></div>
+            <p>关键设计决策：</p>
+            <ul>
+            <li><p><strong>分片键不可修改</strong>。一旦选定分片键（Shard
+            Key），不能更改。MongoDB 5.0 引入了
+            <code>reshardCollection</code>
+            命令，允许更换分片键，但操作代价很大——需要将所有数据重新分发，在大集合上可能耗时数小时。</p></li>
+            <li><p><strong>Chunk
+            分裂与均衡</strong>。数据按分片键范围划分为 Chunk（默认最大
+            128 MB）。当 Chunk 超过阈值时自动分裂。Balancer 进程在后台将
+            Chunk 从”重”的分片迁移到”轻”的分片，目标是各分片的 Chunk
+            数量大致相等。</p></li>
+            <li><p><strong>Jumbo Chunk
+            问题</strong>。如果大量文档的分片键值相同，它们会被聚集在同一个
+            Chunk 中且无法分裂（因为分裂要求 Chunk
+            内至少有两个不同的分片键值）。这种”超大块”（Jumbo
+            Chunk）会导致该分片数据倾斜且无法通过均衡器迁移。避免 Jumbo
+            Chunk 的关键是选择高基数（High
+            Cardinality）的分片键。</p></li>
+            </ul>
+            <h3 id="实际系统分片策略对比">8.5 实际系统分片策略对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 15%" />
+            <col style="width: 28%" />
+            <col style="width: 15%" />
+            <col style="width: 17%" />
+            <col style="width: 23%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>Cassandra</th>
+            <th>TiKV</th>
+            <th>Kafka</th>
+            <th>MongoDB</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>分片策略</td>
+            <td>一致性哈希 + vnode</td>
+            <td>范围分片</td>
+            <td>固定分区 + 哈希</td>
+            <td>范围/哈希可选</td>
+            </tr>
+            <tr>
+            <td>分片粒度</td>
+            <td>token 范围</td>
+            <td>Region（144 MB）</td>
+            <td>Partition</td>
+            <td>Chunk（128 MB）</td>
+            </tr>
+            <tr>
+            <td>范围查询</td>
+            <td>不支持（跨分区 scatter）</td>
+            <td>原生支持</td>
+            <td>不适用</td>
+            <td>范围分片支持</td>
+            </tr>
+            <tr>
+            <td>自动分裂</td>
+            <td>N/A（vnode 固定）</td>
+            <td>支持</td>
+            <td>不支持</td>
+            <td>支持</td>
+            </tr>
+            <tr>
+            <td>扩容迁移量</td>
+            <td>约 1/(N+1)</td>
+            <td>按 Region 迁移</td>
+            <td>手动再分配</td>
+            <td>Balancer 自动</td>
+            </tr>
+            <tr>
+            <td>元数据管理</td>
+            <td>Gossip 协议同步</td>
+            <td>PD 集中管理</td>
+            <td>Controller 集中</td>
+            <td>Config Server</td>
+            </tr>
+            <tr>
+            <td>热点处理</td>
+            <td>key 加盐</td>
+            <td>Region 分裂 + Leader 转移</td>
+            <td>分区级</td>
+            <td>Balancer</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="九分片策略选型指南">九、分片策略选型指南</h2>
+            <h3 id="决策树">9.1 决策树</h3>
+            <p>选择分片策略时，可以按以下决策路径思考：</p>
+            <pre class="text"><code>需要范围查询吗？
+├── 是 → 范围分片
+│        ├── 数据量增长快、分布不可预测？ → 自动分裂（TiKV 模式）
+│        └── 数据分布已知、追求简单？ → 预设固定边界（HBase 模式）
+└── 否 → 哈希分片
+         ├── 节点拓扑稳定、追求极致性能？ → 跳跃一致性哈希
+         ├── 节点需要任意增删、需要权重？ → 会合哈希
+         ├── 需要拓扑感知和故障域隔离？ → CRUSH
+         └── 通用场景、生态成熟？ → 一致性哈希 + 虚拟节点</code></pre>
+            <h3 id="关键权衡维度">9.2 关键权衡维度</h3>
+            <table>
+            <colgroup>
+            <col style="width: 10%" />
+            <col style="width: 15%" />
+            <col style="width: 18%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            <col style="width: 11%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>取模哈希</th>
+            <th>一致性哈希</th>
+            <th>跳跃哈希</th>
+            <th>会合哈希</th>
+            <th>范围分片</th>
+            <th>CRUSH</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>实现复杂度</td>
+            <td>极低</td>
+            <td>中</td>
+            <td>低</td>
+            <td>低</td>
+            <td>高</td>
+            <td>高</td>
+            </tr>
+            <tr>
+            <td>负载均衡</td>
+            <td>均匀</td>
+            <td>依赖 vnode 数</td>
+            <td>完美均匀</td>
+            <td>均匀</td>
+            <td>依赖边界选择</td>
+            <td>依赖权重配置</td>
+            </tr>
+            <tr>
+            <td>扩容迁移量</td>
+            <td>N/(N+1)</td>
+            <td>1/(N+1)</td>
+            <td>1/(N+1)</td>
+            <td>1/(N+1)</td>
+            <td>按分片迁移</td>
+            <td>接近 1/(N+1)</td>
+            </tr>
+            <tr>
+            <td>缩容灵活性</td>
+            <td>任意</td>
+            <td>任意</td>
+            <td>仅尾部</td>
+            <td>任意</td>
+            <td>任意</td>
+            <td>任意</td>
+            </tr>
+            <tr>
+            <td>范围查询</td>
+            <td>不支持</td>
+            <td>不支持</td>
+            <td>不支持</td>
+            <td>不支持</td>
+            <td>支持</td>
+            <td>不支持</td>
+            </tr>
+            <tr>
+            <td>内存开销</td>
+            <td>O(1)</td>
+            <td>O(N * vnode)</td>
+            <td>O(1)</td>
+            <td>O(N)</td>
+            <td>O(分片数)</td>
+            <td>O(拓扑节点数)</td>
+            </tr>
+            <tr>
+            <td>拓扑感知</td>
+            <td>无</td>
+            <td>有限</td>
+            <td>无</td>
+            <td>无</td>
+            <td>无</td>
+            <td>原生支持</td>
+            </tr>
+            <tr>
+            <td>异构权重</td>
+            <td>不支持</td>
+            <td>vnode 近似</td>
+            <td>不支持</td>
+            <td>原生支持</td>
+            <td>不直接相关</td>
+            <td>原生支持</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="工程建议">9.3 工程建议</h3>
+            <p><strong>大多数场景下，一致性哈希 +
+            虚拟节点是最稳妥的选择</strong>。它的生态最成熟，各种语言都有生产级实现，运维经验也最丰富。虚拟节点数推荐从
+            16-32 开始，根据实际的负载均衡效果再调整。</p>
+            <p><strong>如果系统的核心查询模式是范围扫描，范围分片是唯一的选择</strong>。此时要重点关注分片键的设计——避免单调递增、确保高基数、考虑查询模式和写入模式的平衡。TiKV
+            的自动分裂合并模式在大多数场景下比手动预分区更省心，但需要一个可靠的调度中心（PD）。</p>
+            <p><strong>跳跃一致性哈希适合内部基础设施组件</strong>。它的实现简单、性能极好、负载完美均匀，非常适合用在代理层、负载均衡器、缓存路由这类场景。但前提是你的节点拓扑相对稳定，不需要频繁下线中间节点。</p>
+            <p><strong>CRUSH
+            适合大规模存储集群</strong>。当集群规模达到数百上千个节点、需要跨机架跨数据中心的故障域隔离、且硬件配置不一致时，CRUSH
+            的拓扑感知和权重机制能体现出价值。但它的运维门槛也最高——CRUSH
+            Map 的维护、PG
+            数量的规划、回填速率的控制，每一项都需要经验积累。</p>
+            <h3 id="一个完整的实践案例为订单系统选择分片策略">9.4
+            一个完整的实践案例：为订单系统选择分片策略</h3>
+            <p>假设我们要为一个日订单量千万级的电商系统设计分片方案。核心表是订单表，包含以下字段：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a>    order_id    BIGINT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a>    user_id     BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a>    shop_id     BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a>    order_time  <span class="dt">TIMESTAMP</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a>    total_amount <span class="dt">DECIMAL</span>(<span class="dv">12</span>,<span class="dv">2</span>),</span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a>    status      TINYINT,</span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 其他字段省略</span></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a>);</span></code></pre></div>
+            <p>查询模式分析：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>查询场景</th>
+            <th>频率</th>
+            <th>模式</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>用户查看自己的订单列表</td>
+            <td>极高</td>
+            <td>按 user_id 点查 + 按 order_time 排序</td>
+            </tr>
+            <tr>
+            <td>商家查看店铺订单</td>
+            <td>高</td>
+            <td>按 shop_id 点查 + 按 order_time 排序</td>
+            </tr>
+            <tr>
+            <td>按订单号查询</td>
+            <td>高</td>
+            <td>按 order_id 点查</td>
+            </tr>
+            <tr>
+            <td>按时间范围统计</td>
+            <td>低</td>
+            <td>按 order_time 范围扫描</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>分片键的选择：</p>
+            <p><strong>方案 A：按 order_id 哈希分片</strong>。order_id
+            的基数最高，分布最均匀。但用户查询自己的订单需要扫描所有分片（scatter-gather），对用户侧查询不友好。</p>
+            <p><strong>方案 B：按 user_id
+            哈希分片</strong>。用户查询自己的订单只需要访问一个分片，非常高效。但大卖家的订单会集中在一个分片，产生数据倾斜。商家查询店铺订单也需要扫描所有分片。</p>
+            <p><strong>方案 C：按 user_id 哈希分片 + 二级索引表按
+            shop_id 分片</strong>。主表按 user_id
+            分片解决用户侧查询，另建一张索引表按 shop_id
+            分片解决商家侧查询。代价是维护两份数据的一致性。</p>
+            <p>实际工程中方案 C
+            是最常见的选择。分片键的选择本质上是在回答”最高频的查询模式是什么”这个问题。如果无法用一个分片键同时满足所有查询模式，就需要通过冗余数据（二级索引表、物化视图）来弥补。</p>
+            <p>分片数量的计算：</p>
+            <pre class="text"><code>每日新增订单：10,000,000
+单条订单大小：约 500 字节
+每日数据增量：10,000,000 × 500 B ≈ 5 GB
+保留 3 年数据：5 GB × 365 × 3 ≈ 5.5 TB
+预留 2 倍余量：5.5 TB × 2 = 11 TB
+
+单分片目标容量：50-100 GB（兼顾查询性能和运维粒度）
+分片数量：11 TB / 100 GB ≈ 110 → 取 128（2 的幂次，便于取模）</code></pre>
+            <p>128 个分片分布在 16-32 个物理节点上，每个节点承载 4-8
+            个分片。使用一致性哈希将 user_id 映射到 128
+            个分片，每个分片内部按 order_time 排序存储。</p>
+            <p>扩容规划：当数据量接近单分片容量上限时，可以将分片数从
+            128 扩展到
+            256。如果使用一致性哈希做分片路由，扩容时只需迁移约一半的数据；如果使用取模哈希且分片数翻倍（2
+            的幂次扩容），可以利用”翻倍取模”的特性——每个旧分片的数据恰好分裂到两个新分片中，迁移逻辑简单且迁移量恰好是
+            50%。这也是实际工程中分片数常选择 2 的幂次的原因之一。</p>
+            <p>完整的路由逻辑：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a>NUM_SHARDS <span class="op">=</span> <span class="dv">128</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> get_shard(user_id: <span class="bu">int</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;根据 user_id 计算分片编号&quot;&quot;&quot;</span></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a>    key <span class="op">=</span> <span class="bu">str</span>(user_id).encode()</span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a>    digest <span class="op">=</span> hashlib.md5(key).hexdigest()</span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">int</span>(digest, <span class="dv">16</span>) <span class="op">%</span> NUM_SHARDS</span>
+<span id="cb29-10"><a href="#cb29-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-11"><a href="#cb29-11" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> get_node(shard_id: <span class="bu">int</span>, shard_to_node: <span class="bu">dict</span>[<span class="bu">int</span>, <span class="bu">str</span>]) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="cb29-12"><a href="#cb29-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;根据分片编号查找物理节点&quot;&quot;&quot;</span></span>
+<span id="cb29-13"><a href="#cb29-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> shard_to_node[shard_id]</span>
+<span id="cb29-14"><a href="#cb29-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-15"><a href="#cb29-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用示例</span></span>
+<span id="cb29-16"><a href="#cb29-16" aria-hidden="true" tabindex="-1"></a>shard <span class="op">=</span> get_shard(user_id<span class="op">=</span><span class="dv">123456</span>)</span>
+<span id="cb29-17"><a href="#cb29-17" aria-hidden="true" tabindex="-1"></a>node <span class="op">=</span> get_node(shard, shard_to_node<span class="op">=</span>{<span class="dv">0</span>: <span class="st">&quot;node-01&quot;</span>, <span class="dv">1</span>: <span class="st">&quot;node-01&quot;</span>, <span class="dv">2</span>: <span class="st">&quot;node-02&quot;</span>, ...})</span></code></pre></div>
+            <hr />
+            <h2 id="十参考文献">十、参考文献</h2>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>David Karger et al., “Consistent Hashing and Random
+            Trees: Distributed Caching Protocols for Relieving Hot Spots
+            on the World Wide Web”, ACM STOC, 1997 ——
+            一致性哈希的原始论文，提出了哈希环和虚拟节点的基本思想</li>
+            <li>John Lamping, Eric Veach, “A Fast, Minimal Memory,
+            Consistent Hash Algorithm”, arXiv:1406.2294, 2014 ——
+            跳跃一致性哈希的论文，证明了 O(1) 内存和 O(ln N)
+            时间的理论最优性</li>
+            <li>David Thaler, Chinya Ravishankar, “Using Name-Based
+            Mappings to Increase Hit Rates”, IEEE/ACM Transactions on
+            Networking, 1998 —— 会合哈希（HRW）的原始论文</li>
+            <li>Sage Weil et al., “CRUSH: Controlled, Scalable,
+            Decentralized Placement of Replicated Data”, SC’06, 2006 ——
+            CRUSH 算法的论文，详细描述了 Ceph 的数据放置策略</li>
+            <li>Sage Weil, “Ceph: Reliable, Scalable, and
+            High-Performance Distributed Storage”, PhD Thesis, UC Santa
+            Cruz, 2007 —— Weil 的博士论文，包含 CRUSH 的完整推导和 Ceph
+            架构设计</li>
+            </ul>
+            <h3 id="官方文档与技术资料">官方文档与技术资料</h3>
+            <ul>
+            <li>Apache Cassandra Documentation: Architecture —
+            Partitioners — 分区器的实现细节和 num_tokens 配置建议</li>
+            <li>TiKV Documentation: Region — Region
+            的分裂、合并和调度机制</li>
+            <li>Apache Kafka Documentation: Partitioning — 分区策略和
+            DefaultPartitioner 行为说明</li>
+            <li>MongoDB Manual: Sharding — 分片架构、分片键选择和 Chunk
+            管理</li>
+            <li>Ceph Documentation: CRUSH Maps — CRUSH Map
+            的配置、放置规则和桶类型说明</li>
+            </ul>
+            <h3 id="源码参考">源码参考</h3>
+            <ul>
+            <li>Cassandra
+            <code>Murmur3Partitioner</code>：<code>org.apache.cassandra.dht.Murmur3Partitioner</code>
+            —— 默认分区器的实现</li>
+            <li>TiKV Region
+            分裂逻辑：<code>components/raftstore/src/store/worker/split_check.rs</code>
+            —— 分裂检查的核心代码</li>
+            <li>Kafka
+            <code>DefaultPartitioner</code>：<code>org.apache.kafka.clients.producer.internals.DefaultPartitioner</code>
+            —— 默认分区策略的实现</li>
+            <li>Ceph CRUSH 算法：<code>src/crush/mapper.c</code> ——
+            CRUSH 的 C 实现，包含 <code>straw2</code> 选择算法</li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../51-object-performance/object-performance.html">对象存储性能工程</a>
+            <strong>下一篇</strong>: <a
+            href="../53-replication/replication.html">副本与复制策略</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/01-lakehouse-overview/01-lakehouse-overview.html">【数据湖与开放表格式】Lakehouse 全景：从 Hive 表到开放表格式</a></h3>
+                    <p>Hive 目录式分区表把『表』等同于『一组目录加 metastore 里的分区行』，于是没有原子提交、planning 要 LIST 目录、schema 与分区演进常要重写。本文用这三个硬伤切入，讲清 lakehouse 把表拆成『不可变数据文件 + 可变元数据指针 + catalog』三层后各自解决了什么，并给出全系列的分层地图。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/02-parquet-format/02-parquet-format.html">【数据湖与开放表格式】Parquet 文件格式深拆</a></h3>
+                    <p>拆 Parquet 的物理结构：file → row group → column chunk → page，footer 里的 FileMetaData（Thrift）与 PAR1 magic。讲清 PLAIN/RLE-bitpacking/字典/DELTA_BINARY_PACKED/BYTE_STREAM_SPLIT 各自压谁，Dremel 的 repetition/definition level 如何表达嵌套，column index/offset index 与 split-block bloom filter 怎样让谓词在读盘前裁掉 page。基于本机 pyarrow 24.0.0 真实 dump footer 与编码。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/03-orc-format/03-orc-format.html">【数据湖与开放表格式】ORC 文件格式与 Parquet 对照</a></h3>
+                    <p>ORC 用 stripe 而非 row group、用三级统计（file/stripe/row-group index）而非独立 page index、用 PRESENT/DATA 等 stream 而非 page 组织一列。本文按 ORC 规范拆其文件尾（postscript + footer）、stripe 内部结构与 RLEv2 整数编码，并用本机 pyarrow 24.0.0 把同一份 30 万行数据写成 ORC 与 Parquet，对比真实体积与物理布局，最后给出什么场景仍用 ORC。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

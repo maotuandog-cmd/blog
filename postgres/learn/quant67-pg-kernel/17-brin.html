@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】BRIN 与其他索引：什么时候不建 B-Tree 反而更好 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="过一遍 BRIN
+索引的范围摘要哲学——用每个 page range 一条摘要替代逐行索引，在 1TB
+的表上创建时间从小时降到秒级。同时讨论两条”不建
+B-Tree”的高性价比路径：Hash 索引在 PG 10+ 的 WAL 安全边界和 Bloom
+索引的多列任意组合过滤。附带代价对比表和建索引决策树。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, brin, hash-index, bloom-index, btree, index-selection, brin-revmap, page-range, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/17-brin/17-brin.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】BRIN 与其他索引：什么时候不建 B-Tree 反而更好" />
+    <meta property="og:description" content="过一遍 BRIN 索引的范围摘要哲学——用每个 page range 一条摘要替代逐行索引，在 1TB 的表上创建时间从小时降到秒级。同时讨论两条&quot;不建 B-Tree&quot;的高性价比路径：Hash 索引在 PG 10+ 的 WAL 安全边界和 Bloom 索引的多列任意组合过滤。附带代价对比表和建索引决策树。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/17-brin/17-brin.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="brin" />
+    <meta property="article:tag" content="hash-index" />
+    <meta property="article:tag" content="bloom-index" />
+    <meta property="article:tag" content="btree" />
+    <meta property="article:tag" content="index-selection" />
+    <meta property="article:tag" content="brin-revmap" />
+    <meta property="article:tag" content="page-range" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】BRIN 与其他索引：什么时候不建 B-Tree 反而更好" />
+    <meta name="twitter:description" content="过一遍 BRIN 索引的范围摘要哲学——用每个 page range 一条摘要替代逐行索引，在 1TB 的表上创建时间从小时降到秒级。同时讨论两条&quot;不建 B-Tree&quot;的高性价比路径：Hash 索引在 PG 10+ 的 WAL 安全边界和 Bloom 索引的多列任意组合过滤。附带代价对比表和建索引决策树。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】BRIN 与其他索引：什么时候不建 B-Tree 反而更好", "description": "过一遍 BRIN 索引的范围摘要哲学——用每个 page range 一条摘要替代逐行索引，在 1TB 的表上创建时间从小时降到秒级。同时讨论两条\"不建 B-Tree\"的高性价比路径：Hash 索引在 PG 10+ 的 WAL 安全边界和 Bloom 索引的多列任意组合过滤。附带代价对比表和建索引决策树。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/17-brin/17-brin.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "brin", "hash-index", "bloom-index", "btree", "index-selection", "brin-revmap", "page-range"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】BRIN 与其他索引：什么时候不建 B-Tree 反而更好</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#brin</span> <span>#hash-index</span> <span>#bloom-index</span> <span>#btree</span> <span>#index-selection</span> <span>#brin-revmap</span> <span>#page-range</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/brin.html">#brin</a><a class="chip-link" href="/tags/hash-index.html">#hash-index</a><a class="chip-link" href="/tags/bloom-index.html">#bloom-index</a><a class="chip-link" href="/tags/btree.html">#btree</a><a class="chip-link" href="/tags/index-selection.html">#index-selection</a><a class="chip-link" href="/tags/brin-revmap.html">#brin-revmap</a><a class="chip-link" href="/tags/page-range.html">#page-range</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#brin-与其他索引什么时候不建-b-tree-反而更好"
+                id="toc-brin-与其他索引什么时候不建-b-tree-反而更好">BRIN
+                与其他索引：什么时候不建 B-Tree 反而更好</a>
+                <ul>
+                <li><a href="#一brin-的哲学范围摘要替代逐行索引"
+                id="toc-一brin-的哲学范围摘要替代逐行索引">一、BRIN
+                的哲学：范围摘要替代逐行索引</a>
+                <ul>
+                <li><a href="#问题场景"
+                id="toc-问题场景">问题场景</a></li>
+                <li><a href="#brin-插入与维护"
+                id="toc-brin-插入与维护">BRIN 插入与维护</a></li>
+                </ul></li>
+                <li><a href="#三运维场景brin-的坑与排查"
+                id="toc-三运维场景brin-的坑与排查">三、运维场景：BRIN
+                的坑与排查</a>
+                <ul>
+                <li><a href="#坑-1数据物理无序时-brin-退化为全表扫描"
+                id="toc-坑-1数据物理无序时-brin-退化为全表扫描">坑
+                1：数据物理无序时 BRIN 退化为全表扫描</a></li>
+                <li><a href="#坑-2pages_per_range-选太大"
+                id="toc-坑-2pages_per_range-选太大">坑
+                2：pages_per_range 选太大</a></li>
+                <li><a href="#坑-4brin-扫描的-io-模式"
+                id="toc-坑-4brin-扫描的-io-模式">坑 4：BRIN 扫描的 IO
+                模式</a></li>
+                </ul></li>
+                <li><a href="#四hash-索引wal-安全边界与适用场景"
+                id="toc-四hash-索引wal-安全边界与适用场景">四、Hash
+                索引：WAL 安全边界与适用场景</a>
+                <ul>
+                <li><a href="#历史包袱pg-9.x-的-hash-索引不支持-wal"
+                id="toc-历史包袱pg-9.x-的-hash-索引不支持-wal">历史包袱：PG
+                9.x 的 Hash 索引不支持 WAL</a></li>
+                </ul></li>
+                <li><a href="#五bloom-索引多列任意组合过滤"
+                id="toc-五bloom-索引多列任意组合过滤">五、Bloom
+                索引：多列任意组合过滤</a>
+                <ul>
+                <li><a href="#问题场景-1"
+                id="toc-问题场景-1">问题场景</a></li>
+                <li><a href="#bloom-索引的代价与收益"
+                id="toc-bloom-索引的代价与收益">Bloom
+                索引的代价与收益</a></li>
+                <li><a href="#bloom-索引的参数选择"
+                id="toc-bloom-索引的参数选择">Bloom
+                索引的参数选择</a></li>
+                <li><a href="#bloom-索引的限制"
+                id="toc-bloom-索引的限制">Bloom 索引的限制</a></li>
+                </ul></li>
+                <li><a href="#六索引选择决策树"
+                id="toc-六索引选择决策树">六、索引选择决策树</a>
+                <ul>
+                <li><a href="#代价速查表"
+                id="toc-代价速查表">代价速查表</a></li>
+                </ul></li>
+                <li><a href="#七实验brin-vs-b-tree-在时序数据上的对比"
+                id="toc-七实验brin-vs-b-tree-在时序数据上的对比">七、实验：BRIN
+                vs B-Tree 在时序数据上的对比</a>
+                <ul>
+                <li><a href="#环境与数据"
+                id="toc-环境与数据">环境与数据</a></li>
+                <li><a href="#查询性能对比"
+                id="toc-查询性能对比">查询性能对比</a></li>
+                </ul></li>
+                <li><a href="#八关键要点"
+                id="toc-八关键要点">八、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="brin-与其他索引什么时候不建-b-tree-反而更好">BRIN
+            与其他索引：什么时候不建 B-Tree 反而更好</h1>
+            <p>如果你有一张 1TB 的传感器数据表，按时间列 <code>ts</code>
+            查询某一天的数据。建 B-Tree 索引需要扫描每一行、排序、写
+            WAL——索引本身可能
+            200GB，建索引跑一下午。但你会本能地意识到这件事的荒谬：<code>ts</code>
+            列的值天然有序，新数据 <code>ts</code>
+            越来越大，<code>ts</code>
+            与物理存储位置高度相关。有没有一种索引，只利用”page range
+            内的最大值和最小值”，而不逐行建立指针？</p>
+            <p>有。BRIN（Block Range INdex）做的事情就是这个。它不是
+            B-Tree
+            的替代品，而是在”数据物理有序、表太大、查询只关心范围”的场景下，把索引空间和时间开销从
+            <span class="math inline">\(O(n)\)</span> 降到 <span
+            class="math inline">\(O(n/\text{range\_size})\)</span>。</p>
+            <p>本文从 BRIN 的内部结构（revmap + summary
+            tuple）出发，说明它如何用极小的代价提供范围过滤能力。随后讨论另外两种”不建
+            B-Tree”的索引：Hash 索引的 WAL 安全边界，以及 Bloom
+            索引的多列任意组合过滤场景。最后给出索引选择的代价对比表和决策树。</p>
+            <hr />
+            <h2 id="一brin-的哲学范围摘要替代逐行索引">一、BRIN
+            的哲学：范围摘要替代逐行索引</h2>
+            <h3 id="问题场景">问题场景</h3>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> sensor_data (</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    ts      TIMESTAMPTZ,</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    dev_id  <span class="dt">INTEGER</span>,</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    temp    <span class="dt">DOUBLE</span> <span class="dt">PRECISION</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 每天 1000 万行，运行一年</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 总行数：~36 亿</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 表大小：~300GB</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 常见查询：查某一天的温度</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> sensor_data</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> ts <span class="kw">BETWEEN</span> <span class="st">&#39;2025-06-01&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2025-06-02&#39;</span>;</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>B<span class="op">-</span>Tree 在这个场景下有两个问题：</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>建索引代价<span class="op">**</span>：B<span class="op">-</span>Tree 需要读全表、排序、写 WAL，<span class="dv">300</span>GB 表上可能需要数小时。索引本身大约 <span class="dv">50</span><span class="op">-</span><span class="dv">80</span>GB。</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>索引维护代价<span class="op">**</span>：每次 <span class="kw">INSERT</span> 都要更新 B<span class="op">-</span>Tree，可能触发页面分裂和 WAL 写入。每天 <span class="dv">1000</span> 万行的写入速度下，索引维护可能成为瓶颈。</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>BRIN 的观察很简单：如果 `ts` 值与物理存储位置高度相关（新数据自然追加到表的后面），那么每个 page range（比如 <span class="dv">128</span> 个连续页面 <span class="op">=</span> <span class="dv">1</span>MB）只需要存两条信息——这个 <span class="kw">range</span> 内 `ts` 的最小值和最大值。</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>查询 `WHERE ts <span class="kw">BETWEEN</span> <span class="st">&#39;2025-06-01&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2025-06-02&#39;</span>` 时，BRIN 扫描所有 <span class="kw">range</span> summary：如果 <span class="kw">range</span> 的 `[min_ts, max_ts]` 与查询区间 `[<span class="dv">2025</span><span class="op">-</span><span class="dv">06</span><span class="op">-</span><span class="dv">01</span>, <span class="dv">2025</span><span class="op">-</span><span class="dv">06</span><span class="op">-</span><span class="dv">02</span>]` 无交集，直接跳过整个 <span class="kw">range</span> 的所有页面。有交集的 range，才去读实际页面并逐行检查（因为 <span class="kw">summary</span> 只是范围，不能精确过滤每一行）。</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>### 代价对比</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>| 维度 | B<span class="op">-</span>Tree（<span class="dv">300</span>GB 表） | BRIN（pages_per_range<span class="op">=</span><span class="dv">128</span>） |</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|-------------------|----------------------------|</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>| 索引大小 | ~<span class="dv">50</span><span class="op">-</span><span class="dv">80</span>GB | ~<span class="dv">50</span>MB |</span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>| 创建时间 | 数小时 | 数分钟 |</span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>| 每次 <span class="kw">INSERT</span> 的索引维护 | 遍历 B<span class="op">-</span>Tree <span class="op">+</span> 可能分裂 | 更新当前 <span class="kw">range</span> 的 <span class="fu">min</span><span class="op">/</span><span class="fu">max</span> |</span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>| 查询精度 | 精确，回表读目标行 | 粗过滤，回表读整个 <span class="kw">range</span> 的所有行 |</span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>| 适用条件 | 任何数据分布 | 数据物理有序（或近似有序） |</span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>## 二、BRIN 的内部结构：revmap <span class="op">+</span> <span class="kw">summary</span> tuples</span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>### revmap：range 到 <span class="kw">index</span> page 的映射</span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>BRIN 索引本身也使用页面存储，但它的<span class="ot">&quot;行&quot;</span>是 <span class="kw">summary</span> tuples。对于 <span class="kw">heap</span> 表中连续的 `pages_per_range` 个页面，BRIN 在索引中存一行 summary。</span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>revmap（reverse map）是一个数组，存储<span class="ot">&quot;每个 heap page range 对应哪个 BRIN index page&quot;</span>。当 <span class="kw">heap</span> 页面被更新时，PG 需要找到对应的 BRIN <span class="kw">summary</span> tuple 并更新它。revmap 提供 $O(<span class="dv">1</span>)$ 的查找：</span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> src<span class="op">/</span>include<span class="op">/</span><span class="kw">access</span><span class="op">/</span>brin_revmap.h</span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>typedef struct BrinRevmap {</span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>    Relation    rm_irel;            <span class="op">//</span> BRIN <span class="kw">index</span> relation</span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>    BlockNumber rm_pagesPerRange;   <span class="op">//</span> pages_per_range 参数</span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    BlockNumber rm_maxRevmapPages;  <span class="op">//</span> revmap 占用的最大页数</span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>    Buffer      rm_currBuf;         <span class="op">//</span> 当前 revmap 页面的 buffer</span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a>} BrinRevmap;</span></code></pre></div>
+            <p>revmap 存储为 BRIN 索引的 meta page
+            之后的一组连续页面。第 <span
+            class="math inline">\(N\)</span> 个 heap page range（从 heap
+            block 0 开始计数）的 revmap entry 存储在
+            <code>revmap_page = N / entries_per_page</code>
+            页面的偏移位置。每个 revmap entry 是目标 BRIN index page 的
+            block number，或特殊值 <code>BRIN_EMPTY</code>（表示该 range
+            尚未有 summary）。</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/brin/brin_revmap.c</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// revmap 查询</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>BlockNumber</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>brinRevmapGetBlockNumber<span class="op">(</span>BrinRevmap <span class="op">*</span>revmap<span class="op">,</span> BlockNumber heapBlk<span class="op">)</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 计算此 heap block 所属的 range number</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    BlockNumber rangeNo <span class="op">=</span> heapBlk <span class="op">/</span> revmap<span class="op">-&gt;</span>rm_pagesPerRange<span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 从 revmap 中找到此 range 对应的 BRIN index page</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## Summary Tuple：range 内所有行的统计摘要</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>每个 BRIN summary tuple 存储一个 page range 内所有行的统计摘要。对于 `ts` 列（`TIMESTAMPTZ` 类型），summary 就是 range 内的最小值和最大值。</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>PG 为每种支持 BRIN 的数据类型定义了 summary 的格式和操作。核心接口是一个操作符族（opclass），定义在 `pg_amproc` 中：</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`BRIN_PROCNUM_SUMMARIZE`<span class="op">**</span>（过程 <span class="dv">1</span>）：对给定的 tuple 更新统计信息（向 summary 中<span class="st">&quot;加入&quot;</span>一个新值）。</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`BRIN_PROCNUM_CONSISTENT`<span class="op">**</span>（过程 <span class="dv">3</span>）：判断查询条件与 summary 是否一致（即有交集）。</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`BRIN_PROCNUM_UNION`<span class="op">**</span>（过程 <span class="dv">4</span>）：合并两个 summary（页面合并时使用）。</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/brin_internal.h</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> BrinOpcInfo <span class="op">{</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    uint16      oi_nstored<span class="op">;</span>         <span class="co">// 此 opclass 存储的 summary 列数</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    uint16      oi_regular_nulls<span class="op">;</span>   <span class="co">// 是否允许常规 NULL</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    Oid         oi_opaque<span class="op">;</span>          <span class="co">// opaque data type</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> BrinOpcInfo<span class="op">;</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> BrinValues <span class="op">{</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        bv_allnulls<span class="op">;</span>    <span class="co">// 此列所有值都是 NULL？</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        bv_hasnulls<span class="op">;</span>    <span class="co">// 此列有 NULL？</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        bv_attributes<span class="op">;</span>  <span class="co">// 是否有 attribute（TOAST 外存）</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    Datum       bv_values<span class="op">[];</span>    <span class="co">// 实际 summary 值</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> BrinValues<span class="op">;</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> BrinTuple <span class="op">{</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>    uint32      bt_placeholder<span class="op">;</span> <span class="co">// 占位符标志（待删除）</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>    BlockNumber bt_blkno<span class="op">;</span>       <span class="co">// heap block 范围起始</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    uint16      bt_info<span class="op">;</span>        <span class="co">// 标志位：是否有 null、占位符等</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span>        bt_columns<span class="op">[</span>FLEXIBLE_ARRAY_MEMBER<span class="op">];</span> <span class="co">// 各列的 BrinValues</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> BrinTuple<span class="op">;</span></span></code></pre></div>
+            <p>以 <code>timestamp_minmax_ops</code> 为例，summary
+            的物理布局为 <code>[min_ts, max_ts]</code> 两个 8-byte
+            值，共 16 bytes。128 个页面（1MB）的数据，被压缩成 16 bytes
+            的摘要。</p>
+            <h3 id="brin-插入与维护">BRIN 插入与维护</h3>
+            <p>当向 heap 表插入一行时，PG 检查此行所在的 page range
+            是否已有 BRIN summary：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/brin/brin.c, brininsert()</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>brininsert<span class="op">(</span>Relation idxRel<span class="op">,</span> Datum <span class="op">*</span>values<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>nulls<span class="op">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>           ItemPointer heaptid<span class="op">,</span> Relation heapRel<span class="op">,</span> <span class="op">...)</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    BrinDesc   <span class="op">*</span>bdesc<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    BrinRevmap <span class="op">*</span>revmap<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    bdesc <span class="op">=</span> BrinDescInit<span class="op">(</span>idxRel<span class="op">);</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    revmap <span class="op">=</span> brinRevmapInitialize<span class="op">(</span>idxRel<span class="op">,</span> pagesPerRange<span class="op">);</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 从 revmap 中找到此 heap page range 对应的 summary tuple</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 如果已有 summary，更新 min/max</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 如果还没有，创建新的 summary tuple</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    brinaddtuple<span class="op">(</span>idxRel<span class="op">,</span> bdesc<span class="op">,</span> heapRel<span class="op">,</span> values<span class="op">,</span> nulls<span class="op">,</span> heaptid<span class="op">);</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">...</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>关键行为：如果 INSERT 的新值在已有 summary 的范围之内（例如已有 `<span class="op">[</span><span class="dv">2025</span><span class="op">-</span><span class="bn">06</span><span class="op">-</span><span class="bn">01</span><span class="op">,</span> <span class="dv">2025</span><span class="op">-</span><span class="bn">06</span><span class="op">-</span><span class="dv">30</span><span class="op">]</span>`，新插入 `<span class="dv">2025</span><span class="op">-</span><span class="bn">06</span><span class="op">-</span><span class="dv">15</span>`），summary 不需要变化——不需要写 BRIN 索引。只有当新值超出 summary 范围时，才需要更新 BRIN index page。这意味着 BRIN 索引的写入开销极低。</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 查询：CONSISTENT 过程</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>查询时，BRIN 扫描所有 summary tuples，对每个 summary 调用 `CONSISTENT` 过程：</span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/brin/brin.c, bringetbitmap()</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="co">// 简化伪代码</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span>each BRIN index page<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>each summary tuple in page<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 调用 opclass 的 CONSISTENT 函数</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        consistent <span class="op">=</span> DatumGetBool<span class="op">(</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>            FunctionCall3Coll<span class="op">(</span>consistFn<span class="op">,</span> collation<span class="op">,</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>                PointerGetDatum<span class="op">(</span>summary<span class="op">),</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>                PointerGetDatum<span class="op">(</span>scanKey<span class="op">),</span>       <span class="co">// WHERE 条件</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>                PointerGetDatum<span class="op">(</span>nullFlags<span class="op">))</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>        <span class="op">);</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>consistent<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 将此 range 的所有 heap 页面标记到 bitmap 中</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span>blk <span class="op">=</span> start_blk<span class="op">;</span> blk <span class="op">&lt;=</span> end_blk<span class="op">;</span> blk<span class="op">++)</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>                tbm_add_page<span class="op">(</span>tbm<span class="op">,</span> blk<span class="op">);</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>CONSISTENT</code> 返回 <code>true</code> 表示”这个
+            range
+            可能包含符合条件的行”——它是粗粒度的，可能有假阳性（false
+            positive），但不会有假阴性。然后 executor 会用这个 bitmap
+            去扫描 heap 页面，并在回表后做精确的 <code>WHERE</code>
+            条件过滤。这是 BRIN 和 B-Tree 的核心区别：B-Tree
+            精确定位到每一行，BRIN 把一个 range 的所有页面都交给
+            executor 做二次过滤。</p>
+            <hr />
+            <h2 id="三运维场景brin-的坑与排查">三、运维场景：BRIN
+            的坑与排查</h2>
+            <h3 id="坑-1数据物理无序时-brin-退化为全表扫描">坑
+            1：数据物理无序时 BRIN 退化为全表扫描</h3>
+            <p>BRIN 依赖数据物理有序。如果你在一个随机的列（例如 UUID
+            主键）上建 BRIN 索引，每个 page range 内的 <code>min</code>
+            和 <code>max</code> 覆盖了几乎整个值域——每个 range 的
+            summary 与任何查询条件都有交集。BRIN
+            索引不提供任何过滤，每次查询扫描全表。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 错误用法：随机 UUID 主键</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_uuid_brin <span class="kw">ON</span> user_table <span class="kw">USING</span> brin (uuid_col);</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此索引毫无作用——每个 range 的 [min_uuid, max_uuid]</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 几乎总是覆盖整个 UUID 空间</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 正确用法：B-Tree on UUID</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_uuid_btree <span class="kw">ON</span> user_table <span class="kw">USING</span> btree (uuid_col);</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>排查方法：</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 用 pageinspect 观察 BRIN summary 的内容</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pageinspect;</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 BRIN 索引的汇总统计</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> brin_page_items(</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    get_raw_page(<span class="st">&#39;idx_brin_test&#39;</span>, <span class="dv">0</span>), <span class="st">&#39;idx_brin_test&#39;</span>:<span class="ch">:regclass</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果每个 range 的 min/max 几乎覆盖整个值域，说明 BRIN 无效</span></span></code></pre></div>
+            <h3 id="坑-2pages_per_range-选太大">坑 2：pages_per_range
+            选太大</h3>
+            <p><code>pages_per_range</code> 决定每个 summary 覆盖多少个
+            heap 页面。默认值 128（1MB）。如果设太大（例如 1024 =
+            8MB），每个 query 匹配到的 range 会回表扫描 8MB
+            的数据，即使实际只有几行符合条件的。</p>
+            <p>调优规则：<code>pages_per_range</code>
+            应使得每个查询的目标数据均匀落在少量 range
+            内。如果查询通常跨越 1 小时（~400MB
+            数据），<code>pages_per_range = 32</code>（256KB/range）会比默认值
+            128（1MB/range）更有效——更精细的 summary
+            减少回表扫描的浪费。</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 调整 pages_per_range</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_brin_fine <span class="kw">ON</span> sensor_data</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">USING</span> brin (ts) <span class="kw">WITH</span> (pages_per_range <span class="op">=</span> <span class="dv">32</span>);</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>### 坑 <span class="dv">3</span>：BRIN 索引不适用于 <span class="kw">UPDATE</span><span class="op">-</span>heavy 场景</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>BRIN <span class="kw">summary</span> 是<span class="ot">&quot;累积&quot;</span>的——一旦 `max_ts` 更新到 `<span class="dv">2025</span><span class="op">-</span><span class="dv">06</span><span class="op">-</span><span class="dv">30</span>`，即使 `<span class="dv">2025</span><span class="op">-</span><span class="dv">06</span><span class="op">-</span><span class="dv">01</span>` 到 `<span class="dv">2025</span><span class="op">-</span><span class="dv">06</span><span class="op">-</span><span class="dv">29</span>` 的所有行都被 <span class="kw">DELETE</span> 了，`max_ts` 仍然是 `<span class="dv">2025</span><span class="op">-</span><span class="dv">06</span><span class="op">-</span><span class="dv">30</span>`。summary 不会收窄。这导致旧 <span class="kw">range</span> 的 <span class="kw">summary</span> 仍然与大量查询条件匹配，造成不必要的回表扫描。</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>修复方式：周期性运行 `brin_summarize_new_values()`（更新已有 <span class="kw">range</span> 的 summary）或 `VACUUM`（但 VACUUM 不会收窄 summary）。严重的 <span class="kw">summary</span> 膨胀需要通过 `REINDEX` 重建。</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 重新汇总某个 range</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> brin_summarize_new_values(<span class="st">&#39;idx_brin_test&#39;</span>:<span class="ch">:regclass</span>);</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 summary 严重膨胀，重建索引</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>REINDEX <span class="kw">INDEX</span> idx_brin_test;</span></code></pre></div>
+            <h3 id="坑-4brin-扫描的-io-模式">坑 4：BRIN 扫描的 IO
+            模式</h3>
+            <p>BRIN 扫描产生的 bitmap 是连续的 page range——这对 seqscan
+            友好的磁盘是高效的（大块连续读），但会绕过
+            <code>shared_buffers</code> 的随机缓存策略。在
+            <code>EXPLAIN</code> 中看到
+            <code>Bitmap Heap Scan on ... (BRIN)</code> 时，注意
+            <code>Buffers: shared read=...</code> 的数量——如果每个 range
+            都从磁盘读而非缓存命中，IO 可能成为瓶颈。</p>
+            <hr />
+            <h2 id="四hash-索引wal-安全边界与适用场景">四、Hash
+            索引：WAL 安全边界与适用场景</h2>
+            <h3 id="历史包袱pg-9.x-的-hash-索引不支持-wal">历史包袱：PG
+            9.x 的 Hash 索引不支持 WAL</h3>
+            <p>PG 的 Hash 索引有一个历史包袱：在 PG 9.x 及之前，Hash
+            索引<strong>不写 WAL</strong>。这意味着如果数据库
+            crash，Hash 索引的内容无法通过 WAL 恢复——必须用
+            <code>REINDEX</code> 重建。PG 10 之后，Hash 索引写了完整的
+            WAL 支持，但”Hash 索引不可靠”的印象留存至今。</p>
+            <p>在 PG 10+ 中，Hash 索引的 WAL 日志由
+            <code>src/backend/access/hash/hash.c</code> 和
+            <code>hash_xlog.c</code> 实现：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/hash/hash.c</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Hash 索引插入入口</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>hashinsert<span class="op">(</span>Relation rel<span class="op">,</span> Datum <span class="op">*</span>values<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>nulls<span class="op">,</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>           ItemPointer ht_ctid<span class="op">,</span> Relation heapRel<span class="op">,</span> <span class="op">...)</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 查找目标 bucket</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 如果目标页面没有空间，触发 bucket split</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 写 WAL record（PG 10+ 起支持）</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    _hash_doinsert<span class="op">(</span>rel<span class="op">,</span> buf<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>PG <span class="dv">10</span> 的 Hash 索引 WAL 支持覆盖了以下操作：insert、split page、squeeze page（bucket 清理）、meta page 更新。PG <span class="dv">11</span> 增加了对 `CREATE INDEX CONCURRENTLY` 的 WAL 支持。</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 什么时候用 Hash 索引</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>Hash 索引的物理结构是基于线性哈希的 bucket 数组，每个 bucket 包含一个 overflow 链（类似 B<span class="op">-</span>Tree 的页面链）。查找流程为：`hash<span class="op">(</span>key<span class="op">)</span> → bucket number → 扫描该 bucket 的 overflow 链`。</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>Hash 索引的优势场景是<span class="op">**</span>纯等值查询（<span class="op">=</span>），且键值分布均匀<span class="op">**</span>：</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 适合 Hash 索引</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>SELECT <span class="op">*</span> FROM sessions WHERE session_id <span class="op">=</span> <span class="ch">&#39;a</span><span class="er">bc123</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 不适合 Hash 索引</span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>SELECT <span class="op">*</span> FROM sessions WHERE session_id BETWEEN <span class="ch">&#39;a</span><span class="er">bc</span><span class="ch">&#39;</span> AND <span class="ch">&#39;d</span><span class="er">ef</span><span class="ch">&#39;</span><span class="op">;</span>  <span class="op">--</span> 不支持范围</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>SELECT <span class="op">*</span> FROM sessions ORDER BY session_id<span class="op">;</span>                        <span class="op">--</span> 不支持排序</span></code></pre></div>
+            <p>Hash 索引的物理大小通常比 B-Tree 小 20-40%（因为不需要
+            high key 和 rightlink），插入性能在键值均匀分布时略优于
+            B-Tree（不需要复杂的页面分裂点选择逻辑）。但在以下场景下
+            Hash 索引的性能不如 B-Tree：</p>
+            <ol type="1">
+            <li><strong>键值分布不均匀</strong>：某些 bucket
+            显著比其他的大，形成长 overflow 链。</li>
+            <li><strong>有范围查询</strong>：Hash
+            索引不能支持范围扫描——<code>=</code>
+            以外的操作需要全索引扫描。</li>
+            <li><strong>需要排序</strong>：Hash
+            索引不保证任何顺序。</li>
+            </ol>
+            <p>当前底线：Hash 索引在 PG 10+ 中已经
+            WAL-safe，对于纯等值查询且键值均匀的场景，与 B-Tree
+            的差距主要在功能性（无 range scan、无排序）而非可靠性。但
+            B-Tree 仍然是默认选择——除非键值很宽（如长 UUID
+            字符串）且表很大，Hash 索引的空间优势才可能明显。</p>
+            <hr />
+            <h2 id="五bloom-索引多列任意组合过滤">五、Bloom
+            索引：多列任意组合过滤</h2>
+            <h3 id="问题场景-1">问题场景</h3>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> users (</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span>       <span class="dt">INTEGER</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    email    TEXT,</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    phone    TEXT,</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    nickname TEXT</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询模式：任意字段的等值过滤，组合任意</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> email <span class="op">=</span> <span class="st">&#39;a@b.com&#39;</span>;</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> phone <span class="op">=</span> <span class="st">&#39;123456&#39;</span>;</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> email <span class="op">=</span> <span class="st">&#39;a@b.com&#39;</span> <span class="kw">AND</span> phone <span class="op">=</span> <span class="st">&#39;123456&#39;</span>;</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>B<span class="op">-</span>Tree 对于这个模式的解决方案是建三个单列索引，或一个复合索引。但复合索引有前缀匹配限制：`(email, phone)` 上的索引不能只用于 `WHERE phone <span class="op">=</span> <span class="st">&#39;123456&#39;</span>`（除非使用 <span class="kw">Bitmap</span> <span class="kw">Index</span> <span class="kw">Scan</span> 合并多个单列索引的 bitmap）。建三个单列索引意味着：每次 <span class="kw">INSERT</span> 要更新三个 B<span class="op">-</span>Tree、总共 <span class="dv">3</span> 倍索引空间。</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>Bloom 索引（`bloom` 扩展）用布隆过滤器来处理这个问题：对每一行，将<span class="op">**</span>所有被索引的列<span class="op">**</span>的值一起哈希到一个布隆过滤器中。查询时，Bloom 索引对每个过滤条件做布隆过滤器检查——如果有任意条件不通过（即布隆过滤器说<span class="ot">&quot;不存在&quot;</span>），则排除此页面。</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION bloom;</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_users_bloom <span class="kw">ON</span> users</span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="kw">USING</span> bloom (email, phone, nickname)</span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> (<span class="fu">length</span> <span class="op">=</span> <span class="dv">80</span>, col1 <span class="op">=</span> <span class="dv">2</span>, col2 <span class="op">=</span> <span class="dv">2</span>, col3 <span class="op">=</span> <span class="dv">2</span>);</span></code></pre></div>
+            <p>每个签名（signature）是一个 <code>length × 16</code> bits
+            的位图（上例为 <code>80 × 16 = 1280</code> bits = 160
+            bytes），每个列用 <code>colN</code> 个 bits 标记（上例每列 2
+            bits）。</p>
+            <h3 id="bloom-索引的代价与收益">Bloom 索引的代价与收益</h3>
+            <table>
+            <colgroup>
+            <col style="width: 15%" />
+            <col style="width: 42%" />
+            <col style="width: 42%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>三个单列 B-Tree</th>
+            <th>一个 Bloom 索引</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>索引大小</td>
+            <td>3 × (key + ctid) × N ≈ 3 × 32B × N</td>
+            <td>160B × number_of_index_pages</td>
+            </tr>
+            <tr>
+            <td>支持的查询</td>
+            <td>单列等值、前缀、范围</td>
+            <td>任意组合的等值过滤</td>
+            </tr>
+            <tr>
+            <td>假阳性</td>
+            <td>无（精确索引）</td>
+            <td>有——布隆过滤器可能误判”存在”</td>
+            </tr>
+            <tr>
+            <td>假阴性</td>
+            <td>无</td>
+            <td>无——布隆过滤器不会漏掉”存在”</td>
+            </tr>
+            <tr>
+            <td>插入开销</td>
+            <td>3 次 B-Tree 插入</td>
+            <td>1 次布隆过滤器位设置</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Bloom
+            索引的关键价值：当查询模式是”多列的任意子集做等值过滤”时，一个
+            Bloom 索引替代多个单列
+            B-Tree，节省索引空间和写入开销。代价是<strong>存在假阳性</strong>——布隆过滤器说”这个页面可能有这行”但实际上没有。所以执行器仍然需要回表做精确的
+            <code>WHERE</code> 过滤。</p>
+            <h3 id="bloom-索引的参数选择">Bloom 索引的参数选择</h3>
+            <ul>
+            <li><code>length</code>：signature 长度（× 16
+            bits）。越大假阳性越低，但索引越大。</li>
+            <li><code>colN</code>：第 N 列用多少
+            bits。越多假阳性越低，但 signature 空间更快被占满。</li>
+            </ul>
+            <p>参数选择依赖于列数和预期的查询组合数。总签名空间（bits）=
+            <code>length × 16</code>。如果所有列的总 bit 数（<span
+            class="math inline">\(\sum col_i\)</span>）为 <span
+            class="math inline">\(K\)</span>，每行有 <span
+            class="math inline">\(M\)</span>
+            个被索引列，则每个页面可以容纳约 <span
+            class="math inline">\(S / K\)</span> 个签名（<span
+            class="math inline">\(S\)</span> 为 signature 总
+            bits）。当页面填满后，假阳性率由布隆过滤器的位密度决定。</p>
+            <p>一般情况下，两列或三列组合的 Bloom
+            索引使用默认参数（<code>length = 80, col1 = 2, col2 = 2</code>）即可。如果列数较多（5+
+            列），需要增大 <code>length</code> 或减少每列的 bits
+            来控制假阳性率。</p>
+            <h3 id="bloom-索引的限制">Bloom 索引的限制</h3>
+            <ol type="1">
+            <li><strong>不支持范围查询</strong>：布隆过滤器只能回答”可能存在”或”一定不存在”，不能判断范围。</li>
+            <li><strong>不支持 UNIQUE
+            约束</strong>：布隆过滤器的假阳性语义与唯一性检查不兼容。</li>
+            <li><strong>不支持排序</strong>：Bloom
+            索引没有值内容，无法按索引顺序返回结果。</li>
+            <li><strong>不能用于 JOIN</strong>：除非是等值 JOIN
+            且所有列都在 Bloom 索引中被覆盖。</li>
+            </ol>
+            <hr />
+            <h2 id="六索引选择决策树">六、索引选择决策树</h2>
+            <pre class="text"><code>查询模式是什么？
+├─ 等值查询（=, IN）
+│  ├─ 单列 → B-Tree（默认）、Hash（仅 PG 10+、纯等值、均匀分布）
+│  └─ 多列、任意组合 → Bloom（空间和写入开销优势）、多个单列 B-Tree（精确但维护开销大）
+│
+├─ 范围查询（&gt;, &lt;, BETWEEN）
+│  ├─ 数据物理有序 → BRIN（大表、低存储开销）
+│  └─ 数据物理无序 → B-Tree
+│
+├─ 排序（ORDER BY, DISTINCT, GROUP BY）→ B-Tree
+│
+├─ 全文搜索 → GIN（读多写少）、GiST（读写平衡）— 见第 15、16 章
+│
+├─ 几何/空间/相似度 → GiST — 见第 15 章
+│  └─ 或 SP-GiST（支持空间分区的特殊类型）
+│
+└─ UNIQUE 约束 → B-Tree（唯一）</code></pre>
+            <h3 id="代价速查表">代价速查表</h3>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 14%" />
+            <col style="width: 14%" />
+            <col style="width: 14%" />
+            <col style="width: 14%" />
+            <col style="width: 14%" />
+            <col style="width: 14%" />
+            <col style="width: 14%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>索引类型</th>
+            <th>创建时间</th>
+            <th>索引大小</th>
+            <th>插入维护</th>
+            <th>查询精度</th>
+            <th>查询类型</th>
+            <th>WAL 安全</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>B-Tree</td>
+            <td>O(n log n)</td>
+            <td>~30-50% 表大小</td>
+            <td>每次 INSERT 更新</td>
+            <td>精确</td>
+            <td>全部</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td>BRIN</td>
+            <td>O(n)</td>
+            <td>&lt;1% 表大小</td>
+            <td>O(1) per range</td>
+            <td>粗粒度，有假阳性</td>
+            <td>仅范围（有序列）</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td>Hash</td>
+            <td>O(n)</td>
+            <td>~20-40% 小于 B-Tree</td>
+            <td>每次 INSERT 更新</td>
+            <td>精确</td>
+            <td>仅等值（=）</td>
+            <td>PG 10+</td>
+            </tr>
+            <tr>
+            <td>Bloom</td>
+            <td>O(n)</td>
+            <td>取决于参数</td>
+            <td>1 次位设置</td>
+            <td>有假阳性</td>
+            <td>等值、多列任意组合</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td>GiST</td>
+            <td>O(n log n)</td>
+            <td>场景依赖</td>
+            <td>中等</td>
+            <td>精确</td>
+            <td>几何/全文/范围</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td>GIN</td>
+            <td>O(n) 到 O(n log n)</td>
+            <td>场景依赖</td>
+            <td>高（pending list）</td>
+            <td>精确</td>
+            <td>全文/数组</td>
+            <td>是</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2
+            id="七实验brin-vs-b-tree-在时序数据上的对比">七、实验：BRIN
+            vs B-Tree 在时序数据上的对比</h2>
+            <h3 id="环境与数据">环境与数据</h3>
+            <p>测试环境：PG 17，4C/8G，NVMe
+            SSD，<code>shared_buffers = 2GB</code>，<code>work_mem = 64MB</code>。</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建测试表（模拟传感器数据）</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> sensor_test (</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    ts      TIMESTAMPTZ <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    dev_id  <span class="dt">INTEGER</span>,</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    val     <span class="dt">DOUBLE</span> <span class="dt">PRECISION</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 生成模拟数据：时间有序的 5000 万行</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> sensor_test</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">&#39;2025-01-01&#39;</span>:<span class="ch">:timestamptz</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">+</span> <span class="dt">interval</span> <span class="st">&#39;1 second&#39;</span> <span class="op">*</span> generate_series,</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    (<span class="kw">random</span>() <span class="op">*</span> <span class="dv">1000</span>):<span class="ch">:int</span>,</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">random</span>() <span class="op">*</span> <span class="dv">100</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">50000000</span>);</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 表大小</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_size_pretty(pg_relation_size(<span class="st">&#39;sensor_test&#39;</span>));</span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 约 3.5GB</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>### 建索引对比</span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>\timing <span class="kw">on</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- B-Tree：耗时和索引大小</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_sensor_btree <span class="kw">ON</span> sensor_test <span class="kw">USING</span> btree (ts);</span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a><span class="co">-- Time: ~180000 ms（3 分钟）</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_size_pretty(pg_relation_size(<span class="st">&#39;idx_sensor_btree&#39;</span>));</span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a><span class="co">-- 约 1.1GB</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 先删除 B-Tree</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a><span class="kw">DROP</span> <span class="kw">INDEX</span> idx_sensor_btree;</span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a><span class="co">-- BRIN：耗时和索引大小</span></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_sensor_brin <span class="kw">ON</span> sensor_test <span class="kw">USING</span> brin (ts)</span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> (pages_per_range <span class="op">=</span> <span class="dv">128</span>);</span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="co">-- Time: ~8000 ms（8 秒）</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_size_pretty(pg_relation_size(<span class="st">&#39;idx_sensor_brin&#39;</span>));</span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a><span class="co">-- 约 200KB</span></span></code></pre></div>
+            <h3 id="查询性能对比">查询性能对比</h3>
+            <p>```sql SET enable_seqscan = off;</p>
+            <p>– 查询 1 小时数据（~3600 行） EXPLAIN (ANALYZE, BUFFERS)
+            SELECT count(*) FROM sensor_test WHERE ts BETWEEN
+            ‘2025-06-01 12:00:00’ AND ‘2025-06-01 13:00:00’;</p>
+            <p>– B-Tree： – Index Only Scan using idx_sensor_btree
+            (actual time=0.050..2.123) – Heap Fetches: 0 – Buffers:
+            shared hit=14</p>
+            <p>– BRIN： – Bitmap Heap Scan on sensor_test (actual
+            time=0.300..4.567) – Bitmap Index Scan on idx_sensor_brin
+            (actual time=0.200..0.200) – Buffers: shared hit=300 – BRIN
+            扫描了更多页面（整个 range 的所有页面），但仍远小于全表扫描
+            ```text</p>
+            <p>关键观察：BRIN 查询比 B-Tree
+            慢一些（回表了几百个页面而不是精确 14
+            个页面），但这是用<strong>8 秒 vs 3
+            分钟的建索引时间</strong>和<strong>200KB vs 1.1GB
+            的索引空间</strong>换来的。对于时序数据的日常查询，这个权衡通常是值得的。</p>
+            <hr />
+            <h2 id="八关键要点">八、关键要点</h2>
+            <ol type="1">
+            <li><strong>BRIN 用 page range summary
+            替代逐行索引</strong>——每个 range 只存 min/max
+            等统计值，索引大小仅为 B-Tree 的 1/100 到
+            1/1000。代价是查询精度依赖数据物理有序性。</li>
+            <li><strong>BRIN 查询有假阳性，没有假阴性</strong>——consist
+            过程返回 true 的 range 可能不包含目标行，但返回 false 的
+            range 一定不包含。executor 需要回表做精确过滤。</li>
+            <li><strong>BRIN 不适合数据随机分布的列或 UPDATE-heavy
+            的表</strong>——summary 不会收窄，旧 range 会保持宽泛的
+            min/max 导致不必要的回表扫描。</li>
+            <li><strong>Hash 索引在 PG 10+ 中已
+            WAL-safe</strong>——对于纯等值查询且键值均匀的场景，Hash
+            索引能节省 20-40% 的空间。但不支持范围查询和排序。</li>
+            <li><strong>Bloom
+            索引的价值在于多列任意组合的等值过滤</strong>——一个 Bloom
+            索引替代多个单列
+            B-Tree，但存在假阳性，且不支持范围查询、UNIQUE
+            约束、排序。</li>
+            <li><strong>B-Tree
+            仍然是默认选择</strong>——除非空间和写入开销成为瓶颈，且
+            BRIN/Hash/Bloom
+            的前提条件（数据有序、纯等值、多列组合过滤）明确成立。</li>
+            </ol>
+            <p>上一章：<a href="../16-gin/16-gin.html">GIN 索引</a>
+            下一章：<a
+            href="../18-streaming-repl/18-streaming-repl.html">流复制</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/access/brin/brin.c</code>：brininsert(),
+            bringetbitmap() — BRIN 插入与查询主函数</li>
+            <li><code>src/backend/access/brin/brin_revmap.c</code>：brinRevmapInitialize(),
+            brinRevmapGetBlockNumber() — revmap 操作</li>
+            <li><code>src/backend/access/brin/brin_tuple.c</code>：BRIN
+            summary tuple 的创建、修改、序列化</li>
+            <li><code>src/backend/access/brin/brin_minmax.c</code>：timestamptz_minmax_ops
+            等 opclass 的 summary 函数</li>
+            <li><code>src/backend/access/brin/brin_inclusion.c</code>：range
+            类型的 BRIN inclusion opclass</li>
+            <li><code>src/include/access/brin.h</code>：BRIN
+            相关结构体声明</li>
+            <li><code>src/include/access/brin_internal.h</code>：BrinOpcInfo,
+            BrinValues, BrinTuple 定义</li>
+            <li><code>src/include/access/brin_revmap.h</code>：BrinRevmap
+            结构体</li>
+            <li><code>src/backend/access/hash/hash.c</code>：hashinsert(),
+            hashgettuple() — Hash 索引实现</li>
+            <li><code>src/backend/access/hash/hashpage.c</code>：Hash
+            页面管理（bucket split, overflow）</li>
+            <li><code>src/backend/access/hash/hash_xlog.c</code>：Hash
+            索引的 WAL 重放（PG 10+）</li>
+            <li><code>contrib/bloom/bloom.c</code>：Bloom
+            索引的插入和查询实现</li>
+            <li><code>contrib/bloom/blutils.c</code>：Bloom 索引的
+            signature 管理</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 67: BRIN Indexes（BRIN
+            原理和 opclass 接口）</li>
+            <li>PostgreSQL Documentation, Chapter 64: Hash Indexes（Hash
+            索引内部结构）</li>
+            <li>PostgreSQL Documentation, Section 11.2: Index
+            Types（各类索引的概览与使用建议）</li>
+            <li>PostgreSQL Documentation, Appendix F: Additional
+            Supplied Modules — <code>bloom</code>（Bloom
+            索引扩展文档）</li>
+            <li>PostgreSQL Documentation, Section 9.26:
+            <code>pageinspect</code> — <code>brin_page_items()</code>
+            函数</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/14-btree/14-btree.html">【PG 内核】B-Tree 索引：页面分裂、rightlink 与去重</a></h3>
+                    <p>拆解 PostgreSQL B-Tree 索引的内核实现：BTPageOpaque 页面布局（high key / rightlink 的工程意义）、_bt_doinsert() 插入路径与 _bt_split() 页面分裂的完整流程（分裂点选择不是简单的 50/50）、PG 12+ 去重（deduplicate_items）的触发条件与 posting list 压缩策略、B-Tree WAL 记录类型与恢复，以及用 bt_page_items() 和 bt_metap() 观察索引内部结构的实验方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

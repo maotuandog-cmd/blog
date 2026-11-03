@@ -1,0 +1,1876 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】Linux I/O 栈全景：从 write() 到磁盘扇区 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="linux-io, vfs, page-cache, block-layer, io-scheduler, ftrace, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/07-linux-io-stack/linux-io-stack.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】Linux I/O 栈全景：从 write() 到磁盘扇区" />
+    <meta property="og:description" content="当应用程序调用一次 write() 系统调用（System Call）时，数据并不会立刻落到磁盘扇区上。 它需要穿越内核中七个以上的软件层次，每一层都有独立的职责、数据结构和延迟开销。 理解这条完整路径，是进行存储性能调优和故障诊断的基础。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/07-linux-io-stack/linux-io-stack.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="linux-io" />
+    <meta property="article:tag" content="vfs" />
+    <meta property="article:tag" content="page-cache" />
+    <meta property="article:tag" content="block-layer" />
+    <meta property="article:tag" content="io-scheduler" />
+    <meta property="article:tag" content="ftrace" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】Linux I/O 栈全景：从 write() 到磁盘扇区" />
+    <meta name="twitter:description" content="当应用程序调用一次 write() 系统调用（System Call）时，数据并不会立刻落到磁盘扇区上。 它需要穿越内核中七个以上的软件层次，每一层都有独立的职责、数据结构和延迟开销。 理解这条完整路径，是进行存储性能调优和故障诊断的基础。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】Linux I/O 栈全景：从 write() 到磁盘扇区", "description": "当应用程序调用一次 write() 系统调用（System Call）时，数据并不会立刻落到磁盘扇区上。 它需要穿越内核中七个以上的软件层次，每一层都有独立的职责、数据结构和延迟开销。 理解这条完整路径，是进行存储性能调优和故障诊断的基础。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/07-linux-io-stack/linux-io-stack.html"}, "datePublished": "2025-08-16T00:00:00+00:00", "dateModified": "2026-04-15T10:43:36+00:00", "keywords": ["linux-io", "vfs", "page-cache", "block-layer", "io-scheduler", "ftrace"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】Linux I/O 栈全景：从 write() 到磁盘扇区</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-16</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#linux-io</span> <span>#vfs</span> <span>#page-cache</span> <span>#block-layer</span> <span>#io-scheduler</span> <span>#ftrace</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/06-storage-media-selection/storage-media-selection.html">上一篇：【存储工程】存储介质选型指南</a><a class="post-series-nav__link" href="/post/storage/08-block-device-layer/block-device-layer.html">下一篇：【存储工程】块设备层：bio、request 与 I/O 调度器</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/linux-io.html">#linux-io</a><a class="chip-link" href="/tags/vfs.html">#vfs</a><a class="chip-link" href="/tags/page-cache.html">#page-cache</a><a class="chip-link" href="/tags/block-layer.html">#block-layer</a><a class="chip-link" href="/tags/io-scheduler.html">#io-scheduler</a><a class="chip-link" href="/tags/ftrace.html">#ftrace</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一io-栈全景概览"
+                id="toc-一io-栈全景概览">一、I/O 栈全景概览</a>
+                <ul>
+                <li><a href="#完整路径纵览" id="toc-完整路径纵览">1.1
+                完整路径纵览</a></li>
+                <li><a href="#各层延迟预算" id="toc-各层延迟预算">1.2
+                各层延迟预算</a></li>
+                <li><a href="#写操作的两种模式"
+                id="toc-写操作的两种模式">1.3 写操作的两种模式</a></li>
+                </ul></li>
+                <li><a href="#二vfs-层统一文件接口"
+                id="toc-二vfs-层统一文件接口">二、VFS
+                层：统一文件接口</a>
+                <ul>
+                <li><a href="#vfs-四大核心对象"
+                id="toc-vfs-四大核心对象">2.1 VFS 四大核心对象</a></li>
+                <li><a href="#操作函数表" id="toc-操作函数表">2.2
+                操作函数表</a></li>
+                <li><a href="#vfs-分发机制" id="toc-vfs-分发机制">2.3
+                VFS 分发机制</a></li>
+                <li><a href="#文件描述符查找"
+                id="toc-文件描述符查找">2.4 文件描述符查找</a></li>
+                </ul></li>
+                <li><a href="#三文件系统层"
+                id="toc-三文件系统层">三、文件系统层</a>
+                <ul>
+                <li><a href="#逻辑块与物理块映射"
+                id="toc-逻辑块与物理块映射">3.1
+                逻辑块与物理块映射</a></li>
+                <li><a href="#日志journaling机制"
+                id="toc-日志journaling机制">3.2
+                日志（Journaling）机制</a></li>
+                <li><a href="#延迟分配delayed-allocation"
+                id="toc-延迟分配delayed-allocation">3.3
+                延迟分配（Delayed Allocation）</a></li>
+                <li><a href="#ext4-写路径的关键函数"
+                id="toc-ext4-写路径的关键函数">3.4 ext4
+                写路径的关键函数</a></li>
+                </ul></li>
+                <li><a href="#四page-cache-层"
+                id="toc-四page-cache-层">四、Page Cache 层</a>
+                <ul>
+                <li><a href="#缓冲写入过程" id="toc-缓冲写入过程">4.1
+                缓冲写入过程</a></li>
+                <li><a href="#地址空间与-xarray"
+                id="toc-地址空间与-xarray">4.2 地址空间与
+                xarray</a></li>
+                <li><a href="#预读算法readahead"
+                id="toc-预读算法readahead">4.3
+                预读算法（Readahead）</a></li>
+                <li><a href="#脏页回写机制" id="toc-脏页回写机制">4.4
+                脏页回写机制</a></li>
+                <li><a href="#页缓存的内存统计"
+                id="toc-页缓存的内存统计">4.5 页缓存的内存统计</a></li>
+                </ul></li>
+                <li><a href="#五块设备层block-layer"
+                id="toc-五块设备层block-layer">五、块设备层（Block
+                Layer）</a>
+                <ul>
+                <li><a href="#bio-结构基本-io-单元"
+                id="toc-bio-结构基本-io-单元">5.1 bio 结构——基本 I/O
+                单元</a></li>
+                <li><a href="#请求合并与-plugging"
+                id="toc-请求合并与-plugging">5.2 请求合并与
+                Plugging</a></li>
+                <li><a href="#bio-到-request-的转换"
+                id="toc-bio-到-request-的转换">5.3 bio 到 request
+                的转换</a></li>
+                <li><a href="#多队列架构blk-mq"
+                id="toc-多队列架构blk-mq">5.4
+                多队列架构（blk-mq）</a></li>
+                <li><a href="#提交路径与完成路径"
+                id="toc-提交路径与完成路径">5.5
+                提交路径与完成路径</a></li>
+                </ul></li>
+                <li><a href="#六io-调度器" id="toc-六io-调度器">六、I/O
+                调度器</a>
+                <ul>
+                <li><a href="#调度器演进历史"
+                id="toc-调度器演进历史">6.1 调度器演进历史</a></li>
+                <li><a href="#mq-deadline-调度器"
+                id="toc-mq-deadline-调度器">6.2 mq-deadline
+                调度器</a></li>
+                <li><a href="#bfq-调度器" id="toc-bfq-调度器">6.3 BFQ
+                调度器</a></li>
+                <li><a href="#kyber-调度器" id="toc-kyber-调度器">6.4
+                Kyber 调度器</a></li>
+                <li><a href="#none无调度器" id="toc-none无调度器">6.5
+                none（无调度器）</a></li>
+                <li><a href="#调度器选择指南"
+                id="toc-调度器选择指南">6.6 调度器选择指南</a></li>
+                </ul></li>
+                <li><a href="#七设备驱动与硬件"
+                id="toc-七设备驱动与硬件">七、设备驱动与硬件</a>
+                <ul>
+                <li><a href="#scsi-子系统" id="toc-scsi-子系统">7.1 SCSI
+                子系统</a></li>
+                <li><a href="#nvme-驱动" id="toc-nvme-驱动">7.2 NVMe
+                驱动</a></li>
+                <li><a href="#dma-与分散聚集列表"
+                id="toc-dma-与分散聚集列表">7.3 DMA
+                与分散/聚集列表</a></li>
+                <li><a href="#中断处理演进" id="toc-中断处理演进">7.4
+                中断处理演进</a></li>
+                <li><a href="#完成队列处理" id="toc-完成队列处理">7.5
+                完成队列处理</a></li>
+                </ul></li>
+                <li><a href="#八ftracebpftrace-追踪-io-路径"
+                id="toc-八ftracebpftrace-追踪-io-路径">八、ftrace/bpftrace
+                追踪 I/O 路径</a>
+                <ul>
+                <li><a href="#ftrace函数图追踪"
+                id="toc-ftrace函数图追踪">8.1
+                ftrace：函数图追踪</a></li>
+                <li><a href="#blktrace-与-blkparse"
+                id="toc-blktrace-与-blkparse">8.2 blktrace 与
+                blkparse</a></li>
+                <li><a href="#bpftrace-一行追踪"
+                id="toc-bpftrace-一行追踪">8.3 bpftrace
+                一行追踪</a></li>
+                <li><a href="#bcc-工具集" id="toc-bcc-工具集">8.4 BCC
+                工具集</a></li>
+                <li><a href="#实战追踪一次-write-的完整路径"
+                id="toc-实战追踪一次-write-的完整路径">8.5
+                实战：追踪一次 write() 的完整路径</a></li>
+                </ul></li>
+                <li><a href="#九各层延迟测量实战"
+                id="toc-九各层延迟测量实战">九、各层延迟测量实战</a>
+                <ul>
+                <li><a href="#vfs-层开销测量"
+                id="toc-vfs-层开销测量">9.1 VFS 层开销测量</a></li>
+                <li><a href="#文件系统层开销测量"
+                id="toc-文件系统层开销测量">9.2
+                文件系统层开销测量</a></li>
+                <li><a href="#块设备层排队延迟"
+                id="toc-块设备层排队延迟">9.3 块设备层排队延迟</a></li>
+                <li><a href="#设备延迟测量" id="toc-设备延迟测量">9.4
+                设备延迟测量</a></li>
+                <li><a href="#端到端延迟分解实例"
+                id="toc-端到端延迟分解实例">9.5
+                端到端延迟分解实例</a></li>
+                <li><a href="#常见瓶颈模式与诊断"
+                id="toc-常见瓶颈模式与诊断">9.6
+                常见瓶颈模式与诊断</a></li>
+                <li><a href="#实用监控命令速查"
+                id="toc-实用监控命令速查">9.7 实用监控命令速查</a></li>
+                </ul></li>
+                <li><a href="#参考文献"
+                id="toc-参考文献">参考文献</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h2 id="一io-栈全景概览">一、I/O 栈全景概览</h2>
+            <p>当应用程序调用一次 <code>write()</code> 系统调用（System
+            Call）时，数据并不会立刻落到磁盘扇区上。
+            它需要穿越内核中七个以上的软件层次，每一层都有独立的职责、数据结构和延迟开销。
+            理解这条完整路径，是进行存储性能调优和故障诊断的基础。</p>
+            <h3 id="完整路径纵览">1.1 完整路径纵览</h3>
+            <p>从用户态到硬件，一次写操作的完整路径如下：</p>
+            <pre class="text"><code>用户态应用程序
+  │  write(fd, buf, len)
+  ▼
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  系统调用入口（syscall entry）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  │
+  ▼
+┌─────────────────────────────────┐
+│  VFS 层（Virtual File System）  │
+│  统一文件操作接口                │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│  文件系统层（ext4 / XFS / ...） │
+│  逻辑块 → 物理块映射             │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│  Page Cache 层                  │
+│  内存缓存、脏页管理              │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│  块设备层（Block Layer）         │
+│  bio 构造、请求合并              │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│  I/O 调度器（I/O Scheduler）    │
+│  排序、合并、优先级              │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│  设备驱动（Device Driver）      │
+│  SCSI / NVMe 命令构造           │
+└────────────┬────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────┐
+│  硬件控制器 → 磁盘介质           │
+│  DMA 传输、扇区写入             │
+└─────────────────────────────────┘</code></pre>
+            <h3 id="各层延迟预算">1.2 各层延迟预算</h3>
+            <p>在一块典型的企业级 NVMe 固态硬盘（Solid State
+            Drive）上，各层延迟的量级大致如下：</p>
+            <pre class="text"><code>层次                        典型延迟           占比
+────────────────────────────────────────────────────
+系统调用入口/返回            ~0.2 μs           &lt;1%
+VFS 层                      ~0.3 μs           ~1%
+文件系统层                   ~0.5-2 μs         ~2-5%
+Page Cache 层（命中）        ~0.1-0.5 μs       &lt;1%
+块设备层                     ~0.5-1 μs         ~2-3%
+I/O 调度器                  ~0.2-1 μs         ~1-3%
+设备驱动                     ~0.5-1 μs         ~2-3%
+硬件（NVMe SSD）            ~10-100 μs        ~80-90%
+────────────────────────────────────────────────────
+合计                         ~15-110 μs</code></pre>
+            <p>对于传统机械硬盘（Hard Disk Drive），硬件延迟在 3-10
+            毫秒量级， 软件栈的开销几乎可以忽略不计。但对于超低延迟的
+            NVMe 设备，
+            软件栈本身的开销已经不可忽视，这也是近年来内核社区持续优化
+            I/O 路径的原因。</p>
+            <h3 id="写操作的两种模式">1.3 写操作的两种模式</h3>
+            <p>用户态的写操作存在两种截然不同的路径：</p>
+            <ul>
+            <li><p><strong>缓冲写（Buffered
+            Write）</strong>：数据先写入页缓存（Page Cache），
+            由内核在后台异步刷盘。<code>write()</code>
+            返回时数据可能还未落盘。
+            这是默认模式，延迟最低，但存在数据丢失风险。</p></li>
+            <li><p><strong>直接写（Direct I/O）</strong>：通过
+            <code>O_DIRECT</code> 标志绕过页缓存，
+            数据从用户态缓冲区直接提交到块设备层。延迟更高但可预测，
+            数据库等对一致性要求严格的应用通常使用此模式。</p></li>
+            </ul>
+            <p>此外，<code>O_SYNC</code> 和 <code>fsync()</code>
+            可以强制将数据和元数据刷到持久存储，
+            但这会显著增加延迟，因为需要等待硬件确认写入完成。</p>
+            <h2 id="二vfs-层统一文件接口">二、VFS 层：统一文件接口</h2>
+            <p>虚拟文件系统（Virtual File System）是 Linux
+            内核中最重要的抽象层之一。
+            它为上层提供统一的文件操作接口，使得应用程序无需关心底层使用的是
+            ext4、XFS、Btrfs 还是网络文件系统（Network File
+            System）。</p>
+            <h3 id="vfs-四大核心对象">2.1 VFS 四大核心对象</h3>
+            <p>VFS 围绕四个核心数据结构组织：</p>
+            <p><strong>超级块（Superblock）</strong></p>
+            <p>超级块描述一个已挂载文件系统的全局信息，包括块大小、文件系统类型、
+            最大文件大小、挂载选项等。每个挂载点对应一个
+            <code>super_block</code> 结构体。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> super_block <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> list_head    s_list<span class="op">;</span>        <span class="co">/* 所有超级块的链表 */</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    dev_t               s_dev<span class="op">;</span>         <span class="co">/* 设备标识符 */</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span>       s_blocksize<span class="op">;</span>   <span class="co">/* 块大小（字节） */</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    loff_t              s_maxbytes<span class="op">;</span>    <span class="co">/* 最大文件大小 */</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> file_system_type <span class="op">*</span>s_type<span class="op">;</span>   <span class="co">/* 文件系统类型 */</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> super_operations <span class="op">*</span>s_op<span class="op">;</span> <span class="co">/* 超级块操作表 */</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry       <span class="op">*</span>s_root<span class="op">;</span>       <span class="co">/* 根目录项 */</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... 省略其他字段 ... */</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><strong>索引节点（Inode）</strong></p>
+            <p>索引节点代表文件系统中的一个对象（文件、目录、符号链接等），
+            包含文件的元数据信息：权限、大小、时间戳、数据块位置等。
+            注意 VFS 层的 inode 是内存中的结构，与磁盘上的 inode
+            有所区别。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> inode <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    umode_t             i_mode<span class="op">;</span>        <span class="co">/* 文件类型和权限 */</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    kuid_t              i_uid<span class="op">;</span>         <span class="co">/* 所有者 UID */</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    kgid_t              i_gid<span class="op">;</span>         <span class="co">/* 所有者 GID */</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>        i_flags<span class="op">;</span>       <span class="co">/* 文件系统标志 */</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> inode_operations <span class="op">*</span>i_op<span class="op">;</span>   <span class="co">/* inode 操作表 */</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> file_operations  <span class="op">*</span>i_fop<span class="op">;</span>  <span class="co">/* 默认文件操作表 */</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> super_block  <span class="op">*</span>i_sb<span class="op">;</span>         <span class="co">/* 所属超级块 */</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> address_space <span class="op">*</span>i_mapping<span class="op">;</span>   <span class="co">/* 关联的地址空间 */</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    loff_t              i_size<span class="op">;</span>        <span class="co">/* 文件大小（字节） */</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> timespec64   i_atime<span class="op">;</span>       <span class="co">/* 最后访问时间 */</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> timespec64   i_mtime<span class="op">;</span>       <span class="co">/* 最后修改时间 */</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> timespec64   i_ctime<span class="op">;</span>       <span class="co">/* 最后变更时间 */</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... 省略其他字段 ... */</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><strong>目录项（Dentry）</strong></p>
+            <p>目录项是文件路径中的一个分量，用于加速路径名查找。
+            内核维护了一个目录项缓存（Dentry
+            Cache），避免重复遍历磁盘目录结构。</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> dentry <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>        d_flags<span class="op">;</span>       <span class="co">/* 目录项标志 */</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry       <span class="op">*</span>d_parent<span class="op">;</span>     <span class="co">/* 父目录项 */</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> qstr         d_name<span class="op">;</span>        <span class="co">/* 名称 */</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode        <span class="op">*</span>d_inode<span class="op">;</span>      <span class="co">/* 关联的 inode */</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> dentry_operations <span class="op">*</span>d_op<span class="op">;</span> <span class="co">/* 目录项操作表 */</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> super_block  <span class="op">*</span>d_sb<span class="op">;</span>         <span class="co">/* 所属超级块 */</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... 省略其他字段 ... */</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><strong>文件对象（File）</strong></p>
+            <p>文件对象代表一个进程打开的文件实例。同一个文件被不同进程打开时，
+            每个进程拥有独立的文件对象，但共享同一个 inode。</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> file <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> path         f_path<span class="op">;</span>        <span class="co">/* 路径（包含 vfsmount 和 dentry） */</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode        <span class="op">*</span>f_inode<span class="op">;</span>      <span class="co">/* 关联的 inode */</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> file_operations <span class="op">*</span>f_op<span class="op">;</span> <span class="co">/* 文件操作表 */</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    atomic_long_t       f_count<span class="op">;</span>       <span class="co">/* 引用计数 */</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>        f_flags<span class="op">;</span>       <span class="co">/* 打开标志（O_RDWR 等） */</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    fmode_t             f_mode<span class="op">;</span>        <span class="co">/* 访问模式 */</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    loff_t              f_pos<span class="op">;</span>         <span class="co">/* 当前偏移量 */</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> address_space <span class="op">*</span>f_mapping<span class="op">;</span>   <span class="co">/* 页缓存地址空间 */</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... 省略其他字段 ... */</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <h3 id="操作函数表">2.2 操作函数表</h3>
+            <p>VFS 通过函数指针表实现多态分发（Polymorphic Dispatch）。
+            每个具体文件系统在注册时填充自己的函数指针：</p>
+            <p><strong>file_operations</strong>：定义文件级操作</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> file_operations <span class="op">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    loff_t <span class="op">(*</span>llseek<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*,</span> loff_t<span class="op">,</span> <span class="dt">int</span><span class="op">);</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> <span class="op">(*</span>read_iter<span class="op">)(</span><span class="kw">struct</span> kiocb <span class="op">*,</span> <span class="kw">struct</span> iov_iter <span class="op">*);</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> <span class="op">(*</span>write_iter<span class="op">)(</span><span class="kw">struct</span> kiocb <span class="op">*,</span> <span class="kw">struct</span> iov_iter <span class="op">*);</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>mmap<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*,</span> <span class="kw">struct</span> vm_area_struct <span class="op">*);</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>open<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> file <span class="op">*);</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>flush<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*,</span> fl_owner_t<span class="op">);</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>release<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> file <span class="op">*);</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>fsync<span class="op">)(</span><span class="kw">struct</span> file <span class="op">*,</span> loff_t<span class="op">,</span> loff_t<span class="op">,</span> <span class="dt">int</span><span class="op">);</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><strong>inode_operations</strong>：定义 inode 级操作</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> inode_operations <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> dentry <span class="op">*(*</span>lookup<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> dentry <span class="op">*,</span> <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">);</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>create<span class="op">)(</span><span class="kw">struct</span> mnt_idmap <span class="op">*,</span> <span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> dentry <span class="op">*,</span> umode_t<span class="op">,</span> <span class="dt">bool</span><span class="op">);</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>link<span class="op">)(</span><span class="kw">struct</span> dentry <span class="op">*,</span> <span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> dentry <span class="op">*);</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>unlink<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> dentry <span class="op">*);</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>mkdir<span class="op">)(</span><span class="kw">struct</span> mnt_idmap <span class="op">*,</span> <span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> dentry <span class="op">*,</span> umode_t<span class="op">);</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>rmdir<span class="op">)(</span><span class="kw">struct</span> inode <span class="op">*,</span> <span class="kw">struct</span> dentry <span class="op">*);</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <h3 id="vfs-分发机制">2.3 VFS 分发机制</h3>
+            <p>当用户调用 <code>write()</code>
+            时，内核的执行路径如下：</p>
+            <pre class="text"><code>用户态: write(fd, buf, count)
+         │
+         ▼
+sys_write(fd, buf, count)          /* 系统调用入口 */
+         │
+         ▼
+ksys_write(fd, buf, count)         /* 内部实现 */
+  ├── fdget_pos(fd)                /* 通过 fd 查找 file 对象 */
+  │     └── current-&gt;files-&gt;fdt-&gt;fd[fd]
+  └── vfs_write(file, buf, count, &amp;pos)
+         │
+         ▼
+vfs_write()
+  ├── rw_verify_area()             /* 权限和区域检查 */
+  └── new_sync_write() 或 call_write_iter()
+         │
+         ▼
+file-&gt;f_op-&gt;write_iter(kiocb, iov_iter)
+         │
+         ▼
+ext4_file_write_iter()  /  xfs_file_write_iter()  /  ...</code></pre>
+            <p>这里的关键在于 <code>file-&gt;f_op-&gt;write_iter</code>
+            这一行：VFS 通过文件对象中存储的
+            函数指针表，将调用分发到具体文件系统的实现。这是经典的面向对象设计在
+            C 语言中的体现。</p>
+            <h3 id="文件描述符查找">2.4 文件描述符查找</h3>
+            <p>从文件描述符（File
+            Descriptor）到文件对象的查找过程值得单独说明。
+            每个进程维护一个文件描述符表（File Descriptor Table），
+            本质上是一个指针数组，下标就是文件描述符的值：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 简化的查找过程 */</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> file <span class="op">*</span>fget<span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span> fd<span class="op">)</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> files_struct <span class="op">*</span>files <span class="op">=</span> current<span class="op">-&gt;</span>files<span class="op">;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> fdtable <span class="op">*</span>fdt <span class="op">=</span> rcu_dereference<span class="op">(</span>files<span class="op">-&gt;</span>fdt<span class="op">);</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> fdt<span class="op">-&gt;</span>max_fds<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> file <span class="op">*</span>file <span class="op">=</span> rcu_dereference<span class="op">(</span>fdt<span class="op">-&gt;</span>fd<span class="op">[</span>fd<span class="op">]);</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>file<span class="op">)</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>            get_file<span class="op">(</span>file<span class="op">);</span>  <span class="co">/* 增加引用计数 */</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> file<span class="op">;</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>整个查找过程在
+            RCU（Read-Copy-Update）保护下完成，开销极低。</p>
+            <h2 id="三文件系统层">三、文件系统层</h2>
+            <p>文件系统层负责将逻辑文件操作转换为对底层块设备的物理操作。
+            核心任务包括：逻辑块到物理块的映射、空间分配、元数据管理和一致性保证。</p>
+            <h3 id="逻辑块与物理块映射">3.1 逻辑块与物理块映射</h3>
+            <p>文件在逻辑上是一段连续的字节流，但在磁盘上可能分散存储在不同的物理块中。
+            文件系统的核心数据结构之一就是维护这种映射关系。</p>
+            <p><strong>ext4 的 Extent 方式</strong></p>
+            <p>ext4 使用区段（Extent）来描述连续的物理块范围：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ext4_extent <span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    __le32  ee_block<span class="op">;</span>      <span class="co">/* 逻辑块号（文件内偏移） */</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    __le16  ee_len<span class="op">;</span>        <span class="co">/* 连续块数 */</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    __le16  ee_start_hi<span class="op">;</span>   <span class="co">/* 物理块号高 16 位 */</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    __le32  ee_start_lo<span class="op">;</span>   <span class="co">/* 物理块号低 32 位 */</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>一个 Extent 可以描述最多 32768 个连续块（128 MB，按 4 KB
+            块大小计算）。 对于顺序写入的大文件，可能只需要少量 Extent
+            就能描述整个文件， 查找效率远高于传统的间接块（Indirect
+            Block）映射。</p>
+            <p>ext4 将 Extent 组织为一棵 B+ 树（B+
+            Tree）。当文件较小时， 所有 Extent 可以直接存储在 inode
+            中（最多 4 个）。 当文件变大时，自动扩展为多级索引结构。</p>
+            <pre class="text"><code>ext4 Extent B+ 树结构：
+
+inode
+├── extent_header (depth=1)
+├── extent_idx → 指向叶子节点块
+│     ├── extent_header (depth=0)
+│     ├── extent: 逻辑块 0-127   → 物理块 1000-1127
+│     ├── extent: 逻辑块 128-511 → 物理块 2000-2383
+│     └── extent: 逻辑块 512-639 → 物理块 5000-5127
+└── extent_idx → 指向另一个叶子节点块
+      └── ...</code></pre>
+            <p><strong>XFS 的 B+ 树方式</strong></p>
+            <p>XFS 同样使用 Extent
+            来描述连续块范围，但其索引结构更加精细。 XFS
+            为每个文件维护独立的 B+
+            树，支持更大规模的文件和更高效的查找。 XFS
+            的分配组（Allocation Group）机制还允许并行分配，
+            在多线程写入场景下性能优势明显。</p>
+            <pre class="text"><code>XFS Extent 记录（128 位）：
+┌──────────────────────────────────────────────────────┐
+│ 逻辑偏移（54 位）│ 物理块号（52 位）│ 块数（21 位）│标志│
+└──────────────────────────────────────────────────────┘</code></pre>
+            <h3 id="日志journaling机制">3.2 日志（Journaling）机制</h3>
+            <p>文件系统的元数据操作（如创建文件、修改目录、更新
+            inode）涉及多个块的修改。
+            如果在操作中途发生掉电或崩溃，文件系统可能处于不一致状态。
+            预写日志（Write-Ahead
+            Log）机制通过先将修改记录到日志区域来解决这个问题。</p>
+            <p><strong>ext4 的 JBD2 日志</strong></p>
+            <p>ext4 使用 JBD2（Journaling Block Device
+            2）子系统管理日志。 日志操作的基本流程如下：</p>
+            <pre class="text"><code>1. 开始事务（Transaction Begin）
+2. 将要修改的元数据块写入日志区域（Journal Area）
+3. 提交事务（Transaction Commit）— 写入提交记录
+4. 将元数据块写入最终位置（Checkpoint）
+5. 释放日志空间</code></pre>
+            <p>ext4 支持三种日志模式：</p>
+            <pre class="text"><code>日志模式              日志内容              性能        安全性
+─────────────────────────────────────────────────────────────
+journal              元数据 + 数据          最低        最高
+ordered（默认）      仅元数据              中等        中等
+writeback            仅元数据              最高        最低</code></pre>
+            <ul>
+            <li><code>journal</code>
+            模式：元数据和文件数据都经过日志，安全但性能最差。</li>
+            <li><code>ordered</code>
+            模式：只有元数据经过日志，但保证数据先于元数据落盘。</li>
+            <li><code>writeback</code>
+            模式：只有元数据经过日志，数据写入顺序不保证。</li>
+            </ul>
+            <p>可通过挂载选项切换：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前日志模式</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/fs/ext4/sda1/options <span class="kw">|</span> <span class="fu">grep</span> journal</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 以 ordered 模式挂载</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> data=ordered /dev/sda1 /mnt</span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 以 writeback 模式挂载（高性能场景）</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> data=writeback /dev/sda1 /mnt</span></code></pre></div>
+            <h3 id="延迟分配delayed-allocation">3.3 延迟分配（Delayed
+            Allocation）</h3>
+            <p>传统文件系统在 <code>write()</code>
+            调用时就立即分配磁盘块。 ext4 和 XFS
+            都实现了延迟分配（Delayed Allocation）：
+            写操作只将数据放入页缓存并标记为脏页，块分配推迟到实际刷盘时进行。</p>
+            <p>延迟分配的优势：</p>
+            <ul>
+            <li><strong>减少碎片</strong>：积累多个写操作后一次性分配，更容易分配连续块。</li>
+            <li><strong>减少元数据更新</strong>：临时文件可能在刷盘前就被删除，节省了不必要的块分配和回收。</li>
+            <li><strong>提高吞吐</strong>：批量分配减少了分配器的锁竞争。</li>
+            </ul>
+            <pre class="text"><code>延迟分配流程：
+
+write() 调用时：
+  1. 数据复制到 Page Cache
+  2. 页面标记为脏（dirty）
+  3. 记录 &quot;需要 N 个块&quot; 的预留信息
+  4. 不分配实际磁盘块 → 返回
+
+刷盘时（writeback 触发）：
+  1. 查找连续的脏页范围
+  2. 一次性分配连续磁盘块
+  3. 构造 bio 提交 I/O
+  4. 更新 Extent 树</code></pre>
+            <p>但延迟分配也有风险：如果系统在刷盘前崩溃，已写入页缓存但未落盘的数据会丢失。
+            对于需要持久化保证的场景，必须显式调用 <code>fsync()</code>
+            或使用 <code>O_SYNC</code> 标志。</p>
+            <h3 id="ext4-写路径的关键函数">3.4 ext4
+            写路径的关键函数</h3>
+            <p>以 ext4
+            为例，一次缓冲写操作在文件系统层的关键函数调用链：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a>ext4_file_write_iter<span class="op">()</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>  └── ext4_buffered_write_iter<span class="op">()</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>        └── generic_perform_write<span class="op">()</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>              ├── ext4_write_begin<span class="op">()</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>              │     ├── grab_cache_page_write_begin<span class="op">()</span>  <span class="co">/* 获取/分配页面 */</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>              │     └── ext4_journal_start<span class="op">()</span>           <span class="co">/* 开始日志事务 */</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>              ├── copy_page_from_iter<span class="op">()</span>                <span class="co">/* 用户数据 → 页缓存 */</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>              └── ext4_write_end<span class="op">()</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>                    ├── ext4_journal_stop<span class="op">()</span>             <span class="co">/* 结束日志事务 */</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>                    └── mark_inode_dirty<span class="op">()</span>              <span class="co">/* 标记 inode 脏 */</span></span></code></pre></div>
+            <h2 id="四page-cache-层">四、Page Cache 层</h2>
+            <p>页缓存（Page Cache）是 Linux 存储子系统的核心缓存机制。
+            它以内存页（通常 4 KB）为单位缓存文件数据，
+            位于文件系统层和块设备层之间，对上下两层都透明。</p>
+            <h3 id="缓冲写入过程">4.1 缓冲写入过程</h3>
+            <p>一次典型的缓冲写操作在页缓存层的处理过程：</p>
+            <pre class="text"><code>write(fd, buf, 8192)  — 写入 8192 字节（2 个页面）
+
+步骤 1：查找或创建页面
+  ├── 计算文件偏移对应的页索引：index = offset &gt;&gt; PAGE_SHIFT
+  ├── 在 address_space 的 xarray 中查找页面
+  ├── 如果命中：直接使用
+  └── 如果未命中：分配新页面并插入 xarray
+
+步骤 2：数据复制
+  └── copy_from_user(page_address + offset_in_page, user_buf, len)
+
+步骤 3：标记脏页
+  ├── SetPageDirty(page)
+  ├── __set_page_dirty_nobuffers() 或 __set_page_dirty_buffers()
+  └── 将页面加入 inode 的脏页链表
+
+步骤 4：返回用户态
+  └── write() 系统调用返回，数据尚未落盘</code></pre>
+            <h3 id="地址空间与-xarray">4.2 地址空间与 xarray</h3>
+            <p>每个 inode 关联一个地址空间（Address
+            Space）对象，用于管理该文件的所有缓存页。
+            地址空间的核心索引结构是 xarray（原来使用基数树 Radix Tree，
+            在内核 4.20 版本后迁移到 xarray）。</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> address_space <span class="op">{</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> inode        <span class="op">*</span>host<span class="op">;</span>          <span class="co">/* 所属 inode */</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> xarray       i_pages<span class="op">;</span>       <span class="co">/* 页面索引（xarray） */</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    atomic_t            i_mmap_writable<span class="op">;</span> <span class="co">/* 可写映射计数 */</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> rb_root_cached i_mmap<span class="op">;</span>      <span class="co">/* 私有和共享映射 */</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span>       nrpages<span class="op">;</span>       <span class="co">/* 总页面数 */</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> address_space_operations <span class="op">*</span>a_ops<span class="op">;</span> <span class="co">/* 操作表 */</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>    gfp_t               gfp_mask<span class="op">;</span>      <span class="co">/* 页面分配标志 */</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>xarray
+            是一种紧凑的基数树实现，支持高效的按索引查找、插入和范围操作。
+            页面查找的时间复杂度为 O(log n)，其中 n 是文件的页面数。</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 页面查找示意 */</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> folio <span class="op">*</span>filemap_get_folio<span class="op">(</span><span class="kw">struct</span> address_space <span class="op">*</span>mapping<span class="op">,</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>                                pgoff_t index<span class="op">)</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> folio <span class="op">*</span>folio<span class="op">;</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>    folio <span class="op">=</span> xa_load<span class="op">(&amp;</span>mapping<span class="op">-&gt;</span>i_pages<span class="op">,</span> index<span class="op">);</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>folio <span class="op">&amp;&amp;</span> <span class="op">!</span>folio_try_get<span class="op">(</span>folio<span class="op">))</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>        folio <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> folio<span class="op">;</span></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="预读算法readahead">4.3 预读算法（Readahead）</h3>
+            <p>对于顺序读取模式，内核实现了自适应预读（Adaptive
+            Readahead）算法，
+            在应用程序请求数据之前就预先将后续数据加载到页缓存中。</p>
+            <pre class="text"><code>预读窗口示意：
+
+文件偏移 ─────────────────────────────────────────────→
+
+        │← 当前窗口 →│← 预读窗口 →│
+        ├─────────────┼────────────┤
+        │ 已读取/正在  │ 异步预读    │
+        │ 读取的页面    │ 正在加载    │
+        ├─────────────┼────────────┤
+
+初始预读大小：    通常为 128 KB（32 页）
+最大预读大小：    /sys/block/&lt;dev&gt;/queue/read_ahead_kb（默认 128 KB）
+增长策略：        检测到顺序模式后，窗口逐步增大至最大值</code></pre>
+            <p>预读参数可以动态调整：</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前预读大小</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 增大预读窗口（适用于大文件顺序读取场景）</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2048 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 blockdev 命令设置</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a><span class="ex">blockdev</span> <span class="at">--setra</span> 4096 /dev/sda   <span class="co"># 单位为 512 字节扇区，4096 = 2048 KB</span></span></code></pre></div>
+            <p>对于数据库等随机读取场景，过大的预读窗口反而浪费内存和
+            I/O 带宽， 应当适当减小预读值。</p>
+            <h3 id="脏页回写机制">4.4 脏页回写机制</h3>
+            <p>脏页不会一直留在内存中，内核通过多种机制触发回写（Writeback）：</p>
+            <p><strong>周期性回写</strong>：内核线程
+            <code>kworker</code> 定期扫描脏页。</p>
+            <p><strong>阈值触发回写</strong>：当脏页比例超过阈值时触发。</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前脏页相关参数</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_ratio</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_background_ratio</span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_expire_centisecs</span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_writeback_centisecs</span></code></pre></div>
+            <p>各参数的含义和默认值：</p>
+            <pre class="text"><code>参数                            默认值    含义
+──────────────────────────────────────────────────────────────────
+vm.dirty_ratio                  20       脏页占可用内存的百分比上限；
+                                         超过此阈值，写操作将同步等待回写
+vm.dirty_background_ratio       10       后台回写启动阈值；
+                                         脏页超过此比例，后台线程开始刷盘
+vm.dirty_expire_centisecs       3000     脏页过期时间（30 秒）；
+                                         超过此时间的脏页会被优先回写
+vm.dirty_writeback_centisecs    500      回写线程唤醒间隔（5 秒）</code></pre>
+            <p>回写的触发时机：</p>
+            <pre class="text"><code>1. 后台回写：脏页比例 &gt; dirty_background_ratio
+   └── 由 kworker 线程异步执行，不阻塞写操作
+
+2. 前台回写：脏页比例 &gt; dirty_ratio
+   └── write() 调用被阻塞，直到脏页比例降下来
+
+3. 周期回写：每 dirty_writeback_centisecs 检查一次
+   └── 回写过期脏页（存在时间 &gt; dirty_expire_centisecs）
+
+4. 显式回写：fsync() / fdatasync() / sync()
+   └── 等待指定文件/所有文件的脏页全部落盘
+
+5. 内存压力回写：可用内存不足时
+   └── 由 kswapd / direct reclaim 触发</code></pre>
+            <p>针对高吞吐写入场景的调优示例：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 增大脏页阈值，允许更多数据缓存在内存中</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=40</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=10</span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 对于有 UPS 保护的系统，可适当延长过期时间</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=6000</span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 对于数据安全要求高的场景，减小阈值和过期时间</span></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_ratio=5</span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_background_ratio=2</span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> <span class="at">-w</span> vm.dirty_expire_centisecs=500</span></code></pre></div>
+            <h3 id="页缓存的内存统计">4.5 页缓存的内存统计</h3>
+            <p>可以通过以下方式查看页缓存的使用情况：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看整体内存使用（Cached 即页缓存大小）</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 详细信息</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/meminfo <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;Cached|Dirty|Writeback&quot;</span></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Cached:          8234576 kB</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Dirty:              1284 kB</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Writeback:             0 kB</span></span></code></pre></div>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看特定文件的缓存状态（需要 vmtouch 工具）</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="ex">vmtouch</span> /var/log/syslog</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="co">#            Files: 1</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="co">#      Directories: 0</span></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a><span class="co">#   Resident Pages: 128/256  50%</span></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="co">#          Elapsed: 0.001 seconds</span></span></code></pre></div>
+            <h2 id="五块设备层block-layer">五、块设备层（Block
+            Layer）</h2>
+            <p>块设备层是页缓存和设备驱动之间的桥梁。
+            它将文件系统的块级操作封装成标准的 I/O 请求，
+            并通过合并、排序等优化减少实际发送给设备的命令数量。</p>
+            <h3 id="bio-结构基本-io-单元">5.1 bio 结构——基本 I/O
+            单元</h3>
+            <p>bio（Block I/O）是块设备层最基本的数据结构，
+            描述一次从连续逻辑块地址到内存页面的映射：</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> bio <span class="op">{</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio          <span class="op">*</span>bi_next<span class="op">;</span>      <span class="co">/* 链表中的下一个 bio */</span></span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> block_device <span class="op">*</span>bi_bdev<span class="op">;</span>      <span class="co">/* 目标块设备 */</span></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>        bi_opf<span class="op">;</span>        <span class="co">/* 操作类型和标志 */</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">short</span>      bi_flags<span class="op">;</span>      <span class="co">/* bio 标志 */</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">short</span>      bi_ioprio<span class="op">;</span>     <span class="co">/* I/O 优先级 */</span></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a>    sector_t            bi_iter<span class="op">.</span>bi_sector<span class="op">;</span>  <span class="co">/* 起始扇区号 */</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>        bi_iter<span class="op">.</span>bi_size<span class="op">;</span>    <span class="co">/* 剩余字节数 */</span></span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio_vec      <span class="op">*</span>bi_io_vec<span class="op">;</span>    <span class="co">/* bio_vec 数组 */</span></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">short</span>      bi_vcnt<span class="op">;</span>       <span class="co">/* bio_vec 数量 */</span></span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">short</span>      bi_max_vecs<span class="op">;</span>   <span class="co">/* 最大 bio_vec 数 */</span></span>
+<span id="cb30-12"><a href="#cb30-12" aria-hidden="true" tabindex="-1"></a>    bio_end_io_t        <span class="op">*</span>bi_end_io<span class="op">;</span>    <span class="co">/* 完成回调函数 */</span></span>
+<span id="cb30-13"><a href="#cb30-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span>                <span class="op">*</span>bi_private<span class="op">;</span>   <span class="co">/* 私有数据 */</span></span>
+<span id="cb30-14"><a href="#cb30-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb30-15"><a href="#cb30-15" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>每个 <code>bio_vec</code>
+            描述一个内存页面中的一段数据：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> bio_vec <span class="op">{</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> page  <span class="op">*</span>bv_page<span class="op">;</span>     <span class="co">/* 内存页面 */</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>  bv_len<span class="op">;</span>      <span class="co">/* 数据长度 */</span></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>  bv_offset<span class="op">;</span>   <span class="co">/* 页内偏移 */</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>一个 bio 可以包含多个
+            bio_vec，实现分散/聚集（Scatter/Gather）I/O。</p>
+            <h3 id="请求合并与-plugging">5.2 请求合并与 Plugging</h3>
+            <p>当多个相邻的 bio
+            提交时，块设备层会尝试将它们合并成一个更大的请求（Request），
+            减少发送给设备的命令数量。</p>
+            <p><strong>前向合并（Front Merge）</strong>：新 bio
+            的结束位置与现有请求的起始位置相邻。 <strong>后向合并（Back
+            Merge）</strong>：新 bio
+            的起始位置与现有请求的结束位置相邻。</p>
+            <pre class="text"><code>合并示意：
+
+请求队列中已有：[扇区 100-200]
+
+新 bio 到达：[扇区 200-300]
+  → 后向合并：[扇区 100-300]
+
+新 bio 到达：[扇区 50-100]
+  → 前向合并：[扇区 50-300]</code></pre>
+            <p><strong>Plugging 机制</strong></p>
+            <p>为了给合并操作留出时间窗口，内核使用了 plugging
+            机制：</p>
+            <pre class="text"><code>1. 线程开始提交 I/O 时，创建一个 &quot;plug&quot;
+2. 后续的 bio 暂存在 plug 列表中，不立即发送
+3. 线程主动 &quot;unplug&quot; 或调度出去时，批量提交所有暂存的 bio
+4. 批量提交时进行合并和排序优化</code></pre>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Plugging 使用示例（内核代码） */</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> blk_plug plug<span class="op">;</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a>blk_start_plug<span class="op">(&amp;</span>plug<span class="op">);</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="co">/* 提交多个 bio */</span></span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a>submit_bio<span class="op">(</span>bio1<span class="op">);</span></span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a>submit_bio<span class="op">(</span>bio2<span class="op">);</span></span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a>submit_bio<span class="op">(</span>bio3<span class="op">);</span></span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a>blk_finish_plug<span class="op">(&amp;</span>plug<span class="op">);</span>  <span class="co">/* 批量提交并合并 */</span></span></code></pre></div>
+            <h3 id="bio-到-request-的转换">5.3 bio 到 request
+            的转换</h3>
+            <p>bio 是面向数据的结构，而 request 是面向设备的结构。
+            块设备层将一个或多个 bio 合并成一个 request：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> request <span class="op">{</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> request_queue <span class="op">*</span>q<span class="op">;</span>           <span class="co">/* 所属请求队列 */</span></span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_mq_ctx   <span class="op">*</span>mq_ctx<span class="op">;</span>      <span class="co">/* 多队列上下文 */</span></span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_mq_hw_ctx <span class="op">*</span>mq_hctx<span class="op">;</span>    <span class="co">/* 硬件队列上下文 */</span></span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a>    sector_t             __sector<span class="op">;</span>     <span class="co">/* 起始扇区 */</span></span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>         __data_len<span class="op">;</span>   <span class="co">/* 数据总长度 */</span></span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio           <span class="op">*</span>bio<span class="op">;</span>         <span class="co">/* 第一个 bio */</span></span>
+<span id="cb35-8"><a href="#cb35-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio           <span class="op">*</span>biotail<span class="op">;</span>     <span class="co">/* 最后一个 bio */</span></span>
+<span id="cb35-9"><a href="#cb35-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb35-10"><a href="#cb35-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <h3 id="多队列架构blk-mq">5.4 多队列架构（blk-mq）</h3>
+            <p>传统的单队列块设备层在多核系统上存在严重的锁竞争问题。
+            从内核 3.13 开始引入的多队列块设备层（Multi-Queue Block
+            Layer，简称 blk-mq）
+            彻底重新设计了请求提交和完成的路径。</p>
+            <pre class="text"><code>blk-mq 架构：
+
+CPU 0 ──→ [软件队列 0] ──┐
+CPU 1 ──→ [软件队列 1] ──┤
+CPU 2 ──→ [软件队列 2] ──┼──→ [硬件队列 0] ──→ 设备
+CPU 3 ──→ [软件队列 3] ──┤         ↕
+                          └──→ [硬件队列 1] ──→ 设备
+                                   ↕
+每个 CPU 有独立的软件队列         多个硬件队列
+（Software Queue），避免        （Hardware Queue），
+CPU 之间的锁竞争               对应设备的提交队列</code></pre>
+            <p>blk-mq 的核心组件：</p>
+            <ul>
+            <li><p><strong>软件分发队列（Software Staging
+            Queue）</strong>： 每个 CPU 一个，bio 首先进入本 CPU
+            的软件队列。 此队列使用 per-CPU 数据结构，避免跨 CPU
+            锁竞争。</p></li>
+            <li><p><strong>硬件分发队列（Hardware Dispatch
+            Queue）</strong>：
+            对应设备驱动的提交队列。数量通常与设备支持的队列数一致。
+            NVMe 设备通常支持多个硬件队列（可配置）。</p></li>
+            <li><p><strong>标签（Tag）分配</strong>：
+            每个正在处理的请求分配一个唯一的标签，用于匹配完成回调。</p></li>
+            </ul>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看块设备的队列信息</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/block/nvme0n1/mq/</span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看硬件队列数量</span></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/queue/nr_requests</span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看某个硬件队列的 CPU 亲和性</span></span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/mq/0/cpu_list</span></code></pre></div>
+            <h3 id="提交路径与完成路径">5.5 提交路径与完成路径</h3>
+            <p><strong>提交路径（Submission Path）</strong>：</p>
+            <pre class="text"><code>submit_bio()
+  └── submit_bio_noacct()
+        └── __submit_bio()
+              └── blk_mq_submit_bio()
+                    ├── blk_mq_get_request()       /* 分配 request 和 tag */
+                    ├── blk_mq_bio_to_request()     /* bio → request */
+                    └── blk_mq_run_hw_queue()       /* 提交到硬件队列 */
+                          └── blk_mq_dispatch_rq_list()
+                                └── q-&gt;mq_ops-&gt;queue_rq()  /* 驱动回调 */</code></pre>
+            <p><strong>完成路径（Completion Path）</strong>：</p>
+            <pre class="text"><code>设备中断 → 驱动完成处理
+  └── blk_mq_complete_request()
+        └── blk_mq_end_request()
+              ├── blk_update_request()       /* 更新请求状态 */
+              ├── bio_endio(req-&gt;bio)         /* 回调每个 bio 的完成函数 */
+              └── blk_mq_free_request()      /* 释放 request 和 tag */</code></pre>
+            <h2 id="六io-调度器">六、I/O 调度器</h2>
+            <p>I/O 调度器（I/O Scheduler）位于块设备层内部，
+            负责对等待提交的请求进行排序和调度，以优化设备的吞吐量或延迟。</p>
+            <h3 id="调度器演进历史">6.1 调度器演进历史</h3>
+            <p>Linux I/O 调度器经历了几个重要的演进阶段：</p>
+            <pre class="text"><code>时间线        调度器              适用场景
+─────────────────────────────────────────────────────────
+2.6 早期      Linus Elevator      最早的基础调度器
+2.6.x         Anticipatory        增加了预测性等待
+2.6.x         CFQ                 完全公平队列（默认）
+2.6.x         Deadline            截止时间保证
+4.12+         mq-deadline         多队列版 deadline
+4.12+         BFQ                 预算公平队列
+4.12+         Kyber               延迟目标调度器
+4.12+         none                透传（无调度）</code></pre>
+            <p>从内核 5.0 开始，传统的单队列调度器（CFQ、deadline
+            等）已被移除， 仅保留多队列版本的调度器。</p>
+            <h3 id="mq-deadline-调度器">6.2 mq-deadline 调度器</h3>
+            <p>mq-deadline 是最常用的通用型调度器，
+            基于截止时间（Deadline）保证每个请求在合理时间内得到服务。</p>
+            <p>核心机制：</p>
+            <pre class="text"><code>mq-deadline 维护的数据结构：
+
+读请求排序队列（按扇区号排序）──→ 用于合并和顺序访问优化
+读请求截止队列（按提交时间排序）──→ 用于防止饥饿
+
+写请求排序队列（按扇区号排序）──→ 同上
+写请求截止队列（按提交时间排序）──→ 同上
+
+调度策略：
+1. 优先服务读请求（读延迟敏感）
+2. 按排序队列顺序批量派发（减少寻道）
+3. 如果有请求超过截止时间，立即派发（防止饥饿）
+4. 读写交替时，插入一定数量的写请求</code></pre>
+            <p>关键参数：</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前调度器</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出：[mq-deadline] kyber bfq none</span></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 切换调度器</span></span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> mq-deadline <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 mq-deadline 参数</span></span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/block/sda/queue/iosched/</span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-11"><a href="#cb42-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 读截止时间（毫秒），默认 500</span></span>
+<span id="cb42-12"><a href="#cb42-12" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/read_expire</span>
+<span id="cb42-13"><a href="#cb42-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-14"><a href="#cb42-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 写截止时间（毫秒），默认 5000</span></span>
+<span id="cb42-15"><a href="#cb42-15" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/write_expire</span>
+<span id="cb42-16"><a href="#cb42-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-17"><a href="#cb42-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 每次批量派发的请求数</span></span>
+<span id="cb42-18"><a href="#cb42-18" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/fifo_batch</span></code></pre></div>
+            <h3 id="bfq-调度器">6.3 BFQ 调度器</h3>
+            <p>BFQ（Budget Fair Queueing）调度器为每个进程分配 I/O
+            “预算”， 确保带宽在进程间公平分配，同时保持低延迟。</p>
+            <pre class="text"><code>BFQ 核心概念：
+
+1. 每个进程关联一个 BFQ 队列
+2. 调度器轮流服务各队列，每次分配固定 &quot;预算&quot;（扇区数）
+3. 预算用完或队列空闲后，切换到下一个队列
+4. 对交互式进程（低带宽、间歇性 I/O）给予更高优先级</code></pre>
+            <p>BFQ 的优势在于桌面和嵌入式场景：
+            即使后台有大量写入操作，前台应用的 I/O
+            延迟也能保持在可接受范围内。</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 切换到 BFQ</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> bfq <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co"># BFQ 特有参数</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 低延迟模式（默认启用，对交互式进程优化）</span></span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/low_latency</span>
+<span id="cb44-7"><a href="#cb44-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-8"><a href="#cb44-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 后台 I/O 的权重</span></span>
+<span id="cb44-9"><a href="#cb44-9" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/back_seek_penalty</span></code></pre></div>
+            <h3 id="kyber-调度器">6.4 Kyber 调度器</h3>
+            <p>Kyber 是一个面向延迟目标（Latency
+            Target）的轻量级调度器， 特别适合 NVMe 等高性能设备。</p>
+            <pre class="text"><code>Kyber 工作原理：
+
+1. 维护两个延迟目标：读延迟目标和写延迟目标
+2. 监控实际延迟，动态调整队列深度
+3. 如果实际延迟超过目标，减少并发请求数
+4. 如果实际延迟低于目标，增加并发请求数</code></pre>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 切换到 Kyber</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> kyber <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看延迟目标</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/queue/iosched/read_lat_nsec   <span class="co"># 默认 2000000 (2ms)</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/queue/iosched/write_lat_nsec  <span class="co"># 默认 10000000 (10ms)</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整读延迟目标为 1ms</span></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1000000 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/iosched/read_lat_nsec</span></code></pre></div>
+            <h3 id="none无调度器">6.5 none（无调度器）</h3>
+            <p>对于 NVMe 等内部已有高效调度机制的设备，使用
+            <code>none</code> 调度器可以避免
+            软件层的重复调度开销。请求直接透传到硬件队列。</p>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 对 NVMe 设备使用 none 调度器</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> none <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span></code></pre></div>
+            <h3 id="调度器选择指南">6.6 调度器选择指南</h3>
+            <pre class="text"><code>设备类型              推荐调度器        原因
+────────────────────────────────────────────────────────────────
+机械硬盘（HDD）       mq-deadline       减少寻道，防止饥饿
+SATA SSD              mq-deadline       通用型，适用广泛
+NVMe SSD              none 或 kyber     设备内部已有调度
+桌面系统              BFQ               保证交互式应用响应
+虚拟机磁盘            mq-deadline       宿主机已有调度
+高性能数据库          none              最低延迟</code></pre>
+            <h2 id="七设备驱动与硬件">七、设备驱动与硬件</h2>
+            <p>设备驱动层是内核与物理硬件之间的接口。
+            不同类型的存储设备使用不同的驱动子系统。</p>
+            <h3 id="scsi-子系统">7.1 SCSI 子系统</h3>
+            <p>SCSI（Small Computer System Interface）子系统是 Linux 中
+            最成熟的存储驱动框架。不仅用于传统 SCSI 设备， SATA 硬盘通过
+            libata 层也使用 SCSI 子系统的上层接口。</p>
+            <pre class="text"><code>SCSI 子系统层次：
+
+块设备层
+    │
+    ▼
+┌───────────────────────┐
+│ SCSI 上层驱动          │ sd（磁盘）、sr（光驱）、st（磁带）
+├───────────────────────┤
+│ SCSI 中间层            │ 错误处理、命令排队、超时管理
+├───────────────────────┤
+│ SCSI 下层驱动（HBA）   │ ata_piix、ahci、megaraid 等
+└───────────────────────┘
+    │
+    ▼
+  硬件控制器</code></pre>
+            <p>SCSI 命令描述块（Command Descriptor Block，简称 CDB）是
+            SCSI 协议的核心：</p>
+            <pre class="text"><code>WRITE(10) 命令 CDB 结构（10 字节）：
+
+字节   内容
+──────────────────────────
+0      操作码（0x2A）
+1      标志位
+2-5    逻辑块地址（LBA）
+6      分组号
+7-8    传输长度（块数）
+9      控制字节</code></pre>
+            <h3 id="nvme-驱动">7.2 NVMe 驱动</h3>
+            <p>NVMe（Non-Volatile Memory
+            Express）是专为闪存存储设计的协议， 直接通过 PCIe 总线与 CPU
+            通信，无需 SCSI 层的转换开销。</p>
+            <pre class="text"><code>NVMe 架构：
+
+应用程序
+    │
+    ▼
+块设备层（blk-mq）
+    │
+    ▼
+┌──────────────────────────┐
+│  NVMe 驱动               │
+│  ├── 提交队列（SQ）       │  每个 CPU 可有独立的 SQ
+│  ├── 完成队列（CQ）       │  处理设备完成通知
+│  └── 管理队列（Admin Q）  │  设备管理命令
+└──────────────────────────┘
+    │ PCIe
+    ▼
+┌──────────────────────────┐
+│  NVMe 控制器              │
+│  ├── 内部调度器            │
+│  ├── 闪存转换层（FTL）     │
+│  └── NAND Flash           │
+└──────────────────────────┘</code></pre>
+            <p>NVMe 的提交/完成队列模型：</p>
+            <pre class="text"><code>NVMe 命令提交流程：
+
+1. 驱动构造 NVMe 命令（64 字节），写入提交队列（Submission Queue）尾部
+2. 更新提交队列的门铃寄存器（Doorbell Register），通知控制器
+3. 控制器从提交队列取出命令，执行 I/O 操作
+4. 完成后，控制器将完成条目（16 字节）写入完成队列（Completion Queue）
+5. 控制器触发中断，通知驱动
+6. 驱动从完成队列读取结果，执行回调</code></pre>
+            <div class="sourceCode" id="cb53"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 NVMe 设备信息</span></span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvme</span> list</span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看详细控制器信息</span></span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a><span class="ex">nvme</span> id-ctrl /dev/nvme0 <span class="at">-H</span></span>
+<span id="cb53-6"><a href="#cb53-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-7"><a href="#cb53-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看命名空间信息</span></span>
+<span id="cb53-8"><a href="#cb53-8" aria-hidden="true" tabindex="-1"></a><span class="ex">nvme</span> id-ns /dev/nvme0n1 <span class="at">-H</span></span>
+<span id="cb53-9"><a href="#cb53-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-10"><a href="#cb53-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看队列数量</span></span>
+<span id="cb53-11"><a href="#cb53-11" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/device/queue_count</span>
+<span id="cb53-12"><a href="#cb53-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-13"><a href="#cb53-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看每个 CPU 的队列映射</span></span>
+<span id="cb53-14"><a href="#cb53-14" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/mq/<span class="pp">*</span>/cpu_list</span></code></pre></div>
+            <h3 id="dma-与分散聚集列表">7.3 DMA 与分散/聚集列表</h3>
+            <p>直接内存访问（Direct Memory Access，简称
+            DMA）使设备可以直接读写主内存， 无需 CPU
+            逐字节搬运数据。</p>
+            <p>分散/聚集列表（Scatter/Gather List，简称 SGL）允许一次
+            DMA 传输 涉及多个不连续的内存区域：</p>
+            <pre class="text"><code>分散/聚集 DMA：
+
+物理内存                          磁盘
+┌──────┐                         ┌──────┐
+│页面 A │──┐                      │ LBA  │
+├──────┤  │    DMA 控制器         │  0   │
+│页面 B │──┼──→ ════════ ──→     │  1   │
+├──────┤  │                      │  2   │
+│页面 C │──┘                      │  3   │
+└──────┘                         └──────┘
+
+三个不连续的内存页面通过一次 DMA 操作写入连续的磁盘块。</code></pre>
+            <h3 id="中断处理演进">7.4 中断处理演进</h3>
+            <p>存储设备使用中断（Interrupt）通知 CPU 操作完成。
+            中断机制经历了三代演进：</p>
+            <pre class="text"><code>演进                  特点                          限制
+────────────────────────────────────────────────────────────
+传统 IRQ              共享中断线                     需要遍历所有共享设备
+                      电平/边沿触发                  中断号有限
+MSI                   消息信号中断                   每设备最多 32 个中断
+（Message Signaled    写入特定内存地址触发中断
+  Interrupt）         不需要物理中断线
+MSI-X                 扩展消息信号中断               支持 2048 个中断向量
+                      每个中断可独立路由到不同 CPU    可实现完全的每队列中断
+                      NVMe 设备标配</code></pre>
+            <p>对于 NVMe 设备，MSI-X
+            至关重要：每个完成队列可以关联独立的中断向量，
+            中断直接路由到处理该队列的 CPU，避免跨 CPU
+            的中断处理开销。</p>
+            <div class="sourceCode" id="cb56"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb56-1"><a href="#cb56-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看设备中断类型和分配</span></span>
+<span id="cb56-2"><a href="#cb56-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/interrupts <span class="kw">|</span> <span class="fu">grep</span> nvme</span>
+<span id="cb56-3"><a href="#cb56-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-4"><a href="#cb56-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb56-5"><a href="#cb56-5" aria-hidden="true" tabindex="-1"></a><span class="co">#  CPU0   CPU1   CPU2   CPU3</span></span>
+<span id="cb56-6"><a href="#cb56-6" aria-hidden="true" tabindex="-1"></a><span class="co">#  1234   0      0      0     IR-PCI-MSI-X  nvme0q0</span></span>
+<span id="cb56-7"><a href="#cb56-7" aria-hidden="true" tabindex="-1"></a><span class="co">#  0      5678   0      0     IR-PCI-MSI-X  nvme0q1</span></span>
+<span id="cb56-8"><a href="#cb56-8" aria-hidden="true" tabindex="-1"></a><span class="co">#  0      0      9012   0     IR-PCI-MSI-X  nvme0q2</span></span>
+<span id="cb56-9"><a href="#cb56-9" aria-hidden="true" tabindex="-1"></a><span class="co">#  0      0      0      3456  IR-PCI-MSI-X  nvme0q3</span></span></code></pre></div>
+            <h3 id="完成队列处理">7.5 完成队列处理</h3>
+            <p>当设备完成 I/O 操作后，完成处理的路径：</p>
+            <pre class="text"><code>1. 设备将完成条目写入完成队列（CQ）
+2. 设备触发 MSI-X 中断
+3. CPU 执行中断处理程序（Top Half）
+     └── 将工作提交到软中断（softirq）
+4. 软中断处理（Bottom Half）
+     ├── 遍历完成队列，处理所有完成条目
+     ├── 调用 blk_mq_complete_request()
+     └── 触发 bio 完成回调
+5. 更新完成队列头指针，通知设备释放队列空间</code></pre>
+            <p>中断合并（Interrupt Coalescing）是一项重要的优化：
+            设备可以积累多个完成条目后再触发一次中断，减少中断处理开销。
+            但这会增加单个 I/O 的延迟，需要在吞吐量和延迟之间权衡。</p>
+            <div class="sourceCode" id="cb58"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb58-1"><a href="#cb58-1" aria-hidden="true" tabindex="-1"></a><span class="co"># NVMe 设备的中断合并设置</span></span>
+<span id="cb58-2"><a href="#cb58-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvme</span> get-feature /dev/nvme0 <span class="at">-f</span> 0x08 <span class="at">-H</span></span>
+<span id="cb58-3"><a href="#cb58-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置中断合并：聚合时间 100μs，聚合阈值 8 个完成条目</span></span>
+<span id="cb58-4"><a href="#cb58-4" aria-hidden="true" tabindex="-1"></a><span class="ex">nvme</span> set-feature /dev/nvme0 <span class="at">-f</span> 0x08 <span class="at">-v</span> 0x00080064</span></code></pre></div>
+            <h2 id="八ftracebpftrace-追踪-io-路径">八、ftrace/bpftrace
+            追踪 I/O 路径</h2>
+            <p>Linux 内核提供了丰富的追踪工具，可以深入观察 I/O
+            请求在各层的行为。 本节介绍几种常用的追踪方法。</p>
+            <h3 id="ftrace函数图追踪">8.1 ftrace：函数图追踪</h3>
+            <p>ftrace 是内核内置的追踪框架（Tracing Framework），
+            无需安装额外工具即可使用。函数图追踪器（Function Graph
+            Tracer） 可以记录函数的调用关系和执行时间。</p>
+            <div class="sourceCode" id="cb59"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb59-1"><a href="#cb59-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用函数图追踪器</span></span>
+<span id="cb59-2"><a href="#cb59-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> function_graph <span class="op">&gt;</span> /sys/kernel/debug/tracing/current_tracer</span>
+<span id="cb59-3"><a href="#cb59-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-4"><a href="#cb59-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 只追踪 I/O 相关函数</span></span>
+<span id="cb59-5"><a href="#cb59-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;vfs_write&#39;</span> <span class="op">&gt;</span> /sys/kernel/debug/tracing/set_graph_function</span>
+<span id="cb59-6"><a href="#cb59-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;ext4_file_write_iter&#39;</span> <span class="op">&gt;&gt;</span> /sys/kernel/debug/tracing/set_graph_function</span>
+<span id="cb59-7"><a href="#cb59-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;submit_bio&#39;</span> <span class="op">&gt;&gt;</span> /sys/kernel/debug/tracing/set_graph_function</span>
+<span id="cb59-8"><a href="#cb59-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-9"><a href="#cb59-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置追踪深度，避免输出过多</span></span>
+<span id="cb59-10"><a href="#cb59-10" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 5 <span class="op">&gt;</span> /sys/kernel/debug/tracing/max_graph_depth</span>
+<span id="cb59-11"><a href="#cb59-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-12"><a href="#cb59-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用追踪</span></span>
+<span id="cb59-13"><a href="#cb59-13" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> /sys/kernel/debug/tracing/tracing_on</span>
+<span id="cb59-14"><a href="#cb59-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-15"><a href="#cb59-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 触发一次写操作</span></span>
+<span id="cb59-16"><a href="#cb59-16" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/mnt/test bs=4k count=1 oflag=direct <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb59-17"><a href="#cb59-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-18"><a href="#cb59-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 读取追踪结果</span></span>
+<span id="cb59-19"><a href="#cb59-19" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/debug/tracing/trace</span>
+<span id="cb59-20"><a href="#cb59-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-21"><a href="#cb59-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 清理</span></span>
+<span id="cb59-22"><a href="#cb59-22" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/kernel/debug/tracing/tracing_on</span>
+<span id="cb59-23"><a href="#cb59-23" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> nop <span class="op">&gt;</span> /sys/kernel/debug/tracing/current_tracer</span></code></pre></div>
+            <p>典型的追踪输出：</p>
+            <pre class="text"><code># tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+  0)               |  vfs_write() {
+  0)               |    new_sync_write() {
+  0)               |      ext4_file_write_iter() {
+  0)               |        ext4_dio_write_iter() {
+  0)               |          iomap_dio_rw() {
+  0)               |            submit_bio() {
+  0)               |              submit_bio_noacct() {
+  0)   0.521 us    |                blk_mq_submit_bio();
+  0)   1.102 us    |              }
+  0)   1.453 us    |            }
+  0) + 28.774 us   |          }
+  0) + 29.523 us   |        }
+  0) + 30.102 us   |      }
+  0) + 30.847 us   |    }
+  0) + 31.295 us   |  }</code></pre>
+            <h3 id="blktrace-与-blkparse">8.2 blktrace 与 blkparse</h3>
+            <p>blktrace 专门用于追踪块设备层的事件， 可以记录每个 I/O
+            请求的完整生命周期。</p>
+            <div class="sourceCode" id="cb61"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb61-1"><a href="#cb61-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启动 blktrace 追踪（追踪 10 秒）</span></span>
+<span id="cb61-2"><a href="#cb61-2" aria-hidden="true" tabindex="-1"></a><span class="ex">blktrace</span> <span class="at">-d</span> /dev/sda <span class="at">-o</span> trace <span class="at">-w</span> 10</span>
+<span id="cb61-3"><a href="#cb61-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-4"><a href="#cb61-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 在另一个终端触发 I/O</span></span>
+<span id="cb61-5"><a href="#cb61-5" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/mnt/test bs=4k count=1000</span>
+<span id="cb61-6"><a href="#cb61-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-7"><a href="#cb61-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 解析追踪结果</span></span>
+<span id="cb61-8"><a href="#cb61-8" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> trace <span class="at">-o</span> trace.txt</span>
+<span id="cb61-9"><a href="#cb61-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-10"><a href="#cb61-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 生成统计摘要</span></span>
+<span id="cb61-11"><a href="#cb61-11" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> trace <span class="at">-d</span> trace.bin</span>
+<span id="cb61-12"><a href="#cb61-12" aria-hidden="true" tabindex="-1"></a><span class="ex">btt</span> <span class="at">-i</span> trace.bin</span></code></pre></div>
+            <p>blktrace 事件类型说明：</p>
+            <pre class="text"><code>事件代码    含义                    说明
+──────────────────────────────────────────────────────
+Q           Queued                 请求进入队列
+G           Get request            获取 request 结构
+I           Inserted               插入调度器队列
+D           Dispatched             派发到驱动
+C           Completed              设备完成
+M           Merged（back）         后向合并
+F           Front merged           前向合并
+P           Plug                   启动 plug
+U           Unplug                 释放 plug</code></pre>
+            <p>blkparse 输出示例：</p>
+            <pre class="text"><code>  8,0    0        1     0.000000000  1234  Q   W 1000 + 8 [dd]
+  8,0    0        2     0.000001234  1234  G   W 1000 + 8 [dd]
+  8,0    0        3     0.000002345  1234  I   W 1000 + 8 [dd]
+  8,0    0        4     0.000005678  1234  D   W 1000 + 8 [dd]
+  8,0    0        5     0.000125000     0  C   W 1000 + 8 [0]</code></pre>
+            <p>从这个输出可以看出： - 请求在 0 时刻入队（Q） - 经过约 1
+            μs 获取 request（G） - 再经过约 1 μs 插入调度队列（I） - 约
+            3 μs 后派发给驱动（D） - 约 120 μs 后设备完成（C）</p>
+            <h3 id="bpftrace-一行追踪">8.3 bpftrace 一行追踪</h3>
+            <p>bpftrace 是基于 eBPF（extended Berkeley Packet
+            Filter）的高级追踪工具，
+            可以用简洁的脚本实现复杂的追踪和统计。</p>
+            <p><strong>测量块设备 I/O 延迟分布</strong>：</p>
+            <div class="sourceCode" id="cb64"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 按设备统计 I/O 延迟直方图</span></span>
+<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb64-3"><a href="#cb64-3" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:block:block_rq_issue {</span></span>
+<span id="cb64-4"><a href="#cb64-4" aria-hidden="true" tabindex="-1"></a><span class="st">    @start[args-&gt;dev, args-&gt;sector] = nsecs;</span></span>
+<span id="cb64-5"><a href="#cb64-5" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb64-6"><a href="#cb64-6" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:block:block_rq_complete {</span></span>
+<span id="cb64-7"><a href="#cb64-7" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@start[args-&gt;dev, args-&gt;sector]) {</span></span>
+<span id="cb64-8"><a href="#cb64-8" aria-hidden="true" tabindex="-1"></a><span class="st">        @usecs = hist((nsecs - @start[args-&gt;dev, args-&gt;sector]) / 1000);</span></span>
+<span id="cb64-9"><a href="#cb64-9" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@start[args-&gt;dev, args-&gt;sector]);</span></span>
+<span id="cb64-10"><a href="#cb64-10" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb64-11"><a href="#cb64-11" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span></span></code></pre></div>
+            <p><strong>追踪 write() 系统调用延迟</strong>：</p>
+            <div class="sourceCode" id="cb65"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb65-1"><a href="#cb65-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 按进程统计 write() 延迟</span></span>
+<span id="cb65-2"><a href="#cb65-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb65-3"><a href="#cb65-3" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_enter_write {</span></span>
+<span id="cb65-4"><a href="#cb65-4" aria-hidden="true" tabindex="-1"></a><span class="st">    @start[tid] = nsecs;</span></span>
+<span id="cb65-5"><a href="#cb65-5" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb65-6"><a href="#cb65-6" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_exit_write {</span></span>
+<span id="cb65-7"><a href="#cb65-7" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@start[tid]) {</span></span>
+<span id="cb65-8"><a href="#cb65-8" aria-hidden="true" tabindex="-1"></a><span class="st">        @write_us[comm] = hist((nsecs - @start[tid]) / 1000);</span></span>
+<span id="cb65-9"><a href="#cb65-9" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@start[tid]);</span></span>
+<span id="cb65-10"><a href="#cb65-10" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb65-11"><a href="#cb65-11" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span></span></code></pre></div>
+            <p><strong>追踪文件系统层延迟</strong>：</p>
+            <div class="sourceCode" id="cb66"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb66-1"><a href="#cb66-1" aria-hidden="true" tabindex="-1"></a><span class="co"># ext4 写操作延迟</span></span>
+<span id="cb66-2"><a href="#cb66-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb66-3"><a href="#cb66-3" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:ext4_file_write_iter {</span></span>
+<span id="cb66-4"><a href="#cb66-4" aria-hidden="true" tabindex="-1"></a><span class="st">    @start[tid] = nsecs;</span></span>
+<span id="cb66-5"><a href="#cb66-5" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb66-6"><a href="#cb66-6" aria-hidden="true" tabindex="-1"></a><span class="st">kretprobe:ext4_file_write_iter {</span></span>
+<span id="cb66-7"><a href="#cb66-7" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@start[tid]) {</span></span>
+<span id="cb66-8"><a href="#cb66-8" aria-hidden="true" tabindex="-1"></a><span class="st">        @ext4_write_us = hist((nsecs - @start[tid]) / 1000);</span></span>
+<span id="cb66-9"><a href="#cb66-9" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@start[tid]);</span></span>
+<span id="cb66-10"><a href="#cb66-10" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb66-11"><a href="#cb66-11" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span></span></code></pre></div>
+            <p><strong>按进程统计 I/O 大小</strong>：</p>
+            <div class="sourceCode" id="cb67"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb67-1"><a href="#cb67-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 各进程的 I/O 请求大小分布</span></span>
+<span id="cb67-2"><a href="#cb67-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb67-3"><a href="#cb67-3" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:block:block_rq_issue {</span></span>
+<span id="cb67-4"><a href="#cb67-4" aria-hidden="true" tabindex="-1"></a><span class="st">    @io_size[comm] = hist(args-&gt;bytes);</span></span>
+<span id="cb67-5"><a href="#cb67-5" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span></span></code></pre></div>
+            <h3 id="bcc-工具集">8.4 BCC 工具集</h3>
+            <p>BCC（BPF Compiler Collection）提供了大量开箱即用的 I/O
+            分析工具：</p>
+            <p><strong>biolatency——块设备 I/O 延迟直方图</strong>：</p>
+            <div class="sourceCode" id="cb68"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb68-1"><a href="#cb68-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 按设备和操作类型分组的延迟直方图</span></span>
+<span id="cb68-2"><a href="#cb68-2" aria-hidden="true" tabindex="-1"></a><span class="ex">biolatency</span> <span class="at">-D</span> <span class="at">-F</span></span>
+<span id="cb68-3"><a href="#cb68-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb68-4"><a href="#cb68-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb68-5"><a href="#cb68-5" aria-hidden="true" tabindex="-1"></a><span class="co"># disk = nvme0n1  flags = W</span></span>
+<span id="cb68-6"><a href="#cb68-6" aria-hidden="true" tabindex="-1"></a><span class="co">#      usecs               : count     distribution</span></span>
+<span id="cb68-7"><a href="#cb68-7" aria-hidden="true" tabindex="-1"></a><span class="co">#          0 -&gt; 1          : 0        |                    |</span></span>
+<span id="cb68-8"><a href="#cb68-8" aria-hidden="true" tabindex="-1"></a><span class="co">#          2 -&gt; 3          : 0        |                    |</span></span>
+<span id="cb68-9"><a href="#cb68-9" aria-hidden="true" tabindex="-1"></a><span class="co">#          4 -&gt; 7          : 12       |*                   |</span></span>
+<span id="cb68-10"><a href="#cb68-10" aria-hidden="true" tabindex="-1"></a><span class="co">#          8 -&gt; 15         : 156      |*************       |</span></span>
+<span id="cb68-11"><a href="#cb68-11" aria-hidden="true" tabindex="-1"></a><span class="co">#         16 -&gt; 31         : 478      |********************|</span></span>
+<span id="cb68-12"><a href="#cb68-12" aria-hidden="true" tabindex="-1"></a><span class="co">#         32 -&gt; 63         : 234      |*********           |</span></span>
+<span id="cb68-13"><a href="#cb68-13" aria-hidden="true" tabindex="-1"></a><span class="co">#         64 -&gt; 127        : 45       |*                   |</span></span>
+<span id="cb68-14"><a href="#cb68-14" aria-hidden="true" tabindex="-1"></a><span class="co">#        128 -&gt; 255        : 3        |                    |</span></span></code></pre></div>
+            <p><strong>biosnoop——逐个 I/O 请求追踪</strong>：</p>
+            <div class="sourceCode" id="cb69"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb69-1"><a href="#cb69-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 追踪每个块设备 I/O 请求</span></span>
+<span id="cb69-2"><a href="#cb69-2" aria-hidden="true" tabindex="-1"></a><span class="ex">biosnoop</span></span>
+<span id="cb69-3"><a href="#cb69-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb69-4"><a href="#cb69-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb69-5"><a href="#cb69-5" aria-hidden="true" tabindex="-1"></a><span class="co"># TIME(s)     COMM           PID    DISK    T  SECTOR     BYTES   LAT(ms)</span></span>
+<span id="cb69-6"><a href="#cb69-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 0.000000    mysqld         1234   nvme0n1 W  12345678   4096    0.02</span></span>
+<span id="cb69-7"><a href="#cb69-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 0.000125    mysqld         1234   nvme0n1 R  23456789   16384   0.03</span></span>
+<span id="cb69-8"><a href="#cb69-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 0.001234    jbd2/sda1-8    567    sda     W  98765432   8192    0.15</span></span></code></pre></div>
+            <p><strong>ext4slower——追踪慢速 ext4 操作</strong>：</p>
+            <div class="sourceCode" id="cb70"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb70-1"><a href="#cb70-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 追踪延迟超过 1ms 的 ext4 操作</span></span>
+<span id="cb70-2"><a href="#cb70-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ext4slower</span> 1</span>
+<span id="cb70-3"><a href="#cb70-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb70-4"><a href="#cb70-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb70-5"><a href="#cb70-5" aria-hidden="true" tabindex="-1"></a><span class="co"># TIME     COMM           PID    T BYTES   OFF_KB   LAT(ms) FILENAME</span></span>
+<span id="cb70-6"><a href="#cb70-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 09:15:23 mysqld         1234   W 16384   0        3.45    ib_logfile0</span></span>
+<span id="cb70-7"><a href="#cb70-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 09:15:24 tar            5678   R 131072  1024     2.10    backup.tar</span></span></code></pre></div>
+            <h3 id="实战追踪一次-write-的完整路径">8.5 实战：追踪一次
+            write() 的完整路径</h3>
+            <p>下面通过一个完整的实验，追踪一次 <code>write()</code>
+            系统调用 从用户态到设备完成的全过程：</p>
+            <div class="sourceCode" id="cb71"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb71-1"><a href="#cb71-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb71-2"><a href="#cb71-2" aria-hidden="true" tabindex="-1"></a><span class="co"># trace_write.sh - 追踪 write() 完整路径</span></span>
+<span id="cb71-3"><a href="#cb71-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-4"><a href="#cb71-4" aria-hidden="true" tabindex="-1"></a><span class="va">TRACEFS</span><span class="op">=</span>/sys/kernel/debug/tracing</span>
+<span id="cb71-5"><a href="#cb71-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-6"><a href="#cb71-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 重置追踪器</span></span>
+<span id="cb71-7"><a href="#cb71-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/tracing_on</span>
+<span id="cb71-8"><a href="#cb71-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/trace</span>
+<span id="cb71-9"><a href="#cb71-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> function_graph <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/current_tracer</span>
+<span id="cb71-10"><a href="#cb71-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-11"><a href="#cb71-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置追踪过滤</span></span>
+<span id="cb71-12"><a href="#cb71-12" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;vfs_write&#39;</span> <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/set_graph_function</span>
+<span id="cb71-13"><a href="#cb71-13" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 10 <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/max_graph_depth</span>
+<span id="cb71-14"><a href="#cb71-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-15"><a href="#cb71-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 只追踪特定进程（稍后启动）</span></span>
+<span id="cb71-16"><a href="#cb71-16" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/set_ftrace_pid</span>
+<span id="cb71-17"><a href="#cb71-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-18"><a href="#cb71-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用追踪</span></span>
+<span id="cb71-19"><a href="#cb71-19" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/tracing_on</span>
+<span id="cb71-20"><a href="#cb71-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-21"><a href="#cb71-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 执行写操作并记录 PID</span></span>
+<span id="cb71-22"><a href="#cb71-22" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="va">$$</span> <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/set_ftrace_pid</span>
+<span id="cb71-23"><a href="#cb71-23" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/mnt/test bs=4k count=1 oflag=direct <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb71-24"><a href="#cb71-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-25"><a href="#cb71-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 停止追踪</span></span>
+<span id="cb71-26"><a href="#cb71-26" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/tracing_on</span>
+<span id="cb71-27"><a href="#cb71-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-28"><a href="#cb71-28" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出结果</span></span>
+<span id="cb71-29"><a href="#cb71-29" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="va">$TRACEFS</span>/trace</span>
+<span id="cb71-30"><a href="#cb71-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-31"><a href="#cb71-31" aria-hidden="true" tabindex="-1"></a><span class="co"># 清理</span></span>
+<span id="cb71-32"><a href="#cb71-32" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> nop <span class="op">&gt;</span> <span class="va">$TRACEFS</span>/current_tracer</span>
+<span id="cb71-33"><a href="#cb71-33" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> /mnt/test</span></code></pre></div>
+            <h2 id="九各层延迟测量实战">九、各层延迟测量实战</h2>
+            <p>定位 I/O
+            性能瓶颈的关键在于逐层测量延迟，找出延迟最大的环节。
+            本节提供各层延迟的测量方法和常见瓶颈模式。</p>
+            <h3 id="vfs-层开销测量">9.1 VFS 层开销测量</h3>
+            <p>VFS 层的开销主要来自文件描述符查找、权限检查和路径分发。
+            可以通过对比直接函数调用和系统调用入口的延迟来衡量：</p>
+            <div class="sourceCode" id="cb72"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb72-1"><a href="#cb72-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 bpftrace 测量 VFS 层开销</span></span>
+<span id="cb72-2"><a href="#cb72-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb72-3"><a href="#cb72-3" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:vfs_write {</span></span>
+<span id="cb72-4"><a href="#cb72-4" aria-hidden="true" tabindex="-1"></a><span class="st">    @vfs_start[tid] = nsecs;</span></span>
+<span id="cb72-5"><a href="#cb72-5" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb72-6"><a href="#cb72-6" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:ext4_file_write_iter {</span></span>
+<span id="cb72-7"><a href="#cb72-7" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@vfs_start[tid]) {</span></span>
+<span id="cb72-8"><a href="#cb72-8" aria-hidden="true" tabindex="-1"></a><span class="st">        @vfs_overhead_ns = hist(nsecs - @vfs_start[tid]);</span></span>
+<span id="cb72-9"><a href="#cb72-9" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@vfs_start[tid]);</span></span>
+<span id="cb72-10"><a href="#cb72-10" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb72-11"><a href="#cb72-11" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span> <span class="at">-c</span> <span class="st">&#39;dd if=/dev/zero of=/mnt/test bs=4k count=10000 2&gt;/dev/null&#39;</span></span></code></pre></div>
+            <h3 id="文件系统层开销测量">9.2 文件系统层开销测量</h3>
+            <p>文件系统层的开销包括块映射查找、日志操作、空间分配等：</p>
+            <div class="sourceCode" id="cb73"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb73-1"><a href="#cb73-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 测量 ext4 写操作中各子函数的开销</span></span>
+<span id="cb73-2"><a href="#cb73-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb73-3"><a href="#cb73-3" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:ext4_file_write_iter { @fs_start[tid] = nsecs; }</span></span>
+<span id="cb73-4"><a href="#cb73-4" aria-hidden="true" tabindex="-1"></a><span class="st">kretprobe:ext4_file_write_iter {</span></span>
+<span id="cb73-5"><a href="#cb73-5" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@fs_start[tid]) {</span></span>
+<span id="cb73-6"><a href="#cb73-6" aria-hidden="true" tabindex="-1"></a><span class="st">        @fs_lat_us = hist((nsecs - @fs_start[tid]) / 1000);</span></span>
+<span id="cb73-7"><a href="#cb73-7" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@fs_start[tid]);</span></span>
+<span id="cb73-8"><a href="#cb73-8" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb73-9"><a href="#cb73-9" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb73-10"><a href="#cb73-10" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:ext4_journal_start { @jnl_start[tid] = nsecs; }</span></span>
+<span id="cb73-11"><a href="#cb73-11" aria-hidden="true" tabindex="-1"></a><span class="st">kretprobe:ext4_journal_start {</span></span>
+<span id="cb73-12"><a href="#cb73-12" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@jnl_start[tid]) {</span></span>
+<span id="cb73-13"><a href="#cb73-13" aria-hidden="true" tabindex="-1"></a><span class="st">        @journal_start_us = hist((nsecs - @jnl_start[tid]) / 1000);</span></span>
+<span id="cb73-14"><a href="#cb73-14" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@jnl_start[tid]);</span></span>
+<span id="cb73-15"><a href="#cb73-15" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb73-16"><a href="#cb73-16" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span> <span class="at">-c</span> <span class="st">&#39;dd if=/dev/zero of=/mnt/test bs=4k count=10000 2&gt;/dev/null&#39;</span></span></code></pre></div>
+            <h3 id="块设备层排队延迟">9.3 块设备层排队延迟</h3>
+            <p>块设备层的排队延迟反映了请求在调度器中等待的时间：</p>
+            <div class="sourceCode" id="cb74"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb74-1"><a href="#cb74-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 blktrace 分析排队延迟</span></span>
+<span id="cb74-2"><a href="#cb74-2" aria-hidden="true" tabindex="-1"></a><span class="ex">blktrace</span> <span class="at">-d</span> /dev/sda <span class="at">-w</span> 10 <span class="at">-o</span> blk_trace</span>
+<span id="cb74-3"><a href="#cb74-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb74-4"><a href="#cb74-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 btt 生成详细延迟分解</span></span>
+<span id="cb74-5"><a href="#cb74-5" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> blk_trace <span class="at">-d</span> blk_trace.bin</span>
+<span id="cb74-6"><a href="#cb74-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btt</span> <span class="at">-i</span> blk_trace.bin <span class="at">-o</span> btt_report</span>
+<span id="cb74-7"><a href="#cb74-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb74-8"><a href="#cb74-8" aria-hidden="true" tabindex="-1"></a><span class="co"># btt 输出的关键指标：</span></span>
+<span id="cb74-9"><a href="#cb74-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Q2Q  — 请求到达间隔</span></span>
+<span id="cb74-10"><a href="#cb74-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Q2G  — 从入队到获取 request 结构的延迟</span></span>
+<span id="cb74-11"><a href="#cb74-11" aria-hidden="true" tabindex="-1"></a><span class="co"># G2I  — 从获取 request 到插入调度队列的延迟</span></span>
+<span id="cb74-12"><a href="#cb74-12" aria-hidden="true" tabindex="-1"></a><span class="co"># I2D  — 从插入调度队列到派发给驱动的延迟（排队延迟）</span></span>
+<span id="cb74-13"><a href="#cb74-13" aria-hidden="true" tabindex="-1"></a><span class="co"># D2C  — 从派发到设备完成的延迟（设备延迟）</span></span>
+<span id="cb74-14"><a href="#cb74-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Q2C  — 从入队到完成的总延迟</span></span></code></pre></div>
+            <pre class="text"><code>btt 输出示例：
+
+==================== All Coverage ====================
+            ALL           MIN           AVG           MAX           N
+  Q2Q       0.000001023   0.000245678   0.125678901   40960
+  Q2G       0.000000123   0.000001234   0.000012345   40960
+  G2I       0.000000045   0.000000567   0.000005678   40960
+  I2D       0.000000234   0.000003456   0.000034567   40960
+  D2C       0.000012345   0.000098765   0.000987654   40960
+  Q2C       0.000015678   0.000104022   0.001040123   40960</code></pre>
+            <p>从这个输出可以看出，设备延迟（D2C）占了总延迟（Q2C）的
+            95% 以上， 说明瓶颈在硬件层而非软件层。</p>
+            <h3 id="设备延迟测量">9.4 设备延迟测量</h3>
+            <p>直接测量设备的原始 I/O 延迟：</p>
+            <div class="sourceCode" id="cb76"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb76-1"><a href="#cb76-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 fio 测量设备原始延迟（4K 随机读）</span></span>
+<span id="cb76-2"><a href="#cb76-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>latency_test <span class="dt">\</span></span>
+<span id="cb76-3"><a href="#cb76-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/dev/nvme0n1 <span class="dt">\</span></span>
+<span id="cb76-4"><a href="#cb76-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>io_uring <span class="dt">\</span></span>
+<span id="cb76-5"><a href="#cb76-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb76-6"><a href="#cb76-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randread <span class="dt">\</span></span>
+<span id="cb76-7"><a href="#cb76-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb76-8"><a href="#cb76-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--iodepth</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb76-9"><a href="#cb76-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb76-10"><a href="#cb76-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb76-11"><a href="#cb76-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span> <span class="dt">\</span></span>
+<span id="cb76-12"><a href="#cb76-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--group_reporting</span> <span class="dt">\</span></span>
+<span id="cb76-13"><a href="#cb76-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">--output-format</span><span class="op">=</span>json</span>
+<span id="cb76-14"><a href="#cb76-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb76-15"><a href="#cb76-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 ioping 快速测量延迟</span></span>
+<span id="cb76-16"><a href="#cb76-16" aria-hidden="true" tabindex="-1"></a><span class="ex">ioping</span> <span class="at">-c</span> 100 /dev/sda</span>
+<span id="cb76-17"><a href="#cb76-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb76-18"><a href="#cb76-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 4 KiB &lt;&lt;&lt; /dev/sda (block device 931.5 GiB): request=1 time=98.3 us</span></span>
+<span id="cb76-19"><a href="#cb76-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 4 KiB &lt;&lt;&lt; /dev/sda (block device 931.5 GiB): request=2 time=95.7 us</span></span>
+<span id="cb76-20"><a href="#cb76-20" aria-hidden="true" tabindex="-1"></a><span class="co"># ...</span></span>
+<span id="cb76-21"><a href="#cb76-21" aria-hidden="true" tabindex="-1"></a><span class="co"># min/avg/max/mdev = 89.1 us / 97.2 us / 234.5 us / 12.3 us</span></span></code></pre></div>
+            <h3 id="端到端延迟分解实例">9.5 端到端延迟分解实例</h3>
+            <p>下面是一个综合实例，使用多种工具分解一次写操作的端到端延迟：</p>
+            <div class="sourceCode" id="cb77"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb77-1"><a href="#cb77-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb77-2"><a href="#cb77-2" aria-hidden="true" tabindex="-1"></a><span class="co"># latency_breakdown.sh - I/O 延迟分解测量</span></span>
+<span id="cb77-3"><a href="#cb77-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-4"><a href="#cb77-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 第一步：测量端到端延迟 ===&quot;</span></span>
+<span id="cb77-5"><a href="#cb77-5" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb77-6"><a href="#cb77-6" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_enter_write /comm == &quot;dd&quot;/ {</span></span>
+<span id="cb77-7"><a href="#cb77-7" aria-hidden="true" tabindex="-1"></a><span class="st">    @start[tid] = nsecs;</span></span>
+<span id="cb77-8"><a href="#cb77-8" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb77-9"><a href="#cb77-9" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_exit_write /comm == &quot;dd&quot;/ {</span></span>
+<span id="cb77-10"><a href="#cb77-10" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@start[tid]) {</span></span>
+<span id="cb77-11"><a href="#cb77-11" aria-hidden="true" tabindex="-1"></a><span class="st">        @total_us = hist((nsecs - @start[tid]) / 1000);</span></span>
+<span id="cb77-12"><a href="#cb77-12" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@start[tid]);</span></span>
+<span id="cb77-13"><a href="#cb77-13" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb77-14"><a href="#cb77-14" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span> <span class="at">-c</span> <span class="st">&#39;dd if=/dev/zero of=/mnt/test bs=4k count=10000 oflag=direct 2&gt;/dev/null&#39;</span></span>
+<span id="cb77-15"><a href="#cb77-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb77-16"><a href="#cb77-16" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb77-17"><a href="#cb77-17" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 第二步：测量各层延迟 ===&quot;</span></span>
+<span id="cb77-18"><a href="#cb77-18" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb77-19"><a href="#cb77-19" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:vfs_write /comm == &quot;dd&quot;/ {</span></span>
+<span id="cb77-20"><a href="#cb77-20" aria-hidden="true" tabindex="-1"></a><span class="st">    @vfs[tid] = nsecs;</span></span>
+<span id="cb77-21"><a href="#cb77-21" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb77-22"><a href="#cb77-22" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:ext4_file_write_iter /comm == &quot;dd&quot;/ {</span></span>
+<span id="cb77-23"><a href="#cb77-23" aria-hidden="true" tabindex="-1"></a><span class="st">    @fs[tid] = nsecs;</span></span>
+<span id="cb77-24"><a href="#cb77-24" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@vfs[tid]) {</span></span>
+<span id="cb77-25"><a href="#cb77-25" aria-hidden="true" tabindex="-1"></a><span class="st">        @vfs_us = hist((nsecs - @vfs[tid]) / 1000);</span></span>
+<span id="cb77-26"><a href="#cb77-26" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb77-27"><a href="#cb77-27" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb77-28"><a href="#cb77-28" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:submit_bio /comm == &quot;dd&quot;/ {</span></span>
+<span id="cb77-29"><a href="#cb77-29" aria-hidden="true" tabindex="-1"></a><span class="st">    @blk[tid] = nsecs;</span></span>
+<span id="cb77-30"><a href="#cb77-30" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@fs[tid]) {</span></span>
+<span id="cb77-31"><a href="#cb77-31" aria-hidden="true" tabindex="-1"></a><span class="st">        @fs_us = hist((nsecs - @fs[tid]) / 1000);</span></span>
+<span id="cb77-32"><a href="#cb77-32" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb77-33"><a href="#cb77-33" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb77-34"><a href="#cb77-34" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:block:block_rq_issue /comm == &quot;dd&quot;/ {</span></span>
+<span id="cb77-35"><a href="#cb77-35" aria-hidden="true" tabindex="-1"></a><span class="st">    @dev[tid] = nsecs;</span></span>
+<span id="cb77-36"><a href="#cb77-36" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@blk[tid]) {</span></span>
+<span id="cb77-37"><a href="#cb77-37" aria-hidden="true" tabindex="-1"></a><span class="st">        @blk_us = hist((nsecs - @blk[tid]) / 1000);</span></span>
+<span id="cb77-38"><a href="#cb77-38" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb77-39"><a href="#cb77-39" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb77-40"><a href="#cb77-40" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:block:block_rq_complete {</span></span>
+<span id="cb77-41"><a href="#cb77-41" aria-hidden="true" tabindex="-1"></a><span class="st">    if (@dev[tid]) {</span></span>
+<span id="cb77-42"><a href="#cb77-42" aria-hidden="true" tabindex="-1"></a><span class="st">        @dev_us = hist((nsecs - @dev[tid]) / 1000);</span></span>
+<span id="cb77-43"><a href="#cb77-43" aria-hidden="true" tabindex="-1"></a><span class="st">        delete(@dev[tid]);</span></span>
+<span id="cb77-44"><a href="#cb77-44" aria-hidden="true" tabindex="-1"></a><span class="st">    }</span></span>
+<span id="cb77-45"><a href="#cb77-45" aria-hidden="true" tabindex="-1"></a><span class="st">    delete(@vfs[tid]);</span></span>
+<span id="cb77-46"><a href="#cb77-46" aria-hidden="true" tabindex="-1"></a><span class="st">    delete(@fs[tid]);</span></span>
+<span id="cb77-47"><a href="#cb77-47" aria-hidden="true" tabindex="-1"></a><span class="st">    delete(@blk[tid]);</span></span>
+<span id="cb77-48"><a href="#cb77-48" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span> <span class="at">-c</span> <span class="st">&#39;dd if=/dev/zero of=/mnt/test bs=4k count=10000 oflag=direct 2&gt;/dev/null&#39;</span></span></code></pre></div>
+            <h3 id="常见瓶颈模式与诊断">9.6 常见瓶颈模式与诊断</h3>
+            <p><strong>模式一：设备延迟高</strong></p>
+            <pre class="text"><code>症状：D2C 延迟占比 &gt; 95%
+原因：设备本身速度慢，或设备过载
+诊断：
+  - 检查设备利用率：iostat -x 1
+  - 检查队列深度：avgqu-sz
+  - 检查 await（平均 I/O 等待时间）
+解决：
+  - 减少 I/O 负载
+  - 升级到更快的存储设备
+  - 优化应用程序的 I/O 模式</code></pre>
+            <p><strong>模式二：调度器排队延迟高</strong></p>
+            <pre class="text"><code>症状：I2D 延迟异常高
+原因：调度器不匹配，或请求队列满
+诊断：
+  - 检查调度器类型：cat /sys/block/sda/queue/scheduler
+  - 检查队列深度限制：cat /sys/block/sda/queue/nr_requests
+  - 检查是否有 I/O 优先级不合理的进程
+解决：
+  - 切换到更合适的调度器
+  - 增大 nr_requests
+  - 使用 ionice 调整进程 I/O 优先级</code></pre>
+            <p><strong>模式三：文件系统日志瓶颈</strong></p>
+            <pre class="text"><code>症状：文件系统层延迟高，特别是元数据操作
+原因：日志写入成为瓶颈
+诊断：
+  - 检查日志模式
+  - 检查日志设备是否与数据设备共享
+  - 使用 ext4slower 追踪慢操作
+解决：
+  - 将日志放到独立的快速设备上
+  - 切换到 writeback 日志模式（如果可接受）
+  - 减少 fsync() 频率</code></pre>
+            <p><strong>模式四：Page Cache 抖动</strong></p>
+            <pre class="text"><code>症状：缓存命中率低，频繁的页面回收
+原因：工作集大于可用内存
+诊断：
+  - 检查 /proc/meminfo 中的 Cached 和 Active/Inactive 页面
+  - 使用 cachestat（BCC 工具）监控缓存命中率
+  - 检查 sar -B 中的 pgpgin/pgpgout
+解决：
+  - 增加物理内存
+  - 调整应用程序的工作集大小
+  - 对于数据库等应用，使用 O_DIRECT 绕过页缓存</code></pre>
+            <p><strong>模式五：锁竞争导致的延迟</strong></p>
+            <pre class="text"><code>症状：多线程写入时延迟波动大
+原因：inode 锁、journal 锁等竞争
+诊断：
+  - 使用 lock_stat 或 lockdep 分析锁竞争
+  - perf lock 报告
+解决：
+  - 将写入分散到多个文件
+  - 使用 XFS（分配组并行）
+  - 减少 fsync() 频率</code></pre>
+            <h3 id="实用监控命令速查">9.7 实用监控命令速查</h3>
+            <p>以下是日常 I/O 性能监控中常用的命令：</p>
+            <div class="sourceCode" id="cb83"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb83-1"><a href="#cb83-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 实时 I/O 统计（每秒刷新）</span></span>
+<span id="cb83-2"><a href="#cb83-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span>
+<span id="cb83-3"><a href="#cb83-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-4"><a href="#cb83-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 关键指标说明：</span></span>
+<span id="cb83-5"><a href="#cb83-5" aria-hidden="true" tabindex="-1"></a><span class="co"># r/s, w/s     — 每秒读/写请求数</span></span>
+<span id="cb83-6"><a href="#cb83-6" aria-hidden="true" tabindex="-1"></a><span class="co"># rkB/s, wkB/s — 每秒读/写数据量</span></span>
+<span id="cb83-7"><a href="#cb83-7" aria-hidden="true" tabindex="-1"></a><span class="co"># await        — 平均 I/O 响应时间（毫秒）</span></span>
+<span id="cb83-8"><a href="#cb83-8" aria-hidden="true" tabindex="-1"></a><span class="co"># r_await      — 平均读响应时间</span></span>
+<span id="cb83-9"><a href="#cb83-9" aria-hidden="true" tabindex="-1"></a><span class="co"># w_await      — 平均写响应时间</span></span>
+<span id="cb83-10"><a href="#cb83-10" aria-hidden="true" tabindex="-1"></a><span class="co"># avgqu-sz     — 平均队列深度</span></span>
+<span id="cb83-11"><a href="#cb83-11" aria-hidden="true" tabindex="-1"></a><span class="co"># %util        — 设备利用率</span></span>
+<span id="cb83-12"><a href="#cb83-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-13"><a href="#cb83-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 每个进程的 I/O 使用情况</span></span>
+<span id="cb83-14"><a href="#cb83-14" aria-hidden="true" tabindex="-1"></a><span class="ex">iotop</span> <span class="at">-oP</span></span>
+<span id="cb83-15"><a href="#cb83-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-16"><a href="#cb83-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 块设备队列信息</span></span>
+<span id="cb83-17"><a href="#cb83-17" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/stat</span>
+<span id="cb83-18"><a href="#cb83-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 字段：读次数 读合并数 读扇区数 读耗时(ms)</span></span>
+<span id="cb83-19"><a href="#cb83-19" aria-hidden="true" tabindex="-1"></a><span class="co">#        写次数 写合并数 写扇区数 写耗时(ms)</span></span>
+<span id="cb83-20"><a href="#cb83-20" aria-hidden="true" tabindex="-1"></a><span class="co">#        正在处理的请求数 I/O 耗时(ms) 加权 I/O 耗时(ms)</span></span>
+<span id="cb83-21"><a href="#cb83-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-22"><a href="#cb83-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看脏页状态</span></span>
+<span id="cb83-23"><a href="#cb83-23" aria-hidden="true" tabindex="-1"></a><span class="ex">watch</span> <span class="at">-n</span> 1 <span class="st">&#39;grep -E &quot;Dirty|Writeback&quot; /proc/meminfo&#39;</span></span>
+<span id="cb83-24"><a href="#cb83-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb83-25"><a href="#cb83-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 文件系统级统计（ext4）</span></span>
+<span id="cb83-26"><a href="#cb83-26" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/fs/ext4/sda1/mb_groups  <span class="co"># 块分配组信息</span></span>
+<span id="cb83-27"><a href="#cb83-27" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/ext4/sda1/delayed_allocation_blocks  <span class="co"># 延迟分配块数</span></span></code></pre></div>
+            <h2 id="参考文献">参考文献</h2>
+            <ol type="1">
+            <li><p>Robert Love，“Linux Kernel Development”，Third
+            Edition，Addison-Wesley Professional，2010。第 13-16
+            章详细介绍了 VFS、块设备层和页缓存的实现。</p></li>
+            <li><p>Bovet D P，Cesati M，“Understanding the Linux
+            Kernel”，Third Edition，O’Reilly Media，2005。第 14-15
+            章覆盖了块设备驱动和页缓存的设计。</p></li>
+            <li><p>Linux 内核源码，<code>fs/read_write.c</code>：VFS
+            读写路径的核心实现。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/fs/read_write.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/fs/read_write.c</a>
+            查阅。</p></li>
+            <li><p>Linux
+            内核源码，<code>block/blk-mq.c</code>：多队列块设备层实现。可在
+            <a
+            href="https://elixir.bootlin.com/linux/latest/source/block/blk-mq.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/block/blk-mq.c</a>
+            查阅。</p></li>
+            <li><p>Jens Axboe，“Linux Block IO — Present and
+            Future”，Ottawa Linux
+            Symposium，2004。介绍了块设备层的设计演进。</p></li>
+            <li><p>Linux
+            内核源码，<code>mm/filemap.c</code>：页缓存核心操作实现。可在
+            <a
+            href="https://elixir.bootlin.com/linux/latest/source/mm/filemap.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/mm/filemap.c</a>
+            查阅。</p></li>
+            <li><p>Linux 内核源码，<code>fs/ext4/file.c</code>：ext4
+            文件操作实现。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/fs/ext4/file.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/fs/ext4/file.c</a>
+            查阅。</p></li>
+            <li><p>Jonathan Corbet，“The multiqueue block
+            layer”，LWN.net，2013。<a
+            href="https://lwn.net/Articles/552904/"
+            class="uri">https://lwn.net/Articles/552904/</a></p></li>
+            <li><p>Brendan Gregg，“BPF Performance
+            Tools”，Addison-Wesley Professional，2019。第 9
+            章详细介绍了块设备和文件系统的 BPF 追踪方法。</p></li>
+            <li><p>Linux 内核文档，“Block layer documentation”，<a
+            href="https://docs.kernel.org/block/index.html"
+            class="uri">https://docs.kernel.org/block/index.html</a></p></li>
+            <li><p>Linux
+            内核源码，<code>block/mq-deadline.c</code>：mq-deadline
+            调度器实现。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/block/mq-deadline.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/block/mq-deadline.c</a>
+            查阅。</p></li>
+            <li><p>Linux
+            内核源码，<code>drivers/nvme/host/core.c</code>：NVMe
+            驱动核心实现。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/drivers/nvme/host/core.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/drivers/nvme/host/core.c</a>
+            查阅。</p></li>
+            <li><p>NVM Express Base Specification，Revision 2.0，NVM
+            Express Workgroup，2021。定义了 NVMe
+            命令集和队列模型。</p></li>
+            <li><p>Brendan Gregg，“Systems Performance: Enterprise and
+            the Cloud”，Second Edition，Addison-Wesley
+            Professional，2020。第 9 章和第 14 章覆盖了 I/O
+            性能分析方法论。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../06-storage-media-selection/storage-media-selection.html">存储介质选型指南</a>
+            <strong>下一篇</strong>: <a
+            href="../08-block-device-layer/block-device-layer.html">块设备层：bio、request
+            与 I/O 调度器</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-17 · storage</p>
+                    <h3><a href="/post/storage/08-block-device-layer/block-device-layer.html">【存储工程】块设备层：bio、request 与 I/O 调度器</a></h3>
+                    <p>文件系统把&quot;写这个文件&quot;翻译成&quot;写这些逻辑块&quot;，但逻辑块怎么变成磁盘控制器能执行的命令？中间那一层就是块设备层（Block Layer）。它做的事不复杂——把上层的 I/O 请求收集、合并、排序，然后交给设备驱动——但做得好不好，直接决定了存储栈的吞吐和延迟。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-19 · storage</p>
+                    <h3><a href="/post/storage/10-direct-io/direct-io.html">【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</a></h3>
+                    <p>在 Linux 的传统 I/O 路径中，应用程序通过 read() 和 write() 系统调用与文件交互时，数据并不会直接在用户空间缓冲区（User Buffer）和磁盘之间传输。内核会在两者之间插入一层页缓存（Page Cache），作为磁盘数据在内存中的缓存副本。一次典型的写入流程如下：</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-13 · storage</p>
+                    <h3><a href="/post/storage/65-io-analysis-tools/io-analysis-tools.html">【存储工程】I/O 性能分析工具链</a></h3>
+                    <p>系统梳理 Linux I/O 性能分析工具——iostat、blktrace、BCC/bpftrace、ftrace、perf 的使用方法，以及 I/O 瓶颈排查流程与常见问题模式</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-14 · storage</p>
+                    <h3><a href="/post/storage/66-cache-engineering/cache-engineering.html">【存储工程】缓存工程：从 Page Cache 到应用层缓存</a></h3>
+                    <p>深入分析存储多级缓存架构——Page Cache、Buffer Pool、应用缓存的协同设计，缓存淘汰算法对比，缓存穿透/击穿/雪崩的防护策略</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

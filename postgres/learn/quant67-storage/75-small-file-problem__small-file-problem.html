@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】小文件问题：为什么文件数量比文件大小更致命 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化
+slack space、inode 开销和 syscall
+成本，给出应用层聚合与对象存储归档两种工程方案。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="small-file, inode, metadata, filesystem, ext4, xfs, object-storage, fio, mdtest, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/75-small-file-problem/small-file-problem.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】小文件问题：为什么文件数量比文件大小更致命" />
+    <meta property="og:description" content="系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/75-small-file-problem/small-file-problem.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="small-file" />
+    <meta property="article:tag" content="inode" />
+    <meta property="article:tag" content="metadata" />
+    <meta property="article:tag" content="filesystem" />
+    <meta property="article:tag" content="ext4" />
+    <meta property="article:tag" content="xfs" />
+    <meta property="article:tag" content="object-storage" />
+    <meta property="article:tag" content="fio" />
+    <meta property="article:tag" content="mdtest" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】小文件问题：为什么文件数量比文件大小更致命" />
+    <meta name="twitter:description" content="系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】小文件问题：为什么文件数量比文件大小更致命", "description": "系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/75-small-file-problem/small-file-problem.html"}, "datePublished": "2026-06-11T00:00:00+00:00", "dateModified": "2026-07-27T18:01:35+00:00", "keywords": ["small-file", "inode", "metadata", "filesystem", "ext4", "xfs", "object-storage", "fio", "mdtest"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】小文件问题：为什么文件数量比文件大小更致命</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-11</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#small-file</span> <span>#inode</span> <span>#metadata</span> <span>#filesystem</span> <span>#ext4</span> <span>#xfs</span> <span>#object-storage</span> <span>#fio</span> <span>#mdtest</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/small-file.html">#small-file</a><a class="chip-link" href="/tags/inode.html">#inode</a><a class="chip-link" href="/tags/metadata.html">#metadata</a><a class="chip-link" href="/tags/filesystem.html">#filesystem</a><a class="chip-link" href="/tags/ext4.html">#ext4</a><a class="chip-link" href="/tags/xfs.html">#xfs</a><a class="chip-link" href="/tags/object-storage.html">#object-storage</a><a class="chip-link" href="/tags/fio.html">#fio</a><a class="chip-link" href="/tags/mdtest.html">#mdtest</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/74-storage-outlook/storage-outlook.html">上一篇：【存储工程】存储技术展望</a><a class="post-series-nav__link" href="/post/storage/76-disk-full-behavior/disk-full-behavior.html">下一篇：【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链</a></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一什么叫小"
+                id="toc-一什么叫小">一、什么叫”小”</a></li>
+                <li><a href="#二块分配浪费slack-space-的复利效应"
+                id="toc-二块分配浪费slack-space-的复利效应">二、块分配浪费：slack
+                space 的复利效应</a>
+                <ul>
+                <li><a href="#块对齐与内部碎片"
+                id="toc-块对齐与内部碎片">2.1 块对齐与内部碎片</a></li>
+                <li><a href="#各文件系统的块开销"
+                id="toc-各文件系统的块开销">2.2
+                各文件系统的块开销</a></li>
+                <li><a href="#实测小文件的磁盘空间效率"
+                id="toc-实测小文件的磁盘空间效率">2.3
+                实测：小文件的磁盘空间效率</a></li>
+                </ul></li>
+                <li><a href="#三元数据放大inode目录项与-extents"
+                id="toc-三元数据放大inode目录项与-extents">三、元数据放大：inode、目录项与
+                extents</a>
+                <ul>
+                <li><a href="#inode每个文件的固定税"
+                id="toc-inode每个文件的固定税">3.1
+                inode：每个文件的固定税</a></li>
+                <li><a href="#目录项directory-entry"
+                id="toc-目录项directory-entry">3.2 目录项（Directory
+                Entry）</a></li>
+                <li><a href="#extents-与块位图的碎片化"
+                id="toc-extents-与块位图的碎片化">3.3 extents
+                与块位图的碎片化</a></li>
+                <li><a href="#各文件系统的元数据开销对比"
+                id="toc-各文件系统的元数据开销对比">3.4
+                各文件系统的元数据开销对比</a></li>
+                </ul></li>
+                <li><a href="#四物理层的寻道惩罚"
+                id="toc-四物理层的寻道惩罚">四、物理层的寻道惩罚</a>
+                <ul>
+                <li><a href="#hdd每次小文件读都是一次寻道"
+                id="toc-hdd每次小文件读都是一次寻道">4.1
+                HDD：每次小文件读都是一次寻道</a></li>
+                <li><a href="#ssd没有寻道不代表没问题"
+                id="toc-ssd没有寻道不代表没问题">4.2
+                SSD：没有寻道不代表没问题</a></li>
+                <li><a href="#实测用-fio-对比小文件和大文件-io"
+                id="toc-实测用-fio-对比小文件和大文件-io">4.3 实测：用
+                fio 对比小文件和大文件 I/O</a></li>
+                </ul></li>
+                <li><a href="#五应用层的增殖场景"
+                id="toc-五应用层的增殖场景">五、应用层的增殖场景</a>
+                <ul>
+                <li><a href="#日志轮转" id="toc-日志轮转">5.1
+                日志轮转</a></li>
+                <li><a href="#用户生成内容ugc"
+                id="toc-用户生成内容ugc">5.2
+                用户生成内容（UGC）</a></li>
+                <li><a href="#瓦片地图与静态资源"
+                id="toc-瓦片地图与静态资源">5.3
+                瓦片地图与静态资源</a></li>
+                <li><a href="#容器镜像层" id="toc-容器镜像层">5.4
+                容器镜像层</a></li>
+                </ul></li>
+                <li><a href="#六benchmark-方法分离元数据和数据-io"
+                id="toc-六benchmark-方法分离元数据和数据-io">六、Benchmark
+                方法：分离元数据和数据 I/O</a>
+                <ul>
+                <li><a href="#fio数据-io-面" id="toc-fio数据-io-面">6.1
+                fio：数据 I/O 面</a></li>
+                <li><a href="#mdtest元数据-io-面"
+                id="toc-mdtest元数据-io-面">6.2 mdtest：元数据 I/O
+                面</a></li>
+                <li><a href="#strace测量系统调用开销"
+                id="toc-strace测量系统调用开销">6.3
+                strace：测量系统调用开销</a></li>
+                </ul></li>
+                <li><a href="#七补救方案应用层聚合"
+                id="toc-七补救方案应用层聚合">七、补救方案：应用层聚合</a>
+                <ul>
+                <li><a href="#打包-索引" id="toc-打包-索引">7.1 打包 +
+                索引</a></li>
+                <li><a href="#嵌入式存储引擎"
+                id="toc-嵌入式存储引擎">7.2 嵌入式存储引擎</a></li>
+                <li><a href="#对象存储" id="toc-对象存储">7.3
+                对象存储</a></li>
+                </ul></li>
+                <li><a href="#八不应该做的事"
+                id="toc-八不应该做的事">八、不应该做的事</a>
+                <ul>
+                <li><a href="#调小文件系统的-block-size"
+                id="toc-调小文件系统的-block-size">8.1 调小文件系统的
+                block size</a></li>
+                <li><a href="#禁用-atime" id="toc-禁用-atime">8.2 禁用
+                atime</a></li>
+                <li><a href="#换文件系统而应用层不改"
+                id="toc-换文件系统而应用层不改">8.3
+                换文件系统而应用层不改</a></li>
+                </ul></li>
+                <li><a href="#九选型决策框架"
+                id="toc-九选型决策框架">九、选型决策框架</a></li>
+                <li><a href="#参考资料"
+                id="toc-参考资料">参考资料</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>存储系统处理 1 个 10 GB 的大文件，和 1000 万个 1 KB
+            的小文件——两者的数据总量相同，但行为天差地别。大文件几分钟就能读写完毕；小文件可能让文件系统元数据服务崩溃、让磁盘
+            IOPS
+            耗尽、让运维半夜被告警叫醒。更麻烦的是，小文件问题很少在设计阶段被考虑到，它通常是在系统跑了一段时间后，以”磁盘明明还有空间，但写入越来越慢”的形式悄然出现。</p>
+            <p>本文从块分配、元数据管理、磁盘寻道和网络协议四个层面拆解小文件为什么”小就是贵”，用数据量化每层开销，最后给出应用层聚合和对象存储归档两种工程方案。</p>
+            <blockquote>
+            <p><strong>测试环境说明</strong> 本文 §2.3 的 slack space
+            脚本在 Linux 6.8、<code>/tmp</code>（ext4，4 KB
+            块）上实测。§6.1–6.2 的 fio / mdtest
+            命令为可复现模板，文中标注「示意输出」的数值随磁盘与文件系统变化，不作为跨环境对比结论。§6.3
+            的 strace 统计口径为按路径 <code>openat</code>
+            读文件，不含目录遍历。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一什么叫小">一、什么叫”小”</h2>
+            <p>“小文件”没有一个绝对的数字定义。同一个 64 KB 的文件，对
+            HDD 来说已经是”小”（一次寻道比一次读数据还贵），对 NVMe SSD
+            来说还不算（一次 I/O
+            就能搬完），对对象存储来说不管多大都是”小”（HTTP
+            请求开销与数据量无关）。</p>
+            <p>更实用的定义方式是从开销结构出发：<strong>当一个文件的元数据开销超过其数据本身的开销时，它就算小文件。</strong>
+            按照这个标准：</p>
+            <table>
+            <colgroup>
+            <col style="width: 46%" />
+            <col style="width: 34%" />
+            <col style="width: 18%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>存储介质 / 系统</th>
+            <th>“小”的阈值</th>
+            <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>HDD（ext4/XFS）</td>
+            <td>&lt; 256 KB</td>
+            <td>寻道时间（~8 ms）超过顺序读 256 KB 的时间</td>
+            </tr>
+            <tr>
+            <td>SATA SSD（ext4/XFS）</td>
+            <td>&lt; 64 KB</td>
+            <td>一次 NAND 页读取（~100 μs）的开销占比开始显著</td>
+            </tr>
+            <tr>
+            <td>NVMe SSD（ext4/XFS）</td>
+            <td>&lt; 16 KB</td>
+            <td>低于此阈值时 syscall + 文件系统遍历开销占比超过 30%</td>
+            </tr>
+            <tr>
+            <td>S3 / 对象存储</td>
+            <td>&lt; 1 MB</td>
+            <td>PUT/GET 请求的 HTTP 往返延迟（~10–50 ms）是主要开销</td>
+            </tr>
+            <tr>
+            <td>HDFS / GFS</td>
+            <td>&lt; 128 MB</td>
+            <td>默认块大小 64–128 MB，小于此值的文件导致块碎片</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>上表除 HDFS/GFS
+            块大小外，其余阈值为工程经验值（结合介质延迟与 syscall
+            成本估算），非基准测试结论；介质选型可参考本站 <a
+            href="../06-storage-media-selection/storage-media-selection.html">存储介质选型指南</a>。</p>
+            <p>这不是精确的科学划分，而是一个工程判断框架。关键不是找一个”安全阈值”，而是理解为什么小文件贵——它的开销结构和大文件完全不同。</p>
+            <hr />
+            <h2
+            id="二块分配浪费slack-space-的复利效应">二、块分配浪费：slack
+            space 的复利效应</h2>
+            <p>小文件在四个层面的放大效应可以用下图概括；下文按层展开。</p>
+            <pre class="mermaid"><code>flowchart TB
+    subgraph layers[&quot;小文件开销四层放大&quot;]
+        A[&quot;块分配：slack space&quot;]
+        B[&quot;元数据：inode / dentry / extent&quot;]
+        C[&quot;物理 I/O：寻道或页读取放大&quot;]
+        D[&quot;协议层：HTTP / RPC 固定延迟&quot;]
+    end
+    A --&gt; B --&gt; C --&gt; D</code></pre>
+            <h3 id="块对齐与内部碎片">2.1 块对齐与内部碎片</h3>
+            <p>文件系统以块（Block）为单位分配空间。ext4 默认块大小 4
+            KB，意味着一个 1 KB 的文件实际占用 4 KB 磁盘空间——额外的 3
+            KB 被浪费了。这种浪费称为内部碎片（Internal
+            Fragmentation），也叫 slack space。</p>
+            <pre class="text"><code>块对齐示意（ext4，4 KB 块）：
+
+  文件 1 KB          文件 5 KB
+  ┌────┬───┐         ┌────┬────┬───┐
+  │1KB │slack│         │5KB │slack│
+  └────┴───┘         └────┴────┴───┘
+   4 KB 分配           8 KB 分配</code></pre>
+            <p>单个小文件的 slack space：</p>
+            <pre class="text"><code>  文件大小 1 KB → 分配 4 KB（1 个块）→ slack = 3 KB (75% 浪费)
+  文件大小 5 KB → 分配 8 KB（2 个块）→ slack = 3 KB (37.5% 浪费)
+  文件大小 1 MB → 分配 1 MB（256 个块）→ slack = 0 KB（对齐边界）</code></pre>
+            <p>若文件大小在 <span class="math inline">\([1, B]\)</span>
+            内近似均匀分布（<span class="math inline">\(B\)</span>
+            为块大小），平均 slack 约为 <span
+            class="math inline">\(B/2\)</span>。总量近似为：</p>
+            <p><span class="math display">\[\text{slack 总量} \approx N
+            \times \frac{B}{2}\]</span></p>
+            <p>其中 <span class="math inline">\(N\)</span>
+            为文件数量。</p>
+            <p>对于 1000 万个平均大小为 2 KB 的文件（ext4 4 KB
+            块）：</p>
+            <pre class="text"><code>总数据量：10M × 2 KB = 20 GB
+总分配量：10M × 4 KB = 40 GB（最少；部分文件跨块）
+slack space ≈ 20 GB（约 100% 的空间浪费）</code></pre>
+            <p>这只是磁盘空间的浪费。更严重的是，每个块都需要对应的
+            inode 和元数据结构来追踪它。</p>
+            <h3 id="各文件系统的块开销">2.2 各文件系统的块开销</h3>
+            <table>
+            <colgroup>
+            <col style="width: 20%" />
+            <col style="width: 25%" />
+            <col style="width: 20%" />
+            <col style="width: 32%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>文件系统</th>
+            <th>默认块大小</th>
+            <th>子块分配</th>
+            <th>对小文件的意义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>ext4</td>
+            <td>4 KB</td>
+            <td>不支持</td>
+            <td>1 KB 文件占 4 KB</td>
+            </tr>
+            <tr>
+            <td>XFS</td>
+            <td>4 KB</td>
+            <td>不支持</td>
+            <td>同上</td>
+            </tr>
+            <tr>
+            <td>Btrfs</td>
+            <td>4 KB（数据）</td>
+            <td>内联（inline）小文件数据存入元数据块</td>
+            <td>&lt; 2 KB 文件零额外数据块</td>
+            </tr>
+            <tr>
+            <td>ZFS</td>
+            <td>可变（recordsize）</td>
+            <td>小文件直接存在 dnode 中</td>
+            <td>&lt; 512 B 文件可能内联存储</td>
+            </tr>
+            <tr>
+            <td>ReiserFS</td>
+            <td>4 KB</td>
+            <td>尾打包（tail packing）</td>
+            <td>多个小文件尾打包到同一块</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Btrfs 和 ZFS
+            的内联（inline）机制值得单独说明。当文件足够小（Btrfs 默认
+            &lt; 2 KB，取决于元数据块剩余空间），文件数据直接存储在
+            inode
+            所在的元数据块中，不需要额外的数据块分配。这对小文件场景是巨大优势——文件系统层面的块分配浪费被消除了。</p>
+            <p>但内联存储不是银弹。inode 本身的大小是有限的（ext4 默认
+            256 字节，XFS 默认 256 字节，Btrfs 可变但受限于 leaf
+            大小）。文件数据稍有增长就需要迁移到独立数据块，这次迁移本身就是一次写放大。</p>
+            <h3 id="实测小文件的磁盘空间效率">2.3
+            实测：小文件的磁盘空间效率</h3>
+            <p>用以下脚本可以在 ext4 上测量 slack space：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 测量小文件的 slack space</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 环境：ext4, 4KB block size</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="va">TEST_DIR</span><span class="op">=</span><span class="st">&quot;/tmp/small-file-test&quot;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$TEST_DIR</span><span class="st">&quot;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 10000 个 1KB 文件</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 10000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="fu">dd</span> if=/dev/urandom of=<span class="st">&quot;</span><span class="va">$TEST_DIR</span><span class="st">/file_</span><span class="va">$i</span><span class="st">&quot;</span> bs=1K count=1 <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;=== 磁盘使用情况 ===&quot;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;实际数据总量: </span><span class="va">$(</span><span class="fu">du</span> <span class="at">-sb</span> <span class="st">&quot;</span><span class="va">$TEST_DIR</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-f1</span><span class="va">)</span><span class="st"> bytes&quot;</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;磁盘占用: </span><span class="va">$(</span><span class="fu">du</span> <span class="at">-sk</span> <span class="st">&quot;</span><span class="va">$TEST_DIR</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-f1</span><span class="va">)</span><span class="st"> KB&quot;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;文件数量: </span><span class="va">$(</span><span class="fu">find</span> <span class="st">&quot;</span><span class="va">$TEST_DIR</span><span class="st">&quot;</span> <span class="at">-type</span> f <span class="kw">|</span> <span class="fu">wc</span> <span class="at">-l</span><span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 清理</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> <span class="st">&quot;</span><span class="va">$TEST_DIR</span><span class="st">&quot;</span></span></code></pre></div>
+            <p>实测输出（Linux 6.8，<code>/tmp</code> ext4，4 KB
+            block）：</p>
+            <pre class="text"><code>实际数据总量: 10240000 bytes  (10 MB)
+磁盘占用: 40000 KB             (40 MB)
+文件数量: 10000</code></pre>
+            <p>10 MB 的数据占用了 40 MB 磁盘——4 倍放大。换成 1000
+            万个这样的文件，10 GB 数据就会吃掉 40 GB 磁盘。</p>
+            <hr />
+            <h2
+            id="三元数据放大inode目录项与-extents">三、元数据放大：inode、目录项与
+            extents</h2>
+            <h3 id="inode每个文件的固定税">3.1
+            inode：每个文件的固定税</h3>
+            <p>每个文件至少需要一个 inode。inode
+            存储文件的元数据：权限、时间戳、文件大小、数据块指针。在
+            ext4 上，每个 inode 占 256 字节（默认
+            <code>inode_size</code>）。一个 100 GB
+            的文件系统如果创建时使用了默认参数（<code>inode_ratio = 16384</code>，即每
+            16 KB 分配一个 inode），可以容纳约 625 万个 inode。</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件系统 inode 信息</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-l</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;Inode count|Inode size&quot;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Inode count:              6553600</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Inode size:               256</span></span></code></pre></div>
+            <p>1000 万个文件需要 1000 万个 inode，总 inode 开销 2.5
+            GB。如果文件系统的 inode
+            数量不够，即使数据块还有大量空闲空间，创建新文件也会失败（ENOSPC，但报错的原因是
+            <code>No space left on device</code>——这个错误信息在此场景下极具误导性）。</p>
+            <h3 id="目录项directory-entry">3.2 目录项（Directory
+            Entry）</h3>
+            <p>每个文件还需要在父目录中有一个目录项（dentry），记录文件名和对应的
+            inode 号。ext4 使用 HTree
+            索引目录，每个目录项占用的空间为：</p>
+            <pre class="text"><code>ext4_dir_entry_2 结构（可变长度）：
+  4 bytes: inode 号
+  2 bytes: 条目总长度（rec_len）
+  1 byte:  文件名长度
+  1 byte:  文件类型
+  N bytes: 文件名（\0 结尾，对齐到 4 字节边界）</code></pre>
+            <p>一个名为 <code>access_20250611_143052.log</code>（28
+            字符）的文件，其目录项约占 40 字节。1000 万个文件意味着 400
+            MB
+            的目录项数据——而这些数据在目录遍历（<code>ls</code>、<code>find</code>、<code>du</code>）时都会被读入内存。</p>
+            <p>HTree
+            索引能加速单个文件的查找（<code>open("access_20250611_143052.log")</code>
+            是 O(log
+            N)），但对全目录扫描（<code>ls -l</code>）没有帮助——全目录扫描仍然是
+            O(N)，而且 1000 万个目录项的 <code>readdir()</code>
+            需要数千次磁盘 I/O。</p>
+            <h3 id="extents-与块位图的碎片化">3.3 extents
+            与块位图的碎片化</h3>
+            <p>每个文件还需要 extent 映射来记录哪些块属于它。ext4 的单个
+            extent 结构占 12 字节，能映射一段连续块。一个 1 KB
+            小文件通常只需要 1 个 extent（12
+            字节），但如果文件系统的空闲空间是碎片化的，文件数据分散在多个不连续的块中，extent
+            数量就会膨胀。</p>
+            <p>更隐蔽的是块位图（Block
+            Bitmap）的开销：分配和释放块时都需要更新块位图。1000
+            万个小文件意味着至少 1000
+            万次块位图更新——每次更新都涉及一次位图块的读写，这些读写全部是
+            4 KB 随机 I/O。</p>
+            <h3 id="各文件系统的元数据开销对比">3.4
+            各文件系统的元数据开销对比</h3>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 23%" />
+            <col style="width: 20%" />
+            <col style="width: 16%" />
+            <col style="width: 23%" />
+            <col style="width: 16%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>开销项</th>
+            <th>ext4</th>
+            <th>XFS</th>
+            <th>Btrfs</th>
+            <th>ZFS</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>inode 大小</td>
+            <td>256 B 固定</td>
+            <td>256 B（可配至 512 B）</td>
+            <td>可变（内联在 leaf 中）</td>
+            <td>可变（dnode，最大 512 B）</td>
+            </tr>
+            <tr>
+            <td>inode 总数限制</td>
+            <td>创建时固定（inode_ratio）</td>
+            <td>动态分配</td>
+            <td>动态</td>
+            <td>动态</td>
+            </tr>
+            <tr>
+            <td>目录索引</td>
+            <td>HTree (B-tree)</td>
+            <td>B+tree</td>
+            <td>B-tree</td>
+            <td>ZAP（可扩展哈希）</td>
+            </tr>
+            <tr>
+            <td>小文件内联</td>
+            <td>不支持</td>
+            <td>不支持</td>
+            <td>支持（inline）</td>
+            <td>支持（embedded）</td>
+            </tr>
+            <tr>
+            <td>块分配位图</td>
+            <td>块位图（固定位置）</td>
+            <td>AG 内的 B+tree</td>
+            <td>extent allocation tree</td>
+            <td>space map</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>XFS 的动态 inode 分配意味着不会出现 ext4 的”数据空间够但
+            inode 不够”问题——但动态分配本身在 inode
+            数量极大时也会产生性能开销。XFS 为每个分配组（Allocation
+            Group，AG）维护独立的 inode B+tree，如果 inode 数量极大而 AG
+            数量较少，单个 AG 的 B+tree 会变得很高，查找开销增加。</p>
+            <p>Btrfs 和 ZFS 对小文件的优势在于内联存储：文件数据直接嵌入
+            inode
+            所在的元数据块，读一个字节的小文件可能只需要读一个元数据块，而不是一个元数据块加一个数据块。</p>
+            <hr />
+            <h2 id="四物理层的寻道惩罚">四、物理层的寻道惩罚</h2>
+            <h3 id="hdd每次小文件读都是一次寻道">4.1
+            HDD：每次小文件读都是一次寻道</h3>
+            <p>机械硬盘（HDD）处理小文件的开销不在数据量，而在磁头寻道（Seek）和盘片旋转延迟（Rotational
+            Latency）。7200 RPM HDD 的平均寻道时间约 8 ms，旋转延迟约 4
+            ms，合计约 12 ms 的”固定成本”。</p>
+            <p>一次 4 KB 随机读的延迟：~12 ms（寻道+旋转）+ ~0.02
+            ms（数据传输）= ~12 ms。 读取 1 个 10 MB
+            顺序大文件的延迟：~12 ms（首次寻道）+ ~50 ms（数据传输）=
+            ~62 ms。</p>
+            <pre class="text"><code>读 10000 个小文件 vs 1 个大文件（10 MB 数据总量，HDD）：
+
+10000 个小文件（每个 1 KB）：
+  10000 × 12 ms ≈ 120 秒（2 分钟）
+
+1 个大文件（10 MB）：
+  1 × 12 ms + 50 ms ≈ 62 毫秒
+
+差距：~2000 倍</code></pre>
+            <p>这不是理论推算——用 <code>fio</code> 可以直观验证。</p>
+            <h3 id="ssd没有寻道不代表没问题">4.2
+            SSD：没有寻道不代表没问题</h3>
+            <p>SSD 没有机械寻道，但小文件仍然带来两个问题。</p>
+            <p>第一，读取放大。NAND Flash 的读取单位是页（Page），通常 4
+            KB 或 16 KB。读 1 KB 数据，SSD 控制器实际上从 NAND
+            读了一个完整的页（4 KB），然后只返回其中的 1 KB
+            给主机。就这次读而言，4 倍的读放大。</p>
+            <p>第二，syscall 开销成为瓶颈。当每次 I/O
+            操作的延迟从毫秒级（HDD）降到微秒级（NVMe
+            SSD），应用程序和内核之间的上下文切换开销就浮出水面了。一次
+            <code>open()</code> + <code>read()</code> +
+            <code>close()</code> 的系统调用成本在 2–5 μs 量级。1000
+            万个文件意味着 1000 万次系统调用——仅 syscall 开销就达到
+            20–50 秒。</p>
+            <pre class="text"><code>NVMe SSD 上读 10000 个小文件 vs 1 个大文件：
+
+10000 个小文件（4 KB random read, 单线程）：
+  每个文件: open() + read() + close()
+  syscall 开销: ~3 μs per syscall × 3 × 10000 ≈ 90 ms
+  I/O 延迟: ~100 μs × 10000 = 1 s
+  合计: ~1.1 s
+
+1 个大文件（40 MB, sequential read）：
+  syscall 开销: ~3 μs × 3 ≈ 9 μs
+  I/O 延迟: ~40 MB / 3 GB/s ≈ 13 ms
+  合计: ~13 ms
+
+差距: ~85 倍（即使在 NVMe 上）</code></pre>
+            <h3 id="实测用-fio-对比小文件和大文件-io">4.3 实测：用 fio
+            对比小文件和大文件 I/O</h3>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># HDD 环境：1 个大文件顺序读（基线）</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>big-seq-read <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>/mnt/hdd/bigfile <span class="dt">\</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>10G <span class="at">--bs</span><span class="op">=</span>1M <span class="at">--rw</span><span class="op">=</span>read <span class="at">--direct</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="at">--iodepth</span><span class="op">=</span>1 <span class="at">--numjobs</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>30 <span class="at">--time_based</span> <span class="at">--group_reporting</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co"># HDD 环境：模拟小文件随机读</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 filesetup 创建 10000 个 4KB 文件，随机选文件读 4KB</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>small-rand-read <span class="dt">\</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--directory</span><span class="op">=</span>/mnt/hdd/smallfiles <span class="dt">\</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--nrfiles</span><span class="op">=</span>10000 <span class="at">--filesize</span><span class="op">=</span>4k <span class="at">--rw</span><span class="op">=</span>randread <span class="dt">\</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--direct</span><span class="op">=</span>1 <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>    <span class="at">--iodepth</span><span class="op">=</span>1 <span class="at">--numjobs</span><span class="op">=</span>1 <span class="at">--runtime</span><span class="op">=</span>30 <span class="dt">\</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span> <span class="at">--group_reporting</span> <span class="at">--file_service_type</span><span class="op">=</span>random</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注输出中的 IOPS 和带宽差异</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 大文件场景：高带宽（100+ MB/s），低 IOPS</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 小文件场景：低带宽（&lt;5 MB/s），高 IOPS（受寻道限制）</span></span></code></pre></div>
+            <p>关键指标不是总数据量，而是 IOPS
+            消耗。一个小文件读写场景可能 IOPS
+            已经打满，但带宽利用率和磁盘空间利用率都远未触及上限——这就是”磁盘还有
+            50% 空闲空间，但系统已经不可用”的典型特征。</p>
+            <hr />
+            <h2 id="五应用层的增殖场景">五、应用层的增殖场景</h2>
+            <p>小文件很少是刻意设计的产物。更多时候，它们是业务逻辑的副产品——某个模块把日志按分钟切分了，另一个模块把用户头像存成了独立文件，CDN
+            把瓦片地图拆成了 256×256
+            的网格。下面列出几种最常见的小文件增殖场景。</p>
+            <h3 id="日志轮转">5.1 日志轮转</h3>
+            <p>Logrotate
+            或应用自带的日志轮转机制，按小时或按大小切分日志文件。一个中等规模的
+            Web 服务，每天可能产生 24–96 个日志文件。一年下来 8000–35000
+            个文件。如果日志进一步被按服务、按容器拆分，每个容器每天产生几十个日志文件，文件数量会以”容器数
+            × 日志轮转数 × 天数”的速度增长。</p>
+            <p>单个日志文件可能 10–100
+            MB，不算小。但许多应用还生成辅助日志（访问日志、错误日志、慢查询日志、GC
+            日志），每个都可能被单独轮转。所有这些文件共享一个日志目录，而这个目录的
+            <code>readdir()</code> 成本随文件数量线性增长。</p>
+            <h3 id="用户生成内容ugc">5.2 用户生成内容（UGC）</h3>
+            <p>用户头像、附件缩略图、文档预览图——每个用户都可能产生几十个小文件。以典型的
+            SaaS 产品为例：</p>
+            <pre class="text"><code>10 万用户 × 每个用户 20 个小文件（头像 + 缩略图 + 附件）= 200 万文件
+
+这些文件通常 &lt; 100 KB，磁盘占用约 200 GB（含 slack），
+但元数据开销（inode + dentry + extent）额外增加约 5 GB。</code></pre>
+            <p>如果文件系统是 ext4 且创建时使用了默认的
+            <code>inode_ratio = 16384</code>，200 万文件需要至少 32 GB
+            的”inode 配额”——在 200 GB
+            的分区上，这个配额可能不够（取决于创建时的参数选择）。</p>
+            <h3 id="瓦片地图与静态资源">5.3 瓦片地图与静态资源</h3>
+            <p>Web 地图应用的瓦片服务器（Tile
+            Server）是小文件问题的经典受害者。一个全球地图的缩放级别
+            15，瓦片数量是 4^15 ≈ 10 亿个 256×256 像素的 PNG 图片，每个
+            1–20 KB。即使只覆盖中国大陆区域，也是数千万个文件。</p>
+            <p>把这么多文件放在传统文件系统上是灾难性的。MBTiles
+            格式（SQLite 数据库内存储瓦片）和 S3
+            对象存储是这一场景的标准解决方案。</p>
+            <h3 id="容器镜像层">5.4 容器镜像层</h3>
+            <p>容器镜像由多层 tar
+            归档组成。每一层可能包含数千个小文件（系统配置文件、动态链接库、证书文件）。拉取镜像的过程本质上是下载
+            tar 归档并逐个文件解压的过程，小文件密度极高。</p>
+            <p>这就是为什么 <code>docker pull</code> 在某些存储驱动（如
+            overlay2）上比在其他驱动（如
+            devicemapper）上快得多——overlay2
+            的元数据操作更轻量，小文件创建的开销更低。</p>
+            <hr />
+            <h2 id="六benchmark-方法分离元数据和数据-io">六、Benchmark
+            方法：分离元数据和数据 I/O</h2>
+            <p>小文件场景的 benchmark 需要同时测量数据面和元数据面。只用
+            <code>fio</code> 测数据 I/O
+            会漏掉最贵的部分——<code>open()</code>、<code>stat()</code>、<code>unlink()</code>
+            这些元数据操作。</p>
+            <h3 id="fio数据-io-面">6.1 fio：数据 I/O 面</h3>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 模拟 10000 个小文件的随机读写</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 每个文件 4KB，总共约 40MB 数据</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>smallfile-test <span class="dt">\</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--directory</span><span class="op">=</span>/mnt/test/smallfiles <span class="dt">\</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--nrfiles</span><span class="op">=</span>10000 <span class="at">--filesize</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randrw <span class="at">--rwmixread</span><span class="op">=</span>70 <span class="dt">\</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--direct</span><span class="op">=</span>1 <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--iodepth</span><span class="op">=</span>32 <span class="at">--numjobs</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>60 <span class="at">--time_based</span> <span class="dt">\</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--group_reporting</span> <span class="at">--file_service_type</span><span class="op">=</span>random</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注：</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="co">#   IOPS —— 是否触碰了设备的 IOPS 上限</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="co">#   clat percentiles —— P99/P999 延迟是否出现长尾</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="co">#   BW —— 带宽可能极低（正常现象，因为块太小）</span></span></code></pre></div>
+            <h3 id="mdtest元数据-io-面">6.2 mdtest：元数据 I/O 面</h3>
+            <p><code>mdtest</code>
+            是专门测量文件系统元数据性能的工具，能单独测量
+            <code>create</code>、<code>stat</code>、<code>remove</code>
+            等元数据操作的速率：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 安装 mdtest（通常包含在 ior 软件包中）</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="co"># apt-get install mdtest 或从源码编译</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 测试：创建 100 万个文件，测量元数据 ops</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mpirun</span> <span class="at">--allow-run-as-root</span> <span class="at">-np</span> 1 <span class="dt">\</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    mdtest <span class="at">-d</span> /mnt/test/mdtest-dir <span class="at">-n</span> 1000000 <span class="at">-i</span> 3 <span class="at">-F</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 示意输出（数值随文件系统与磁盘变化）：</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="co"># File creation     :   45000 ops/sec</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="co"># File stat         :  120000 ops/sec</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="co"># File removal      :   38000 ops/sec</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Tree creation     :   82000 ops/sec</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Tree removal      :   55000 ops/sec</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注 create 和 stat 的 ops/sec</span></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 对比大文件场景：create 速率应该相似，但实际操作为空</span></span></code></pre></div>
+            <p><code>mdtest</code>
+            测的是纯粹的元数据操作速率——数据块几乎不参与
+            I/O（文件大小为零或接近零）。这个数字告诉你文件系统的元数据吞吐上限。当你的业务在这个指标上接近饱和时，无论磁盘还有多少带宽，系统都已经不可用了。</p>
+            <h3 id="strace测量系统调用开销">6.3
+            strace：测量系统调用开销</h3>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 统计一个小文件读取场景的系统调用分布</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-c</span> <span class="at">-f</span> python3 <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="st">import os</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="st">for i in range(10000):</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="st">    fd = os.open(f&#39;/mnt/test/smallfiles/file_{i}&#39;, os.O_RDONLY)</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="st">    data = os.read(fd, 4096)</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="st">    os.close(fd)</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 示意输出（截断，按路径 open 不含 readdir）：</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a><span class="co"># % time     seconds  usecs/call     calls    errors syscall</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="co"># ------ ----------- ----------- --------- --------- ----------------</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="co">#  72.10    1.234567         123     10000           openat</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="co">#  19.30    0.333333          33     10000           read</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a><span class="co">#   8.60    0.146789          14     10000           close</span></span></code></pre></div>
+            <p><code>openat</code>
+            通常占主导——开销在路径解析与权限检查，而非数据传输。这解释了为什么大文件场景的瓶颈在带宽，而小文件场景的瓶颈在
+            IOPS 和元数据操作。</p>
+            <hr />
+            <h2 id="七补救方案应用层聚合">七、补救方案：应用层聚合</h2>
+            <p>小文件问题的根在应用层，所以最有效的补救也在应用层。文件系统层的调优（换文件系统、调
+            block size）只能缓解症状，不能根治。</p>
+            <h3 id="打包-索引">7.1 打包 + 索引</h3>
+            <p>把多个小文件合并成一个大文件，维护一个内存索引记录每个小文件在大文件中的偏移（offset）和长度（length）。这是磁带备份（tar）、容器镜像（OCI
+            layers）、游戏资源包（WAD/PAK）和 CDN
+            瓦片存储（MBTiles）的共同模式。</p>
+            <pre class="text"><code>打包文件结构示例：
+
++------------------+
+| Header            |  ← 魔数、版本、文件总数
++------------------+
+| Index Entry 0     |  ← 文件名哈希 + offset + length (12-24 B)
+| Index Entry 1     |
+| ...               |
+| Index Entry N-1   |
++------------------+
+| File Data 0       |  ← 原始文件内容
+| File Data 1       |
+| ...               |
+| File Data N-1     |
++------------------+</code></pre>
+            <p>读写接口：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> struct</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> mmap</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> dataclasses <span class="im">import</span> dataclass</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> typing <span class="im">import</span> Optional</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="at">@dataclass</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> IndexEntry:</span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>    filename_hash: <span class="bu">int</span>  <span class="co"># 64-bit，用于查找</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>    offset: <span class="bu">int</span>         <span class="co"># 数据在包文件中的偏移</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>    length: <span class="bu">int</span>         <span class="co"># 数据长度</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> FileBundle:</span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;简单的小文件打包实现。仅用于演示原理。&quot;&quot;&quot;</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>    HEADER_FMT <span class="op">=</span> <span class="st">&quot;&gt;4s Q&quot;</span>       <span class="co"># magic(4B) + file_count(8B)</span></span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    ENTRY_FMT <span class="op">=</span> <span class="st">&quot;&gt;Q Q Q&quot;</span>       <span class="co"># hash(8B) + offset(8B) + length(8B)</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>    MAGIC <span class="op">=</span> <span class="st">b&quot;FB01&quot;</span></span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>, path: <span class="bu">str</span>):</span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>._path <span class="op">=</span> path</span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> <span class="bu">open</span>(path, <span class="st">&quot;rb&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>            magic, file_count <span class="op">=</span> struct.unpack(</span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>                <span class="va">self</span>.HEADER_FMT, f.read(<span class="dv">12</span>))</span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> magic <span class="op">!=</span> <span class="va">self</span>.MAGIC:</span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>                <span class="cf">raise</span> <span class="pp">ValueError</span>(<span class="st">&quot;不是有效的 bundle 文件&quot;</span>)</span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>            <span class="va">self</span>._index: <span class="bu">dict</span>[<span class="bu">int</span>, IndexEntry] <span class="op">=</span> {}</span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(file_count):</span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>                h, off, length <span class="op">=</span> struct.unpack(</span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>                    <span class="va">self</span>.ENTRY_FMT, f.read(<span class="dv">24</span>))</span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>                <span class="va">self</span>._index[h] <span class="op">=</span> IndexEntry(h, off, length)</span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a>    <span class="at">@staticmethod</span></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> _hash(filename: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">int</span>:</span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">int</span>.from_bytes(</span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a>            hashlib.blake2b(</span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a>                filename.encode(), digest_size<span class="op">=</span><span class="dv">8</span>).digest(),</span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>            byteorder<span class="op">=</span><span class="st">&quot;big&quot;</span>)</span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> read(<span class="va">self</span>, filename: <span class="bu">str</span>) <span class="op">-&gt;</span> Optional[<span class="bu">bytes</span>]:</span>
+<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>._hash(filename)</span>
+<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a>        entry <span class="op">=</span> <span class="va">self</span>._index.get(h)</span>
+<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> entry <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="va">None</span></span>
+<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> <span class="bu">open</span>(<span class="va">self</span>._path, <span class="st">&quot;rb&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a>            f.seek(entry.offset)</span>
+<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> f.read(entry.length)</span></code></pre></div>
+            <p>这种方案把 N 次 <code>open()</code> + <code>read()</code>
+            + <code>close()</code> 压缩为 1 次 <code>open()</code> + 1
+            次索引查找 + 1 次
+            <code>read()</code>。索引可以在启动时一次性读入内存（假设
+            100 万个文件，索引约 24
+            MB），后续所有文件访问都不需要遍历目录。</p>
+            <h3 id="嵌入式存储引擎">7.2 嵌入式存储引擎</h3>
+            <p>对于需要频繁更新的小数据场景，嵌入式键值存储（LMDB、RocksDB、SQLite）是比文件系统更好的选择。存储引擎把大量小键值对合并到有限的几个
+            SST 文件或 B-Tree 文件中，消除了 per-file
+            的系统调用和元数据开销。</p>
+            <p>Bitcask（Riak
+            的存储引擎）是一个极端例子：它在日志文件中按顺序追加写入，内存中维护一个全局哈希索引映射
+            key
+            到文件偏移。所有数据存在少量大文件中，文件系统上的文件数量与数据量无关。</p>
+            <pre class="text"><code>文件系统 vs 嵌入式存储引擎（100 万条 1 KB 记录）：
+
+文件系统方案：
+  - 100 万个文件（每个 1 KB）
+  - 100 万个 inode（~250 MB）
+  - 100 万个目录项（~40 MB）
+  - 磁盘占用（含 slack）：~4 GB
+
+嵌入式引擎方案（以 LMDB 为例）：
+  - 1 个数据文件（mmap 映射）
+  - 1 个 inode
+  - 内存中的 B+Tree 索引
+  - 磁盘占用（含内部碎片）：~1.5 GB</code></pre>
+            <p>这就是为什么几乎没有数据库选择”每个 key
+            存成一个文件”——哪怕是最简单的键值存储也会先做一个日志结构的合并层。</p>
+            <h3 id="对象存储">7.3 对象存储</h3>
+            <p>S3 和兼容的对象存储（MinIO、GCS、Azure
+            Blob）天然消除了文件系统的 inode
+            和目录树限制。对象存储用扁平的键空间替代了层级目录结构，元数据开销按对象数量线性增长而不是在单个目录上瓶颈。</p>
+            <p>但是：对象存储的每次 GET/PUT 是一次 HTTP 请求。对于一个 1
+            KB 的对象，请求延迟（通常 10–50
+            ms）是数据本身传输时间的数千倍。这意味着：</p>
+            <ul>
+            <li>对象存储解决的是文件数量上限的问题，不是小文件的延迟问题。</li>
+            <li>如果业务需要毫秒级的小文件读取，仍然需要在对象存储前面加一层本地缓存（如
+            AlluxIO、MinIO 的网关缓存）。</li>
+            <li>对于归档类数据（一年读一次），对象存储是最理想的小文件归宿——文件数量没有上限，每对象的计费模式清晰，不需要维护本地文件系统的
+            inode 配额。</li>
+            </ul>
+            <p>参考本站 <a
+            href="../46-object-storage-model/object-storage-model.html">对象存储模型</a>
+            和 <a href="../48-minio/minio.html">MinIO 原理和架构</a>
+            了解对象存储的底层设计。</p>
+            <hr />
+            <h2 id="八不应该做的事">八、不应该做的事</h2>
+            <h3 id="调小文件系统的-block-size">8.1 调小文件系统的 block
+            size</h3>
+            <p>一个常见的直觉是：“既然 slack space 是 block size
+            造成的，那把 block size 调小不就好了？”</p>
+            <p>ext4 的最低 block size 是 1024 字节。把 block size 从 4
+            KB 降到 1 KB：</p>
+            <pre class="text"><code>优势：
+  - slack space 减少：平均从 2 KB/file 降到 512 B/file
+  - 1000 万文件可节省约 15 GB 空间
+
+代价：
+  - inode 体内直接存放的 extent 项仍有限（ext4 默认 4 项）；更大映射靠 extent tree，块变小后树深度可能增加
+  - 单文件最大大小从 16 TB（4 KB 块）降到 4 TB（1 KB 块）
+  - 块位图大小增加 4 倍——管理开销增大
+  - 每次 I/O 的块数量增加 4 倍——文件系统层遍历变慢
+  - 与页缓存（4 KB page）不对齐——每次 I/O 需要额外处理</code></pre>
+            <p>对于大多数场景，调小 block size
+            的代价远超收益。真正该做的是不让小文件以独立文件的形式存在，而不是让文件系统的块变小。</p>
+            <h3 id="禁用-atime">8.2 禁用 atime</h3>
+            <p><code>noatime</code>
+            挂载选项确实能减少小文件场景下的元数据写操作（每次
+            <code>read()</code> 不再更新
+            atime），但这不是解决小文件问题的方案，只是一个普遍适用的优化。用
+            <code>noatime</code> 能减少几毫秒的延迟，但对 1000
+            万个文件的结构性开销无能为力。</p>
+            <h3 id="换文件系统而应用层不改">8.3
+            换文件系统而应用层不改</h3>
+            <p>从 ext4 换成 Btrfs 或 ZFS
+            确实能通过内联存储和内建校验和获得一些缓解——但这是边际改善，不是解决。如果一个应用把
+            1000 万个 1 KB 文件写到 Btrfs 上，Btrfs 仍然需要维护 1000
+            万个 inode、1000 万个目录项和 extent
+            映射。内联存储让每个文件省了 4 KB
+            的数据块，但每个文件的元数据开销（~200 字节）乘以 1000
+            万仍然是 2 GB。</p>
+            <hr />
+            <h2 id="九选型决策框架">九、选型决策框架</h2>
+            <pre class="text"><code>文件数量        每个文件大小     推荐方案
+────────────────────────────────────────────────
+&lt; 1 万          &gt; 1 MB         传统文件系统（ext4/XFS），问题不大
+1 万–10 万      &lt; 100 KB       考虑应用层打包或 SQLite
+10 万–100 万    &lt; 100 KB       应用层打包（LMDB/SQLite/tar)
+&gt; 100 万        任意            对象存储（S3/MinIO）或嵌入式引擎
+&gt; 1000 万       任意            对象存储（唯一选择）</code></pre>
+            <p>这个框架不是绝对的——如果你的 100
+            万个文件永远是顺序访问、从不列举目录、不需要修改，传统文件系统也完全够用。关键是理解开销来源并做有意识的工程权衡，而不是等到文件系统不可用了才被动应对。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <ul>
+            <li>Mathur, A., Cao, M., Bhattacharya, S., Dilger, A.,
+            Tomas, A., &amp; Vivier, L. (2007). “The New Ext4
+            Filesystem: Current Status and Future Plans.”
+            <em>Proceedings of the Linux Symposium 2007</em>. 描述了
+            ext4 的 inode 结构、extent 格式和块分配器设计。</li>
+            <li>Sweeney, A., Doucette, D., Hu, W., Anderson, C.,
+            Nishimoto, M., &amp; Peck, G. (1996). “Scalability in the
+            XFS File System.” <em>Proceedings of the USENIX 1996 Annual
+            Technical Conference</em>. XFS 的 AG 设计和动态 inode
+            分配的最早文档。</li>
+            <li>Rodeh, O., Bacik, J., &amp; Mason, C. (2013). “BTRFS:
+            The Linux B-tree Filesystem.” <em>ACM Transactions on
+            Storage</em>, 9(3). Btrfs 内联存储（inline
+            extent）的机制说明。</li>
+            <li>Bonwick, J., &amp; Ahrens, M. (2006). “The Zettabyte
+            File System.” <em>Proceedings of the 2nd International
+            Workshop on Storage Security and Survivability</em>. ZFS 的
+            dnode 结构和内联小文件机制。</li>
+            <li>Linux 内核源码：<code>fs/ext4/ext4.h</code>（inode
+            结构定义）、<code>fs/ext4/namei.c</code>（HTree
+            目录索引）、<code>fs/xfs/libxfs/xfs_alloc.c</code>（XFS
+            块分配器）、<code>fs/btrfs/inode.c</code>（Btrfs
+            内联存储路径）。</li>
+            <li>fio 文档：Filesetup 与 File Service Type。<a
+            href="https://fio.readthedocs.io/"
+            class="uri">https://fio.readthedocs.io/</a></li>
+            <li>mdtest 文档：Metadata Benchmarking。<a
+            href="https://github.com/hpc/ior"
+            class="uri">https://github.com/hpc/ior</a></li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../74-storage-outlook/storage-outlook.html">存储技术展望</a>
+            <strong>下一篇</strong>: <a
+            href="../76-disk-full-behavior/disk-full-behavior.html">磁盘空间耗尽：从
+            70% 到 ENOSPC 的行为退化链</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-27 · storage</p>
+                    <h3><a href="/post/storage/18-filesystem-selection/filesystem-selection.html">【存储工程】文件系统选型与基准测试</a></h3>
+                    <p>在生产环境中，文件系统（Filesystem）的选择直接影响存储栈的性能上限、数据安全边界和运维复杂度。本文将从设计目标、元数据性能、数据吞吐、典型业务场景、基准测试方法论等多个维度，对 ext4、XFS、Btrfs（B-tree Filesystem）、ZFS（Zettabyte File System）四种主流文件…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/76-disk-full-behavior/disk-full-behavior.html">【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链</a></h3>
+                    <p>逐层拆解 ext4、XFS、Btrfs、ZFS 从 70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC 故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-24 · storage</p>
+                    <h3><a href="/post/storage/46-object-storage-model/object-storage-model.html">【存储工程】对象存储模型：从文件到对象的范式转变</a></h3>
+                    <p>深入分析对象存储的设计哲学——文件系统与对象存储的本质差异、CAP 权衡、最终一致性到强一致性的演进，以及 S3 API 核心操作实战</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

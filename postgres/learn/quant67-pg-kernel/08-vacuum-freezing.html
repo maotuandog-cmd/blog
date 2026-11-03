@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】VACUUM 与 Freezing：膨胀的根因和 Wraparound 危机 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL VACUUM
+的完整内部流程：heap scan、dead tuple 回收、索引清理、FSM/VM
+更新。深入可见性映射和空闲空间映射的结构设计，以及 Index-Only Scan
+如何依赖 VM 判断页面全可见。解析 Freezing 机制与事务 ID
+回卷防御，Autovacuum 的触发阈值和 cost-based delay。最后用一条从
+n_tup_del 增长到数据库强制只读的完整危机时间线，讲清楚 Anti-wraparound
+VACUUM 的预警信号链、典型陷阱和排查方法。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, vacuum, freezing, wraparound, autovacuum, visibility-map, free-space-map, index-only-scan, pgstattuple, bloat, pg-stat-progress-vacuum, transaction-id, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/08-vacuum-freezing/08-vacuum-freezing.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】VACUUM 与 Freezing：膨胀的根因和 Wraparound 危机" />
+    <meta property="og:description" content="拆解 PostgreSQL VACUUM 的完整内部流程：heap scan、dead tuple 回收、索引清理、FSM/VM 更新。深入可见性映射和空闲空间映射的结构设计，以及 Index-Only Scan 如何依赖 VM 判断页面全可见。解析 Freezing 机制与事务 ID 回卷防御，Autovacuum 的触发阈值和 cost-based delay。最后用一条从 n_tup_del 增长到数据库强制只读的完整危机时间线，讲清楚 Anti-wraparound VACUUM 的预警信号链、典型陷阱和排查方法。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/08-vacuum-freezing/08-vacuum-freezing.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="vacuum" />
+    <meta property="article:tag" content="freezing" />
+    <meta property="article:tag" content="wraparound" />
+    <meta property="article:tag" content="autovacuum" />
+    <meta property="article:tag" content="visibility-map" />
+    <meta property="article:tag" content="free-space-map" />
+    <meta property="article:tag" content="index-only-scan" />
+    <meta property="article:tag" content="pgstattuple" />
+    <meta property="article:tag" content="bloat" />
+    <meta property="article:tag" content="pg-stat-progress-vacuum" />
+    <meta property="article:tag" content="transaction-id" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】VACUUM 与 Freezing：膨胀的根因和 Wraparound 危机" />
+    <meta name="twitter:description" content="拆解 PostgreSQL VACUUM 的完整内部流程：heap scan、dead tuple 回收、索引清理、FSM/VM 更新。深入可见性映射和空闲空间映射的结构设计，以及 Index-Only Scan 如何依赖 VM 判断页面全可见。解析 Freezing 机制与事务 ID 回卷防御，Autovacuum 的触发阈值和 cost-based delay。最后用一条从 n_tup_del 增长到数据库强制只读的完整危机时间线，讲清楚 Anti-wraparound VACUUM 的预警信号链、典型陷阱和排查方法。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】VACUUM 与 Freezing：膨胀的根因和 Wraparound 危机", "description": "拆解 PostgreSQL VACUUM 的完整内部流程：heap scan、dead tuple 回收、索引清理、FSM/VM 更新。深入可见性映射和空闲空间映射的结构设计，以及 Index-Only Scan 如何依赖 VM 判断页面全可见。解析 Freezing 机制与事务 ID 回卷防御，Autovacuum 的触发阈值和 cost-based delay。最后用一条从 n_tup_del 增长到数据库强制只读的完整危机时间线，讲清楚 Anti-wraparound VACUUM 的预警信号链、典型陷阱和排查方法。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/08-vacuum-freezing/08-vacuum-freezing.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "vacuum", "freezing", "wraparound", "autovacuum", "visibility-map", "free-space-map", "index-only-scan", "pgstattuple", "bloat", "pg-stat-progress-vacuum", "transaction-id"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】VACUUM 与 Freezing：膨胀的根因和 Wraparound 危机</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#vacuum</span> <span>#freezing</span> <span>#wraparound</span> <span>#autovacuum</span> <span>#visibility-map</span> <span>#free-space-map</span> <span>#index-only-scan</span> <span>#pgstattuple</span> <span>#bloat</span> <span>#pg-stat-progress-vacuum</span> <span>#transaction-id</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/vacuum.html">#vacuum</a><a class="chip-link" href="/tags/freezing.html">#freezing</a><a class="chip-link" href="/tags/wraparound.html">#wraparound</a><a class="chip-link" href="/tags/autovacuum.html">#autovacuum</a><a class="chip-link" href="/tags/visibility-map.html">#visibility-map</a><a class="chip-link" href="/tags/free-space-map.html">#free-space-map</a><a class="chip-link" href="/tags/index-only-scan.html">#index-only-scan</a><a class="chip-link" href="/tags/pgstattuple.html">#pgstattuple</a><a class="chip-link" href="/tags/bloat.html">#bloat</a><a class="chip-link" href="/tags/pg-stat-progress-vacuum.html">#pg-stat-progress-vacuum</a><a class="chip-link" href="/tags/transaction-id.html">#transaction-id</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#vacuum-与-freezing膨胀的根因和-wraparound-危机"
+                id="toc-vacuum-与-freezing膨胀的根因和-wraparound-危机">VACUUM
+                与 Freezing：膨胀的根因和 Wraparound 危机</a>
+                <ul>
+                <li><a href="#一为什么-pg-的-mvcc-必然需要-vacuum"
+                id="toc-一为什么-pg-的-mvcc-必然需要-vacuum">一、为什么
+                PG 的 MVCC 必然需要 VACUUM</a>
+                <ul>
+                <li><a href="#阶段-1扫描-heap标记-dead-tuple"
+                id="toc-阶段-1扫描-heap标记-dead-tuple">阶段 1：扫描
+                heap，标记 dead tuple</a></li>
+                <li><a href="#阶段-4更新可见性映射vm"
+                id="toc-阶段-4更新可见性映射vm">阶段
+                4：更新可见性映射（VM）</a></li>
+                <li><a href="#阶段-5更新空闲空间映射fsm"
+                id="toc-阶段-5更新空闲空间映射fsm">阶段
+                5：更新空闲空间映射（FSM）</a></li>
+                <li><a href="#阶段-6截断尾部空页"
+                id="toc-阶段-6截断尾部空页">阶段
+                6：截断尾部空页</a></li>
+                </ul></li>
+                <li><a href="#三可见性映射visibility-map"
+                id="toc-三可见性映射visibility-map">三、可见性映射（Visibility
+                Map）</a>
+                <ul>
+                <li><a href="#vm-的物理结构" id="toc-vm-的物理结构">VM
+                的物理结构</a></li>
+                <li><a href="#fsm-的更新时机"
+                id="toc-fsm-的更新时机">FSM 的更新时机</a></li>
+                </ul></li>
+                <li><a href="#五index-only-scan-与-vm"
+                id="toc-五index-only-scan-与-vm">五、Index-Only Scan 与
+                VM</a></li>
+                <li><a href="#七autovacuum自动化垃圾回收"
+                id="toc-七autovacuum自动化垃圾回收">七、Autovacuum：自动化垃圾回收</a>
+                <ul>
+                <li><a href="#触发阈值公式"
+                id="toc-触发阈值公式">触发阈值公式</a></li>
+                </ul></li>
+                <li><a href="#八膨胀量化与监控"
+                id="toc-八膨胀量化与监控">八、膨胀量化与监控</a>
+                <ul>
+                <li><a href="#pgstattuple"
+                id="toc-pgstattuple">pgstattuple</a></li>
+                <li><a href="#膨胀率预警信号"
+                id="toc-膨胀率预警信号">膨胀率预警信号</a></li>
+                <li><a href="#pg_stat_progress_vacuum"
+                id="toc-pg_stat_progress_vacuum">pg_stat_progress_vacuum</a></li>
+                <li><a href="#阶段-1-2信号在统计视图中"
+                id="toc-阶段-1-2信号在统计视图中">阶段
+                1-2：信号在统计视图中</a></li>
+                <li><a href="#阶段-5写阻塞forcetransactionid"
+                id="toc-阶段-5写阻塞forcetransactionid">阶段
+                5：写阻塞（ForceTransactionId）</a></li>
+                <li><a href="#阶段-6数据库强制只读-shutdown"
+                id="toc-阶段-6数据库强制只读-shutdown">阶段
+                6：数据库强制只读 shutdown</a></li>
+                </ul></li>
+                <li><a href="#十排查路径与监控-sql-汇总"
+                id="toc-十排查路径与监控-sql-汇总">十、排查路径与监控
+                SQL 汇总</a>
+                <ul>
+                <li><a href="#日常监控三件套"
+                id="toc-日常监控三件套">日常监控三件套</a></li>
+                <li><a href="#autovacuum-配置审计"
+                id="toc-autovacuum-配置审计">autovacuum
+                配置审计</a></li>
+                </ul></li>
+                <li><a href="#十关键要点"
+                id="toc-十关键要点">十、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="vacuum-与-freezing膨胀的根因和-wraparound-危机">VACUUM
+            与 Freezing：膨胀的根因和 Wraparound 危机</h1>
+            <p>如果你用过 PostgreSQL，大概率听过这句话：“PG 需要
+            VACUUM。”但 VACUUM 到底做了什么？为什么 MVCC
+            的实现必然导致它存在？膨胀多快才算危险？“事务 ID
+            回卷（wraparound）”这个词为什么会让 DBA 半夜惊醒？</p>
+            <p>本文从源码路径拆解 VACUUM 的内部流程——从 heap scan 到
+            index cleanup 到 FSM/VM
+            更新，讲清楚可见性映射和空闲空间映射的结构设计，解析
+            Freezing 机制如何防御事务 ID 回卷，然后用一条从
+            <code>n_tup_del</code>
+            增长到数据库强制只读的完整危机时间线，告诉你 Anti-wraparound
+            VACUUM 的预警信号链和排查方法。</p>
+            <p>与本文强相关的前置阅读：<a
+            href="../03-mvcc-clog/03-mvcc-clog.html">MVCC
+            实现：CLOG、hint bit 与快照可扩展性（第 03 篇）</a>讲了
+            xmin/xmax 的可见性判断、CLOG 结构和 hint bit
+            机制——本文默认你已经理解这些基础。</p>
+            <hr />
+            <h2 id="一为什么-pg-的-mvcc-必然需要-vacuum">一、为什么 PG
+            的 MVCC 必然需要 VACUUM</h2>
+            <p>PG 的 MVCC 采用”多版本元组”策略：UPDATE
+            不是原地修改，而是插入一个新版本元组，把旧版本标记为已删除（设置
+            <code>xmax</code>）。DELETE 同样不真正删除——只设置
+            <code>xmax</code>，旧元组留在页面里。</p>
+            <p>这种策略的优势很直接：读不阻塞写，写不阻塞读，ROLLBACK
+            几乎没有代价。但代价也明确：<strong>每次 UPDATE 和 DELETE
+            都会产生垃圾元组（dead
+            tuple）</strong>，它们占据磁盘空间、消耗
+            buffer、拖慢扫描。</p>
+            <p>用一个简单实验就能直观感受：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建测试表</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t (<span class="kw">id</span> <span class="dt">INT</span>, val TEXT);</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> t <span class="kw">SELECT</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>), repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">100</span>);</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看初始大小：约 13 MB</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_size_pretty(pg_relation_size(<span class="st">&#39;t&#39;</span>));</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 全表 UPDATE 10 次——每次产生 10 万 dead tuple</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>DO $$ <span class="cf">BEGIN</span> <span class="cf">FOR</span> i <span class="kw">IN</span> <span class="dv">1</span><span class="op">..</span><span class="dv">10</span> <span class="cf">LOOP</span> <span class="kw">UPDATE</span> t <span class="kw">SET</span> val <span class="op">=</span> repeat(<span class="st">&#39;y&#39;</span>, <span class="dv">100</span>); <span class="cf">END</span> <span class="cf">LOOP</span>; <span class="cf">END</span> $$;</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 表现在约 143 MB——膨胀了约 10 倍</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_size_pretty(pg_relation_size(<span class="st">&#39;t&#39;</span>));</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>每次 <span class="kw">UPDATE</span> 都在页面里插入新版本，旧版本还在原地。<span class="dv">10</span> 轮 <span class="kw">UPDATE</span> 后，表里有 <span class="dv">100</span> 万 dead tuple 和 <span class="dv">10</span> 万 live tuple。如果你不做 VACUUM，这些 dead tuple 会永远占据空间。</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>这就是 VACUUM 存在的根本原因：<span class="op">**</span>回收 dead tuple 占据的空间，标记为空闲空间供后续 <span class="kw">INSERT</span><span class="op">/</span><span class="kw">UPDATE</span> 复用<span class="op">**</span>。它不是可选优化——没有 VACUUM，PG 的 MVCC 会把磁盘撑爆。</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>## 二、VACUUM 的完整流程</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>VACUUM 分两种：`VACUUM`（不锁表，允许并发读写）和 `VACUUM FULL`（锁表，重写整个表，回收所有空间还给 OS）。日常运维只涉及前者，后者是紧急瘦身手段。本节聚焦 `VACUUM`。</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>核心实现在 `src<span class="op">/</span>backend<span class="op">/</span><span class="kw">access</span><span class="op">/</span><span class="kw">heap</span><span class="op">/</span>vacuumlazy.c`。函数 `heap_vacuum_rel()` 是主入口，内部调用 `lazy_scan_heap()` 完成主要工作。整个流程分六个阶段：</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>flowchart TD</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>  S[<span class="ot">&quot;lazy_scan_heap()&quot;</span>] <span class="co">--&gt; P1[&quot;阶段 1: 扫描 heap&lt;br/&gt;读每个页面，标记 dead tuple&quot;]</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>  P1 <span class="co">--&gt; P2[&quot;阶段 2: 清理 heap 页面&lt;br/&gt;移除 dead tuple，压缩页面&quot;]</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>  P2 <span class="co">--&gt; P3[&quot;阶段 3: 清理索引&lt;br/&gt;移除指向 dead tuple 的 index entry&quot;]</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>  P3 <span class="co">--&gt; P4[&quot;阶段 4: 更新 VM&lt;br/&gt;标记全可见页面&quot;]</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>  P4 <span class="co">--&gt; P5[&quot;阶段 5: 更新 FSM&lt;br/&gt;记录每个页面的空闲空间&quot;]</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>  P5 <span class="co">--&gt; P6[&quot;阶段 6: 截断尾部空页&lt;br/&gt;归还空间给 OS（可触发）&quot;]</span></span></code></pre></div>
+            <h3 id="阶段-1扫描-heap标记-dead-tuple">阶段 1：扫描
+            heap，标记 dead tuple</h3>
+            <p><code>lazy_scan_heap()</code>
+            遍历表的所有页面。对每个页面，它获取 buffer
+            pin（共享锁，不阻塞读写），然后调用
+            <code>heap_page_prune()</code> 判断页面内有哪些元组是 dead
+            的。</p>
+            <p>判断逻辑在
+            <code>HeapTupleSatisfiesVacuum()</code>（<code>src/backend/utils/time/tqual.c</code>）中：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 简化版 dead tuple 判断逻辑</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> HeapTupleSatisfiesVacuum<span class="op">(</span>HeapTupleHeader tuple<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. xmax 非空，且 xmax 对应的事务已提交 → tuple 被 DELETE/UPDATE 标记为 dead</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. xmin 对应的事务回滚 → tuple 是 aborted tuple，也应清理</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 关键：xmax 必须对所有活跃快照都可见</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    如果还有旧快照能看到这个 tuple，就不能回收</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>关键约束是<span class="st">&quot;所有活跃快照都看不到这个 tuple&quot;</span>——如果存在一个长时间运行的查询，它持有的快照在 xid<span class="op">=</span><span class="dv">100</span> 时刻，那么 xmax<span class="op">=</span><span class="dv">101</span> 的 dead tuple 对它来说仍然是<span class="st">&quot;活着&quot;</span>的。这就是长事务（idle in transaction）导致膨胀的根因：<span class="op">**</span>长事务持有的旧快照阻止 VACUUM 回收它启动之后产生的 dead tuple<span class="op">**</span>。</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>扫描阶段维护一个 `dead_tuples` 数组，收集所有可回收元组的行指针（`ItemPointer`）。同时更新 `t_infomask` 中的 hint bit，让后续可见性判断不需要查 CLOG。</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 阶段 2：清理 heap 页面</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>对每个包含 dead tuple 的页面，`lazy_vacuum_heap_page<span class="op">()</span>` 物理移除 dead tuple。它调用 `PageRepairFragmentation<span class="op">()</span>` 压缩页面：把 live tuple 紧凑排列，更新 ItemId 数组，重置页面内的空闲空间指针。</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>这里不会触发 I<span class="op">/</span>O——页面已经在 shared_buffers 中被 pin 住。修改后标记为 dirty，由 bgwriter 或 checkpoint 写入磁盘。</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 阶段 3：清理索引</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>每个 dead tuple 后面都有一个对应的 index entry。VACUUM 调用 `lazy_vacuum_index<span class="op">()</span>` 遍历索引，删除所有指向已回收 dead tuple 的 index entries。</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/heap/vacuumlazy.c</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="co">// lazy_vacuum() 的索引清理部分（简化）</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span>i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> nindexes<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    IndexBulkDeleteResult <span class="op">*</span>result<span class="op">;</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> index_bulk_delete<span class="op">(</span>indrel<span class="op">,</span> lazy_tid_reaped<span class="op">,</span> dead_tuples<span class="op">);</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 更新每个索引的统计信息（删除行数、空页面数）</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>这个阶段的代价很高——如果表上有多个索引（比如 5
+            个），每个索引都要做一次完整扫描来匹配
+            <code>dead_tuples</code>
+            数组。<code>maintenance_work_mem</code> 控制
+            <code>dead_tuples</code> 数组的大小：如果 dead tuple
+            太多，VACUUM
+            会分多趟（multi-pass）进行，每一趟都重新扫描所有索引。<strong>这是
+            VACUUM 慢的主要瓶颈之一</strong>。</p>
+            <h3 id="阶段-4更新可见性映射vm">阶段
+            4：更新可见性映射（VM）</h3>
+            <p>清理完成后，<code>visibilitymap_set()</code>
+            标记哪些页面”全可见”（all-visible）——页面上所有 tuple
+            对所有活跃快照都可见。VM 是一个每页面 2 bit
+            的位图文件，下节详解。</p>
+            <h3 id="阶段-5更新空闲空间映射fsm">阶段
+            5：更新空闲空间映射（FSM）</h3>
+            <p><code>RecordPageWithFreeSpace()</code>
+            把每个页面清理后释放的空闲空间量写入 FSM。后续 INSERT 和
+            UPDATE 通过 FSM 快速找到有足够空间容纳新 tuple
+            的页面，而不是从头顺序扫描。</p>
+            <h3 id="阶段-6截断尾部空页">阶段 6：截断尾部空页</h3>
+            <p>如果表尾部的连续页面全部为空（page 上没有
+            tuple），<code>lazy_truncate_heap()</code>
+            会截断它们，把空间归还 OS。触发条件：尾部连续空页数达到
+            <code>REL_TRUNCATE_MINIMUM</code>（默认为 32 页，即 256
+            KB）。不想触发截断可以用
+            <code>VACUUM (TRUNCATE false)</code>。</p>
+            <hr />
+            <h2
+            id="三可见性映射visibility-map">三、可见性映射（Visibility
+            Map）</h2>
+            <p>可见性映射（Visibility Map，VM）是 PG
+            中最容易被低估的数据结构。它的核心价值一句话概括：<strong>“这个页面上还有没有可能被某个快照看不到的
+            tuple？”</strong> 答案只需 1 bit。</p>
+            <h3 id="vm-的物理结构">VM 的物理结构</h3>
+            <p>VM 是一个独立的 fork
+            文件，与表的数据文件（<code>main</code> fork）和 FSM
+            文件（<code>fsm</code> fork）并列。每个 heap 页面在 VM 中占
+            2 bit：</p>
+            <table>
+            <colgroup>
+            <col style="width: 29%" />
+            <col style="width: 35%" />
+            <col style="width: 35%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>Bit</th>
+            <th>名称</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Bit 0</td>
+            <td><code>VISIBILITYMAP_ALL_VISIBLE</code></td>
+            <td>页面上所有 tuple 对所有活跃快照都可见</td>
+            </tr>
+            <tr>
+            <td>Bit 1</td>
+            <td><code>VISIBILITYMAP_ALL_FROZEN</code></td>
+            <td>页面上所有 tuple 已被 freeze（xmin 被冻结为
+            <code>FrozenTransactionId</code>）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>代码实现在
+            <code>src/backend/access/heap/visibilitymap.c</code>。每个
+            VM 页面（8 KB）覆盖大约 <span class="math inline">\(8 \times
+            1024 \times 8 \times 2 = 131072\)</span> 个 heap 页面的
+            bit（约 1 GB 数据）。VM
+            文件不是创建时就预分配的——按需增长。VACUUM
+            清理页面后设置对应 bit，INSERT 第一次插入 tuple 到页面时
+            clear 对应 bit。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/heap/visibilitymap.c</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> visibilitymap_set<span class="op">(</span>Relation rel<span class="op">,</span> BlockNumber heapBlk<span class="op">,</span> Buffer heapBuf<span class="op">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>                       XLogRecPtr recptr<span class="op">,</span> Buffer vmBuf<span class="op">,</span> TransactionId cutoff_xid<span class="op">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>                       uint8 flags<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 设置 VISIBILITYMAP_ALL_VISIBLE bit（如果 flags 包含该标记）</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 设置 VISIBILITYMAP_ALL_FROZEN bit（如果 flags 包含该标记）</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 写 WAL 记录（VM 的修改也需要 WAL 保护）</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 标记 VM 页面 dirty</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## VM 的两个消费者</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>VACUUM 本身<span class="op">**</span>：跳过全可见且全冻结的页面，大幅减少扫描量。`lazy_scan_heap<span class="op">()</span>` 中调用 `visibilitymap_get_status<span class="op">()</span>` 检查每个页面，跳过已经完全冻结的页面。</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>Index<span class="op">-</span>Only Scan<span class="op">**</span>：这是 VM 对查询性能最大的贡献——下节展开。</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 四、空闲空间映射（Free Space Map）</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>空闲空间映射（Free Space Map，FSM）回答的问题是：<span class="st">&quot;哪个页面有足够的空间放下这个 tuple？&quot;</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## FSM 的物理结构</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>FSM 也用独立的 fork 文件存储。核心数据结构是一棵多级二叉树（`src<span class="op">/</span>backend<span class="op">/</span>storage<span class="op">/</span>freespace<span class="op">/</span>freespace<span class="op">.</span>c`）：</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>级别 <span class="dv">0</span>（叶子页面）<span class="op">**</span>：存储最多约 <span class="dv">4000</span> 个 heap 页面的空闲空间信息</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>级别 <span class="dv">1</span><span class="op">**</span>：每个内部节点对应一个级别 <span class="dv">0</span> 页面的最大值</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>级别 <span class="dv">2</span>（根页面）<span class="op">**</span>：对应所有级别 <span class="dv">1</span> 页面的最大值</span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>每个 FSM 页面内部是一棵完整的二叉树，叶子节点对应具体 heap 页面的空闲空间量（以 <span class="dv">1</span><span class="op">/</span><span class="dv">256</span> 字节为单位），非叶子节点存储其子树中最大的可用空闲空间。查找路径：从根页面出发，沿着<span class="st">&quot;左子树最大值大于等于请求值&quot;</span>的路径向下，最终到达叶子节点指向的 heap 页面。</span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/fsm_internals.h</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="co">// FSM 页面的内部结构（简化）</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="co">//</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="co">// 每个 FSM 页面是一个完整的二叉树</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="co">//                            [根: 128]      ← 整个 FSM 页面最大空闲为 128 单位</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="co">//                    /                      \</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="co">//              [L1: 64]                  [L1: 128]</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="co">//             /        \                /          \</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a><span class="co">//        [L2: 0]    [L2: 64]       [L2: 128]    [L2: 32]</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="co">// 叶子节点中的值对应具体 heap 页面的空闲空间量</span></span></code></pre></div>
+            <h3 id="fsm-的更新时机">FSM 的更新时机</h3>
+            <p>VACUUM 清理页面后调用
+            <code>RecordPageWithFreeSpace()</code> 更新 FSM。INSERT
+            填充页面后也会更新 FSM。但 FSM
+            不保证精确——如果页面实际空闲空间比 FSM 记录的大，INSERT
+            会用自己的检查更新 FSM 记录。如果比记录的小，INSERT 会
+            report 给 FSM 并尝试下一个页面。</p>
+            <p>这种”近似值”设计是刻意的：FSM
+            只是加速查找的辅助结构，精确的空闲空间在页面本身的
+            <code>PageHeaderData.pd_lower</code> / <code>pd_upper</code>
+            中。</p>
+            <hr />
+            <h2 id="五index-only-scan-与-vm">五、Index-Only Scan 与
+            VM</h2>
+            <p>Index-Only Scan 是 PG 中最直接依赖 VM
+            的查询优化。原理：如果索引包含了查询需要的所有列，而且目标
+            tuple 所在的 heap 页面是”全可见”的（VM 中
+            <code>ALL_VISIBLE</code> bit =
+            1），那么可以直接从索引返回结果，不需要访问 heap 页面。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 把 index-only scan 的工作过程用 EXPLAIN 可视化</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t (<span class="kw">id</span> <span class="dt">INT</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>, val TEXT);</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> t <span class="kw">SELECT</span> g, <span class="st">&#39;data&#39;</span> <span class="op">||</span> g <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 初始没有 VM 信息，index-only scan 仍需访问 heap</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS) <span class="kw">SELECT</span> <span class="kw">id</span> <span class="kw">FROM</span> t;</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出：Index Only Scan using t_pkey ... Heap Fetches: 100000</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- VACUUM 后设置 VM bit</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>VACUUM t;</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 再次执行：Heap Fetches 应该大幅下降</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS) <span class="kw">SELECT</span> <span class="kw">id</span> <span class="kw">FROM</span> t;</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出：Index Only Scan using t_pkey ... Heap Fetches: 0</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>`Heap Fetches` 就是 <span class="kw">index</span><span class="op">-</span><span class="kw">only</span> <span class="kw">scan</span> 实际需要访问 <span class="kw">heap</span> 页面的次数。如果这个值接近返回行数，意味着 VM 信息过期或不存在——index<span class="op">-</span><span class="kw">only</span> <span class="kw">scan</span> 退化为普通的 <span class="kw">index</span> scan，失去了 I<span class="op">/</span>O 节省的优势。</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>VM bit 被 <span class="kw">clear</span> 的场景：INSERT 插入新 tuple 到页面、UPDATE 在页面内产生新版本、VACUUM 还没跑到这个页面。如果你的核心 OLTP 查询依赖 <span class="kw">index</span><span class="op">-</span><span class="kw">only</span> <span class="kw">scan</span> 加速，应该确保 `autovacuum` 足够频繁地维护 VM，或者对关键表手动 `VACUUM`。</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>## 六、Freezing：事务 <span class="kw">ID</span> 回卷防御</span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>### 事务 <span class="kw">ID</span> 是 <span class="dv">32</span> 位的</span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>PG 的事务 ID（`TransactionId`）是 <span class="dv">32</span> 位无符号整数，总共约 <span class="dv">40</span> 亿个值（$<span class="dv">2</span>^{<span class="dv">32</span>}$）。PG 用模运算来比较事务 <span class="kw">ID</span> 大小——不是简单的 $a <span class="op">&lt;</span> b$，而是 `TransactionIdPrecedes(a, b)`——把 <span class="dv">40</span> 亿的环对折，从当前事务向后看最多 <span class="dv">20</span> 亿个 xid 视为<span class="ot">&quot;过去&quot;</span>，向前看最多 <span class="dv">20</span> 亿个 xid 视为<span class="ot">&quot;未来&quot;</span>。</span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>如果事务 <span class="kw">ID</span> 真的用完并回卷，老 tuple 的 `xmin` 可能落在<span class="ot">&quot;未来&quot;</span>半环里——本来应该对所有快照可见的老数据，突然变得不可见。这就是 PG 运维中最危险的故障之一：<span class="op">**</span>wraparound 导致数据<span class="ot">&quot;消失&quot;</span><span class="op">**</span>。</span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>### Freezing 的作用</span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>不能等到事务 <span class="kw">ID</span> 真的用完时才处理。PG 的策略是<span class="ot">&quot;冻结&quot;</span>（freeze）足够老的 tuple：把 tuple 的 `xmin` 替换为特殊值 `FrozenTransactionId`（值为 <span class="dv">2</span>）。被冻结的 tuple 在可见性判断时无条件视为<span class="ot">&quot;对所有快照可见&quot;</span>——它已经足够老了，不需要再跟任何事务 <span class="kw">ID</span> 比较。</span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>`t_infomask` 中的 `HEAP_XMIN_FROZEN` 标志表示这个 tuple 的 `xmin` 已被冻结。PG <span class="fl">9.4</span> 之前，freeze 操作直接在 tuple <span class="kw">header</span> 里把 `xmin` 改为 `FrozenTransactionId`，这产生 WAL 记录。PG <span class="fl">9.4</span> 开始引入 freeze map（就是 VM 中的 `ALL_FROZEN` bit），可以在不修改 tuple 自身的情况下完成 freeze——如果页面上所有 tuple 都满足冻结条件，设置 `ALL_FROZEN` bit 即可。</span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>### 冻结的触发条件</span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>两个关键参数控制何时触发冻结：</span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>| 参数 | 含义 | 默认值 |</span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|--------|</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>| `vacuum_freeze_min_age` | VACUUM 周期中，tuple 的 `xmin` 距当前事务 <span class="kw">ID</span> 超过此值时被冻结 | `<span class="dv">50000000</span>`（<span class="dv">5</span> 千万） |</span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>| `vacuum_freeze_table_age` | 表的 `pg_class.relfrozenxid` 距当前事务 <span class="kw">ID</span> 超过此值时触发 aggressive VACUUM | `<span class="dv">150000000</span>`（<span class="fl">1.5</span> 亿） |</span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>源码中的冻结判断逻辑在 `heap_prepare_freeze_tuple()`（`src<span class="op">/</span>backend<span class="op">/</span><span class="kw">access</span><span class="op">/</span><span class="kw">heap</span><span class="op">/</span>heapam.c`）：</span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> 简化版冻结条件</span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>bool heap_prepare_freeze_tuple(HeapTupleHeader tuple, <span class="op">..</span>.) {</span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>    <span class="op">//</span> <span class="fl">1.</span> 计算 cutoff_xid <span class="op">=</span> 当前事务ID <span class="op">-</span> vacuum_freeze_min_age</span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">//</span> <span class="fl">2.</span> 如果 tuple<span class="op">-&gt;</span>xmin <span class="op">&lt;</span> cutoff_xid → 冻结 xmin</span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">//</span> <span class="fl">3.</span> 如果 tuple<span class="op">-&gt;</span>xmax <span class="op">!=</span> <span class="dv">0</span> 且 tuple<span class="op">-&gt;</span>xmax <span class="op">&lt;</span> cutoff_xid → 冻结 xmax</span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">//</span> <span class="fl">4.</span> 冻结：设置 HEAP_XMIN_FROZEN flag（<span class="fl">9.4</span><span class="op">+</span>）</span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div>
+            <p>冻结时同时更新
+            <code>pg_class.relfrozenxid</code>，记录该表中最老的未冻结
+            xmin。下次 VACUUM 根据这个值和当前事务 ID 的差值决定是否需要
+            aggressive VACUUM。</p>
+            <hr />
+            <h2
+            id="七autovacuum自动化垃圾回收">七、Autovacuum：自动化垃圾回收</h2>
+            <p>Autovacuum 是 PG
+            中最重要的后台进程子系统之一。它不是一个进程，而是两个角色：</p>
+            <ul>
+            <li><strong>Autovacuum
+            Launcher</strong>：一个长期运行的进程，定期检查所有数据库，决定哪些表需要
+            VACUUM 或 ANALYZE，然后 fork Autovacuum Worker 去执行。</li>
+            <li><strong>Autovacuum Worker</strong>：临时进程，由
+            Launcher fork 出来，执行具体一个表的 VACUUM 或
+            ANALYZE，完成后退出。</li>
+            </ul>
+            <h3 id="触发阈值公式">触发阈值公式</h3>
+            <p>Autovacuum Launcher 对每张表使用以下阈值公式判断是否触发
+            VACUUM（<code>src/backend/postmaster/autovacuum.c</code>
+            中的 <code>relation_needs_vacanalyze()</code> 逻辑）：</p>
+            <p><span class="math display">\[
+            \text{触发条件} =
+            \text{n\_dead\_tup} &gt;
+            \text{autovacuum\_vacuum\_threshold} +
+            \text{autovacuum\_vacuum\_scale\_factor} \times
+            \text{n\_live\_tup}
+            \]</span></p>
+            <p>默认
+            <code>autovacuum_vacuum_threshold = 50</code>，<code>autovacuum_vacuum_scale_factor = 0.2</code>。具体例子：</p>
+            <ul>
+            <li>小表 1000 行：dead tuple 超过 <span
+            class="math inline">\(50 + 0.2 \times 1000 = 250\)</span>
+            即触发</li>
+            <li>大表 1 亿行：dead tuple 超过 <span
+            class="math inline">\(50 + 0.2 \times 10^8 = 2000\)</span>
+            万才触发</li>
+            </ul>
+            <p>这就是为什么大表的
+            <code>autovacuum_vacuum_scale_factor</code>
+            默认值在很多场景下根本不合适——2000 万 dead tuple
+            意味着表已经膨胀了 20%，对一张 100 GB 的表来说就是 20 GB
+            的垃圾。生产环境通常对大表单独调低这个值：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> large_table <span class="kw">SET</span> (</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    autovacuum_vacuum_scale_factor <span class="op">=</span> <span class="fl">0.01</span>,</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    autovacuum_vacuum_threshold <span class="op">=</span> <span class="dv">1000</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> 的触发公式类似，使用 `autovacuum_analyze_threshold` 和 `autovacuum_analyze_scale_factor`。</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>### Anti<span class="op">-</span>wraparound VACUUM 的触发条件</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>除了普通的 dead tuple 触发，还有一类更高级别的触发：<span class="op">**</span>Anti<span class="op">-</span>wraparound VACUUM<span class="op">**</span>。触发条件不看 dead tuple 数量，只看事务 <span class="kw">ID</span> 年龄：</span></code></pre></div>
+            <p>当 age(relfrozenxid) &gt; autovacuum_freeze_max_age
+            时触发 aggressive VACUUM 默认 autovacuum_freeze_max_age =
+            200000000（2 亿）</p>
+            <pre class="text"><code>
+Aggressive VACUUM 和普通 VACUUM 的区别：它扫描**所有页面**，不跳过 VM 标记的全可见页面——因为它的目的是 freeze 老的 tuple，而不是回收 dead tuple。
+
+触发优先级是 Anti-wraparound &gt; 普通 VACUUM。当多个表同时满足条件时，优先级按事务 ID 年龄降序排列——最接近 wraparound 的表先处理。
+
+### Cost-based Delay
+
+VACUUM 有大量 I/O。为了防止 VACUUM 打满磁盘影响正常查询，PG 使用 cost-based delay 机制限速：
+
+```c
+// src/backend/commands/vacuum.c, vacuum_delay_point()
+// cost-based delay 计算逻辑（简化）
+void vacuum_delay_point(void) {
+    VacuumCostBalance += VacuumCostPageHit * hits_per_page
+                       + VacuumCostPageMiss * misses_per_page
+                       + VacuumCostPageDirty * dirty_per_page;
+
+    if (VacuumCostBalance &gt;= VacuumCostLimit) {
+        // sleep autovacuum_vacuum_cost_delay 毫秒
+        pg_usleep(VacuumCostDelay * 1000);
+        VacuumCostBalance = 0;
+    }
+}</code></pre>
+            <p>关键 GUC 参数：</p>
+            <table>
+            <colgroup>
+            <col style="width: 30%" />
+            <col style="width: 30%" />
+            <col style="width: 40%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>参数</th>
+            <th>含义</th>
+            <th>默认值</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>autovacuum_vacuum_cost_limit</code></td>
+            <td>每个 sleep 周期前的 cost 积累上限</td>
+            <td><code>200</code></td>
+            </tr>
+            <tr>
+            <td><code>autovacuum_vacuum_cost_delay</code></td>
+            <td>每次 sleep 的毫秒数</td>
+            <td><code>2ms</code></td>
+            </tr>
+            <tr>
+            <td><code>vacuum_cost_page_miss</code></td>
+            <td>从磁盘读一页的 cost</td>
+            <td><code>10</code></td>
+            </tr>
+            <tr>
+            <td><code>vacuum_cost_page_dirty</code></td>
+            <td>写脏一页的 cost</td>
+            <td><code>20</code></td>
+            </tr>
+            <tr>
+            <td><code>vacuum_cost_page_hit</code></td>
+            <td>从 shared_buffers 读一页的 cost</td>
+            <td><code>1</code></td>
+            </tr>
+            </tbody>
+            </table>
+            <p>默认配置下，autovacuum worker 每个 cost 周期处理约 200
+            cost 单位后 sleep 2ms。对于一个 I/O 密集的 VACUUM（大量 cold
+            pages），每秒处理约 <span class="math inline">\(200/10
+            \times 500 = 10000\)</span> pages 左右（约 80
+            MB/s），远低于现代 NVMe 磁盘的能力。</p>
+            <p>这个限制是<strong>保护机制</strong>，但对大表来说也可能成为<strong>瓶颈</strong>——如果
+            dead tuple 产生速度超过了 VACUUM
+            的回收速度，膨胀会持续积累。</p>
+            <hr />
+            <h2 id="八膨胀量化与监控">八、膨胀量化与监控</h2>
+            <h3 id="pgstattuple">pgstattuple</h3>
+            <p><code>pgstattuple</code> 扩展是量化膨胀的最直接工具：</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pgstattuple;</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pgstattuple(<span class="st">&#39;large_table&#39;</span>);</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- table_len       | 1572864000    (1.5 GB)</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- tuple_count     | 1000000       (100 万 live tuple)</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- tuple_len       | 120000000     (120 MB, live tuple 实际占用)</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- tuple_percent   | 7.63          (只有 7.63% 的空间是活数据)</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- dead_tuple_count| 9000000       (900 万 dead tuple)</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- dead_tuple_len  | 1080000000    (1.08 GB)</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- dead_tuple_percent | 68.66</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- free_space      | 350000000     (350 MB)</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- free_percent    | 22.25</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>如果 `dead_tuple_percent` 超过 <span class="dv">30</span>%，说明表已经明显膨胀，需要关注 VACUUM 是否跟不上。</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>### pg_stat_user_tables</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>日常监控不需要跑 `pgstattuple`（它在大表上很慢，会全表扫描），应该用 `pg_stat_user_tables`：</span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    schemaname,</span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    relname,</span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    n_live_tup,</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    n_dead_tup,</span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="fu">round</span>(<span class="fl">100.0</span> <span class="op">*</span> n_dead_tup <span class="op">/</span> <span class="fu">NULLIF</span>(n_live_tup <span class="op">+</span> n_dead_tup, <span class="dv">0</span>), <span class="dv">2</span>) <span class="kw">AS</span> dead_ratio,</span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    last_vacuum,</span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    last_autovacuum,</span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    vacuum_count,</span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    autovacuum_count</span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> n_dead_tup <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> n_dead_tup <span class="kw">DESC</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>;</span></code></pre></div>
+            <p>核心指标：</p>
+            <ul>
+            <li><strong><code>n_dead_tup</code></strong>：统计信息中估算的
+            dead tuple 数量。注意这是统计值，VACUUM 运行后更新。</li>
+            <li><strong><code>n_live_tup</code></strong>：统计信息中估算的
+            live tuple 数量。</li>
+            <li><strong><code>last_autovacuum</code></strong>：最近一次
+            autovacuum 完成的时间。如果 <code>n_dead_tup</code>
+            很高且这个时间很久远，autovacuum 可能跟不上。</li>
+            <li><strong><code>n_tup_del</code></strong> 和
+            <strong><code>n_tup_upd</code></strong>：累计删除和更新的行数——它们的增长速度决定了
+            dead tuple 的产生速度。</li>
+            </ul>
+            <h3 id="膨胀率预警信号">膨胀率预警信号</h3>
+            <p>以下信号组合意味着膨胀正在加速，VACUUM 跟不上：</p>
+            <ol type="1">
+            <li><code>n_dead_tup / (n_live_tup + n_dead_tup) &gt; 20%</code>——dead
+            tuple 占比超过 20%</li>
+            <li><code>last_autovacuum</code> 距离现在超过 1 天，且
+            <code>n_dead_tup</code> 在持续增长</li>
+            <li><code>n_tup_del + n_tup_upd</code>
+            的每小时增长率显著高于
+            <code>n_live_tup * autovacuum_vacuum_scale_factor</code></li>
+            </ol>
+            <h3
+            id="pg_stat_progress_vacuum">pg_stat_progress_vacuum</h3>
+            <p>PG 9.6 开始提供 <code>pg_stat_progress_vacuum</code>
+            视图，让你实时看到正在运行的 VACUUM 在做什么：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    p.relid:<span class="ch">:regclass</span> <span class="kw">AS</span> table_name,</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    p.phase,</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    p.heap_blks_total,</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    p.heap_blks_scanned,</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">round</span>(<span class="fl">100.0</span> <span class="op">*</span> p.heap_blks_scanned <span class="op">/</span> <span class="fu">NULLIF</span>(p.heap_blks_total, <span class="dv">0</span>), <span class="dv">2</span>) <span class="kw">AS</span> heap_scan_pct,</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    p.heap_blks_vacuumed,</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    p.index_vacuum_count,</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    p.max_dead_tuple_bytes,</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    p.num_dead_tuples</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_progress_vacuum p;</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>关键 `phase` 值：</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>| Phase | 含义 | 常见瓶颈 |</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>|<span class="co">-------|------|----------|</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>| `initializing` | 启动阶段 | 短暂 |</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>| `scanning heap` | 扫描 <span class="kw">heap</span> 页面 | 大表扫描慢，特别是 cold pages |</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>| `vacuuming indexes` | 清理索引 | 多个索引时，每个索引都需要完整扫描 |</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>| `vacuuming heap` | 清理 <span class="kw">heap</span> 页面 | 通常很快 |</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>| `cleaning up indexes` | 索引清理收尾 | 最后一次索引遍历 |</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>| `truncating heap` | 截断尾部空页 | 持有 AccessExclusiveLock |</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>如果你看到 VACUUM 在 `scanning heap` 阶段走得很慢，同时 `heap_blks_scanned` 接近 `heap_blks_total`——这是一张冷数据大表，大部分页面需要从磁盘读。如果卡在 `vacuuming indexes`，说明索引多或索引大——可以考虑减少不必要的索引，或者增大 `maintenance_work_mem` 让每次索引扫描处理更多 dead tuple。</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>## 九、Wraparound 危机时间线</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>这是整个 PG 运维中最危险的故障模式之一。事务 <span class="kw">ID</span> 回卷（wraparound）危机不是突然发生的——它有清晰的预警信号链。如果你识别了这些信号并采取措施，可以避免数据库变只读。如果没识别，数据库会强制 shutdown。</span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>flowchart TD</span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>  S1[<span class="ot">&quot;阶段 1: 正常运维&lt;br/&gt;n_tup_del 持续增长&lt;br/&gt;autovacuum 正常回收&quot;</span>] </span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">--&gt;|&quot;dead tuple 积累&quot;| S2[&quot;阶段 2: 延迟膨胀&lt;br/&gt;n_dead_tup 稳定增加&lt;br/&gt;last_autovacuum 间隔变长&quot;]</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>  </span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>  S2 <span class="co">--&gt;|&quot;xid 年龄增长&quot;| S3[&quot;阶段 3: 首次告警&lt;br/&gt;age(relfrozenxid) &gt; 1 亿&lt;br/&gt;日志: &#39;aggressive vacuum&#39;&quot;]</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>  </span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>  S3 <span class="co">--&gt;|&quot;未能完成&quot;| S4[&quot;阶段 4: 强制 autovacuum&lt;br/&gt;age(relfrozenxid) &gt; autovacuum_freeze_max_age (2 亿)&lt;br/&gt;日志: &#39;to prevent wraparound&#39;&quot;]</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>  </span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>  S4 <span class="co">--&gt;|&quot;大表跑太慢&quot;| S5[&quot;阶段 5: 写阻塞&lt;br/&gt;age(datfrozenxid) &gt; 15 亿&lt;br/&gt;ForceTransactionId 拦截新事务 ID 分配&lt;br/&gt;新增/删除/更新全部报错&quot;]</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>  </span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>  S5 <span class="co">--&gt;|&quot;不干预&quot;| S6[&quot;阶段 6: 数据库只读&lt;br/&gt;age(datfrozenxid) &gt; 20 亿&lt;br/&gt;PG 强制 shutdown&lt;br/&gt;启动即只读，唯一恢复: 单用户 VACUUM&quot;]</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>  style S5 fill:#f0883e,stroke:#d2752f,color:#fff</span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>  style S6 fill:#f85149,stroke:#cc3f3b,color:#fff</span></code></pre></div>
+            <h3 id="阶段-1-2信号在统计视图中">阶段
+            1-2：信号在统计视图中</h3>
+            <p>最早的信号在 <code>pg_stat_user_tables</code>
+            中。<code>n_dead_tup</code>
+            持续增长，<code>last_autovacuum</code>
+            时间离现在越来越远。如果你没设监控，你可能根本不知道问题在积累。</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 监控 SQL 1: 各表的年龄和 dead tuple 比率</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    c.<span class="kw">oid</span>:<span class="ch">:regclass</span> <span class="kw">AS</span> table_name,</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    age(c.relfrozenxid) <span class="kw">AS</span> xid_age,</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    s.n_dead_tup,</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    s.n_live_tup,</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">round</span>(<span class="fl">100.0</span> <span class="op">*</span> s.n_dead_tup <span class="op">/</span> <span class="fu">NULLIF</span>(s.n_live_tup <span class="op">+</span> s.n_dead_tup, <span class="dv">0</span>), <span class="dv">2</span>) <span class="kw">AS</span> dead_ratio,</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    s.last_autovacuum,</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    now() <span class="op">-</span> s.last_autovacuum <span class="kw">AS</span> since_last_av</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class c</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_user_tables s <span class="kw">ON</span> s.relid <span class="op">=</span> c.<span class="kw">oid</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.relfrozenxid <span class="op">!=</span> <span class="st">&#39;0&#39;</span>:<span class="ch">:xid</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> age(c.relfrozenxid) <span class="kw">DESC</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>;</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>### 阶段 <span class="dv">3</span>：日志中出现 <span class="ot">&quot;aggressive vacuum&quot;</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>当表的 `age(relfrozenxid)` 超过 `vacuum_freeze_table_age`（默认 <span class="fl">1.5</span> 亿），PG 会在日志中输出：</span></code></pre></div>
+            <p>automatic aggressive vacuum of table
+            “mydb.public.large_table”: index scans: 1 pages: 0 removed,
+            123456 remain tuples: 0 removed, 5000000 remain, 200000 dead
+            …</p>
+            <pre class="text"><code>
+这行日志是**正常行为**——PG 在主动处理。但如果大型表（几百 GB）的 aggressive VACUUM 频繁触发且每次耗时很长，意味着 autovacuum 的调度压力在增大。
+
+### 阶段 4：日志中的 &quot;to prevent wraparound&quot;
+
+当年龄超过 `autovacuum_freeze_max_age`（默认 2 亿），日志会变成：
+</code></pre>
+            <p>autovacuum: VACUUM public.large_table (to prevent
+            wraparound)</p>
+            <pre class="text"><code>
+关键变化：Autovacuum Worker 的进程名会显示 &quot;(to prevent wraparound)&quot;。这意味着该表的年龄已经到了必须处理的阈值。所有其他 autovacuum work（普通 VACUUM、ANALYZE）会被暂停，优先处理这个表。
+
+```sql
+-- 监控 SQL 2: 数据库级别的事务 ID 年龄（最关键的监控指标）
+SELECT
+    datname,
+    age(datfrozenxid) AS xid_age,
+    datfrozenxid,
+    pg_size_pretty(pg_database_size(datname)) AS db_size
+FROM pg_database
+ORDER BY age(datfrozenxid) DESC;</code></pre>
+            <p><code>age(datfrozenxid)</code>
+            是整个数据库中最老的未冻结事务 ID
+            距当前的距离。<strong>这个值是你需要设置告警的核心指标</strong>：</p>
+            <ul>
+            <li>小于 1 亿：正常</li>
+            <li>1 亿到 1.5 亿：关注，检查 autovacuum 是否正常</li>
+            <li>1.5 亿到 1.9 亿：告警，确认所有大表的 aggressive VACUUM
+            在跑</li>
+            <li>大于 1.9 亿：紧急，手动对大表
+            <code>VACUUM FREEZE</code></li>
+            <li>大于 2
+            亿（<code>autovacuum_freeze_max_age</code>）：已经触发强制
+            VACUUM，如果再增长就有风险</li>
+            </ul>
+            <h3 id="阶段-5写阻塞forcetransactionid">阶段
+            5：写阻塞（ForceTransactionId）</h3>
+            <p>当 <code>age(datfrozenxid)</code> 超过 15
+            亿，<code>GetNewTransactionId()</code> 中的
+            <code>ForceTransactionId</code> 检查会将新事务 ID
+            的分配阻塞。此时应用程序会收到错误：</p>
+            <pre class="text"><code>ERROR:  database is not accepting commands to avoid wraparound data loss in database &quot;mydb&quot;
+HINT:  Stop the postmaster and vacuum that database in single-user mode.
+       You might also need to commit or roll back old prepared transactions,
+       or drop stale replication slots.</code></pre>
+            <p><strong>这还不是只读模式</strong>——已经持有事务 ID
+            的读写操作仍可继续，但新事务无法开始。此时你必须尽快完成
+            VACUUM FREEZE。</p>
+            <h3 id="阶段-6数据库强制只读-shutdown">阶段
+            6：数据库强制只读 shutdown</h3>
+            <p>如果 <code>age(datfrozenxid)</code> 达到 20 亿，PG 会直接
+            PANIC 并
+            shutdown。重启后数据库处于只读模式——你只能以单用户模式启动（<code>postgres --single</code>），手动执行
+            VACUUM FREEZE。</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 单用户模式 VACUUM——最后的手段</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">postgres</span> <span class="at">--single</span> <span class="at">-D</span> /path/to/data mydb <span class="op">&lt;&lt;EOF</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="st">VACUUM FREEZE;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="ex">恢复时间取决于表的大小和磁盘性能。对于</span> TB 级别的大表，这个 VACUUM 可能跑几个小时甚至几天——在此期间数据库不可用。</span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="co">### 两种典型陷阱</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="ex">**陷阱一：手动取消</span> autovacuum 导致 wraparound<span class="pp">**</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="ex">一个常见的错误操作——DBA</span> 看到 autovacuum 跑得慢、占 I/O，心想<span class="st">&quot;先取消吧，晚上手动跑&quot;</span>。于是 <span class="kw">`</span>SELECT pg_cancel_backend<span class="er">(</span><span class="ex">pid</span><span class="kw">)`</span> <span class="ex">终止了</span> autovacuum worker。Autovacuum Launcher 会重新 schedule，但如果再次被取消，这个表就再也不会被 autovacuum 处理。</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="ex">如果你需要临时让某个表不通过</span> autovacuum 被 freeze，至少要在表级别设置一个较高的 freeze age，而不是 kill worker：</span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>sql</span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a><span class="ex">ALTER</span> TABLE large_table SET <span class="er">(</span><span class="ex">autovacuum_freeze_max_age</span> = 400000000<span class="kw">);</span></span></code></pre></div>
+            <p>也绝对不要用
+            <code>ALTER TABLE large_table SET (autovacuum_enabled = false)</code>
+            来阻止 anti-wraparound VACUUM——即使 autovacuum
+            被表级禁用，PG 仍会触发 anti-wraparound 检查，但不会再分配
+            autovacuum worker 去处理，最终导致阶段 5/6。</p>
+            <p><strong>陷阱二：<code>autovacuum_vacuum_cost_delay</code>
+            设太高，VACUUM 跟不上</strong></p>
+            <p>当你在一张 500 GB 的大表上调高
+            <code>autovacuum_vacuum_cost_delay</code> 到
+            20ms（甚至是表级别的），看起来是在”保护生产负载”，但实际上
+            autovacuum 的处理速度降为原来的 1/10。如果这张表每天产生 5
+            GB 的 dead tuple，而 autovacuum 每天只能回收 2 GB，那么 3
+            GB/天 的积累会在几周内让年龄突破 2 亿。</p>
+            <p>正确做法是提高
+            <code>autovacuum_vacuum_cost_limit</code>（比如从 200 提到
+            2000），而不是提高 delay。或者利用 PG 13+ 的表级 cost
+            参数，为特定表设置独立的加速配置，不影响全局 autovacuum
+            行为。</p>
+            <hr />
+            <h2 id="十排查路径与监控-sql-汇总">十、排查路径与监控 SQL
+            汇总</h2>
+            <h3 id="日常监控三件套">日常监控三件套</h3>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 数据库级别事务年龄（告警阈值建议小于 1.5 亿）</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> datname, age(datfrozenxid) <span class="kw">AS</span> age_xid,</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>       pg_size_pretty(pg_database_size(datname)) <span class="kw">AS</span> <span class="kw">size</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_database</span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> age(datfrozenxid) <span class="kw">DESC</span>;</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 表级别 dead tuple 积累与 autovacuum 间隔</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> c.<span class="kw">oid</span>:<span class="ch">:regclass</span> <span class="kw">AS</span> tbl,</span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>       age(c.relfrozenxid) <span class="kw">AS</span> xid_age,</span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>       s.n_dead_tup, s.n_live_tup,</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>       <span class="fu">round</span>(<span class="fl">100.0</span> <span class="op">*</span> s.n_dead_tup <span class="op">/</span> <span class="fu">NULLIF</span>(s.n_live_tup <span class="op">+</span> s.n_dead_tup, <span class="dv">0</span>), <span class="dv">2</span>) <span class="kw">AS</span> dead_pct,</span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>       s.last_autovacuum,</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> s.last_autovacuum <span class="kw">AS</span> since_last_av</span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class c</span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_user_tables s <span class="kw">ON</span> s.relid <span class="op">=</span> c.<span class="kw">oid</span></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.relfrozenxid <span class="op">!=</span> <span class="st">&#39;0&#39;</span>:<span class="ch">:xid</span> <span class="kw">AND</span> s.n_dead_tup <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> age(c.relfrozenxid) <span class="kw">DESC</span>;</span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 当前正在运行的 VACUUM 进度</span></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> p.relid:<span class="ch">:regclass</span>, p.phase,</span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a>       p.heap_blks_scanned, p.heap_blks_total,</span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>       <span class="fu">round</span>(<span class="fl">100.0</span> <span class="op">*</span> p.heap_blks_scanned <span class="op">/</span> <span class="fu">NULLIF</span>(p.heap_blks_total, <span class="dv">0</span>), <span class="dv">2</span>) <span class="kw">AS</span> pct,</span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a>       p.num_dead_tuples, p.index_vacuum_count,</span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a>       a.query_start, now() <span class="op">-</span> a.query_start <span class="kw">AS</span> elapsed</span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_progress_vacuum p</span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity a <span class="kw">ON</span> a.pid <span class="op">=</span> p.pid;</span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a>### 膨胀速度与 VACUUM 能力匹配检查</span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a><span class="co">-- 计算每个表的 dead tuple 日均增长速率（需要快照基线）</span></span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第一步：创建基线表</span></span>
+<span id="cb14-34"><a href="#cb14-34" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> dead_tup_snapshot <span class="kw">AS</span></span>
+<span id="cb14-35"><a href="#cb14-35" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> now() <span class="kw">AS</span> snap_ts, relid, n_dead_tup, n_tup_del, n_tup_upd</span>
+<span id="cb14-36"><a href="#cb14-36" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables;</span>
+<span id="cb14-37"><a href="#cb14-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-38"><a href="#cb14-38" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第二步：24 小时后查询增长量</span></span>
+<span id="cb14-39"><a href="#cb14-39" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb14-40"><a href="#cb14-40" aria-hidden="true" tabindex="-1"></a>    c.<span class="kw">oid</span>:<span class="ch">:regclass</span> <span class="kw">AS</span> tbl,</span>
+<span id="cb14-41"><a href="#cb14-41" aria-hidden="true" tabindex="-1"></a>    s.n_dead_tup <span class="op">-</span> d.n_dead_tup <span class="kw">AS</span> dead_tup_growth,</span>
+<span id="cb14-42"><a href="#cb14-42" aria-hidden="true" tabindex="-1"></a>    s.n_tup_del <span class="op">-</span> d.n_tup_del <span class="kw">AS</span> del_24h,</span>
+<span id="cb14-43"><a href="#cb14-43" aria-hidden="true" tabindex="-1"></a>    s.n_tup_upd <span class="op">-</span> d.n_tup_upd <span class="kw">AS</span> upd_24h,</span>
+<span id="cb14-44"><a href="#cb14-44" aria-hidden="true" tabindex="-1"></a>    s.last_autovacuum,</span>
+<span id="cb14-45"><a href="#cb14-45" aria-hidden="true" tabindex="-1"></a>    (s.n_tup_del <span class="op">-</span> d.n_tup_del) <span class="op">/</span> <span class="fl">24.0</span> <span class="kw">AS</span> del_per_hour</span>
+<span id="cb14-46"><a href="#cb14-46" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables s</span>
+<span id="cb14-47"><a href="#cb14-47" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> dead_tup_snapshot d <span class="kw">ON</span> d.relid <span class="op">=</span> s.relid</span>
+<span id="cb14-48"><a href="#cb14-48" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_class c <span class="kw">ON</span> c.<span class="kw">oid</span> <span class="op">=</span> s.relid</span>
+<span id="cb14-49"><a href="#cb14-49" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> s.n_dead_tup <span class="op">&gt;</span> d.n_dead_tup</span>
+<span id="cb14-50"><a href="#cb14-50" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> dead_tup_growth <span class="kw">DESC</span>;</span>
+<span id="cb14-51"><a href="#cb14-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-52"><a href="#cb14-52" aria-hidden="true" tabindex="-1"></a><span class="co">-- 清理基线</span></span>
+<span id="cb14-53"><a href="#cb14-53" aria-hidden="true" tabindex="-1"></a><span class="kw">DROP</span> <span class="kw">TABLE</span> dead_tup_snapshot;</span></code></pre></div>
+            <p>如果 <code>del_per_hour</code> 持续上升且
+            <code>last_autovacuum</code> 的间隔在拉长——说明 autovacuum
+            在追赶，但追不上。</p>
+            <h3 id="autovacuum-配置审计">autovacuum 配置审计</h3>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 检查所有表级别的 autovacuum 定制配置</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    c.<span class="kw">oid</span>:<span class="ch">:regclass</span>,</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    c.reloptions</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class c</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.reloptions <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> c.relkind <span class="op">=</span> <span class="st">&#39;r&#39;</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> (array_to_string(c.reloptions, <span class="st">&#39;,&#39;</span>) <span class="kw">LIKE</span> <span class="st">&#39;%autovacuum%&#39;</span>);</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>关注是否有表设置了过高的 `autovacuum_vacuum_cost_delay`（大于 <span class="dv">10</span>ms）或过低的 `autovacuum_vacuum_scale_factor`（但这通常是好事）。</span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>### 长事务检查</span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>长事务持有旧快照，阻止 VACUUM 回收其启动之后产生的 dead tuple：</span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a>    pid,</span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>    usename,</span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a>    application_name,</span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a>    state,</span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>    backend_start,</span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a>    xact_start,</span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a>    now() <span class="op">-</span> xact_start <span class="kw">AS</span> xact_duration,</span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">query</span></span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;idle in transaction&#39;</span></span>
+<span id="cb15-29"><a href="#cb15-29" aria-hidden="true" tabindex="-1"></a>   <span class="kw">OR</span> (xact_start <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">AND</span> now() <span class="op">-</span> xact_start <span class="op">&gt;</span> <span class="dt">interval</span> <span class="st">&#39;5 minutes&#39;</span>)</span>
+<span id="cb15-30"><a href="#cb15-30" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> xact_start;</span></code></pre></div>
+            <p>任何一个 <code>xact_duration</code>
+            超过几分钟的事务都需要被审视——如果是一个遗留的、忘了 COMMIT
+            的 psql session，它会阻碍所有表上的 VACUUM 回收。</p>
+            <hr />
+            <h2 id="十关键要点">十、关键要点</h2>
+            <ol type="1">
+            <li><strong>VACUUM 是 PG MVCC
+            的必然代价</strong>——UPDATE/DELETE 产生 dead
+            tuple，不回收就会膨胀；回收速度取决于
+            <code>OldestXmin</code> 和 autovacuum
+            是否跟得上写入速率。</li>
+            <li><strong>lazy VACUUM 分六步</strong>：heap scan → heap
+            prune → index cleanup → VM 更新 → FSM 更新 →
+            可选截断；瓶颈常在 index cleanup 或 cost-based delay
+            限速。</li>
+            <li><strong>VM 支撑 Index-Only Scan，FSM
+            指导插入位置</strong>——VM 标记全可见页可跳过 heap 读取；FSM
+            记录页内空闲空间，但 VACUUM
+            不收缩物理文件（<code>VACUUM FULL</code> 才还空间给
+            OS）。</li>
+            <li><strong>Freezing 是 wraparound 防御线</strong>——把老
+            tuple 的 <code>xmin</code> 标记为 frozen，释放 XID
+            比较空间；<code>age(relfrozenxid)</code> 和
+            <code>autovacuum_freeze_max_age</code> 是核心监控指标。</li>
+            <li><strong>Anti-wraparound VACUUM 有完整危机链</strong>——从
+            autovacuum 告警、<code>ForceTransactionId</code>
+            写阻塞，到数据库只读 shutdown；长事务和手动取消 autovacuum
+            是最常见的加速器。</li>
+            </ol>
+            <p>上一章：<a
+            href="../07-transaction-subxact/07-transaction-subxact.html">事务与子事务</a>
+            下一章：<a
+            href="../09-parse-rewrite/09-parse-rewrite.html">查询解析与重写</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/access/heap/vacuumlazy.c</code>：VACUUM
+            主循环与 heap 清理，<code>heap_vacuum_rel()</code>,
+            <code>lazy_scan_heap()</code>,
+            <code>lazy_vacuum_all_indexes()</code>,
+            <code>lazy_vacuum_heap_rel()</code></li>
+            <li><code>src/backend/commands/vacuum.c</code>：VACUUM
+            命令入口与 cost-based delay，<code>ExecVacuum()</code>,
+            <code>vacuum_delay_point()</code></li>
+            <li><code>src/backend/postmaster/autovacuum.c</code>：Autovacuum
+            Launcher 与 Worker 调度，<code>AutoVacLauncherMain()</code>,
+            <code>AutoVacWorkerMain()</code>,
+            <code>relation_needs_vacanalyze()</code></li>
+            <li><code>src/backend/access/heap/visibilitymap.c</code>：可见性映射，<code>visibilitymap_set()</code>,
+            <code>visibilitymap_clear()</code>,
+            <code>visibilitymap_get_status()</code></li>
+            <li><code>src/backend/storage/freespace/freespace.c</code>：空闲空间映射，<code>fsm_search_avail()</code>,
+            <code>RecordPageWithFreeSpace()</code></li>
+            <li><code>src/backend/utils/time/tqual.c</code>：<code>HeapTupleSatisfiesVacuum()</code>
+            可见性判断</li>
+            <li><code>src/backend/access/heap/heapam.c</code>：<code>heap_prepare_freeze_tuple()</code>
+            冻结逻辑</li>
+            <li><code>src/backend/access/transam/varsup.c</code>：<code>GetNewTransactionId()</code>
+            与 <code>ForceTransactionId()</code> wraparound 检查</li>
+            <li><code>src/include/storage/fsm_internals.h</code>：FSM
+            内部结构</li>
+            <li><code>src/include/access/htup_details.h</code>：<code>HeapTupleHeaderData</code>
+            结构定义，t_infomask 标志位</li>
+            <li><code>contrib/pgstattuple/</code>：pgstattuple
+            扩展源码</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL 17 Documentation, Chapter 25: Routine
+            Database Maintenance Tasks（VACUUM、autovacuum 配置）</li>
+            <li>PostgreSQL 17 Documentation, Section 25.1.5: Preventing
+            Transaction ID Wraparound Failures（wraparound
+            防护策略）</li>
+            <li>PostgreSQL 17 Documentation, Section 20.10: Automatic
+            Vacuuming（autovacuum 触发公式与参数）</li>
+            <li>PostgreSQL 17 Documentation, Section 68.4: Visibility
+            Map（VM 的物理格式）</li>
+            <li>PostgreSQL 17 Documentation, Section 68.5: Free Space
+            Map（FSM 的物理格式）</li>
+            <li>PostgreSQL 17 Documentation, Section 27.2.4:
+            <code>pg_stat_progress_vacuum</code> 视图</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Berenson, H. et al. <em>A Critique of ANSI SQL Isolation
+            Levels</em>. SIGMOD 1995.（快照隔离的形式化定义，包含事务 ID
+            回卷的原始讨论）</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html">【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性</a></h3>
+                    <p>在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/07-transaction-subxact/07-transaction-subxact.html">【PG 内核】事务与子事务：Savepoint 的 TransactionState 栈和 2PC 的状态文件</a></h3>
+                    <p>拆解 PostgreSQL 事务系统的三层结构：事务状态机 TransState 的状态转换路径、子事务（savepoint）的 TransactionState 栈与 ResourceOwner 嵌套管理、两阶段提交（2PC）的 WAL 记录与 pg_twophase 状态文件格式、事务 ID 分配的 xidStopLimit/xidWrapLimit 防线。附带 2PC 泄露的排查 SQL 和子事务栈过深的故障案例。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/21-monitoring/21-monitoring.html">【PG 内核】监控体系与告警设计：从内核机制出发定义该监控什么</a></h3>
+                    <p>不从 Grafana 模板照抄，而是从 PG 内核机制推导出必须监控的六个维度：连接与 wait_event、存储膨胀与 XID wraparound、WAL 与复制延迟、查询性能突变、锁等待链、以及 shared_buffers 命中率骗局。每个维度配具体 SQL 和指标解读，告警阈值给出内核依据而非拍脑袋数字，同时盘点 pg_stat_statements queryid 冲突、track_io_timing 开销、pg_stat_activity 自身代价等监控工具本身的陷阱。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

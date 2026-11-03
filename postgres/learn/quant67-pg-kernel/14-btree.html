@@ -1,0 +1,1163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】B-Tree 索引：页面分裂、rightlink 与去重 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL B-Tree
+索引的内核实现：BTPageOpaque 页面布局（high key / rightlink
+的工程意义）、_bt_doinsert() 插入路径与 _bt_split()
+页面分裂的完整流程（分裂点选择不是简单的 50/50）、PG 12+
+去重（deduplicate_items）的触发条件与 posting list 压缩策略、B-Tree WAL
+记录类型与恢复，以及用 bt_page_items() 和 bt_metap()
+观察索引内部结构的实验方法。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, btree, index, page-split, deduplicate, rightlink, high-key, bt-page-items, bt-metap, btpagiopaque, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/14-btree/14-btree.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】B-Tree 索引：页面分裂、rightlink 与去重" />
+    <meta property="og:description" content="拆解 PostgreSQL B-Tree 索引的内核实现：BTPageOpaque 页面布局（high key / rightlink 的工程意义）、_bt_doinsert() 插入路径与 _bt_split() 页面分裂的完整流程（分裂点选择不是简单的 50/50）、PG 12+ 去重（deduplicate_items）的触发条件与 posting list 压缩策略、B-Tree WAL 记录类型与恢复，以及用 bt_page_items() 和 bt_metap() 观察索引内部结构的实验方法。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/14-btree/14-btree.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="btree" />
+    <meta property="article:tag" content="index" />
+    <meta property="article:tag" content="page-split" />
+    <meta property="article:tag" content="deduplicate" />
+    <meta property="article:tag" content="rightlink" />
+    <meta property="article:tag" content="high-key" />
+    <meta property="article:tag" content="bt-page-items" />
+    <meta property="article:tag" content="bt-metap" />
+    <meta property="article:tag" content="btpagiopaque" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】B-Tree 索引：页面分裂、rightlink 与去重" />
+    <meta name="twitter:description" content="拆解 PostgreSQL B-Tree 索引的内核实现：BTPageOpaque 页面布局（high key / rightlink 的工程意义）、_bt_doinsert() 插入路径与 _bt_split() 页面分裂的完整流程（分裂点选择不是简单的 50/50）、PG 12+ 去重（deduplicate_items）的触发条件与 posting list 压缩策略、B-Tree WAL 记录类型与恢复，以及用 bt_page_items() 和 bt_metap() 观察索引内部结构的实验方法。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】B-Tree 索引：页面分裂、rightlink 与去重", "description": "拆解 PostgreSQL B-Tree 索引的内核实现：BTPageOpaque 页面布局（high key / rightlink 的工程意义）、_bt_doinsert() 插入路径与 _bt_split() 页面分裂的完整流程（分裂点选择不是简单的 50/50）、PG 12+ 去重（deduplicate_items）的触发条件与 posting list 压缩策略、B-Tree WAL 记录类型与恢复，以及用 bt_page_items() 和 bt_metap() 观察索引内部结构的实验方法。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/14-btree/14-btree.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "btree", "index", "page-split", "deduplicate", "rightlink", "high-key", "bt-page-items", "bt-metap", "btpagiopaque"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】B-Tree 索引：页面分裂、rightlink 与去重</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#btree</span> <span>#index</span> <span>#page-split</span> <span>#deduplicate</span> <span>#rightlink</span> <span>#high-key</span> <span>#bt-page-items</span> <span>#bt-metap</span> <span>#btpagiopaque</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/btree.html">#btree</a><a class="chip-link" href="/tags/index.html">#index</a><a class="chip-link" href="/tags/page-split.html">#page-split</a><a class="chip-link" href="/tags/deduplicate.html">#deduplicate</a><a class="chip-link" href="/tags/rightlink.html">#rightlink</a><a class="chip-link" href="/tags/high-key.html">#high-key</a><a class="chip-link" href="/tags/bt-page-items.html">#bt-page-items</a><a class="chip-link" href="/tags/bt-metap.html">#bt-metap</a><a class="chip-link" href="/tags/btpagiopaque.html">#btpagiopaque</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#b-tree-索引页面分裂rightlink-与去重"
+                id="toc-b-tree-索引页面分裂rightlink-与去重">B-Tree
+                索引：页面分裂、rightlink 与去重</a>
+                <ul>
+                <li><a
+                href="#一b-tree-页面布局btpageopaquehigh-key-与-rightlink"
+                id="toc-一b-tree-页面布局btpageopaquehigh-key-与-rightlink">一、B-Tree
+                页面布局：BTPageOpaque、high key 与 rightlink</a>
+                <ul>
+                <li><a href="#三层结构-special-space"
+                id="toc-三层结构-special-space">1.1 三层结构 + special
+                space</a></li>
+                </ul></li>
+                <li><a href="#二b-tree-元页面bt_metap"
+                id="toc-二b-tree-元页面bt_metap">二、B-Tree
+                元页面：bt_metap()</a>
+                <ul>
+                <li><a href="#bt_search利用-rightlink-向下搜索"
+                id="toc-bt_search利用-rightlink-向下搜索">3.2
+                _bt_search()：利用 rightlink 向下搜索</a></li>
+                </ul></li>
+                <li><a href="#四页面分裂_bt_split-的完整流程"
+                id="toc-四页面分裂_bt_split-的完整流程">四、页面分裂：_bt_split()
+                的完整流程</a>
+                <ul>
+                <li><a href="#后缀截断suffix-truncation"
+                id="toc-后缀截断suffix-truncation">4.2 后缀截断（Suffix
+                Truncation）</a></li>
+                <li><a href="#第三步迁移元组"
+                id="toc-第三步迁移元组">4.4 第三步：迁移元组</a></li>
+                <li><a href="#第四步插入父指针_bt_insert_parent"
+                id="toc-第四步插入父指针_bt_insert_parent">4.5
+                第四步：插入父指针（_bt_insert_parent）</a></li>
+                <li><a href="#posting-list-的物理格式"
+                id="toc-posting-list-的物理格式">5.3 posting list
+                的物理格式</a></li>
+                </ul></li>
+                <li><a href="#六wal-记录类型与崩溃恢复"
+                id="toc-六wal-记录类型与崩溃恢复">六、WAL
+                记录类型与崩溃恢复</a>
+                <ul>
+                <li><a href="#uuid-主键的-b-tree-灾难"
+                id="toc-uuid-主键的-b-tree-灾难">7.2 UUID 主键的 B-Tree
+                灾难</a></li>
+                <li><a href="#唯一索引插入的死锁风险"
+                id="toc-唯一索引插入的死锁风险">7.4
+                唯一索引插入的死锁风险</a></li>
+                <li><a href="#去重与-index-only-scan-的隐性代价"
+                id="toc-去重与-index-only-scan-的隐性代价">7.5 去重与
+                index-only scan 的隐性代价</a></li>
+                </ul></li>
+                <li><a href="#八实验用-pageinspect-观察-b-tree-页面"
+                id="toc-八实验用-pageinspect-观察-b-tree-页面">八、实验：用
+                pageinspect 观察 B-Tree 页面</a>
+                <ul>
+                <li><a href="#环境准备" id="toc-环境准备">8.1
+                环境准备</a></li>
+                <li><a href="#查看页面统计" id="toc-查看页面统计">8.3
+                查看页面统计</a></li>
+                <li><a href="#观察去重效果" id="toc-观察去重效果">8.6
+                观察去重效果</a></li>
+                </ul></li>
+                <li><a href="#九关键要点"
+                id="toc-九关键要点">九、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文与设计讨论"
+                id="toc-论文与设计讨论">论文与设计讨论</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="b-tree-索引页面分裂rightlink-与去重">B-Tree
+            索引：页面分裂、rightlink 与去重</h1>
+            <p>你在 PG 里跑了几个月的 <code>orders</code> 表，突然发现
+            <code>INSERT</code> 延迟跳了 5
+            倍。<code>EXPLAIN ANALYZE</code>
+            看不出问题——查询本身很快。<code>pg_stat_user_tables</code>
+            的 <code>n_tup_ins</code> 也没有异常。但
+            <code>pg_stat_statements</code> 抓到那条 <code>INSERT</code>
+            的 <code>shared_blks_written</code> 比平时翻了 3 倍。</p>
+            <p>问题在索引。B-Tree 页面分裂时，PG
+            要分配新页面、迁移元组、在父页面插入 downlink、写
+            WAL——这个操作持有页面的
+            LWLock，阻塞同一页面上的所有并发插入。分裂从叶子向上传播，最坏情况一直裂到根节点，树高加一。</p>
+            <p>本文从 PG 17 源码出发，拆解 B-Tree
+            的三个核心机制：页面布局（<code>BTPageOpaque</code>、high
+            key、rightlink）、插入与分裂的完整源码路径、PG 12
+            引入的去重。读完你会理解为什么 <code>fillfactor</code> 和
+            <code>deduplicate_items</code>
+            不是可有可无的存储参数，以及什么时候该在 UUID 列上建
+            B-Tree、什么时候不该。</p>
+            <hr />
+            <h2
+            id="一b-tree-页面布局btpageopaquehigh-key-与-rightlink">一、B-Tree
+            页面布局：BTPageOpaque、high key 与 rightlink</h2>
+            <h3 id="三层结构-special-space">1.1 三层结构 + special
+            space</h3>
+            <p>B-Tree 页面复用了 PG 通用 Page 的 8KB
+            三层结构（<code>PageHeaderData</code> + ItemId 数组 + Tuple
+            区域），区别在 <code>special space</code> 里塞了 B-Tree
+            专用元数据：</p>
+            <pre class="text"><code>┌─────────────────────────────────────────────┐
+│              PageHeaderData (24B)            │ ← pd_lsn, pd_lower, pd_upper
+├─────────────────────────────────────────────┤
+│          ItemId 数组（每项 4B）               │ ← 指向每个 IndexTuple
+├─────────────────────────────────────────────┤
+│               空闲空间                        │
+├─────────────────────────────────────────────┤
+│  IndexTuple N │ ... │ IndexTuple 2 │ IndexTuple 1 │ ← 从底部向上增长
+├─────────────────────────────────────────────┤
+│            BTPageOpaqueData (16B)            │ ← special space
+└─────────────────────────────────────────────┘</code></pre>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/nbtree.h</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> BTPageOpaqueData <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    BlockNumber  btpo_prev<span class="op">;</span>       <span class="co">// 左兄弟 block number（同层双向链表）</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    BlockNumber  btpo_next<span class="op">;</span>       <span class="co">// 右兄弟 block number</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    uint32       btpo_level<span class="op">;</span>      <span class="co">// 树中层级（0 = 叶子）</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    uint16       btpo_flags<span class="op">;</span>      <span class="co">// BTP_LEAF / BTP_ROOT / BTP_DELETED / BTP_META / BTP_HALF_DEAD</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    BTCycleId    btpo_cycleid<span class="op">;</span>    <span class="co">// 最近一次 VACUUM 的 cycle ID</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> BTPageOpaqueData<span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>`btpo_flags` 的标志位：</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 标志 <span class="op">|</span> 含义 <span class="op">|</span> 如何产生 <span class="op">|</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="op">|------|------|---------|</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BTP_LEAF` <span class="op">|</span> 叶子页面，btpo_level <span class="op">==</span> <span class="dv">0</span> <span class="op">|</span> 页面创建时，如果是叶子层 <span class="op">|</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BTP_ROOT` <span class="op">|</span> 根页面 <span class="op">|</span> 根分裂时新分配的页面被设为此标志 <span class="op">|</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BTP_DELETED` <span class="op">|</span> 页面已标记删除，元组被迁移 <span class="op">|</span> VACUUM 发现叶子页完全无活跃元组时标记 <span class="op">|</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BTP_HALF_DEAD` <span class="op">|</span> 页面半死——内部页面删除的中间状态 <span class="op">|</span> 内部节点的 key 全被删空，但仍被父节点引用 <span class="op">|</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BTP_META` <span class="op">|</span> metapage——索引的第 <span class="dv">0</span> 号块 <span class="op">|</span> 索引创建时 <span class="op">|</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 1.2 rightlink：同层页面的单链表</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>`btpo_prev` 和 `btpo_next` 构成双向链表，把所有同一层的页面串在一起。教科书 B<span class="op">-</span>Tree 没有兄弟指针——跨节点遍历必须回到父节点重新向下。PG 的 rightlink 解决了两个工程问题：</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>第一，并发扫描的窗口期安全。<span class="op">**</span> 页面分裂是两阶段操作——先裂叶子页，再在父页插入 downlink。在父页更新之前，新产生的右页面对扫描器不可达。rightlink 让扫描器可以从旧页面<span class="st">&quot;向右走&quot;</span>找到新页面，不会因为<span class="st">&quot;父页还没更新 downlink&quot;</span>而丢数据。</span></code></pre></div>
+            <p>分裂前: [Page A] → next → [Page B] 分裂: [Page A] → next
+            → [NEW Page A’] → next → [Page B] 此时父页面还不知道 Page A’
+            存在，但扫描器从 Page A 沿 rightlink 能找到它</p>
+            <pre class="text"><code>
+**第二，范围扫描的 IO 模式。** 范围查询 `WHERE key BETWEEN 100 AND 200` 不再需要 $O(\log N)$ 次回父节点再向下——只需要两次二分查找（定位起始和终止位置），中间的页面全部沿 rightlink 顺序读取。在缓存预热的情况下，这是一个接近顺序 IO 的扫描。
+
+### 1.3 high key：每个非最右页面的&quot;上限&quot;
+
+每个非最右叶子页面的 offset 1 是 `P_HIKEY`，一个特殊的索引项，存储本页所有索引 key 的上界：
+
+```c
+// src/include/access/nbtree.h
+#define P_HIKEY     ((OffsetNumber) 1)   // high key 总是在偏移位置 1
+#define P_FIRSTKEY  ((OffsetNumber) 2)   // 第一个正常数据项在偏移位置 2</code></pre>
+            <p>high key 的来源：页面分裂时，从右兄弟页面取最小的 key
+            拷贝到左页面的 offset
+            1。如果本页面就是最右页面（没有右兄弟），则没有 high
+            key。</p>
+            <p>high key 参与两个决策：</p>
+            <ol type="1">
+            <li><strong>插入路由</strong>：<code>_bt_doinsert()</code>
+            判断新 key 插哪一页时，如果新 key <span
+            class="math inline">\(\ge\)</span> high key，沿 rightlink
+            向右移动，直到找到容纳它的页面。</li>
+            <li><strong>分裂点选择</strong>：<code>_bt_findsplitloc()</code>
+            用 high key 计算新的页面边界。</li>
+            </ol>
+            <hr />
+            <h2 id="二b-tree-元页面bt_metap">二、B-Tree
+            元页面：bt_metap()</h2>
+            <p>每个 B-Tree 索引的 block 0 是
+            metapage，存储索引级别的元数据：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/nbtree.h</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> BTMetaPageData <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    uint32       btm_magic<span class="op">;</span>                 <span class="co">// BTREE_MAGIC (0x053162)</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    uint32       btm_version<span class="op">;</span>               <span class="co">// PG 17 为 4 (PG 12+ 支持去重后升版)</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    BlockNumber  btm_root<span class="op">;</span>                  <span class="co">// 根页面的 block number</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    uint32       btm_level<span class="op">;</span>                 <span class="co">// 根页面的 btpo_level</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    BlockNumber  btm_fastroot<span class="op">;</span>              <span class="co">// &quot;快速根&quot;——跳过顶部空页面</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    uint32       btm_fastlevel<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    uint32       btm_last_cleanup_num_delpages<span class="op">;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>         btm_allequalimage<span class="op">;</span>         <span class="co">// PG 17: 所有列支持等值比较优化</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> BTMetaPageData<span class="op">;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>`fastroot` 是一个值得注意的设计：当根节点因为大量删除变空时，PG 不会立即释放它——它被标记为 `BTP_HALF_DEAD`，树的实际根下移一层。`fastroot` 指向这个<span class="st">&quot;有效根&quot;</span>，避免每次扫描路过一个空页面。</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 三、插入路径：从 _bt_doinsert() 到页面分裂</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.1 入口调用链</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>B<span class="op">-</span>Tree 插入的入口是 `btinsert<span class="op">()</span>`（在 `nbtinsert<span class="op">.</span>c` 中，由索引 AM 接口 `index_insert<span class="op">()</span>` 调用）：</span></code></pre></div>
+            <p>btinsert() // nbtinsert.c → _bt_doinsert() 1.
+            _bt_search() // 从 root 找到目标叶子页 2. _bt_check_unique()
+            // 唯一索引冲突检查 3. _bt_insertonpg() // 在页面上执行插入
+            → _bt_findinsertloc() // 二分查找插入位置 →
+            有空间：直接写入页面 → 空间不足：_bt_split() //
+            触发页面分裂</p>
+            <pre class="text"><code>
+```c
+// src/backend/access/nbtree/nbtinsert.c
+bool _bt_doinsert(Relation rel, IndexTuple itup,
+                  IndexUniqueCheck checkUnique, bool indexUnchanged,
+                  Relation heapRel) {
+    BTInsertStateData insertstate;
+    Buffer buf;
+
+    // 1. 从 root 下降到目标叶子页，pin 住
+    _bt_search(rel, &amp;insertstate, &amp;buf);
+
+    // 2. 唯一索引冲突检测
+    if (checkUnique != UNIQUE_CHECK_NO)
+        _bt_check_unique(rel, &amp;insertstate, heapRel, checkUnique, ...);
+
+    // 3. 在叶子页插入或分裂
+    _bt_insertonpg(rel, itup, buf, InvalidBuffer, NULL, itup_key,
+                   false, false, checkUnique != UNIQUE_CHECK_NO,
+                   indexUnchanged, &amp;insertstate);
+}</code></pre>
+            <h3 id="bt_search利用-rightlink-向下搜索">3.2
+            _bt_search()：利用 rightlink 向下搜索</h3>
+            <p><code>_bt_search()</code> 从 root
+            页面开始，逐层下降直到叶子层。在每一层，二分查找第一个 key
+            大于等于目标 key 的项，获取该项指向的子页 block number，pin
+            住子页，释放当前页。</p>
+            <p>关键细节：在内部节点上二分查找时，<strong><code>P_HIKEY</code>
+            位置被跳过</strong>——只有叶子节点才有 high key 在 offset
+            1。内部节点的第一个项不是 high key。</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/nbtree/nbtsearch.c, _bt_search() 核心（简化）</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    page <span class="op">=</span> BufferGetPage<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    opaque <span class="op">=</span> BTPageGetOpaque<span class="op">(</span>page<span class="op">);</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>P_ISLEAF<span class="op">(</span>opaque<span class="op">))</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span>   <span class="co">// 到达叶子层</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 内部节点二分查找，跳过 offset 1</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    offnum <span class="op">=</span> _bt_binsrch<span class="op">(</span>rel<span class="op">,</span> insertstate<span class="op">,</span> buf<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    itup <span class="op">=</span> <span class="op">(</span>IndexTuple<span class="op">)</span> PageGetItem<span class="op">(</span>page<span class="op">,</span> PageGetItemId<span class="op">(</span>page<span class="op">,</span> offnum<span class="op">));</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    blkno <span class="op">=</span> BTreeInnerTupleGetDownLink<span class="op">(</span>itup<span class="op">);</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    buf <span class="op">=</span> _bt_relandgetbuf<span class="op">(</span>rel<span class="op">,</span> buf<span class="op">,</span> blkno<span class="op">,</span> BT_READ<span class="op">);</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.3 _bt_insertonpg()：插入或分裂的决策点</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/nbtree/nbtinsert.c, _bt_insertonpg() 简化</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>PageGetFreeSpace<span class="op">(</span>page<span class="op">)</span> <span class="op">&gt;=</span> itemsz<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 空间足够，直接插入</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    _bt_findinsertloc<span class="op">(</span>rel<span class="op">,</span> insertstate<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    PageIndexTupleOverwrite<span class="op">(</span>page<span class="op">,</span> insertstate<span class="op">-&gt;</span>offnum<span class="op">,</span> <span class="op">(</span>Item<span class="op">)</span> itup<span class="op">,</span> itemsz<span class="op">);</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 空间不足，触发分裂</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>    _bt_split<span class="op">(</span>rel<span class="op">,</span> insertstate<span class="op">,</span> buf<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>PG 的 B-Tree
+            不做”页面重整”（尽管碎片化后总空闲空间够但不连续）——遇到不连续空闲空间时，PG
+            也走分裂路径，不尝试在页面内重排 item 来腾出连续空间。这是
+            <code>fillfactor</code> 有意义的原因之一：为 UPDATE-heavy
+            的索引留足页面内空间，让 HOT update 的新索引 tuple
+            版本能放进同一页，避免频繁分裂。</p>
+            <hr />
+            <h2
+            id="四页面分裂_bt_split-的完整流程">四、页面分裂：_bt_split()
+            的完整流程</h2>
+            <p><code>_bt_split()</code> 定义在
+            <code>src/backend/access/nbtree/nbtsplitloc.c</code> 中，是
+            B-Tree 实现中最复杂的单个操作。它分五步：</p>
+            <pre class="mermaid"><code>sequenceDiagram
+    participant Caller as 调用者
+    participant Split as _bt_split()
+    participant SplitLoc as _bt_findsplitloc()
+    participant Parent as _bt_insert_parent()
+
+    Caller-&gt;&gt;Split: 页面已满，请求分裂
+    Split-&gt;&gt;SplitLoc: 1. 选择分裂点
+    SplitLoc--&gt;&gt;Split: 返回最佳分裂位置
+    Split-&gt;&gt;Split: 2. _bt_split_alloc() 分配新页面
+    Split-&gt;&gt;Split: 3. 迁移元组到新页面
+    Split-&gt;&gt;Split: 更新双向链表 (btpo_next/prev)
+    Split-&gt;&gt;Parent: 4. 在父页面插入 downlink
+    Note over Parent: 父页满时递归触发分裂
+    Parent--&gt;&gt;Split: 完成
+    Split-&gt;&gt;Split: 5. WAL logging
+    Split--&gt;&gt;Caller: 返回左页或右页的 buffer
+```bash
+
+### 4.1 第一步：选择分裂点（_bt_findsplitloc）
+
+`_bt_findsplitloc()` 是 `nbtsplitloc.c` 约 800 行的核心——整个 C 文件只做&quot;在哪里切这一刀&quot;。它不是一个简单的&quot;找中间位置&quot;，而是对每个候选分裂点计算一个惩罚分，选惩罚最小的。
+
+为什么不是 50/50？因为 PG B-Tree 页面中 item 大小差异巨大。如果一个 item 占了页面 70% 的空间，按 item 个数对半分会导致新页装不下这个大 item。分裂点选择必须满足：
+
+1. **硬约束**：两个新页面都能装下各自的那一半元组。
+2. **软优化**：左右填充量尽可能均衡。
+3. **key 边界优化**：如果存在大量相同 key 的数据，把相同 key 的元组分到同一侧——有助于后缀截断。
+
+```c
+// src/backend/access/nbtree/nbtsplitloc.c, _bt_findsplitloc() 策略（简化）
+
+// 策略一：默认单后缀策略
+// 把每个 item 的 penalty 设为 1，找左右 penalty 总和最接近的位置
+for (offnum = firstright; offnum &lt;= lastleft; offnum++) {
+    delta = Abs(leftfree - rightfree);
+    if (delta &lt; best_delta) {
+        best_delta = delta;
+        bestoff = offnum;
+    }
+}
+
+// 策略二：多后缀策略（大量相同 key 时触发）
+// 找到 newitemoff 附近第一个不同 key 的边界作为分裂点
+if (_bt_afternewitemoff(rel, page, newitemoff, ...)) {
+    // 在 key 边界处分裂——相同 key 留在一侧
+    return _bt_bestsplitloc(rel, page, ...);
+}</code></pre>
+            <h3 id="后缀截断suffix-truncation">4.2 后缀截断（Suffix
+            Truncation）</h3>
+            <p>分裂后，插入父页面的 downlink key
+            不需要存完整的索引值——它可以被截断到”刚好能区分左右子树的最短前缀”。</p>
+            <p>举例：如果索引列是 <code>text</code>，左页面的最大值是
+            <code>"PostgreSQL"</code>，右页面的最小值是
+            <code>"Postmaster"</code>，父页面的 downlink key 只需要
+            <code>"Postm"</code>——这个前缀已经足够引导搜索到正确的子页面。截断在
+            <code>_bt_truncate()</code> 中实现：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/nbtree/nbtsplitloc.c</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>IndexTuple _bt_truncate<span class="op">(</span>Relation rel<span class="op">,</span> IndexTuple lastleft<span class="op">,</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>                         IndexTuple firstright<span class="op">,</span> BTScanInsert itup_key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 计算需要多少字节才能区分 lastleft 和 firstright</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> natts <span class="op">=</span> _bt_keep_natts_fast<span class="op">(</span>rel<span class="op">,</span> lastleft<span class="op">,</span> firstright<span class="op">);</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 生成截断后的 index tuple，只保留前 natts 个属性列</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>后缀截断的效果：<span class="op">**</span>内部节点变窄，树高更矮<span class="op">**</span>。对于 text 列，内部节点的 key 通常只需要几个字符，不需要完整字符串。</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.3 第二步：分配新页面</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/nbtree/nbtinsert.c</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>rbuf <span class="op">=</span> _bt_getbuf<span class="op">(</span>rel<span class="op">,</span> P_NEW<span class="op">,</span> BT_WRITE<span class="op">);</span>  <span class="co">// 从 FSM 获取空闲页面</span></span></code></pre></div>
+            <p>如果 FSM 中有之前被 <code>BTP_DELETED</code>
+            标记后回收的页面，优先复用。否则在索引文件末尾追加新
+            block。</p>
+            <h3 id="第三步迁移元组">4.4 第三步：迁移元组</h3>
+            <p>分裂点之后的元组从原页面（左页）拷贝到新页面（右页），原页面的
+            high key 更新为新的上界（右页面的最小 key）。左右页面的
+            <code>btpo_next</code>/<code>btpo_prev</code> 重新链接：</p>
+            <pre class="text"><code>迁移前: [Page A] ←→ [Page B]
+迁移后: [Page A] ←→ [NEW Page A&#39;] ←→ [Page B]</code></pre>
+            <h3 id="第四步插入父指针_bt_insert_parent">4.5
+            第四步：插入父指针（_bt_insert_parent）</h3>
+            <p><code>_bt_insert_parent()</code> 向父页面插入一个新的
+            downlink，指向新右页面。如果父页面也满了，递归调用
+            <code>_bt_split()</code>——分裂从叶子向上传播。根节点分裂时，分配新根页面，放两个
+            downlink 指向旧根和新兄弟，树高加一，同时更新 metapage 的
+            <code>btm_root</code> 和 <code>btm_level</code>。</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// nbtinsert.c, _bt_insert_parent() 中根分裂的处理（简化）</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>is_root_split<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    rootbuf <span class="op">=</span> _bt_getbuf<span class="op">(</span>rel<span class="op">,</span> P_NEW<span class="op">,</span> BT_WRITE<span class="op">);</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 在新根页面写入两个 item，分别指向左子页和右子页</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    _bt_update_meta<span class="op">(</span>rel<span class="op">,</span> BufferGetBlockNumber<span class="op">(</span>rootbuf<span class="op">),</span> level <span class="op">+</span> <span class="dv">1</span><span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.6 分裂的性能开销</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>一次叶子页面分裂涉及：</span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 一次 Buffer Manager 分配（可能触发 victim 选择）</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 约半页 IndexTuple 的内存拷贝</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 一次父页面写入（可能触发递归分裂）</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 双向链表的两次指针更新</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> WAL record 的构建和写入</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>全部在持着原页面和父页面 LWLock 的情况下完成。如果 `fillfactor` 设太高（初始填充 <span class="dv">100</span><span class="op">%</span>），分裂频率会随着插入量线性增长。</span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 五、PG 12+ 去重（deduplicate_items）</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 5.1 问题：非唯一索引的空间浪费</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>在非唯一索引中，同一个 key 可能对应成千上万行。经典 B<span class="op">-</span>Tree 为每个 `<span class="op">(</span>key<span class="op">,</span> TID<span class="op">)</span>` 对存储独立的 `IndexTuple`。当 <span class="dv">10000</span> 行的 `status <span class="op">=</span> <span class="ch">&#39;a</span><span class="er">ctive</span><span class="ch">&#39;</span>` 时，索引中存储了 <span class="dv">10000</span> 份 `<span class="ch">&#39;a</span><span class="er">ctive</span><span class="ch">&#39;</span>` 的字符串拷贝。</span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>PG <span class="dv">12</span> 引入的去重机制改变了这一点：<span class="op">**</span>相同 key 的多个 TID 被打包到一个 posting list 中，key 数据只存一份<span class="op">**</span>。</span></code></pre></div>
+            <p>去重前: [(“active”, tid1)] [(“active”, tid2)] [(“active”,
+            tid3)] [(“active”, tid4)] 去重后: [(“active”, {tid1, tid2,
+            tid3, tid4})]</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co">### 5.2 触发条件</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">去重由</span> <span class="kw">`</span><span class="ex">nbtdedup.c</span><span class="kw">`</span> 中的 <span class="kw">`</span><span class="fu">_bt_dedup_one_page()</span><span class="kw">`</span> 实现，在以下条件同时满足时触发：</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">1.</span> 页面是叶子页面（只有叶子页面有重复 key 的数据）</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="ex">2.</span> 页面空间不足以直接插入新项——插入失败后、分裂之前，先尝试去重</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="ex">3.</span> 索引为<span class="pp">**</span>非唯一<span class="pp">**</span>索引（<span class="kw">`</span><span class="ex">deduplicate_items</span><span class="kw">`</span> 在唯一索引上默认为 off——key 本来就不重复）</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="ex">4.</span> <span class="kw">`</span><span class="ex">deduplicate_items</span><span class="kw">`</span> 存储参数为 <span class="kw">`</span><span class="ex">on</span><span class="kw">`</span>（PG 13+ 默认 on）</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">c</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> src/backend/access/nbtree/nbtdedup.c, _bt_dedup_one_page<span class="er">(</span><span class="kw">)</span><span class="ex">（简化）</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="ex">void</span> _bt_dedup_one_page<span class="er">(</span><span class="ex">Relation</span> rel, Buffer buf, BTInsertState insertstate,</span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>                        <span class="ex">bool</span> checkingunique<span class="kw">)</span> <span class="kw">{</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>    <span class="ex">Page</span> page = BufferGetPage<span class="er">(</span><span class="ex">buf</span><span class="kw">);</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>    <span class="ex">BTPageOpaque</span> opaque = BTPageOpaque<span class="er">(</span><span class="ex">page</span><span class="kw">);</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">(</span><span class="ex">!P_ISLEAF</span><span class="er">(</span><span class="ex">opaque</span><span class="kw">))</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="kw">;</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>    <span class="ex">OffsetNumber</span> offnum = P_FIRSTKEY<span class="kw">;</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>    <span class="ex">OffsetNumber</span> maxoff = PageGetMaxOffsetNumber<span class="er">(</span><span class="ex">page</span><span class="kw">);</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="kw">(</span><span class="ex">offnum</span> <span class="op">&lt;</span>= maxoff<span class="kw">)</span> <span class="kw">{</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>        <span class="ex">IndexTuple</span> itup = <span class="er">(</span><span class="ex">IndexTuple</span><span class="kw">)</span> <span class="ex">PageGetItem</span><span class="er">(</span><span class="ex">page,</span> ...<span class="kw">);</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>        <span class="ex">OffsetNumber</span> nextoff = offnum + 1<span class="kw">;</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>        <span class="ex">//</span> 找到所有 key 相同的连续 tuple</span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="kw">(</span><span class="ex">nextoff</span> <span class="op">&lt;</span>= maxoff <span class="kw">&amp;&amp;</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a>               <span class="ex">_bt_compare</span><span class="er">(</span><span class="ex">rel,</span> insertstate, itup, nextup<span class="kw">)</span> <span class="ex">==</span> 0<span class="kw">)</span> <span class="kw">{</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>            <span class="ex">nextoff++</span><span class="kw">;</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a>        <span class="kw">}</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>        <span class="ex">//</span> 如果有 2 个以上相同 key，合并为 posting list</span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">(</span><span class="ex">nextoff</span> <span class="at">-</span> offnum <span class="op">&gt;</span> 1<span class="kw">)</span></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a>            <span class="ex">_bt_swap_posting</span><span class="er">(</span><span class="ex">rel,</span> buf, offnum, nextoff <span class="at">-</span> offnum<span class="kw">);</span></span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a>        <span class="ex">offnum</span> = nextoff<span class="kw">;</span></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a>    <span class="kw">}</span></span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span></code></pre></div>
+            <h3 id="posting-list-的物理格式">5.3 posting list
+            的物理格式</h3>
+            <p>去重后的 tuple 的 header 中设置了
+            <code>INDEX_ALT_TID_MASK</code> 标志：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/itup.h</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define INDEX_ALT_TID_MASK  </span><span class="bn">0x2000</span><span class="pp">  </span><span class="co">// 这是一个 posting list，不是普通 tuple</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>物理布局：</span></code></pre></div>
+            <p>[IndexTuple Header | INDEX_ALT_TID_MASK] [key data] [TID
+            1 (6B)] [TID 2 (6B)] … [TID N (6B)]</p>
+            <pre class="text"><code>
+每个 TID 是 6 字节的 `ItemPointerData`（block number 4B + offset 2B）。去重后，原来 $N$ 个各自独立的 tuple（每个约 `8 + key_size + 6` 字节），变成 1 个 `(8 + key_size + N × 6)` 字节的 tuple。当 $N$ 足够大时，空间节省接近：
+
+$$\text{节省比例} \approx \frac{N - 1}{N} \cdot \frac{\text{key\_size}}{\text{key\_size} + 14}$$
+
+### 5.4 去重的副作用
+
+**对 index-only scan 的影响**：posting list 中的 TID 不对应单独的 VM bit。当一个 page 被去重后，index-only scan 对去重过的 key 需要回表检查可见性，即使对应的 heap page 在 VM 中标记为 all-visible。VM bit 的粒度为 heap page，而 posting list 中的 TID 可能来自多个 heap page。
+
+**对 `=` 扫描的影响**：去重后，扫描器遇到 posting list 时需要展开后逐个返回 TID。`_bt_readpage()` 对此做了优化——展开 posting list 是纯内存操作，开销通常小于节省的 IO。
+
+### 5.5 什么时候该关闭去重
+
+1. **UUID 或几乎唯一的索引**：每个 key 几乎不重复，去重每次扫描都找不到可合并的 tuple，浪费 CPU。
+2. **索引列从不被 UPDATE 修改**：HOT update 不需要更新索引——去重在这里没有数据可以合并。
+
+```sql
+-- 关闭单个索引的去重
+ALTER INDEX idx_orders_customer SET (deduplicate_items = off);</code></pre>
+            <hr />
+            <h2 id="六wal-记录类型与崩溃恢复">六、WAL
+            记录类型与崩溃恢复</h2>
+            <p>B-Tree 的所有结构变更通过 WAL 记录，定义在
+            <code>src/include/access/nbtxlog.h</code>：</p>
+            <table>
+            <colgroup>
+            <col style="width: 38%" />
+            <col style="width: 29%" />
+            <col style="width: 32%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>WAL Record</th>
+            <th>触发操作</th>
+            <th>Redo 行为</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>XLOG_BTREE_INSERT_LEAF</code></td>
+            <td>叶子页面插入（无分裂）</td>
+            <td>重放插入到指定偏移</td>
+            </tr>
+            <tr>
+            <td><code>XLOG_BTREE_INSERT_UPPER</code></td>
+            <td>内部页面插入（downlink）</td>
+            <td>重放插入</td>
+            </tr>
+            <tr>
+            <td><code>XLOG_BTREE_SPLIT_L</code></td>
+            <td>页面分裂——原页面（左）</td>
+            <td>恢复左页内容，清空右半元组</td>
+            </tr>
+            <tr>
+            <td><code>XLOG_BTREE_SPLIT_R</code></td>
+            <td>页面分裂——新页面（右）</td>
+            <td>从 WAL 直接构造新页面</td>
+            </tr>
+            <tr>
+            <td><code>XLOG_BTREE_DEDUP</code></td>
+            <td>页面去重</td>
+            <td>重放去重操作</td>
+            </tr>
+            <tr>
+            <td><code>XLOG_BTREE_DELETE</code></td>
+            <td>页面标记删除</td>
+            <td>标记 BTP_DELETED</td>
+            </tr>
+            <tr>
+            <td><code>XLOG_BTREE_UNLINK_PAGE</code></td>
+            <td>从链表摘除页面</td>
+            <td>恢复 rightlink 链</td>
+            </tr>
+            <tr>
+            <td><code>XLOG_BTREE_REUSE_PAGE</code></td>
+            <td>回收被删除页面</td>
+            <td>复用为新的 B-Tree 页</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>分裂的 WAL
+            是最复杂的——需要记录对三个页面的修改（左页、右页、父页）。<code>XLOG_BTREE_SPLIT_L</code>
+            和 <code>XLOG_BTREE_SPLIT_R</code> 成对记录，redo
+            时先恢复左页再恢复右页；父页面的 downlink 插入单独记录为
+            <code>XLOG_BTREE_INSERT_UPPER</code>。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/nbtxlog.h</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> xl_btree_split <span class="op">{</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    uint32       level<span class="op">;</span>              <span class="co">// 分裂层级（0=叶子）</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    BlockNumber  leftsib<span class="op">;</span>            <span class="co">// 左兄弟</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    BlockNumber  rightsib<span class="op">;</span>           <span class="co">// 右兄弟</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    BlockNumber  rnext<span class="op">;</span>              <span class="co">// 新页面之后的下一页</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    uint32       npage<span class="op">;</span>              <span class="co">// 分到新页面的元组数</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 后面跟着：新页面的所有 IndexTuple 数据</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> xl_btree_split<span class="op">;</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>WAL replay 是幂等的——redo 函数在修改页面之前检查 `BufferGetLSNApplied<span class="op">()</span>`，如果页面 LSN 已经大于等于 record LSN，跳过该操作。</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 七、运维：常见坑与排查</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 7.1 索引膨胀：分裂后的填充率下降</span></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a>每次页面分裂，两个新页面的平均填充率约为 <span class="dv">50</span><span class="op">%-</span><span class="dv">70</span><span class="op">%</span>（具体取决于分裂点选择算法找到的最优位置）。对 append<span class="op">-</span>only 的单调递增主键（如 `SERIAL`），新 key 总是追加到最右页面，只有最右页面在参与分裂，其他页面保持分裂后的填充率不变。但对于随机分布的 key（如 UUID），分裂均匀分布在整个索引中，所有页面都处于 <span class="dv">50</span><span class="op">%-</span><span class="dv">70</span><span class="op">%</span> 填充状态——索引体积比最优值膨胀 <span class="dv">30</span><span class="op">%-</span><span class="dv">50</span><span class="op">%</span>。</span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>排查：</span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 查看索引大小与预期值的偏差</span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a>SELECT</span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a>    indexrelname<span class="op">,</span></span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty<span class="op">(</span>pg_relation_size<span class="op">(</span>indexrelid<span class="op">))</span> AS actual_size<span class="op">,</span></span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a>    idx_scan<span class="op">,</span> idx_tup_read<span class="op">,</span> idx_tup_fetch</span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a>FROM pg_stat_user_indexes</span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a>WHERE indexrelname <span class="op">=</span> <span class="ch">&#39;i</span><span class="er">dx_orders_customer</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 查看各页面的填充率分布</span>
+<span id="cb14-34"><a href="#cb14-34" aria-hidden="true" tabindex="-1"></a>SELECT</span>
+<span id="cb14-35"><a href="#cb14-35" aria-hidden="true" tabindex="-1"></a>    blkno<span class="op">,</span> type<span class="op">,</span> live_items<span class="op">,</span></span>
+<span id="cb14-36"><a href="#cb14-36" aria-hidden="true" tabindex="-1"></a>    ROUND<span class="op">((</span><span class="dv">8152</span> <span class="op">-</span> free_size<span class="op">)::</span>numeric <span class="op">/</span> <span class="dv">8152</span> <span class="op">*</span> <span class="dv">100</span><span class="op">,</span> <span class="dv">1</span><span class="op">)</span> AS fill_pct</span>
+<span id="cb14-37"><a href="#cb14-37" aria-hidden="true" tabindex="-1"></a>FROM bt_page_stats<span class="op">(</span><span class="ch">&#39;i</span><span class="er">dx_orders_customer</span><span class="ch">&#39;</span><span class="op">,</span> blkno<span class="op">)</span></span>
+<span id="cb14-38"><a href="#cb14-38" aria-hidden="true" tabindex="-1"></a>FROM generate_series<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">50</span><span class="op">)</span> AS blkno<span class="op">;</span></span></code></pre></div>
+            <p>修复：<code>REINDEX INDEX CONCURRENTLY idx_orders_customer;</code>
+            重建索引，将填充率恢复到接近 100%（按
+            <code>fillfactor</code> 的值）。<code>CONCURRENTLY</code>
+            不会阻塞写入，但需要两次全表扫描。</p>
+            <h3 id="uuid-主键的-b-tree-灾难">7.2 UUID 主键的 B-Tree
+            灾难</h3>
+            <p>UUID v4（完全随机）有两个特征对 B-Tree 极不友好：</p>
+            <ol type="1">
+            <li><strong>随机分布</strong>：每个 INSERT
+            跳到一个随机的叶子页面，所有被碰到的页面都被弄脏、都写
+            WAL。<code>shared_buffers</code>
+            缓存的索引页面不断被驱逐和重新读入。</li>
+            <li><strong>无重复</strong>：去重对 UUID 无效——每个 key
+            唯一。<code>deduplicate_items</code>
+            每次插入都扫描页面寻找可合并的 tuple，每次都一无所获。</li>
+            </ol>
+            <p>对比实验：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- UUID 主键的写入性能</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t_uuid_v4 (<span class="kw">id</span> UUID <span class="kw">DEFAULT</span> gen_random_uuid() <span class="kw">PRIMARY</span> <span class="kw">KEY</span>, <span class="kw">data</span> TEXT);</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> t_uuid_v4 (<span class="kw">data</span>) <span class="kw">SELECT</span> <span class="st">&#39;x&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>);</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察 pg_stat_user_tables.idx_tup_fetch vs idx_scan</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- SERIAL 主键的写入性能</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t_serial (<span class="kw">id</span> SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>, <span class="kw">data</span> TEXT);</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> t_serial (<span class="kw">data</span>) <span class="kw">SELECT</span> <span class="st">&#39;x&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>);</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>SERIAL 主键的 <span class="kw">INSERT</span> 是 append<span class="op">-</span>only——每次都在最右叶子页面写入，缓存命中率极高。UUID v4 的 <span class="kw">INSERT</span> 是随机写入——每 <span class="dv">100</span> 次插入可能踩到 <span class="dv">50</span> 个不同的叶子页面，缓存被频繁驱逐。</span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>缓解方案<span class="op">**</span>：</span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 使用 `uuid_generate_v1mc()`（基于时间戳 <span class="op">+</span> MAC 地址，趋势递增，部分有序）</span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 或者使用 `uuid_generate_v7()`（PG <span class="dv">17</span> 内置时间排序 UUID）</span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 如果必须用 UUID v4，考虑降低 `fillfactor` 到 <span class="dv">80</span>，给后续插入留足空间</span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>### <span class="fl">7.3</span> fillfactor 的权衡与配置陷阱</span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>`fillfactor` 控制索引页面在初始构建时的填充比例。后续插入可以使用剩余空间：</span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a>| fillfactor | 优点 | 缺点 | 适用场景 |</span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>|<span class="co">-----------|------|------|---------|</span></span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a>| <span class="dv">90</span><span class="op">-</span><span class="dv">100</span>（默认）| 页面利用率高，索引小，读快 | <span class="kw">INSERT</span> 分裂频繁 | append<span class="op">-</span>only（`SERIAL`、时间序列） |</span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a>| <span class="dv">70</span><span class="op">-</span><span class="dv">80</span> | 有空余容纳新 key，分裂少 | 索引体积增大 <span class="dv">10</span>%<span class="op">-</span><span class="dv">20</span>% | <span class="kw">UPDATE</span><span class="op">-</span>heavy、随机插入 |</span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a>| <span class="dv">50</span> | 极低的初始填充，分裂极少 | 索引体积约翻倍，scan 慢 | 极端随机写入 <span class="op">+</span> 极少查询 |</span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a>常见配置错误：在 append<span class="op">-</span><span class="kw">only</span> 的 `SERIAL` 主键上设 `fillfactor <span class="op">=</span> <span class="dv">70</span>`——新 <span class="kw">key</span> 只在最右页面插入，不会用到预留空间。降低了页面利用率却没有减少分裂。</span>
+<span id="cb15-29"><a href="#cb15-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-30"><a href="#cb15-30" aria-hidden="true" tabindex="-1"></a>排查：</span>
+<span id="cb15-31"><a href="#cb15-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-32"><a href="#cb15-32" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb15-33"><a href="#cb15-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看索引的页数和每个页面的填充率</span></span>
+<span id="cb15-34"><a href="#cb15-34" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb15-35"><a href="#cb15-35" aria-hidden="true" tabindex="-1"></a>    (<span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> bt_page_stats(<span class="st">&#39;idx_orders_pkey&#39;</span>)) <span class="kw">AS</span> total_pages,</span>
+<span id="cb15-36"><a href="#cb15-36" aria-hidden="true" tabindex="-1"></a>    (<span class="kw">SELECT</span> pg_relation_size(<span class="st">&#39;idx_orders_pkey&#39;</span>)) <span class="kw">AS</span> index_size;</span>
+<span id="cb15-37"><a href="#cb15-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-38"><a href="#cb15-38" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果一个索引有 1000 页，与表大小的比率异常高，</span></span>
+<span id="cb15-39"><a href="#cb15-39" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可能是 fillfactor 设太低或分裂过度导致膨胀</span></span></code></pre></div>
+            <h3 id="唯一索引插入的死锁风险">7.4
+            唯一索引插入的死锁风险</h3>
+            <p>唯一索引上的并发 INSERT 有一个经典死锁场景：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- Session 1</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> t (<span class="kw">id</span>) <span class="kw">VALUES</span> (<span class="dv">1</span>);    <span class="co">-- 在唯一索引中插入 key=1，获取页面的排他 LWLock</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- Session 2</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> t (<span class="kw">id</span>) <span class="kw">VALUES</span> (<span class="dv">1</span>);    <span class="co">-- 同样尝试插入 key=1</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>                                  <span class="co">-- _bt_check_unique() 发现冲突</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>                                  <span class="co">-- 等待 Session 1 的事务结束</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>                                  <span class="co">-- 但在等待过程中持有页面的共享 LWLock</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- Session 1 执行其他操作需要获取同一页面的排他 LWLock</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- → 死锁：Session 1 等锁，Session 2 持锁并等 Session 1 的事务</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>PG 的 `_bt_check_unique()` 通过<span class="ot">&quot;推测性插入&quot;</span>（speculative insertion）来避免这个死锁。如果发现可能的冲突（另一个事务正在插入相同的 key），PG 使用 `XactLockTableWait()` 在事务级别等待，而不持有页面级别的锁。如果最终发现对方回滚了，PG 的插入继续；如果对方提交了，上报唯一约束冲突错误。</span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a>排查唯一索引死锁：</span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>    pg_blocking_pids(pid) <span class="kw">AS</span> blocking_pids,</span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>    wait_event_type, wait_event,</span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">query</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;Lock&#39;</span> <span class="kw">AND</span> <span class="kw">query</span> <span class="kw">LIKE</span> <span class="st">&#39;%INSERT%&#39;</span>;</span></code></pre></div>
+            <h3 id="去重与-index-only-scan-的隐性代价">7.5 去重与
+            index-only scan 的隐性代价</h3>
+            <p>去重后的 posting list tuple 不设置 VM 位——即使对应的 heap
+            page 在 VM 中标记为 all-visible，index-only scan 对 posting
+            list 中的 TID
+            也需要回表检查可见性。在以下场景可能观察到性能回归：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 建一个高重复率索引 + index-only scan 查询</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t (val <span class="dt">INT</span>, extra TEXT);</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> t <span class="kw">SELECT</span> <span class="dv">1</span>, <span class="st">&#39;x&#39;</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>);</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_t_val <span class="kw">ON</span> t (val);</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- index-only scan</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS) <span class="kw">SELECT</span> val <span class="kw">FROM</span> t <span class="kw">WHERE</span> val <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察 Heap Fetches: 可能有大量的回表操作</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>如果 `Heap Fetches` 很高（远超 `rows`），说明 <span class="kw">index</span><span class="op">-</span><span class="kw">only</span> <span class="kw">scan</span> 没有达到预期的优化效果——部分原因是去重后的 posting <span class="kw">list</span> 需要回表验证。关闭去重后重新测试：</span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">INDEX</span> idx_t_val <span class="kw">SET</span> (deduplicate_items <span class="op">=</span> <span class="kw">off</span>);</span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 重新执行 EXPLAIN ANALYZE，对比 Heap Fetches</span></span></code></pre></div>
+            <p>但这之间存在权衡：关闭去重减少回表，但索引体积会增大，可能超过
+            <code>shared_buffers</code> 缓存容量。</p>
+            <hr />
+            <h2 id="八实验用-pageinspect-观察-b-tree-页面">八、实验：用
+            pageinspect 观察 B-Tree 页面</h2>
+            <h3 id="环境准备">8.1 环境准备</h3>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pageinspect;</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> test_btree (val <span class="dt">INTEGER</span>);</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> test_btree <span class="kw">SELECT</span> (<span class="kw">random</span>() <span class="op">*</span> <span class="dv">10000</span>):<span class="ch">:INTEGER</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">500</span>);</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_test <span class="kw">ON</span> test_btree (val);</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>### <span class="fl">8.2</span> 查看索引元数据</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> bt_metap(<span class="st">&#39;idx_test&#39;</span>);</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出:</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="co">--  magic  | version | root | level | fastroot | fastlevel | allequalimage</span></span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- --------+---------+------+-------+----------+-----------+---------------</span></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a><span class="co">--  340322 |       4 |    3 |     1 |        3 |         1 | t</span></span></code></pre></div>
+            <p><code>root=3</code> 表示根页面是 block 3（block 0 是
+            metapage，block 1-2 是叶子页面），<code>level=1</code>
+            表示根页面在层级 1（叶子层 level=0），树高为 2。</p>
+            <h3 id="查看页面统计">8.3 查看页面统计</h3>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> bt_page_stats(<span class="st">&#39;idx_test&#39;</span>, <span class="dv">1</span>);</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- type=l（叶子页面），live_items 约 200，free_size 约 5000</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- btpo_level=0，btpo_next 指向下一页</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> bt_page_stats(<span class="st">&#39;idx_test&#39;</span>, <span class="dv">3</span>);</span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- type=i（内部页面），live_items=2，btpo_level=1</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a>### <span class="fl">8.4</span> 逐项查看页面内容</span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 叶子页面</span></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> itemoffset, ctid, itemlen, dead, <span class="kw">data</span></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> bt_page_items(<span class="st">&#39;idx_test&#39;</span>, <span class="dv">1</span>)</span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">5</span>;</span>
+<span id="cb19-16"><a href="#cb19-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-17"><a href="#cb19-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- itemoffset=1: high key (P_HIKEY)，data 是十六进制表示的键值</span></span>
+<span id="cb19-18"><a href="#cb19-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- itemoffset=2: 第一个用户数据项，ctid=(heap_block, heap_offset)</span></span></code></pre></div>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 内部页面（根页面）</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> itemoffset, ctid, itemlen, <span class="kw">data</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> bt_page_items(<span class="st">&#39;idx_test&#39;</span>, <span class="dv">3</span>);</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 内部节点的 ctid 不指向 heap tuple，而是子页面的 block number</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>### <span class="fl">8.5</span> 观察页面分裂</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 插入足够多的行迫使分裂</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> test_btree <span class="kw">SELECT</span> generate_series(<span class="dv">501</span>, <span class="dv">1000</span>);</span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 再次查看 metapage</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> bt_metap(<span class="st">&#39;idx_test&#39;</span>);</span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察 root 和 level 是否变化（树高可能增加）</span></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 遍历所有页面，观察 rightlink 链</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> blkno, <span class="kw">type</span>, btpo_next, live_items</span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> generate_series(<span class="dv">0</span>, <span class="dv">10</span>) <span class="kw">AS</span> blkno</span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> LATERAL bt_page_stats(<span class="st">&#39;idx_test&#39;</span>, blkno) <span class="kw">ON</span> <span class="kw">true</span></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> blkno;</span></code></pre></div>
+            <h3 id="观察去重效果">8.6 观察去重效果</h3>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> test_dedup (val <span class="dt">INTEGER</span>);</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> test_dedup <span class="kw">SELECT</span> <span class="dv">42</span> <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">500</span>);</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_dedup <span class="kw">ON</span> test_dedup (val);</span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察去重后的 posting list</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> itemoffset, ctid, htid, tids</span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> bt_page_items(<span class="st">&#39;idx_dedup&#39;</span>, <span class="dv">1</span>);</span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- htid 包含第一个 TID，tids 包含剩余的 TID 数组</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果所有 500 行都去重成功，itemoffset=2 会是一个 posting list</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>对比关闭去重时的大小：</span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_relation_size(<span class="st">&#39;idx_dedup&#39;</span>) <span class="kw">AS</span> size_with_dedup;</span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a><span class="kw">DROP</span> <span class="kw">INDEX</span> idx_dedup;</span>
+<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_dedup <span class="kw">ON</span> test_dedup (val) <span class="kw">WITH</span> (deduplicate_items <span class="op">=</span> <span class="kw">off</span>);</span>
+<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_relation_size(<span class="st">&#39;idx_dedup&#39;</span>) <span class="kw">AS</span> size_without_dedup;</span></code></pre></div>
+            <p>在 500 行全为相同 key
+            的场景下，去重开启时的索引体积约为关闭时的 5%-10%。</p>
+            <hr />
+            <h2 id="九关键要点">九、关键要点</h2>
+            <ol type="1">
+            <li><strong>B-Tree 页面通过 BTPageOpaque
+            管理同层链接和节点类型</strong>——rightlink
+            让范围扫描和并发操作不需要回父节点；high key
+            提供本地搜索上界，是分裂和插入路由的决策依据。</li>
+            <li>**_bt_split() 的分裂点选择不是简单的
+            50/50**——<code>nbtsplitloc.c</code> 针对 item 大小不均、相同
+            key
+            分组、新项位置三种场景选择不同策略，目标是左右页面都能装下自己的元组且填充率尽量均衡。</li>
+            <li><strong>后缀截断让内部节点变窄</strong>——插入父页面的
+            downlink key
+            被截断到”刚好能区分左右子树的最短前缀”，让每个内部页面容纳更多
+            key，降低树高。</li>
+            <li><strong>PG 12+ 的去重将相同 key 的 TID 合并为 posting
+            list</strong>——在高重复率列上索引体积可以减少 90% 以上，但对
+            UUID 和几乎唯一的索引无效，对 index-only scan
+            有回表代价。</li>
+            <li><strong><code>fillfactor</code>
+            是控制分裂频率的主要杠杆</strong>——对 append-only
+            的单调递增主键，默认 100 即可；对随机分布的
+            key（UUID），降低到 70-80
+            可以减少分裂频率，代价是更大的索引体积和更慢的扫描。</li>
+            <li><strong><code>bt_page_items()</code> 和
+            <code>bt_metap()</code> 是观察 B-Tree
+            内部结构的核心工具</strong>——可以直接查看每个页面的 high
+            key、rightlink 链、去重后的 posting
+            list、分裂后的页面填充率。</li>
+            </ol>
+            <p>下一章：<a href="../15-gist/15-gist.html">GiST 索引</a>
+            —— PG 的可扩展索引框架：抽象算子接口（Consistent / Union /
+            Penalty / PickSplit）、几何类型和全文搜索的 GiST 实现。</p>
+            <p>上一章：<a href="../13-jit/13-jit.html">JIT 编译</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/access/nbtree/nbtinsert.c</code>：<code>_bt_doinsert()</code>,
+            <code>_bt_insertonpg()</code>, <code>_bt_split()</code>,
+            <code>_bt_insert_parent()</code></li>
+            <li><code>src/backend/access/nbtree/nbtsplitloc.c</code>：<code>_bt_findsplitloc()</code>,
+            <code>_bt_bestsplitloc()</code>,
+            <code>_bt_truncate()</code></li>
+            <li><code>src/backend/access/nbtree/nbtdedup.c</code>：<code>_bt_dedup_one_page()</code>,
+            <code>_bt_swap_posting()</code></li>
+            <li><code>src/backend/access/nbtree/nbtsearch.c</code>：<code>_bt_search()</code>,
+            <code>_bt_binsrch()</code>, <code>_bt_readpage()</code></li>
+            <li><code>src/backend/access/nbtree/nbtxlog.c</code>：<code>btree_xlog_insert()</code>,
+            <code>btree_xlog_split()</code></li>
+            <li><code>src/backend/access/nbtree/nbtpage.c</code>：<code>_bt_getbuf()</code>,
+            <code>_bt_split_alloc()</code></li>
+            <li><code>src/backend/access/nbtree/nbtutils.c</code>：<code>_bt_compare()</code>,
+            <code>_bt_truncate()</code></li>
+            <li><code>src/include/access/nbtree.h</code>：<code>BTPageOpaqueData</code>,
+            <code>BTMetaPageData</code>, <code>P_HIKEY</code>,
+            <code>P_FIRSTKEY</code></li>
+            <li><code>src/include/access/nbtxlog.h</code>：<code>xl_btree_split</code>,
+            WAL record 类型定义</li>
+            <li><code>src/include/access/itup.h</code>：<code>IndexTupleData</code>,
+            <code>INDEX_ALT_TID_MASK</code></li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 67: B-Tree Indexes —
+            B-Tree 内部机制的官方描述，包括页面格式、分裂算法和去重</li>
+            <li>PostgreSQL Documentation, Section 67.4: B-Tree
+            Deduplication — 去重的设计文档和性能考量</li>
+            <li>PostgreSQL Documentation, Section 11.2: Index Types —
+            <code>fillfactor</code> 和 <code>deduplicate_items</code>
+            存储参数</li>
+            </ul>
+            <h3 id="论文与设计讨论">论文与设计讨论</h3>
+            <ul>
+            <li>Lehman, P. L. &amp; Yao, S. B. <em>Efficient Locking for
+            Concurrent Operations on B-Trees</em>. ACM TODS, 1981. —
+            B-link tree 原始论文，PG 的 rightlink + high key
+            设计理论基础</li>
+            <li>Peter Geoghegan, “B-Tree Deduplication for PostgreSQL
+            12”, pgsql-hackers (2019) —
+            去重功能的原始设计提案和实现迭代</li>
+            <li>pgsql-hackers discussion: “Suffix truncation for B-Tree
+            inner pages” — 后缀截断的设计动机和性能数据</li>
+            <li>Graefe, G. <em>A Survey of B-Tree Locking
+            Techniques</em>. ACM TODS, 2010. — B-Tree
+            并发控制方案的全面综述</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/15-gist/15-gist.html">【PG 内核】GiST 索引：一套接口搞定几何、全文、数组——通用搜索树怎么把&quot;像什么&quot;变成索引查找</a></h3>
+                    <p>拆解 PostgreSQL GiST 索引的抽象算子接口（Consistent/Union/Penalty/PickSplit）、深度优先搜索与 Consistent 过滤的组合逻辑、Penalty 引导插入路径与 PickSplit 决定分裂策略的完整流程，以及 point_ops 的几何距离搜索和 tsvector_ops 的全文搜索两种典型实现。读完你会理解为什么 GiST 能用一个通用框架支持十几种数据类型，以及它什么时候比 B-Tree 好、什么时候该用 GIN 替代。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/17-brin/17-brin.html">【PG 内核】BRIN 与其他索引：什么时候不建 B-Tree 反而更好</a></h3>
+                    <p>过一遍 BRIN 索引的范围摘要哲学——用每个 page range 一条摘要替代逐行索引，在 1TB 的表上创建时间从小时降到秒级。同时讨论两条&quot;不建 B-Tree&quot;的高性价比路径：Hash 索引在 PG 10+ 的 WAL 安全边界和 Bloom 索引的多列任意组合过滤。附带代价对比表和建索引决策树。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / kernel</p>
+                    <h3><a href="/post/db/mysql-innodb/11-btree-index/11-btree-index.html">【MySQL InnoDB 内核】B+Tree 与索引：聚簇、回表与页分裂</a></h3>
+                    <p>从 btr0btr.cc 拆解 InnoDB B+Tree：聚簇索引即数据、二级索引回表、Page Directory、btr_cur_search_to_nth_level、页分裂 btr_page_split 与合并、索引 latch。对照 PG nbtree。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

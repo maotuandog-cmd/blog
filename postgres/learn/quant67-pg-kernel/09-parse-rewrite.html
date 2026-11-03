@@ -1,0 +1,1207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】查询解析与重写：从 SQL 字符串到 Query Tree | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+查询编译的前两步：Parser 如何将 SQL 字符串转换为 RawStmt 语法树（基于
+gram.y 的 Bison 语法文件），Analyzer 如何通过 parse_analyze()
+完成表名/列名解析、类型推导和权限检查，Rewriter 如何基于 pg_rewrite
+规则系统展开视图和行级安全策略，以及 Query 结构体中
+rtable、jointree、targetList 等核心字段的含义。配合 debug_print_parse 和
+debug_print_rewritten 参数，读者可以自己观察每一步的输出。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, parser, analyzer, rewriter, gram-y, query-tree, parse-analyze, pg-rewrite, view-expansion, rtable, jointree, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/09-parse-rewrite/09-parse-rewrite.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】查询解析与重写：从 SQL 字符串到 Query Tree" />
+    <meta property="og:description" content="拆解 PostgreSQL 查询编译的前两步：Parser 如何将 SQL 字符串转换为 RawStmt 语法树（基于 gram.y 的 Bison 语法文件），Analyzer 如何通过 parse_analyze() 完成表名/列名解析、类型推导和权限检查，Rewriter 如何基于 pg_rewrite 规则系统展开视图和行级安全策略，以及 Query 结构体中 rtable、jointree、targetList 等核心字段的含义。配合 debug_print_parse 和 debug_print_rewritten 参数，读者可以自己观察每一步的输出。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/09-parse-rewrite/09-parse-rewrite.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="parser" />
+    <meta property="article:tag" content="analyzer" />
+    <meta property="article:tag" content="rewriter" />
+    <meta property="article:tag" content="gram-y" />
+    <meta property="article:tag" content="query-tree" />
+    <meta property="article:tag" content="parse-analyze" />
+    <meta property="article:tag" content="pg-rewrite" />
+    <meta property="article:tag" content="view-expansion" />
+    <meta property="article:tag" content="rtable" />
+    <meta property="article:tag" content="jointree" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】查询解析与重写：从 SQL 字符串到 Query Tree" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 查询编译的前两步：Parser 如何将 SQL 字符串转换为 RawStmt 语法树（基于 gram.y 的 Bison 语法文件），Analyzer 如何通过 parse_analyze() 完成表名/列名解析、类型推导和权限检查，Rewriter 如何基于 pg_rewrite 规则系统展开视图和行级安全策略，以及 Query 结构体中 rtable、jointree、targetList 等核心字段的含义。配合 debug_print_parse 和 debug_print_rewritten 参数，读者可以自己观察每一步的输出。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】查询解析与重写：从 SQL 字符串到 Query Tree", "description": "拆解 PostgreSQL 查询编译的前两步：Parser 如何将 SQL 字符串转换为 RawStmt 语法树（基于 gram.y 的 Bison 语法文件），Analyzer 如何通过 parse_analyze() 完成表名/列名解析、类型推导和权限检查，Rewriter 如何基于 pg_rewrite 规则系统展开视图和行级安全策略，以及 Query 结构体中 rtable、jointree、targetList 等核心字段的含义。配合 debug_print_parse 和 debug_print_rewritten 参数，读者可以自己观察每一步的输出。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/09-parse-rewrite/09-parse-rewrite.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "parser", "analyzer", "rewriter", "gram-y", "query-tree", "parse-analyze", "pg-rewrite", "view-expansion", "rtable", "jointree"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】查询解析与重写：从 SQL 字符串到 Query Tree</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#parser</span> <span>#analyzer</span> <span>#rewriter</span> <span>#gram-y</span> <span>#query-tree</span> <span>#parse-analyze</span> <span>#pg-rewrite</span> <span>#view-expansion</span> <span>#rtable</span> <span>#jointree</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/parser.html">#parser</a><a class="chip-link" href="/tags/analyzer.html">#analyzer</a><a class="chip-link" href="/tags/rewriter.html">#rewriter</a><a class="chip-link" href="/tags/gram-y.html">#gram-y</a><a class="chip-link" href="/tags/query-tree.html">#query-tree</a><a class="chip-link" href="/tags/parse-analyze.html">#parse-analyze</a><a class="chip-link" href="/tags/pg-rewrite.html">#pg-rewrite</a><a class="chip-link" href="/tags/view-expansion.html">#view-expansion</a><a class="chip-link" href="/tags/rtable.html">#rtable</a><a class="chip-link" href="/tags/jointree.html">#jointree</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#查询解析与重写从-sql-字符串到-query-tree"
+                id="toc-查询解析与重写从-sql-字符串到-query-tree">查询解析与重写：从
+                SQL 字符串到 Query Tree</a>
+                <ul>
+                <li><a href="#一查询编译流水线三步到位"
+                id="toc-一查询编译流水线三步到位">一、查询编译流水线：三步到位</a>
+                <ul>
+                <li><a href="#语法分析gram.y-的关键规则"
+                id="toc-语法分析gram.y-的关键规则">2.2 语法分析：gram.y
+                的关键规则</a></li>
+                <li><a href="#raw_parser解析入口"
+                id="toc-raw_parser解析入口">2.3
+                raw_parser()：解析入口</a></li>
+                <li><a href="#名称解析表名到-oid"
+                id="toc-名称解析表名到-oid">3.2 名称解析：表名到
+                OID</a></li>
+                <li><a href="#类型推导" id="toc-类型推导">3.3
+                类型推导</a></li>
+                </ul></li>
+                <li><a href="#四rewriter规则系统与视图展开"
+                id="toc-四rewriter规则系统与视图展开">四、Rewriter：规则系统与视图展开</a>
+                <ul>
+                <li><a href="#pg_rewrite-规则系统"
+                id="toc-pg_rewrite-规则系统">4.1 pg_rewrite
+                规则系统</a></li>
+                <li><a href="#rewritehandler.c-的核心函数"
+                id="toc-rewritehandler.c-的核心函数">4.3
+                rewriteHandler.c 的核心函数</a></li>
+                <li><a href="#rtable范围表" id="toc-rtable范围表">5.1
+                rtable：范围表</a></li>
+                <li><a href="#targetlist目标列表"
+                id="toc-targetlist目标列表">5.3
+                targetList：目标列表</a></li>
+                <li><a href="#观察-parse-tree"
+                id="toc-观察-parse-tree">6.2 观察 parse tree</a></li>
+                <li><a href="#用-nodetostring-在代码中观察"
+                id="toc-用-nodetostring-在代码中观察">6.5 用
+                nodeToString 在代码中观察</a></li>
+                </ul></li>
+                <li><a href="#七关键要点"
+                id="toc-七关键要点">七、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="查询解析与重写从-sql-字符串到-query-tree">查询解析与重写：从
+            SQL 字符串到 Query Tree</h1>
+            <p>你用 psql 敲下
+            <code>SELECT name, salary FROM employees WHERE dept_id = 3 ORDER BY salary DESC LIMIT 5;</code>
+            并按下回车。在这条 SQL 被执行器拿到手里之前，它要经过
+            Parser、Analyzer、Rewriter
+            三个阶段的变形——从一段文本变成一棵语义完整的 Query
+            Tree。</p>
+            <p>这三个阶段在 PG
+            源码中分属三个目录：<code>src/backend/parser/</code>（词法和语法分析）、<code>src/backend/parser/</code>（语义分析，同目录不同文件）、<code>src/backend/rewrite/</code>（规则系统和视图展开）。每层有独立的职责边界：Parser
+            只保证语法正确，Analyzer
+            负责”这个名字指的是哪个表/列/函数”，Rewriter
+            负责”视图其实是一条子查询，把它展开”。</p>
+            <p>本文从源码路径拆解这三个阶段的内部流程，重点解释
+            <code>Query</code> 结构体在堆满了
+            rtable、jointree、targetList 之后到底长什么样——以及你能用
+            <code>debug_print_parse</code> 和
+            <code>debug_print_rewritten</code>
+            自己观察每一步的输出。</p>
+            <hr />
+            <h2
+            id="一查询编译流水线三步到位">一、查询编译流水线：三步到位</h2>
+            <p>一条 SQL 从文本到可执行的 Query Tree 的完整路径如下：</p>
+            <pre class="mermaid"><code>flowchart LR
+  SQL[&quot;SQL 字符串&quot;] --&gt; P[&quot;Parser&lt;br/&gt;(gram.y + scan.l)&quot;]
+  P --&gt; RT[&quot;RawStmt&lt;br/&gt;(语法树)&quot;]
+  RT --&gt; A[&quot;Analyzer&lt;br/&gt;(parse_analyze)&quot;]
+  A --&gt; QT[&quot;Query&lt;br/&gt;(语义树)&quot;]
+  QT --&gt; RW[&quot;Rewriter&lt;br/&gt;(rewriteQuery)&quot;]
+  RW --&gt; QT2[&quot;Query Tree&lt;br/&gt;(展开后)&quot;]
+  QT2 --&gt; PL[&quot;Planner&lt;br/&gt;(第 10-11 章)&quot;]
+```text
+
+三个阶段的职责边界：
+
+| 阶段 | 输入 | 输出 | 做什么 | 源码入口 |
+|------|------|------|--------|---------|
+| Parser | SQL 字符串 | `List *raw_parsetree_list`（`RawStmt` 链表） | 词法分析 (scan.l) + 语法分析 (gram.y)，构建语法树 | `raw_parser()` |
+| Analyzer | `RawStmt` 语法树 | `Query *` | 语义分析：表名/列名解析为 OID，类型推导，权限检查 | `parse_analyze()` |
+| Rewriter | `Query *` | `List *querytree_list`（`Query` 链表） | 规则系统：视图展开，行级安全策略注入 | `QueryRewrite()` |
+
+关键事实：**Parser 和 Analyzer 的职责绝不重叠**。Parser 不认识 `employees` 是表还是视图——它只知道那是个 identifier，生成一个 `RangeVar` 节点，把名字存进去。Analyzer 才去查 `pg_class`，把 `employees` 解析成 OID 12345。
+
+---
+
+## 二、Parser：从字符串到语法树
+
+### 2.1 词法分析：scan.l
+
+PG 的词法分析器由 flex 从 `src/backend/parser/scan.l` 生成。它把 SQL 字符串切成 token 流——identifier、keyword、数字字面量、字符串字面量、运算符符号等。
+
+一个关键细节：**PG 的关键字不是固定的 token 集合**。`scan.l` 把所有看起来像 identifier 的东西先输出为 `IDENT` token，然后由语法分析器根据上下文判断它是关键字还是普通标识符。这意味着 `SELECT select FROM select;` 在 Parser 看来语法是合法的——`gram.y` 中大部分关键字都用 `%nonassoc IDENT` 规则处理，允许关键字出现在列名和表名的位置。
+
+```c
+// src/backend/parser/scan.l（简化逻辑）
+// 核心规则：字母开头的 token → IDENT，数字 → ICONST/FCONST，字符串 → SCONST
+{identifier}  {
+    // 查 ScanKeywordLookup() 判断是否是 keyword
+    // 是 keyword → 返回对应的 keyword token
+    // 不是 keyword → 返回 IDENT
+    yylval.str = pstrdup(yytext);
+    return keyword-&gt;value;
+}</code></pre>
+            <h3 id="语法分析gram.y-的关键规则">2.2 语法分析：gram.y
+            的关键规则</h3>
+            <p><code>src/backend/parser/gram.y</code> 是 PG
+            源码中最大的单个文件之一（约 17000 行），由 Bison
+            从语法规则定义生成。它的顶层入口规则是
+            <code>stmt</code>，分发到各种 SQL 语句类型：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode yacc"><code class="sourceCode yacc"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/parser/gram.y（简化）</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>stmt:</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    AlterStmt | AnalyzeStmt | CreateStmt | DeleteStmt | DropStmt</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    | InsertStmt | SelectStmt | UpdateStmt | ViewStmt</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    | ...</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>;</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>SelectStmt:</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    select_no_parens    <span class="kw">%prec</span> UMINUS</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    | select_with_parens  %prec UMINUS</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>;</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>select_no_parens:</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    simple_select</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    | select_clause sort_clause</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    | select_clause sort_clause limit_clause</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    | ...</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>;</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>simple_select:</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    SELECT opt_all_clause opt_target_list</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    into_clause from_clause where_clause</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    group_clause having_clause window_clause</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    {</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        SelectStmt *n = makeNode(SelectStmt);</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>        n-&gt;targetList = $3;</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        n-&gt;fromClause = $5;</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>        n-&gt;whereClause = $6;</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>        n-&gt;groupClause = $7;</span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>        n-&gt;havingClause = $8;</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>        n-&gt;windowClause = $9;</span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>        $$ = (Node *)n;</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>;</span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>对于一条 `SELECT name, salary FROM employees WHERE dept_id = 3 ORDER BY salary DESC`，语法规则归约后的节点树（简化）为：</span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>RawStmt</span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>  └── stmt: SelectStmt</span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>        ├── targetList: [ResTarget(name=&quot;name&quot;), ResTarget(name=&quot;salary&quot;)]</span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>        ├── fromClause: [RangeVar(schemaname=NULL, relname=&quot;employees&quot;)]</span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>        ├── whereClause: A_Expr</span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>        │     ├── name: &quot;=&quot;</span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>        │     ├── lexpr: ColumnRef(fields=[&quot;dept_id&quot;])</span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>        │     └── rexpr: A_Const(val=Integer(3))</span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>        ├── sortClause: [SortBy(node=ColumnRef(name=&quot;salary&quot;), sortby_dir=SORTBY_DESC)]</span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>        └── limitClause: ...</span></code></pre></div>
+            <p>注意 Parser 的输出节点里没有
+            OID，没有类型信息，没有权限检查——只有语法结构。<code>RangeVar</code>
+            存的是表名字符串，<code>ColumnRef</code>
+            存的是列名，<code>A_Const</code> 存的是字面量值。</p>
+            <h3 id="raw_parser解析入口">2.3 raw_parser()：解析入口</h3>
+            <p>Parser 的总入口在 <code>raw_parser()</code>：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/parser/parser.c</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>List <span class="op">*</span>raw_parser<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>str<span class="op">)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    core_yyscan_t yyscanner<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    yy_extra_type yyextra<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         yyresult<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 初始化 flex scanner</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    yyscanner <span class="op">=</span> scanner_init<span class="op">(</span>str<span class="op">,</span> <span class="op">&amp;</span>yyextra<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 调用 Bison 生成的解析器</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    yyresult <span class="op">=</span> base_yyparse<span class="op">(</span>yyscanner<span class="op">);</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// yyextra.parsetree 存的是 parsing 过程中积累的 RawStmt 链表</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> yyextra<span class="op">.</span>parsetree<span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>`raw_parser<span class="op">()</span>` 在 `exec_simple_query<span class="op">()</span>` 中被调用。返回的 `List` 可能包含多条 `RawStmt`（如果输入是多语句字符串，如 `SELECT <span class="dv">1</span><span class="op">;</span> SELECT <span class="dv">2</span><span class="op">;</span>`）。</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 三、Analyzer：语义分析</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.1 parse_analyze()：分发入口</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>`parse_analyze<span class="op">()</span>` 是语义分析的入口：</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/parser/analyze.c</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>Query <span class="op">*</span>parse_analyze<span class="op">(</span>RawStmt <span class="op">*</span>parseTree<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>sourceText<span class="op">,</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>                     Oid <span class="op">*</span>paramTypes<span class="op">,</span> <span class="dt">int</span> numParams<span class="op">,</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>                     QueryEnvironment <span class="op">*</span>queryEnv<span class="op">)</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    ParseState <span class="op">*</span>pstate <span class="op">=</span> make_parsestate<span class="op">(</span>NULL<span class="op">);</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    Query      <span class="op">*</span>query<span class="op">;</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    pstate<span class="op">-&gt;</span>p_sourcetext <span class="op">=</span> sourceText<span class="op">;</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 分发到对应的 transform 函数</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    query <span class="op">=</span> transformTopLevelStmt<span class="op">(</span>pstate<span class="op">,</span> parseTree<span class="op">);</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 检查是否有未解决的标识符或类型错误</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>pstate<span class="op">-&gt;</span>p_hasAggs <span class="op">||</span> pstate<span class="op">-&gt;</span>p_hasWindowFuncs<span class="op">)</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>        parseCheckAggregates<span class="op">(</span>pstate<span class="op">,</span> query<span class="op">);</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>pstate<span class="op">-&gt;</span>p_hasSubLinks<span class="op">)</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        parseCheckSubLinks<span class="op">(</span>pstate<span class="op">,</span> query<span class="op">);</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>    free_parsestate<span class="op">(</span>pstate<span class="op">);</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> query<span class="op">;</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>transformTopLevelStmt()</code> 根据
+            <code>RawStmt</code> 的节点类型分发：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/parser/analyze.c</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>Query <span class="op">*</span>transformTopLevelStmt<span class="op">(</span>ParseState <span class="op">*</span>pstate<span class="op">,</span> RawStmt <span class="op">*</span>parseTree<span class="op">)</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>nodeTag<span class="op">(</span>parseTree<span class="op">-&gt;</span>stmt<span class="op">))</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_SelectStmt<span class="op">:</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformSelectStmt<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>SelectStmt <span class="op">*)</span>parseTree<span class="op">-&gt;</span>stmt<span class="op">);</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_InsertStmt<span class="op">:</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformInsertStmt<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>InsertStmt <span class="op">*)</span>parseTree<span class="op">-&gt;</span>stmt<span class="op">);</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_DeleteStmt<span class="op">:</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformDeleteStmt<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>DeleteStmt <span class="op">*)</span>parseTree<span class="op">-&gt;</span>stmt<span class="op">);</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_UpdateStmt<span class="op">:</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformUpdateStmt<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>UpdateStmt <span class="op">*)</span>parseTree<span class="op">-&gt;</span>stmt<span class="op">);</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... CREATE TABLE, ALTER TABLE 等走 transformCreateStmt 等</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">default</span><span class="op">:</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 实用命令（DDL, VACUUM 等）走特殊路径</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformUtilityStmt<span class="op">(</span>pstate<span class="op">,</span> parseTree<span class="op">);</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>对于 `SELECT`，核心调用链为：</span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>transformSelectStmt<span class="op">()</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>  → transformFromClause<span class="op">()</span>       <span class="co">// FROM 子句 → rtable</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    → transformFromClauseItem<span class="op">()</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>      → addRangeTableEntry<span class="op">()</span>    <span class="co">// 为每个表创建 RangeTblEntry</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>  → transformWhereClause<span class="op">()</span>     <span class="co">// WHERE → qual 表达式</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>  → transformTargetList<span class="op">()</span>      <span class="co">// SELECT 列表 → targetList</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>  → transformSortClause<span class="op">()</span>      <span class="co">// ORDER BY → sortClause</span></span></code></pre></div>
+            <h3 id="名称解析表名到-oid">3.2 名称解析：表名到 OID</h3>
+            <p>Analyzer 的核心任务之一是把 Parser
+            输出的字符串名字解析为数据库内部标识符。以表名解析为例，调用链：</p>
+            <pre class="text"><code>transformFromClauseItem()
+  → transformTableEntry()
+    → addRangeTableEntry()
+      → RangeVarGetRelid()          // 查 pg_class，字符串 → OID
+      → heap_open(relid, AccessShareLock)  // 打开 relation
+      → get_rel_name(relid)         // 确认名字
+```text
+
+`RangeVarGetRelid()` 是名称解析的关键函数。它接受 `RangeVar *relation`（存 `schemaname`、`relname`），走 search_path 查找对应的 relation OID，并在内部执行权限检查：
+
+```c
+// src/backend/catalog/namespace.c
+Oid RangeVarGetRelid(const RangeVar *relation, LOCKMODE lockmode,
+                     bool missing_ok, ...)
+{
+    Oid relId;
+    if (relation-&gt;schemaname)
+        relId = GetSysCacheOid2(RELNAMENSP,
+                                Anum_pg_class_oid,
+                                CStringGetDatum(relation-&gt;relname),
+                                ObjectIdGetDatum(namespaceId));
+    else
+        relId = RelnameGetRelid(relation-&gt;relname);
+    // ... 未找到时根据 missing_ok 抛错或返回 InvalidOid
+}</code></pre>
+            <p>对于列名，解析更加复杂。<code>transformColumnRef()</code>
+            处理 <code>ColumnRef</code> 节点，区分
+            <code>colname</code>、<code>tablename.colname</code> 和
+            <code>schemaname.tablename.colname</code> 三种形式，最终调用
+            <code>colNameToVar()</code> 将列名映射到具体的
+            <code>Var</code> 节点（包含
+            <code>varno</code>、<code>varattno</code>、<code>vartype</code>
+            等信息）。</p>
+            <h3 id="类型推导">3.3 类型推导</h3>
+            <p>Analyzer
+            的另一项任务是给表达式树中的每个节点赋类型。这个过程由
+            <code>transformExpr()</code> 驱动，对每个表达式节点调用
+            <code>exprType()</code> 完成自底向上的类型推导：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/parser/parse_expr.c</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>Node <span class="op">*</span>transformExpr<span class="op">(</span>ParseState <span class="op">*</span>pstate<span class="op">,</span> Node <span class="op">*</span>expr<span class="op">,</span> ParseExprKind exprKind<span class="op">)</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>nodeTag<span class="op">(</span>expr<span class="op">))</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_ColumnRef<span class="op">:</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformColumnRef<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>ColumnRef <span class="op">*)</span>expr<span class="op">);</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_A_Const<span class="op">:</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformAConst<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>A_Const <span class="op">*)</span>expr<span class="op">);</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_A_Expr<span class="op">:</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformAExprOp<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>A_Expr <span class="op">*)</span>expr<span class="op">);</span>   <span class="co">// 运算符类型推导</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> T_FuncCall<span class="op">:</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> transformFuncCall<span class="op">(</span>pstate<span class="op">,</span> <span class="op">(</span>FuncCall <span class="op">*)</span>expr<span class="op">);</span> <span class="co">// 函数签名查找</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>对于 `dept_id <span class="op">=</span> <span class="dv">3</span>` 这个表达式，Analyzer 需要：</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> 把 `ColumnRef<span class="op">(</span><span class="st">&quot;dept_id&quot;</span><span class="op">)</span>` 解析为对应列的 `Var`（从该列的 `pg_attribute` 记录中拿到类型 OID 和 attnum）。</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> 把 `A_Const<span class="op">(</span>Integer<span class="op">(</span><span class="dv">3</span><span class="op">))</span>` 从语法树的整数字面量转换为 `Const` 节点（标注类型为 `int4`）。</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> 查找 `<span class="op">=</span>` 操作符的签名 `int4 <span class="op">=</span> int4 → bool`（通过 `oper<span class="op">()</span>` 函数查 `pg_operator` 系统表）。</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> 构造 `OpExpr` 节点，包含操作符 OID、两个参数的类型、结果类型 `bool`。</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.4 权限检查</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>PostgreSQL 在 Analyzer 阶段执行 DML 操作的权限检查，而不是在执行器阶段。这样做的优势是可以在执行开始前就发现权限不足的查询，避免执行到一半才报错。</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>权限检查通过 `ExecCheckRTPerms<span class="op">()</span>` 执行，核心逻辑在 `ExecCheckRTEPerms<span class="op">()</span>` 中：</span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execCheck.c（由 Analyzer 调用）</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> ExecCheckRTPerms<span class="op">(</span>List <span class="op">*</span>rangeTable<span class="op">,</span> <span class="dt">bool</span> ereport_on_violation<span class="op">)</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    foreach<span class="op">(</span>l<span class="op">,</span> rangeTable<span class="op">)</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>        RangeTblEntry <span class="op">*</span>rte <span class="op">=</span> <span class="op">(</span>RangeTblEntry <span class="op">*)</span> lfirst<span class="op">(</span>l<span class="op">);</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 检查类型：SELECT / INSERT / UPDATE / DELETE</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>        aclresult <span class="op">=</span> pg_class_aclmask<span class="op">(</span>rte<span class="op">-&gt;</span>relid<span class="op">,</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>                                     rte<span class="op">-&gt;</span>checkAsUser<span class="op">,</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>                                     requiredPerms<span class="op">,</span> ACLMASK_ALL<span class="op">);</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>aclresult <span class="op">!=</span> requiredPerms<span class="op">)</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 报错：permission denied</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>pg_class_aclmask()</code> 查 <code>pg_class</code>
+            的 <code>relacl</code> 列（存储
+            ACL），结合调用者的角色成员关系，确定该角色对目标表是否有
+            SELECT / INSERT / UPDATE / DELETE 权限。</p>
+            <hr />
+            <h2
+            id="四rewriter规则系统与视图展开">四、Rewriter：规则系统与视图展开</h2>
+            <h3 id="pg_rewrite-规则系统">4.1 pg_rewrite 规则系统</h3>
+            <p>PG 的重写规则存储在 <code>pg_rewrite</code>
+            系统表中。每当执行 <code>CREATE RULE</code> 时，PG
+            将规则的事件类型（SELECT/INSERT/UPDATE/DELETE）、条件、动作都编码为
+            <code>pg_rewrite</code> 中的一行。<code>pg_rewrite</code>
+            的关键列：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>列名</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>rulename</code></td>
+            <td>规则名称</td>
+            </tr>
+            <tr>
+            <td><code>ev_class</code></td>
+            <td>规则所属的表 OID</td>
+            </tr>
+            <tr>
+            <td><code>ev_type</code></td>
+            <td>触发类型：<code>1</code>=SELECT, <code>2</code>=UPDATE,
+            <code>3</code>=INSERT, <code>4</code>=DELETE</td>
+            </tr>
+            <tr>
+            <td><code>ev_enabled</code></td>
+            <td>规则是否启用</td>
+            </tr>
+            <tr>
+            <td><code>is_instead</code></td>
+            <td><code>true</code> 表示 INSTEAD OF
+            规则（拦截原操作）</td>
+            </tr>
+            <tr>
+            <td><code>ev_qual</code></td>
+            <td>规则条件（<code>WHERE</code> 子句的表达式树）</td>
+            </tr>
+            <tr>
+            <td><code>ev_action</code></td>
+            <td>规则动作（替换执行的查询树）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Rewriter 的入口在 <code>QueryRewrite()</code>：</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/rewrite/rewriteHandler.c</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>List <span class="op">*</span>QueryRewrite<span class="op">(</span>Query <span class="op">*</span>parsetree<span class="op">)</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 应用 CMD 规则：查找所有匹配 pg_rewrite 规则的 DML 语句</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>parsetree<span class="op">-&gt;</span>commandType <span class="op">!=</span> CMD_UTILITY<span class="op">)</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>        results <span class="op">=</span> QueryRewriteOne<span class="op">(</span>parsetree<span class="op">);</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 替换为规则指定的动作</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    对于 instead 规则，原查询被丢弃</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    对于非 instead 规则，原查询和规则动作都执行</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 展开所有 RTE 中的子查询（视图、WITH CTE）</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    foreach<span class="op">(</span>l<span class="op">,</span> results<span class="op">)</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>        query <span class="op">=</span> <span class="op">(</span>Query <span class="op">*)</span> lfirst<span class="op">(</span>l<span class="op">);</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>        FireRIRrules<span class="op">(</span>query<span class="op">,</span> <span class="op">...);</span>  <span class="co">// 递归展开 RangeTblEntry 的子查询</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> results<span class="op">;</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.2 视图展开的实质</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>视图在 PG 中并非独立的存储对象。`CREATE VIEW foo AS SELECT <span class="op">...</span>` 等价于创建了一条 `_RETURN` 规则。具体来说：</span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>CREATE VIEW high_salary AS</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>SELECT name<span class="op">,</span> salary FROM employees WHERE salary <span class="op">&gt;</span> <span class="dv">100000</span><span class="op">;</span></span></code></pre></div>
+            <p>这条语句在内部执行了两个操作： 1. 在
+            <code>pg_class</code> 中创建 <code>high_salary</code> 的
+            entry（<code>relkind = 'v'</code>）。 2. 在
+            <code>pg_rewrite</code>
+            中插入一条规则：<code>ev_type='1'</code>（SELECT），<code>is_instead=true</code>，<code>ev_action</code>
+            编码了
+            <code>SELECT name, salary FROM employees WHERE salary &gt; 100000</code>
+            的 Query Tree。</p>
+            <p>当你查询
+            <code>SELECT * FROM high_salary WHERE name LIKE 'A%'</code>
+            时，Rewriter 执行的步骤是：</p>
+            <ol type="1">
+            <li>Analyzer 已经把 <code>high_salary</code> 解析为一个
+            <code>RangeTblEntry</code>（<code>relkind='v'</code>）。</li>
+            <li>Rewriter 在 <code>pg_rewrite</code> 中找到
+            <code>high_salary</code> 的 <code>_RETURN</code> 规则。</li>
+            <li>将规则动作（<code>SELECT name, salary FROM employees WHERE salary &gt; 100000</code>）替换原查询中对
+            <code>high_salary</code> 的引用。</li>
+            <li>原查询的 <code>WHERE name LIKE 'A%'</code>
+            被合入展开后的查询树，变成：<code>SELECT name, salary FROM employees WHERE salary &gt; 100000 AND name LIKE 'A%'</code>。</li>
+            </ol>
+            <p>这就是为什么视图只是”保存的查询”——它在每次引用时都被展开为子查询或直接合入外层查询树。</p>
+            <h3 id="rewritehandler.c-的核心函数">4.3 rewriteHandler.c
+            的核心函数</h3>
+            <p>核心调用链：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/rewrite/rewriteHandler.c</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>RewriteQuery<span class="op">()</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  → QueryRewrite<span class="op">()</span>              <span class="co">// 入口</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    → QueryRewriteOne<span class="op">()</span>         <span class="co">// 应用匹配的 pg_rewrite 规则</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>      → RewriteQuery<span class="op">()</span>          <span class="co">// 递归：规则动作本身可能触发更多规则</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    → FireRIRrules<span class="op">()</span>            <span class="co">// 展开子查询（视图、CTE、子查询 RTE）</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>      → fireRIRrules<span class="op">()</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        → ApplyRetrieveRule<span class="op">()</span>   <span class="co">// 应用 _RETURN 规则展开视图</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>ApplyRetrieveRule<span class="op">()</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>  → 从 pg_rewrite 提取 ev_action</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>  → 将 ev_action 的目标列表（targetList）和 WHERE 条件合入原查询</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>  → 将原查询的 WHERE 条件作为额外的 qual 添加到展开后的查询</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>  → 递归调用 FireRIRrules<span class="op">()</span> 处理嵌套视图</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>对于 `INSTEAD` 规则（`is_instead<span class="op">=</span>true`），原查询被完全丢弃，只执行规则动作。对于非 `INSTEAD` 规则，规则动作在原查询之前或之后追加执行。</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 五、Query 结构体深度拆解</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>经过 Parser → Analyzer → Rewriter 三步后，一条 SQL 最终变成一个或多个 `Query` 结构体。这是查询编译流水线的核心输出，也是 Planner 的输入。</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/nodes/parsenodes.h</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> Query</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>    NodeTag     type<span class="op">;</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>    CmdType     commandType<span class="op">;</span>    <span class="co">// CMD_SELECT / CMD_INSERT / CMD_UPDATE / CMD_DELETE / CMD_UTILITY</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    QuerySource querySource<span class="op">;</span>    <span class="co">// 来源：原始 SQL / 规则展开 / 其他</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    uint64      queryId<span class="op">;</span>        <span class="co">// query identifier（如 pg_stat_statements 中用于聚合）</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        canSetTag<span class="op">;</span>      <span class="co">// 这条 Query 是否是&quot;主查询&quot;（影响命令标签和行计数）</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>utilityStmt<span class="op">;</span>    <span class="co">// 对于 CMD_UTILITY，指向 DDL 等实用命令节点</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         resultRelation<span class="op">;</span> <span class="co">// 对于 INSERT/UPDATE/DELETE，目标表在 rtable 中的索引</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>                                <span class="co">// 对于 SELECT ... FOR UPDATE，也需要锁定结果表</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        hasAggs<span class="op">;</span>        <span class="co">// 是否包含聚合函数（决定是否需要分组规划）</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        hasWindowFuncs<span class="op">;</span> <span class="co">// 是否包含窗口函数</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        hasSubLinks<span class="op">;</span>    <span class="co">// 是否包含子查询（SubLink 节点）</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        hasDistinctOn<span class="op">;</span>  <span class="co">// 是否有 DISTINCT ON</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        hasRecursive<span class="op">;</span>   <span class="co">// 是否有递归 CTE</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>cteList<span class="op">;</span>        <span class="co">// WITH 子句定义的 CTE 列表</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>rtable<span class="op">;</span>         <span class="co">// 范围表（Range Table）：查询涉及的所有关系</span></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>    FromExpr   <span class="op">*</span>jointree<span class="op">;</span>       <span class="co">// Join 树：FROM 和 WHERE 的组合表示</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>targetList<span class="op">;</span>     <span class="co">// 目标列表：SELECT 的输出列</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a>    OnConflictExpr <span class="op">*</span>onConflict<span class="op">;</span> <span class="co">// INSERT ... ON CONFLICT 的处理规范</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>groupClause<span class="op">;</span>    <span class="co">// GROUP BY 子句</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>groupDistinct<span class="op">;</span>  <span class="co">// GROUP BY 是否带有 DISTINCT</span></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>groupingSets<span class="op">;</span>   <span class="co">// GROUPING SETS</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>havingQual<span class="op">;</span>     <span class="co">// HAVING 子句</span></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>windowClause<span class="op">;</span>   <span class="co">// WINDOW 子句定义</span></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-63"><a href="#cb8-63" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>distinctClause<span class="op">;</span> <span class="co">// SELECT DISTINCT 的目标列表</span></span>
+<span id="cb8-64"><a href="#cb8-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-65"><a href="#cb8-65" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>sortClause<span class="op">;</span>     <span class="co">// ORDER BY 子句</span></span>
+<span id="cb8-66"><a href="#cb8-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-67"><a href="#cb8-67" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>limitOffset<span class="op">;</span>    <span class="co">// LIMIT 偏移量</span></span>
+<span id="cb8-68"><a href="#cb8-68" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>limitCount<span class="op">;</span>     <span class="co">// LIMIT 行数</span></span>
+<span id="cb8-69"><a href="#cb8-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-70"><a href="#cb8-70" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>rowMarks<span class="op">;</span>       <span class="co">// 行级锁标记（FOR UPDATE / FOR SHARE / FOR KEY SHARE）</span></span>
+<span id="cb8-71"><a href="#cb8-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-72"><a href="#cb8-72" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>setOperations<span class="op">;</span>  <span class="co">// UNION / INTERSECT / EXCEPT 的集合操作树</span></span>
+<span id="cb8-73"><a href="#cb8-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-74"><a href="#cb8-74" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>constraintDeps<span class="op">;</span> <span class="co">// 约束依赖（PL/pgSQL 使用）</span></span>
+<span id="cb8-75"><a href="#cb8-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-76"><a href="#cb8-76" aria-hidden="true" tabindex="-1"></a>    <span class="co">// PG 14+：合并聚合、窗口函数和子查询的标记</span></span>
+<span id="cb8-77"><a href="#cb8-77" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        hasRowSecurity<span class="op">;</span> <span class="co">// 是否启用了行级安全策略</span></span>
+<span id="cb8-78"><a href="#cb8-78" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        hasForUpdate<span class="op">;</span>   <span class="co">// 是否有 FOR UPDATE 子句</span></span>
+<span id="cb8-79"><a href="#cb8-79" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> Query<span class="op">;</span></span></code></pre></div>
+            <p>这个结构体看似庞大，但其中三个字段构成了查询的核心骨架：<code>rtable</code>、<code>jointree</code>、<code>targetList</code>。</p>
+            <h3 id="rtable范围表">5.1 rtable：范围表</h3>
+            <p><code>rtable</code> 是一个
+            <code>List *</code>，每个元素是
+            <code>RangeTblEntry</code>（RTE）。RTE
+            描述查询涉及的一个”关系”，可以是普通表、子查询、视图、CTE、函数调用、JOIN
+            结果等：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/nodes/parsenodes.h</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> RangeTblEntry</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    NodeTag     type<span class="op">;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    RTEKind     rtekind<span class="op">;</span>        <span class="co">// RTE_RELATION / RTE_SUBQUERY / RTE_JOIN</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>                                <span class="co">// RTE_FUNCTION / RTE_VALUES / RTE_CTE / ...</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    Oid         relid<span class="op">;</span>          <span class="co">// 关系 OID（RTE_RELATION 时有效）</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span>        relkind<span class="op">;</span>        <span class="co">// &#39;r&#39;=普通表, &#39;v&#39;=视图, &#39;m&#39;=物化视图, &#39;f&#39;=外部表</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         rellockmode<span class="op">;</span>    <span class="co">// 锁模式（AccessShareLock 等）</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    Query      <span class="op">*</span>subquery<span class="op">;</span>       <span class="co">// RTE_SUBQUERY 时，指向子查询的 Query 树</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        security_barrier<span class="op">;</span> <span class="co">// 安全屏障视图标志</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// JOIN RTE 相关</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    JoinType    jointype<span class="op">;</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         joinmergedcols<span class="op">;</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>joinaliasvars<span class="op">;</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>joinleftcols<span class="op">;</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>joinrightcols<span class="op">;</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 函数 RTE 相关</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>functions<span class="op">;</span>      <span class="co">// RangeTblFunction 链表</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 别名</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>    Alias      <span class="op">*</span>alias<span class="op">;</span>          <span class="co">// 用户指定的表别名（如 FROM employees AS e）</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>    Alias      <span class="op">*</span>eref<span class="op">;</span>           <span class="co">// 系统内部引用名</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        lateral<span class="op">;</span>        <span class="co">// 是否标记为 LATERAL</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 安全性</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        inh<span class="op">;</span>            <span class="co">// 是否包含继承子表</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>    Oid         userid<span class="op">;</span>         <span class="co">// 检查权限的用户 ID</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         securityQuals<span class="op">;</span>  <span class="co">// 行级安全策略的 security_barrier 标记</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> RangeTblEntry<span class="op">;</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a>对于查询 `SELECT e<span class="op">.</span>name<span class="op">,</span> d<span class="op">.</span>dept_name FROM employees e JOIN departments d ON e<span class="op">.</span>dept_id <span class="op">=</span> d<span class="op">.</span>id WHERE e<span class="op">.</span>salary <span class="op">&gt;</span> <span class="dv">100000</span>`，`rtable` 包含至少两个 `RangeTblEntry`：</span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> RTE<span class="op">[</span><span class="dv">1</span><span class="op">]:</span> `employees` <span class="op">(</span>relid<span class="op">=</span>employees表的OID<span class="op">,</span> alias<span class="op">={</span>aliasname<span class="op">=</span><span class="st">&quot;e&quot;</span><span class="op">},</span> rtekind<span class="op">=</span>RTE_RELATION<span class="op">)</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> RTE<span class="op">[</span><span class="dv">2</span><span class="op">]:</span> `departments` <span class="op">(</span>relid<span class="op">=</span>departments表的OID<span class="op">,</span> alias<span class="op">={</span>aliasname<span class="op">=</span><span class="st">&quot;d&quot;</span><span class="op">},</span> rtekind<span class="op">=</span>RTE_RELATION<span class="op">)</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a>如果在 Rewriter 阶段将视图展开，可能存在 RTE_SUBQUERY 类型的 RTE，指向展开后的子查询。</span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 5.2 jointree：Join 树</span></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a>`jointree` 是 `FromExpr <span class="op">*</span>` 类型，它是 FROM 子句和 WHERE 子句的组合表示：</span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-48"><a href="#cb9-48" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb9-49"><a href="#cb9-49" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/nodes/parsenodes.h</span></span>
+<span id="cb9-50"><a href="#cb9-50" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> FromExpr</span>
+<span id="cb9-51"><a href="#cb9-51" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-52"><a href="#cb9-52" aria-hidden="true" tabindex="-1"></a>    NodeTag     type<span class="op">;</span></span>
+<span id="cb9-53"><a href="#cb9-53" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>fromlist<span class="op">;</span>       <span class="co">// FROM 子句中的关系列表（指向 rtable 的索引节点）</span></span>
+<span id="cb9-54"><a href="#cb9-54" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>quals<span class="op">;</span>          <span class="co">// WHERE 子句的表达式树</span></span>
+<span id="cb9-55"><a href="#cb9-55" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> FromExpr<span class="op">;</span></span></code></pre></div>
+            <p><code>fromlist</code> 中的每个节点是一个
+            <code>RangeTblRef</code>（指向 <code>rtable</code> 中某个
+            RTE 的索引号）或 <code>JoinExpr</code>（显式 JOIN
+            的表示）：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> JoinExpr</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    NodeTag     type<span class="op">;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    JoinType    jointype<span class="op">;</span>       <span class="co">// JOIN_INNER / JOIN_LEFT / JOIN_RIGHT / JOIN_FULL</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>larg<span class="op">;</span>           <span class="co">// 左子节点（RangeTblRef 或 JoinExpr）</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>rarg<span class="op">;</span>           <span class="co">// 右子节点</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>usingClause<span class="op">;</span>    <span class="co">// USING(...) 子句</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    Node       <span class="op">*</span>quals<span class="op">;</span>          <span class="co">// ON 子句的表达式</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    Alias      <span class="op">*</span>alias<span class="op">;</span>          <span class="co">// JOIN 结果的别名</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         rtindex<span class="op">;</span>        <span class="co">// 在 rtable 中的索引</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> JoinExpr<span class="op">;</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>对于上面的查询，`jointree` 的结构（简化）为：</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>FromExpr</span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>  ├── fromlist<span class="op">:</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>  │     └── JoinExpr <span class="op">(</span>INNER<span class="op">)</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>  │           ├── larg<span class="op">:</span> RangeTblRef<span class="op">(</span>rtindex<span class="op">=</span><span class="dv">1</span><span class="op">)</span>       <span class="co">// employees</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>  │           ├── rarg<span class="op">:</span> RangeTblRef<span class="op">(</span>rtindex<span class="op">=</span><span class="dv">2</span><span class="op">)</span>       <span class="co">// departments</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>  │           └── quals<span class="op">:</span> OpExpr<span class="op">(</span><span class="st">&quot;=&quot;</span><span class="op">,</span> Var<span class="op">(</span><span class="dv">1</span><span class="op">,</span>dept_id<span class="op">),</span> Var<span class="op">(</span><span class="dv">2</span><span class="op">,</span>id<span class="op">))</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>  └── quals<span class="op">:</span> OpExpr<span class="op">(</span><span class="st">&quot;&gt;&quot;</span><span class="op">,</span> Var<span class="op">(</span><span class="dv">1</span><span class="op">,</span>salary<span class="op">),</span> Const<span class="op">(</span><span class="dv">100000</span><span class="op">))</span></span></code></pre></div>
+            <p>值得注意：隐式
+            JOIN（<code>FROM a, b WHERE a.x = b.y</code>）和显式
+            JOIN（<code>FROM a JOIN b ON a.x = b.y</code>）在 Analyzer
+            处理之后，jointree 结构可能不同——隐式 JOIN 的条件会放在
+            <code>FromExpr.quals</code> 中，而显式 JOIN 的条件放在
+            <code>JoinExpr.quals</code> 中。这会影响 Planner 的 Join
+            顺序搜索行为。</p>
+            <h3 id="targetlist目标列表">5.3 targetList：目标列表</h3>
+            <p><code>targetList</code> 是
+            <code>List *</code>，每个元素是
+            <code>TargetEntry</code>，表示 SELECT 输出的每个列：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> TargetEntry</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    Expr        xpr<span class="op">;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    Expr       <span class="op">*</span>expr<span class="op">;</span>           <span class="co">// 该列的表达式（Var / OpExpr / FuncExpr / Const 等）</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    AttrNumber  resno<span class="op">;</span>          <span class="co">// 结果列在输出中的序号（从 1 开始）</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span>       <span class="op">*</span>resname<span class="op">;</span>        <span class="co">// 列名（如果用户指定了别名则为别名）</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    Index       ressortgroupref<span class="op">;</span> <span class="co">// ORDER BY 和 GROUP BY 使用的引用编号</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    Oid         resorigtbl<span class="op">;</span>     <span class="co">// 原始表 OID</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    AttrNumber  resorigcol<span class="op">;</span>     <span class="co">// 原始列号</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        resjunk<span class="op">;</span>        <span class="co">// 是否为&quot;垃圾&quot;列（不输出给客户端，但用于内部计算）</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> TargetEntry<span class="op">;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>对于 `SELECT e<span class="op">.</span>name<span class="op">,</span> e<span class="op">.</span>salary <span class="op">*</span> <span class="fl">1.1</span> AS adjusted FROM employees e`，`targetList` 包含两个 `TargetEntry`：</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> TE<span class="op">(</span>resno<span class="op">=</span><span class="dv">1</span><span class="op">,</span> resname<span class="op">=</span><span class="st">&quot;name&quot;</span><span class="op">):</span> expr <span class="op">=</span> `Var<span class="op">(</span>varno<span class="op">=</span><span class="dv">1</span><span class="op">,</span> varattno<span class="op">=</span>name列的attnum<span class="op">,</span> vartype<span class="op">=</span>name列的类型<span class="op">)</span>`<span class="op">,</span> resjunk<span class="op">=</span><span class="kw">false</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> TE<span class="op">(</span>resno<span class="op">=</span><span class="dv">2</span><span class="op">,</span> resname<span class="op">=</span><span class="st">&quot;adjusted&quot;</span><span class="op">):</span> expr <span class="op">=</span> `OpExpr<span class="op">(</span><span class="st">&quot;*&quot;</span><span class="op">,</span> Var<span class="op">(</span><span class="dv">1</span><span class="op">,</span>salary<span class="op">),</span> Const<span class="op">(</span><span class="fl">1.1</span><span class="op">))</span>`<span class="op">,</span> resjunk<span class="op">=</span><span class="kw">false</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>Resjunk 列（`resjunk<span class="op">=</span>true`）是优化器在执行阶段需要的中间计算列，但不返回给客户端。例如 `ORDER BY salary` 如果 `salary` 不在 SELECT 列表中，Optimizer 可能会创建一个 junk TargetEntry 来计算 `salary`，供排序使用。</span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 六、实验：观察每一步的输出</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 6.1 启用 debug 输出</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>PG 提供了几个 developer<span class="op">-</span>level 的 GUC 参数，让你可以在不重新编译的情况下观察 parse tree 和 rewritten tree：</span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 输出 parse tree（Analyzer 处理之后的 Query Tree）</span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>SET debug_print_parse <span class="op">=</span> on<span class="op">;</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 输出 rewritten tree（Rewriter 处理之后的 Query Tree）</span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>SET debug_print_rewritten <span class="op">=</span> on<span class="op">;</span></span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 输出 planner 选择的 plan tree</span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a>SET debug_print_plan <span class="op">=</span> on<span class="op">;</span></span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 单次执行时开启（避免全局日志污染）</span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 配合 client_min_messages 使用</span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a>SET client_min_messages <span class="op">=</span> NOTICE<span class="op">;</span></span></code></pre></div>
+            <p>这些参数需要以超级用户身份设置，输出会发送到 server
+            log。</p>
+            <h3 id="观察-parse-tree">6.2 观察 parse tree</h3>
+            <p>创建实验表和视图：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> employees (</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span>      <span class="dt">int</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    name    text,</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    salary  <span class="dt">numeric</span>,</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    dept_id <span class="dt">int</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> employees <span class="kw">VALUES</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>    (<span class="dv">1</span>, <span class="st">&#39;Alice&#39;</span>, <span class="dv">120000</span>, <span class="dv">1</span>),</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>    (<span class="dv">2</span>, <span class="st">&#39;Bob&#39;</span>,   <span class="dv">85000</span>, <span class="dv">2</span>),</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>    (<span class="dv">3</span>, <span class="st">&#39;Charlie&#39;</span>, <span class="dv">95000</span>, <span class="dv">1</span>);</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">VIEW</span> high_salary <span class="kw">AS</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> name, salary <span class="kw">FROM</span> employees <span class="kw">WHERE</span> salary <span class="op">&gt;</span> <span class="dv">90000</span>;</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>在 psql 中执行（需要超级用户）：</span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> debug_print_parse <span class="op">=</span> <span class="kw">on</span>;</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> high_salary <span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">&#39;A%&#39;</span>;</span></code></pre></div>
+            <p>server log 中输出的 parse
+            tree（经删减，关键字段）大致为：</p>
+            <pre class="text"><code>QUERY:
+  commandType: CMD_SELECT
+  querySource: QSRC_ORIGINAL
+  rtable:
+    RTE[1]: rtekind=RTE_RELATION, relid=high_salary视图的OID, alias=high_salary
+  jointree:
+    FromExpr:
+      fromlist: [RangeTblRef(rtindex=1)]
+      quals: OpExpr(&quot;~~&quot;, Var(name列), Const(&#39;A%&#39;))   -- LIKE &#39;A%&#39;
+  targetList:
+    TargetEntry(resno=1, resname=&quot;name&quot;,   expr=Var(name列),   resjunk=false)
+    TargetEntry(resno=2, resname=&quot;salary&quot;, expr=Var(salary列), resjunk=false)
+```text
+
+此时视图还没有被展开——`RTE[1]` 的 `rtekind` 仍然是 `RTE_RELATION`，指向 `high_salary` 这个 `relkind=&#39;v&#39;` 的关系。
+
+### 6.3 观察 rewritten tree
+
+```sql
+-- 同时开启 parse 和 rewritten 输出
+SET debug_print_parse = on;
+SET debug_print_rewritten = on;
+
+SELECT * FROM high_salary WHERE name LIKE &#39;A%&#39;;</code></pre>
+            <p>server log 中在 parse tree 之后，会输出 rewritten
+            tree（经删减）：</p>
+            <pre class="text"><code>REWRITTEN QUERY:
+  commandType: CMD_SELECT
+  rtable:
+    RTE[1]: rtekind=RTE_SUBQUERY, alias=high_salary
+      subquery:
+        commandType: CMD_SELECT
+        rtable:
+          RTE[1]: rtekind=RTE_RELATION, relid=employees表OID
+        targetList:
+          TargetEntry(resjunk=false): Var(employees, name)
+          TargetEntry(resjunk=false): Var(employees, salary)
+        qual: OpExpr(&quot;&gt;&quot;, Var(employees, salary), Const(90000))
+  jointree:
+    FromExpr:
+      fromlist: [RangeTblRef(rtindex=1)]   -- 指向 RTE_SUBQUERY
+      quals: OpExpr(&quot;~~&quot;, Var(name列), Const(&#39;A%&#39;))
+  targetList:
+    TargetEntry: Var(varno=1, name), Var(varno=1, salary)
+```text
+
+可见视图被展开为一个 `RTE_SUBQUERY` 类型的 RTE，子查询中包含了 `where salary &gt; 90000` 的条件。外层查询的 `WHERE name LIKE &#39;A%&#39;` 保留在 `jointree.quals` 中。
+
+### 6.4 观察 INSERT 的规则触发
+
+PG 允许为表创建 DO INSTEAD 规则来拦截 INSERT，这对实现可更新视图很常见：
+
+```sql
+CREATE RULE insert_high_salary AS
+    ON INSERT TO high_salary
+    DO INSTEAD
+    INSERT INTO employees (name, salary, dept_id)
+    VALUES (NEW.name, NEW.salary, 99);
+
+SET debug_print_parse = on;
+SET debug_print_rewritten = on;
+
+INSERT INTO high_salary VALUES (&#39;Dave&#39;, 150000);</code></pre>
+            <p>rewritten tree 中会显示 <code>commandType</code> 从
+            <code>CMD_INSERT</code> 保持不变，但目标表变成了
+            <code>employees</code>，所有字段映射通过 <code>NEW</code>
+            伪关系完成。</p>
+            <h3 id="用-nodetostring-在代码中观察">6.5 用 nodeToString
+            在代码中观察</h3>
+            <p>如果你在阅读源码或使用 gdb，可以在关键时刻调用
+            <code>elog(NOTICE, "%s", nodeToString(node))</code>
+            来输出当前树的结构——这正是 <code>debug_print_parse</code>
+            等参数内部使用的机制。PG 的 <code>outfuncs.c</code>
+            为每种节点类型实现了序列化函数，输出格式是可读的 Lisp
+            风格树。</p>
+            <hr />
+            <h2 id="七关键要点">七、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>Parser
+            只做语法，不做语义</strong>。<code>gram.y</code> 将 SQL
+            字符串生成为 <code>RawStmt</code>
+            语法树，节点里只有字符串名称和字面量值，没有 OID
+            和类型信息。PG 通过 <code>%nonassoc IDENT</code>
+            规则允许关键字作为标识符使用，这是
+            <code>SELECT select FROM select</code>
+            合法化的原因。</p></li>
+            <li><p><strong>Analyzer
+            做名称解析、类型推导和权限检查</strong>。<code>parse_analyze()</code>
+            将 <code>RawStmt</code> 转换为
+            <code>Query</code>，核心工作包括：<code>RangeVarGetRelid()</code>
+            将表名字符串查为 relation OID，<code>colNameToVar()</code>
+            将列名映射到 <code>Var</code> 节点，<code>exprType()</code>
+            自底向上推导表达式类型，<code>pg_class_aclmask()</code>
+            在规划执行前就检查权限。</p></li>
+            <li><p><strong>Rewriter
+            负责规则触发和视图展开</strong>。视图的实质是
+            <code>_RETURN</code> 规则——<code>CREATE VIEW</code> 在
+            <code>pg_rewrite</code> 中插入一条
+            <code>is_instead=true</code>
+            的规则。<code>ApplyRetrieveRule()</code>
+            将规则动作（视图定义查询）展开为 <code>RTE_SUBQUERY</code>
+            类型的 RTE，并将原查询的 WHERE
+            条件合入展开后的查询树。</p></li>
+            <li><p><strong>Query
+            有三个核心骨架字段</strong>：<code>rtable</code>（Range
+            Table，查询涉及的所有关系列表，每个关系用
+            <code>RangeTblEntry</code>
+            描述）、<code>jointree</code>（Join
+            树，<code>FromExpr.fromlist</code> 描述 FROM 子句中的关系和
+            JOIN 结构，<code>FromExpr.quals</code> 描述 WHERE
+            条件）、<code>targetList</code>（目标列表，每个
+            <code>TargetEntry</code> 描述输出列表达式和别名）。</p></li>
+            <li><p><strong><code>debug_print_parse</code> 和
+            <code>debug_print_rewritten</code>
+            是观察查询编译过程的直接工具</strong>，不需要重新编译
+            PG。它们调用 <code>nodeToString()</code>
+            将内存中的节点树序列化为文本输出到 server log。这是理解
+            Planner 行为之前的第一手材料。</p></li>
+            </ol>
+            <p>下一章：<a
+            href="../10-statistics-cost/10-statistics-cost.html">查询规划器——统计信息与代价模型</a>，进入
+            <code>pg_statistic</code> 内部，理解 ANALYZE
+            如何收集统计信息，以及代价常量 <code>random_page_cost</code>
+            和 <code>seq_page_cost</code> 如何影响 Planner 的索引扫描 vs
+            顺序扫描决策。</p>
+            <p>上一章：<a
+            href="../08-vacuum-freezing/08-vacuum-freezing.html">VACUUM
+            与 Freezing</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/parser/parser.c</code>：<code>raw_parser()</code>
+            — 词法和语法分析的入口</li>
+            <li><code>src/backend/parser/gram.y</code>：Bison
+            语法规则，约 17000 行，定义所有 SQL 语句的语法结构</li>
+            <li><code>src/backend/parser/scan.l</code>：flex
+            词法规则，将 SQL 字符串切分为 token 流</li>
+            <li><code>src/backend/parser/analyze.c</code>：<code>parse_analyze()</code>、<code>transformTopLevelStmt()</code>
+            — 语义分析入口和分发</li>
+            <li><code>src/backend/parser/parse_clause.c</code>：<code>transformFromClause()</code>、<code>transformWhereClause()</code>
+            — FROM/WHERE 等子句的语义分析</li>
+            <li><code>src/backend/parser/parse_expr.c</code>：<code>transformExpr()</code>
+            — 表达式语义分析，类型推导</li>
+            <li><code>src/backend/parser/parse_relation.c</code>：名称解析，<code>addRangeTableEntry()</code>、<code>colNameToVar()</code></li>
+            <li><code>src/backend/parser/parse_target.c</code>：<code>transformTargetList()</code>
+            — SELECT 列表的语义分析</li>
+            <li><code>src/backend/rewrite/rewriteHandler.c</code>：<code>QueryRewrite()</code>、<code>ApplyRetrieveRule()</code>、<code>FireRIRrules()</code>
+            — 规则系统和视图展开</li>
+            <li><code>src/backend/rewrite/rewriteDefine.c</code>：<code>DefineRule()</code>
+            — <code>CREATE RULE</code> 的实现</li>
+            <li><code>src/backend/rewrite/rewriteManip.c</code>：查询树操作工具函数（增加/替换/删除条件等）</li>
+            <li><code>src/backend/catalog/namespace.c</code>：<code>RangeVarGetRelid()</code>
+            — 字符串表名到 OID 的查询</li>
+            <li><code>src/backend/catalog/aclchk.c</code>：<code>pg_class_aclmask()</code>
+            — 权限检查</li>
+            <li><code>src/backend/executor/execCheck.c</code>：<code>ExecCheckRTPerms()</code>
+            — RTE 权限检查</li>
+            <li><code>src/backend/tcop/postgres.c</code>：<code>exec_simple_query()</code>
+            — 查询执行的顶层调用链（展示了 Parser → Analyzer → Rewriter
+            → Planner → Executor 的完整调用顺序）</li>
+            <li><code>src/include/nodes/parsenodes.h</code>：<code>Query</code>、<code>RangeTblEntry</code>、<code>FromExpr</code>、<code>JoinExpr</code>、<code>TargetEntry</code>
+            等核心结构体定义</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 50: Overview of
+            PostgreSQL Internals — 第 50.1 节：SQL
+            查询语句的处理路径概述</li>
+            <li>PostgreSQL Documentation, Chapter 37: The Rule System —
+            规则系统的完整说明，包括 <code>_RETURN</code>
+            规则与视图的关系</li>
+            <li>PostgreSQL Documentation, Chapter 5.7: Privileges —
+            权限检查机制</li>
+            <li>PostgreSQL Documentation, Chapter 41: PL/pgSQL —
+            内部查询编译机制（<code>SPI_prepare</code> 调用相同的
+            Parser-Analyzer-Rewriter 路径）</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Chamberlin, D. D. et al. <em>A History and Evaluation of
+            System R</em>. CACM, 1981. — 查询编译流水线（Parser →
+            Semantic Analysis → Optimization）的学术起源</li>
+            <li>Stonebraker, M. &amp; Rowe, L. A. <em>The Design of
+            POSTGRES</em>. SIGMOD 1986. — POSTGRES
+            初始设计中规则系统的用意</li>
+            <li>Stonebraker, M. et al. <em>The Implementation of
+            POSTGRES</em>. IEEE Trans. on Knowledge and Data
+            Engineering, 1990. — 早期 POSTGRES 查询重写的实现方案</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html">【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性</a></h3>
+                    <p>在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/04-wal-internals/04-wal-internals.html">【PG 内核】WAL 内部机制：从事务提交到磁盘刷写</a></h3>
+                    <p>拆解 PostgreSQL WAL 的完整内部机制：XLogInsert() 从分段锁到 WAL Buffer 的插入路径、XLogRecord 的物理布局（Header + Block Headers + Data）、Checkpoint 的两阶段流程与 IO 摊平算法、REDO 恢复的 RMGR 分发、wal_level 三级差异的 WAL 记录对比。运维部分聚焦 checkpoint IO 风暴的根因与 checkpoint_completion_target 的调优陷阱、max_wal_size 设小导致 WAL 段疯狂切换的机制，以及用 pg_waldump 定位问题 WAL record 的实操方法。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

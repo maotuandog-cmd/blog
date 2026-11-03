@@ -1,0 +1,1999 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】索引结构：从 B+Tree 到倒排索引 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="index, btree, hash-index, inverted-index, bloom-filter, bitmap, r-tree, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/29-index-structures/index-structures.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】索引结构：从 B+Tree 到倒排索引" />
+    <meta property="og:description" content="数据库里存了一亿行数据，要找出 userid 42 的那一行。没有索引的做法是全表扫描（Full Table Scan）——从第一个数据页读到最后一个数据页，逐行比对。假设每个数据页 16 KB，一亿行占 20 GB，即使顺序读能跑到 500 MB/s，也需要 40 秒。加一个 B+Tree 索引，三次磁盘 I/O 就…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/29-index-structures/index-structures.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="index" />
+    <meta property="article:tag" content="btree" />
+    <meta property="article:tag" content="hash-index" />
+    <meta property="article:tag" content="inverted-index" />
+    <meta property="article:tag" content="bloom-filter" />
+    <meta property="article:tag" content="bitmap" />
+    <meta property="article:tag" content="r-tree" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】索引结构：从 B+Tree 到倒排索引" />
+    <meta name="twitter:description" content="数据库里存了一亿行数据，要找出 userid 42 的那一行。没有索引的做法是全表扫描（Full Table Scan）——从第一个数据页读到最后一个数据页，逐行比对。假设每个数据页 16 KB，一亿行占 20 GB，即使顺序读能跑到 500 MB/s，也需要 40 秒。加一个 B+Tree 索引，三次磁盘 I/O 就…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】索引结构：从 B+Tree 到倒排索引", "description": "数据库里存了一亿行数据，要找出 userid 42 的那一行。没有索引的做法是全表扫描（Full Table Scan）——从第一个数据页读到最后一个数据页，逐行比对。假设每个数据页 16 KB，一亿行占 20 GB，即使顺序读能跑到 500 MB/s，也需要 40 秒。加一个 B+Tree 索引，三次磁盘 I/O 就…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/29-index-structures/index-structures.html"}, "datePublished": "2025-09-07T00:00:00+00:00", "dateModified": "2026-04-15T11:20:56+00:00", "keywords": ["index", "btree", "hash-index", "inverted-index", "bloom-filter", "bitmap", "r-tree"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】索引结构：从 B+Tree 到倒排索引</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-07</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#index</span> <span>#btree</span> <span>#hash-index</span> <span>#inverted-index</span> <span>#bloom-filter</span> <span>#bitmap</span> <span>#r-tree</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/28-transaction-isolation/transaction-isolation.html">上一篇：【存储工程】事务隔离级别的存储实现</a><a class="post-series-nav__link" href="/post/storage/30-bitcask/bitcask.html">下一篇：【存储工程】Bitcask 与日志结构哈希表</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/index.html">#index</a><a class="chip-link" href="/tags/btree.html">#btree</a><a class="chip-link" href="/tags/hash-index.html">#hash-index</a><a class="chip-link" href="/tags/inverted-index.html">#inverted-index</a><a class="chip-link" href="/tags/bloom-filter.html">#bloom-filter</a><a class="chip-link" href="/tags/bitmap.html">#bitmap</a><a class="chip-link" href="/tags/r-tree.html">#r-tree</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一索引的本质"
+                id="toc-一索引的本质">一、索引的本质</a>
+                <ul>
+                <li><a href="#以空间和写入换读取速度"
+                id="toc-以空间和写入换读取速度">1.1
+                以空间和写入换读取速度</a></li>
+                <li><a href="#有序索引与无序索引"
+                id="toc-有序索引与无序索引">1.2
+                有序索引与无序索引</a></li>
+                <li><a href="#主索引与辅助索引"
+                id="toc-主索引与辅助索引">1.3 主索引与辅助索引</a></li>
+                <li><a href="#索引的代价模型"
+                id="toc-索引的代价模型">1.4 索引的代价模型</a></li>
+                </ul></li>
+                <li><a href="#二btree-索引"
+                id="toc-二btree-索引">二、B+Tree 索引</a>
+                <ul>
+                <li><a href="#btree-的结构" id="toc-btree-的结构">2.1
+                B+Tree 的结构</a></li>
+                <li><a href="#btree-的操作" id="toc-btree-的操作">2.2
+                B+Tree 的操作</a></li>
+                <li><a href="#聚簇索引与非聚簇索引"
+                id="toc-聚簇索引与非聚簇索引">2.3
+                聚簇索引与非聚簇索引</a></li>
+                <li><a href="#覆盖索引与索引覆盖扫描"
+                id="toc-覆盖索引与索引覆盖扫描">2.4
+                覆盖索引与索引覆盖扫描</a></li>
+                <li><a href="#btree-索引的局限性"
+                id="toc-btree-索引的局限性">2.5 B+Tree
+                索引的局限性</a></li>
+                </ul></li>
+                <li><a href="#三hash-索引" id="toc-三hash-索引">三、Hash
+                索引</a>
+                <ul>
+                <li><a href="#哈希索引的原理"
+                id="toc-哈希索引的原理">3.1 哈希索引的原理</a></li>
+                <li><a href="#哈希索引的适用场景"
+                id="toc-哈希索引的适用场景">3.2
+                哈希索引的适用场景</a></li>
+                <li><a href="#mysql-中的-hash-索引"
+                id="toc-mysql-中的-hash-索引">3.3 MySQL 中的 Hash
+                索引</a></li>
+                <li><a href="#一致性哈希与分布式索引"
+                id="toc-一致性哈希与分布式索引">3.4
+                一致性哈希与分布式索引</a></li>
+                </ul></li>
+                <li><a href="#四倒排索引inverted-index"
+                id="toc-四倒排索引inverted-index">四、倒排索引（Inverted
+                Index）</a>
+                <ul>
+                <li><a href="#为什么需要倒排索引"
+                id="toc-为什么需要倒排索引">4.1
+                为什么需要倒排索引</a></li>
+                <li><a href="#倒排索引的结构"
+                id="toc-倒排索引的结构">4.2 倒排索引的结构</a></li>
+                <li><a href="#倒排索引的构建流程"
+                id="toc-倒排索引的构建流程">4.3
+                倒排索引的构建流程</a></li>
+                <li><a href="#elasticsearch-与-lucene-的倒排索引实现"
+                id="toc-elasticsearch-与-lucene-的倒排索引实现">4.4
+                Elasticsearch 与 Lucene 的倒排索引实现</a></li>
+                <li><a href="#倒排索引的性能特征"
+                id="toc-倒排索引的性能特征">4.5
+                倒排索引的性能特征</a></li>
+                <li><a href="#mysql-中的全文索引"
+                id="toc-mysql-中的全文索引">4.6 MySQL
+                中的全文索引</a></li>
+                </ul></li>
+                <li><a href="#五bitmap-索引"
+                id="toc-五bitmap-索引">五、Bitmap 索引</a>
+                <ul>
+                <li><a href="#bitmap-索引的原理"
+                id="toc-bitmap-索引的原理">5.1 Bitmap
+                索引的原理</a></li>
+                <li><a href="#位运算实现多条件过滤"
+                id="toc-位运算实现多条件过滤">5.2
+                位运算实现多条件过滤</a></li>
+                <li><a href="#bitmap-索引的适用场景"
+                id="toc-bitmap-索引的适用场景">5.3 Bitmap
+                索引的适用场景</a></li>
+                <li><a href="#bitmap-索引的压缩"
+                id="toc-bitmap-索引的压缩">5.4 Bitmap
+                索引的压缩</a></li>
+                <li><a href="#oracle-与-bitmap-索引"
+                id="toc-oracle-与-bitmap-索引">5.5 Oracle 与 Bitmap
+                索引</a></li>
+                </ul></li>
+                <li><a href="#六空间索引r-tree"
+                id="toc-六空间索引r-tree">六、空间索引：R-Tree</a>
+                <ul>
+                <li><a href="#空间数据的索引挑战"
+                id="toc-空间数据的索引挑战">6.1
+                空间数据的索引挑战</a></li>
+                <li><a href="#r-tree-的结构" id="toc-r-tree-的结构">6.2
+                R-Tree 的结构</a></li>
+                <li><a href="#r-tree-操作的复杂度"
+                id="toc-r-tree-操作的复杂度">6.3 R-Tree
+                操作的复杂度</a></li>
+                <li><a href="#postgis-中的空间索引"
+                id="toc-postgis-中的空间索引">6.4 PostGIS
+                中的空间索引</a></li>
+                <li><a href="#mongodb-地理空间索引"
+                id="toc-mongodb-地理空间索引">6.5 MongoDB
+                地理空间索引</a></li>
+                </ul></li>
+                <li><a href="#七bloom-filter"
+                id="toc-七bloom-filter">七、Bloom Filter</a>
+                <ul>
+                <li><a href="#布隆过滤器的原理"
+                id="toc-布隆过滤器的原理">7.1 布隆过滤器的原理</a></li>
+                <li><a href="#假阳性率的数学分析"
+                id="toc-假阳性率的数学分析">7.2
+                假阳性率的数学分析</a></li>
+                <li><a href="#bloom-filter-在-lsm-tree-中的应用"
+                id="toc-bloom-filter-在-lsm-tree-中的应用">7.3 Bloom
+                Filter 在 LSM-Tree 中的应用</a></li>
+                <li><a href="#bloom-filter-的变体"
+                id="toc-bloom-filter-的变体">7.4 Bloom Filter
+                的变体</a></li>
+                </ul></li>
+                <li><a href="#八列存索引与-zone-maps"
+                id="toc-八列存索引与-zone-maps">八、列存索引与 Zone
+                Maps</a>
+                <ul>
+                <li><a href="#列式存储中的索引思路"
+                id="toc-列式存储中的索引思路">8.1
+                列式存储中的索引思路</a></li>
+                <li><a href="#zone-map-的原理"
+                id="toc-zone-map-的原理">8.2 Zone Map 的原理</a></li>
+                <li><a href="#parquet-与-orc-的索引机制"
+                id="toc-parquet-与-orc-的索引机制">8.3 Parquet 与 ORC
+                的索引机制</a></li>
+                <li><a
+                href="#clickhouse-的主键索引与-data-skipping-索引"
+                id="toc-clickhouse-的主键索引与-data-skipping-索引">8.4
+                ClickHouse 的主键索引与 Data Skipping 索引</a></li>
+                <li><a href="#数据排序对-zone-map-效果的影响"
+                id="toc-数据排序对-zone-map-效果的影响">8.5 数据排序对
+                Zone Map 效果的影响</a></li>
+                </ul></li>
+                <li><a href="#九索引设计最佳实践"
+                id="toc-九索引设计最佳实践">九、索引设计最佳实践</a>
+                <ul>
+                <li><a href="#复合索引的列顺序"
+                id="toc-复合索引的列顺序">9.1 复合索引的列顺序</a></li>
+                <li><a href="#选择性分析" id="toc-选择性分析">9.2
+                选择性分析</a></li>
+                <li><a href="#索引合并与交叉"
+                id="toc-索引合并与交叉">9.3 索引合并与交叉</a></li>
+                <li><a href="#explain-分析方法论"
+                id="toc-explain-分析方法论">9.4 EXPLAIN
+                分析方法论</a></li>
+                <li><a href="#何时不该建索引"
+                id="toc-何时不该建索引">9.5 何时不该建索引</a></li>
+                </ul></li>
+                <li><a href="#十mysql-索引实战"
+                id="toc-十mysql-索引实战">十、MySQL 索引实战</a>
+                <ul>
+                <li><a href="#explain-输出详解"
+                id="toc-explain-输出详解">10.1 EXPLAIN 输出详解</a></li>
+                <li><a href="#index-merge" id="toc-index-merge">10.2
+                Index Merge</a></li>
+                <li><a href="#索引条件下推index-condition-pushdown"
+                id="toc-索引条件下推index-condition-pushdown">10.3
+                索引条件下推（Index Condition Pushdown）</a></li>
+                <li><a href="#不可见索引invisible-indexes"
+                id="toc-不可见索引invisible-indexes">10.4
+                不可见索引（Invisible Indexes）</a></li>
+                <li><a href="#索引监控与维护"
+                id="toc-索引监控与维护">10.5 索引监控与维护</a></li>
+                <li><a href="#常见索引陷阱" id="toc-常见索引陷阱">10.6
+                常见索引陷阱</a></li>
+                </ul></li>
+                <li><a href="#参考文献"
+                id="toc-参考文献">参考文献</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>数据库里存了一亿行数据，要找出 <code>user_id = 42</code>
+            的那一行。没有索引的做法是全表扫描（Full Table
+            Scan）——从第一个数据页读到最后一个数据页，逐行比对。假设每个数据页
+            16 KB，一亿行占 20 GB，即使顺序读能跑到 500 MB/s，也需要 40
+            秒。加一个 B+Tree 索引，三次磁盘 I/O 就能定位到目标行——从 40
+            秒到 3 毫秒，四个数量级的差距。</p>
+            <p>索引是存储引擎里最核心的数据结构。它决定了查询能不能用上快速路径，决定了写入时需要付出多少额外代价，决定了存储空间的膨胀程度。不同的索引结构解决不同类型的查询问题：B+Tree
+            擅长范围扫描，Hash
+            索引擅长点查，倒排索引擅长全文检索，Bitmap
+            索引擅长低基数列的多条件过滤，R-Tree 擅长空间查询，Bloom
+            Filter 擅长快速判断”不存在”。</p>
+            <p>本文从索引的本质出发，逐一拆解七种核心索引结构的设计原理、适用场景与工程实现，最后落到
+            MySQL 索引实战。所有 SQL 示例基于 MySQL 8.0（InnoDB
+            存储引擎），部分内容涉及 PostgreSQL、Elasticsearch 和
+            ClickHouse。</p>
+            <hr />
+            <h2 id="一索引的本质">一、索引的本质</h2>
+            <h3 id="以空间和写入换读取速度">1.1
+            以空间和写入换读取速度</h3>
+            <p>索引的核心思想可以用一句话概括：<strong>用额外的存储空间和写入开销，换取读取速度的提升</strong>。这是一个经典的工程权衡（Trade-off）。</p>
+            <p>没有索引时，存储引擎只能做全表扫描。数据按插入顺序（或按主键顺序）存放在数据页中，查询时必须遍历所有数据页。时间复杂度是
+            O(N)，其中 N 是数据行数。</p>
+            <p>加上索引后，存储引擎在原始数据之外维护一份额外的数据结构。这份数据结构按照某种规则对数据进行排序或分类，使得查询时可以快速定位到目标数据，而不需要遍历所有数据。代价有两个：</p>
+            <ol type="1">
+            <li><strong>空间代价</strong>：索引本身占用磁盘空间。一个包含索引键和指针的
+            B+Tree 索引，通常占原始数据的 10%–30%。</li>
+            <li><strong>写入代价</strong>：每次插入（INSERT）、更新（UPDATE）、删除（DELETE）操作，除了修改原始数据，还需要同步维护索引结构。对于
+            B+Tree，这意味着可能触发节点分裂（Split）或合并（Merge）。</li>
+            </ol>
+            <p>用公式表达这个权衡：</p>
+            <pre class="text"><code>读取性能提升 = f(索引结构效率, 数据分布, 查询模式)
+写入性能下降 = g(索引数量, 索引结构维护成本)
+空间膨胀     = h(索引键大小, 索引结构开销)</code></pre>
+            <p>在实际系统中，一张表上通常有 3–5
+            个索引。每多一个索引，写入时就多一份维护开销。索引不是越多越好——过多的索引会让写入变慢，占用更多内存，还会让优化器（Optimizer）的选择变得更复杂。</p>
+            <h3 id="有序索引与无序索引">1.2 有序索引与无序索引</h3>
+            <p>按照索引键的组织方式，索引可以分为两大类：</p>
+            <p><strong>有序索引（Ordered
+            Index）</strong>：索引键按照某种顺序排列。典型代表是 B+Tree
+            索引。有序索引支持等值查询（Point Query）、范围查询（Range
+            Query）和排序操作（ORDER
+            BY）。因为键是有序的，所以可以高效地执行
+            <code>WHERE age BETWEEN 20 AND 30</code>
+            这样的范围查询。</p>
+            <p><strong>无序索引（Unordered
+            Index）</strong>：索引键没有按照值的大小排列，而是通过某种映射函数（通常是哈希函数）定位数据。典型代表是
+            Hash
+            索引。无序索引只支持等值查询，不支持范围查询和排序。但对于等值查询，它可以做到
+            O(1) 的时间复杂度，比 B+Tree 的 O(log N) 更快。</p>
+            <p>两者的对比：</p>
+            <pre class="text"><code>┌──────────────┬──────────────────┬──────────────────┐
+│ 特性         │ 有序索引（B+Tree）│ 无序索引（Hash） │
+├──────────────┼──────────────────┼──────────────────┤
+│ 等值查询     │ O(log N)         │ O(1)             │
+│ 范围查询     │ ✓（高效）        │ ✗（不支持）      │
+│ 排序         │ ✓（天然有序）    │ ✗（无序）        │
+│ 前缀匹配     │ ✓（最左前缀）    │ ✗                │
+│ 空间占用     │ 较大             │ 较小             │
+│ 写入开销     │ 节点分裂/合并    │ 哈希桶扩展       │
+└──────────────┴──────────────────┴──────────────────┘</code></pre>
+            <h3 id="主索引与辅助索引">1.3 主索引与辅助索引</h3>
+            <p>按照索引与数据行的关系，索引可以分为：</p>
+            <p><strong>主索引（Primary
+            Index）</strong>：也叫聚簇索引（Clustered
+            Index）。数据行按照主索引的键顺序物理存储。在 InnoDB
+            中，主键索引就是聚簇索引，B+Tree
+            的叶子节点直接存储完整的数据行。一张表只能有一个聚簇索引，因为数据只能按一种顺序物理排列。</p>
+            <p><strong>辅助索引（Secondary
+            Index）</strong>：也叫非聚簇索引（Non-Clustered
+            Index）或二级索引。辅助索引的叶子节点存储的不是完整的数据行，而是主键值（在
+            InnoDB 中）或行指针（Row
+            Pointer，在其他存储引擎中）。通过辅助索引查找数据时，需要先在辅助索引中找到主键值，再回到主索引中查找完整的数据行——这个过程叫做回表（Bookmark
+            Lookup / Table Access by Index ROWID）。</p>
+            <pre class="text"><code>辅助索引查找流程：
+                    辅助索引 B+Tree
+                  ┌───────────────────┐
+  WHERE name=&#39;张三&#39; │  查找 name=&#39;张三&#39;   │
+                  │  → 得到 PK=42      │
+                  └───────┬───────────┘
+                          │ 回表
+                          ▼
+                    主键索引 B+Tree
+                  ┌───────────────────┐
+                  │  查找 PK=42        │
+                  │  → 得到完整数据行  │
+                  └───────────────────┘</code></pre>
+            <p>回表是有代价的。如果一次查询需要通过辅助索引找到 1000
+            个主键值，然后逐一回表查找完整数据行，那就意味着额外的 1000
+            次随机 I/O。这也是为什么覆盖索引（Covering
+            Index）那么重要——如果辅助索引中已经包含了查询需要的所有列，就不需要回表，直接从辅助索引返回结果即可。</p>
+            <h3 id="索引的代价模型">1.4 索引的代价模型</h3>
+            <p>在理解具体索引结构之前，先建立一个简单的代价模型。假设数据存储在磁盘上，每次磁盘
+            I/O 读取一个数据页（Page），页大小为 B 字节。</p>
+            <p>对于一张包含 N 行数据、每行 R 字节的表：</p>
+            <pre class="text"><code>数据页数      = ⌈N × R / B⌉
+全表扫描代价  = 数据页数 × 每次 I/O 时间
+
+B+Tree 索引查找代价：
+  树高度 h    ≈ ⌈log_f(N)⌉  （f 为扇出系数，通常 100–1000）
+  点查代价    = h × 每次 I/O 时间  （通常 2–4 次 I/O）
+  范围查代价  = h × 每次 I/O 时间 + 扫描叶子页数 × 每次 I/O 时间</code></pre>
+            <p>以 InnoDB 为例，页大小 16 KB，主键为 8 字节
+            BIGINT，每个指针 6
+            字节。每个内部节点能容纳的键数（扇出系数）约为：</p>
+            <pre class="text"><code>f = 16384 / (8 + 6) ≈ 1170</code></pre>
+            <p>三层 B+Tree 能索引的行数：1170³ ≈ 16
+            亿行。这意味着对于绝大多数业务表，B+Tree 的高度不超过 3–4
+            层，每次点查只需要 3–4 次 I/O。</p>
+            <hr />
+            <h2 id="二btree-索引">二、B+Tree 索引</h2>
+            <h3 id="btree-的结构">2.1 B+Tree 的结构</h3>
+            <p>B+Tree 是 B-Tree（Balanced
+            Tree，平衡树）的变体，是关系数据库中最广泛使用的索引结构。几乎所有主流关系数据库——MySQL（InnoDB）、PostgreSQL、Oracle、SQL
+            Server——都使用 B+Tree 作为默认索引结构。</p>
+            <p>B+Tree 与 B-Tree 的关键区别在于：</p>
+            <ol type="1">
+            <li><strong>数据只存在叶子节点</strong>：B-Tree
+            的内部节点和叶子节点都存储数据，B+Tree
+            的内部节点只存储键和子节点指针，数据全部存储在叶子节点。这使得内部节点可以容纳更多的键，降低树的高度。</li>
+            <li><strong>叶子节点形成有序链表</strong>：B+Tree
+            的叶子节点通过双向指针串联成一个有序双向链表。范围查询时，只需要找到起始叶子节点，然后沿着链表顺序扫描，不需要回溯到父节点。</li>
+            </ol>
+            <pre class="text"><code>B+Tree 结构示意图：
+
+         [内部节点]  ← 只存键和指针
+        /     |     \
+   [内部]   [内部]   [内部]  ← 只存键和指针
+   / | \   / | \   / | \
+  [叶] [叶] [叶] [叶] [叶] [叶]  ← 存键和数据
+   ↔    ↔    ↔    ↔    ↔         ← 叶子节点双向链表</code></pre>
+            <h3 id="btree-的操作">2.2 B+Tree 的操作</h3>
+            <p><strong>查找（Search）</strong>：从根节点开始，在每个内部节点中通过二分查找确定应该访问的子节点，逐层向下，直到到达叶子节点。在叶子节点中再次二分查找，找到目标键。时间复杂度
+            O(log_f N)，其中 f 是扇出系数。</p>
+            <p><strong>插入（Insert）</strong>：先查找到应该插入的叶子节点。如果叶子节点还有空间，直接插入。如果叶子节点已满，触发节点分裂——把叶子节点一分为二，中间键提升到父节点。如果父节点也满了，继续向上分裂，最坏情况下一直分裂到根节点，树高度增加一层。</p>
+            <p><strong>删除（Delete）</strong>：先查找到目标叶子节点并删除。如果叶子节点的键数低于最小填充因子（通常是半满），尝试从相邻兄弟节点借一个键。如果兄弟节点也没有多余的键，则合并两个节点。合并可能导致父节点中的键减少，向上传播，最坏情况下树高度降低一层。</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- InnoDB 中 B+Tree 的页结构</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 每个页 16 KB，包含以下部分：</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- File Header (38 bytes) : 页号、前后页指针、页类型</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- Page Header (56 bytes) : 记录数、空闲空间指针、页层级</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- Infimum + Supremum (26 bytes) : 虚拟最小/最大记录</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- User Records : 实际数据记录，按主键有序排列</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- Free Space : 空闲区域</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- Page Directory : 稀疏目录，用于页内二分查找</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- File Trailer (8 bytes) : 校验和，用于检测页损坏</span></span></code></pre></div>
+            <h3 id="聚簇索引与非聚簇索引">2.3 聚簇索引与非聚簇索引</h3>
+            <p>在 InnoDB 中，主键索引是聚簇索引（Clustered
+            Index）。数据行按照主键顺序存储在 B+Tree
+            的叶子节点中。如果没有显式定义主键，InnoDB
+            会选择第一个唯一非空索引作为聚簇索引；如果连这个也没有，InnoDB
+            会隐式创建一个 6 字节的 ROW_ID 作为聚簇索引。</p>
+            <p>聚簇索引的优势：</p>
+            <ol type="1">
+            <li><strong>范围查询高效</strong>：按主键范围查询时，数据物理上是连续存储的，可以利用顺序
+            I/O。</li>
+            <li><strong>覆盖查询</strong>：主键查询不需要回表，因为叶子节点就是数据本身。</li>
+            <li><strong>排序免排序</strong>：按主键 ORDER BY
+            时，数据天然有序，不需要额外排序。</li>
+            </ol>
+            <p>聚簇索引的劣势：</p>
+            <ol type="1">
+            <li><strong>插入顺序敏感</strong>：如果主键不是自增的（比如
+            UUID），插入时会导致大量随机 I/O 和页分裂。</li>
+            <li><strong>辅助索引更大</strong>：辅助索引的叶子节点存储的是主键值而非行指针，如果主键很大（比如
+            36 字节的 UUID），每个辅助索引都要多存这些字节。</li>
+            <li><strong>更新主键代价高</strong>：更新主键意味着数据行需要移动到新的物理位置。</li>
+            </ol>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 自增主键 vs UUID 主键的插入性能对比</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 测试表结构</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t_autoincrement (</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> BIGINT AUTO_INCREMENT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">data</span> <span class="dt">VARCHAR</span>(<span class="dv">200</span>),</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    created_at DATETIME <span class="kw">DEFAULT</span> <span class="fu">CURRENT_TIMESTAMP</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>InnoDB;</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t_uuid (</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> <span class="dt">CHAR</span>(<span class="dv">36</span>) <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,  <span class="co">-- UUID 作为主键</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">data</span> <span class="dt">VARCHAR</span>(<span class="dv">200</span>),</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    created_at DATETIME <span class="kw">DEFAULT</span> <span class="fu">CURRENT_TIMESTAMP</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>InnoDB;</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 插入 100 万行：</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- t_autoincrement: ~12 秒（顺序写入，几乎无页分裂）</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- t_uuid:          ~45 秒（随机写入，大量页分裂）</span></span></code></pre></div>
+            <h3 id="覆盖索引与索引覆盖扫描">2.4
+            覆盖索引与索引覆盖扫描</h3>
+            <p>覆盖索引（Covering
+            Index）是指一个索引包含了查询需要的所有列，查询可以完全通过索引返回结果，不需要回表访问数据行。MySQL
+            的 EXPLAIN 输出中，如果 Extra 列显示
+            <code>Using index</code>，就说明使用了索引覆盖扫描（Index-Only
+            Scan）。</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 示例：订单表</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    order_id BIGINT AUTO_INCREMENT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    user_id BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    product_id BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    amount <span class="dt">DECIMAL</span>(<span class="dv">10</span>, <span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    status TINYINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    created_at DATETIME <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_user_status_amount (user_id, status, amount)</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>InnoDB;</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询 1：覆盖索引，不需要回表</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- idx_user_status_amount 包含了 user_id, status, amount 三列</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> user_id, status, amount</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1001</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: Using index  ← 索引覆盖扫描</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询 2：需要回表，因为 SELECT 了 created_at，不在索引中</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> user_id, status, amount, created_at</span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1001</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: NULL  ← 需要回表</span></span></code></pre></div>
+            <p>覆盖索引的收益在高并发场景下尤为显著。回表意味着随机
+            I/O，而索引覆盖扫描只需要顺序扫描索引页。对于热点查询，一个精心设计的覆盖索引可以把查询延迟从毫秒级降到微秒级。</p>
+            <h3 id="btree-索引的局限性">2.5 B+Tree 索引的局限性</h3>
+            <p>B+Tree 并非万能。以下场景中 B+Tree 表现不佳：</p>
+            <ol type="1">
+            <li><strong>全文搜索</strong>：在文章内容中搜索一个关键词，B+Tree
+            无能为力。需要倒排索引。</li>
+            <li><strong>高维空间查询</strong>：查找某个经纬度附近的餐厅，B+Tree
+            只能沿一个维度排序。需要 R-Tree。</li>
+            <li><strong>低基数列过滤</strong>：性别列只有两个值，B+Tree
+            索引的选择性太低，扫描半张表还不如全表扫描。需要 Bitmap
+            索引。</li>
+            <li><strong>存在性判断</strong>：判断一个 key
+            是否存在，B+Tree 需要 O(log N) 次 I/O。Bloom Filter 可以用
+            O(1) 做概率性判断。</li>
+            <li><strong>极高写入吞吐</strong>：B+Tree
+            的随机写入和页分裂限制了写入吞吐。LSM-Tree（Log-Structured
+            Merge-Tree）通过顺序写和延迟合并优化写入性能。</li>
+            </ol>
+            <hr />
+            <h2 id="三hash-索引">三、Hash 索引</h2>
+            <h3 id="哈希索引的原理">3.1 哈希索引的原理</h3>
+            <p>哈希索引（Hash Index）基于哈希表（Hash
+            Table）实现。核心思想很简单：对索引键应用一个哈希函数（Hash
+            Function），计算出一个哈希值（Hash
+            Value），用这个哈希值直接定位到数据的存储位置。</p>
+            <pre class="text"><code>哈希索引的结构：
+
+  索引键 key
+     ↓
+  hash(key)  →  桶编号（Bucket Number）
+     ↓
+  [Bucket 0] → [entry] → [entry] → NULL
+  [Bucket 1] → [entry] → NULL
+  [Bucket 2] → [entry] → [entry] → [entry] → NULL
+  ...
+  [Bucket N] → NULL
+
+  每个 entry 包含：(key, value/pointer)</code></pre>
+            <p>理想情况下，哈希函数能把键均匀地分布到各个桶中，每个桶只有一个或少量条目，查找时间复杂度为
+            O(1)。但如果发生哈希冲突（Hash
+            Collision）——多个键映射到同一个桶——就需要在桶内遍历链表或使用开放寻址法（Open
+            Addressing）解决冲突。</p>
+            <h3 id="哈希索引的适用场景">3.2 哈希索引的适用场景</h3>
+            <p>哈希索引只适用于等值查询（Equality Query），即
+            <code>WHERE key = value</code>
+            形式的查询。对于以下操作，哈希索引无法提供任何帮助：</p>
+            <ul>
+            <li>范围查询：<code>WHERE key &gt; 100 AND key &lt; 200</code></li>
+            <li>排序：<code>ORDER BY key</code></li>
+            <li>前缀匹配：<code>WHERE key LIKE 'abc%'</code></li>
+            <li>部分键查询：复合哈希索引无法只使用前几列</li>
+            </ul>
+            <p>原因很简单：哈希函数打乱了键的自然顺序。<code>hash('abc')</code>
+            和 <code>hash('abd')</code> 之间没有任何顺序关系。</p>
+            <h3 id="mysql-中的-hash-索引">3.3 MySQL 中的 Hash 索引</h3>
+            <p><strong>MEMORY 引擎的显式 Hash 索引</strong>：</p>
+            <p>MySQL 的 MEMORY 存储引擎（也叫 HEAP 引擎）原生支持 Hash
+            索引，而且 Hash 索引是 MEMORY 引擎的默认索引类型。</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- MEMORY 引擎创建 Hash 索引</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> session_cache (</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    session_id <span class="dt">CHAR</span>(<span class="dv">32</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    user_id BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">data</span> TEXT,</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    expire_at DATETIME <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">PRIMARY</span> <span class="kw">KEY</span> <span class="kw">USING</span> <span class="kw">HASH</span> (session_id),  <span class="co">-- 显式指定 Hash 索引</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_user <span class="kw">USING</span> <span class="kw">HASH</span> (user_id)</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>MEMORY;</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 等值查询：O(1) 复杂度</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> session_cache <span class="kw">WHERE</span> session_id <span class="op">=</span> <span class="st">&#39;abc123def456&#39;</span>;</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 范围查询：无法使用 Hash 索引，全表扫描</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> session_cache <span class="kw">WHERE</span> expire_at <span class="op">&lt;</span> NOW();</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 解决办法：为 expire_at 创建 BTREE 索引</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> session_cache <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_expire <span class="kw">USING</span> BTREE (expire_at);</span></code></pre></div>
+            <p>MEMORY
+            引擎的局限性很明显：数据全部存储在内存中，服务器重启后数据丢失；不支持
+            TEXT 和 BLOB 类型的索引；表级锁（Table
+            Lock）限制了并发性能。在生产环境中，MEMORY
+            引擎通常只用于临时表和会话级缓存。</p>
+            <p><strong>InnoDB 的自适应哈希索引（Adaptive Hash
+            Index）</strong>：</p>
+            <p>InnoDB 没有显式的 Hash
+            索引类型，但它有一个自适应哈希索引（Adaptive Hash
+            Index，AHI）机制。InnoDB 在运行时监控 B+Tree
+            索引的访问模式，如果发现某些索引页被频繁访问、且访问模式符合等值查询特征，就会自动在内存中为这些页构建一个哈希索引，加速后续的等值查询。</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看自适应哈希索引的状态</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在 SEMAPHORES 和 INSERT BUFFER AND ADAPTIVE HASH INDEX 段可以看到 AHI 信息</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- AHI 的配置</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;innodb_adaptive_hash_index&#39;</span>;</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 默认开启：ON</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;innodb_adaptive_hash_index_parts&#39;</span>;</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 默认值：8（将 AHI 分为 8 个分区，减少锁争用）</span></span></code></pre></div>
+            <p>AHI 的特点：</p>
+            <ol type="1">
+            <li><strong>全自动</strong>：无需用户干预，InnoDB
+            自动决定是否构建和销毁 AHI。</li>
+            <li><strong>内存中</strong>：AHI 只存在于 Buffer Pool
+            内存中，不持久化到磁盘。</li>
+            <li><strong>部分索引</strong>：AHI
+            不覆盖所有索引，只覆盖被频繁等值查询的热点索引页。</li>
+            <li><strong>有争议</strong>：在高并发场景下，AHI
+            的内部锁（btr_search_latch）可能成为瓶颈。MySQL 8.0 将 AHI
+            分为多个分区以缓解这个问题，但仍有部分场景建议关闭
+            AHI。</li>
+            </ol>
+            <h3 id="一致性哈希与分布式索引">3.4
+            一致性哈希与分布式索引</h3>
+            <p>在分布式存储系统中，一致性哈希（Consistent
+            Hashing）是一种常用的数据分片策略。它不是传统意义上的”索引”，但其核心思想——通过哈希函数将键映射到节点——与哈希索引一脉相承。</p>
+            <pre class="text"><code>一致性哈希环：
+
+        Node A
+       /      \
+  hash=0     hash=2^32
+      |        |
+  Node D    Node B
+       \      /
+        Node C
+
+  key1 → hash(key1) → 顺时针找到最近的节点 → Node B
+  key2 → hash(key2) → 顺时针找到最近的节点 → Node C</code></pre>
+            <p>当增加或删除节点时，一致性哈希只需要重新分配一小部分键，而不是全部重新哈希。这个特性使得一致性哈希在
+            Cassandra、DynamoDB、Memcached
+            等分布式系统中被广泛使用。</p>
+            <hr />
+            <h2 id="四倒排索引inverted-index">四、倒排索引（Inverted
+            Index）</h2>
+            <h3 id="为什么需要倒排索引">4.1 为什么需要倒排索引</h3>
+            <p>考虑一个典型的全文搜索场景：在一个包含 100
+            万篇文章的数据库中，搜索包含”分布式事务”的文章。</p>
+            <p>用 B+Tree 索引无法高效解决这个问题。B+Tree
+            索引是基于列值的前缀匹配，<code>LIKE '%分布式事务%'</code>
+            这种包含前导通配符的查询，B+Tree
+            索引完全用不上，只能全表扫描。即使没有前导通配符，<code>LIKE '分布式事务%'</code>
+            只能匹配列值以”分布式事务”开头的行，无法匹配”浅谈分布式事务的实现”。</p>
+            <p>倒排索引（Inverted
+            Index）的思想是<strong>反转索引方向</strong>：不是从文档到词语，而是从词语到文档。</p>
+            <h3 id="倒排索引的结构">4.2 倒排索引的结构</h3>
+            <p>倒排索引由两部分组成：</p>
+            <p><strong>词项字典（Term
+            Dictionary）</strong>：所有出现过的词语（Term）的有序列表。通常用
+            B+Tree、有限状态转换器（FST，Finite State Transducer）或
+            Trie 树实现，支持快速查找某个词项。</p>
+            <p><strong>倒排列表（Posting
+            List）</strong>：每个词项对应一个文档列表，记录哪些文档包含了这个词项。每个条目通常包含文档
+            ID（Document ID）、词频（Term
+            Frequency）和位置信息（Position）。</p>
+            <pre class="text"><code>倒排索引结构示意：
+
+词项字典          倒排列表
+────────          ─────────────────────────────
+&quot;分布式&quot;    →    [doc1:2, doc3:1, doc7:3]
+&quot;事务&quot;      →    [doc1:1, doc2:4, doc3:2, doc5:1]
+&quot;隔离级别&quot;  →    [doc2:2, doc5:3]
+&quot;索引&quot;      →    [doc4:5, doc6:1, doc7:2]
+&quot;B+Tree&quot;    →    [doc4:3, doc6:2]
+
+其中 docN:M 表示词项出现在文档 N 中，出现了 M 次。
+
+搜索&quot;分布式事务&quot;：
+  1. 查找&quot;分布式&quot;的倒排列表：{doc1, doc3, doc7}
+  2. 查找&quot;事务&quot;的倒排列表：{doc1, doc2, doc3, doc5}
+  3. 取交集：{doc1, doc3}
+  4. 按相关性评分排序返回</code></pre>
+            <h3 id="倒排索引的构建流程">4.3 倒排索引的构建流程</h3>
+            <p>从原始文本到倒排索引，需要经过以下处理步骤：</p>
+            <ol type="1">
+            <li><strong>分词（Tokenization）</strong>：将文本拆分为词语。英文按空格和标点分词；中文需要使用分词器（如
+            jieba、IK Analyzer）进行词语切分。</li>
+            <li><strong>词项归一化（Normalization）</strong>：统一大小写、去除标点、词干提取（Stemming，如
+            running → run）、同义词映射。</li>
+            <li><strong>构建倒排列表</strong>：遍历所有文档，为每个词项记录出现的文档
+            ID、位置和频率。</li>
+            <li><strong>压缩存储</strong>：对倒排列表中的文档 ID
+            列表进行差值编码（Delta
+            Encoding）和变长编码（Variable-Length
+            Encoding），减少存储空间。</li>
+            </ol>
+            <pre class="text"><code>差值编码示例：
+
+原始文档 ID 列表：  [1, 5, 12, 17, 25, 100, 108]
+差值编码后：        [1, 4, 7, 5, 8, 75, 8]
+                     ↑  ↑  ↑  ↑  ↑   ↑  ↑
+                    原值 差 差 差 差   差  差
+
+差值通常较小，可以用更少的字节存储。
+配合变长编码（VByte / PForDelta），压缩比可达 4:1 甚至更高。</code></pre>
+            <h3 id="elasticsearch-与-lucene-的倒排索引实现">4.4
+            Elasticsearch 与 Lucene 的倒排索引实现</h3>
+            <p>Elasticsearch
+            是目前最流行的全文搜索引擎，其核心搜索能力由 Apache Lucene
+            库提供。Lucene 的倒排索引实现包含以下关键组件：</p>
+            <p><strong>段（Segment）</strong>：Lucene
+            的索引由多个不可变（Immutable）的段组成。新文档写入时，先进入内存缓冲区，定期刷写（Flush）为新的段。段一旦写入磁盘就不再修改——删除操作只是标记删除，更新操作等价于先删除再插入。不可变性带来了并发安全和缓存友好的好处，代价是需要定期合并（Merge）段以回收空间和提高查询效率。</p>
+            <p><strong>FST（Finite State Transducer）</strong>：Lucene
+            使用 FST 作为词项字典的内存数据结构。FST 比 B+Tree 和 Hash
+            Map
+            更省内存，它能在共享前缀和后缀的同时支持快速查找。对于百万级别的词项，FST
+            通常只需要几十 MB 内存。</p>
+            <p><strong>Skip
+            List（跳表）</strong>：倒排列表内部使用跳表加速交集和并集运算。当需要对两个倒排列表取交集时，跳表允许跳过大量不匹配的文档
+            ID，而不需要逐个比较。</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode json"><code class="sourceCode json"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="er">//</span> <span class="er">Elasticsearch</span> <span class="er">创建索引的示例</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="er">PUT</span> <span class="er">/articles</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;settings&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;number_of_shards&quot;</span><span class="fu">:</span> <span class="dv">3</span><span class="fu">,</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;number_of_replicas&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;analysis&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;analyzer&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;chinese_analyzer&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;custom&quot;</span><span class="fu">,</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;tokenizer&quot;</span><span class="fu">:</span> <span class="st">&quot;ik_max_word&quot;</span><span class="fu">,</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;filter&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;lowercase&quot;</span><span class="ot">,</span> <span class="st">&quot;stop&quot;</span><span class="ot">]</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>        <span class="fu">}</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;mappings&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;properties&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;title&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;text&quot;</span><span class="fu">,</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;analyzer&quot;</span><span class="fu">:</span> <span class="st">&quot;chinese_analyzer&quot;</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>      <span class="fu">},</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;content&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;text&quot;</span><span class="fu">,</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;analyzer&quot;</span><span class="fu">:</span> <span class="st">&quot;chinese_analyzer&quot;</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>      <span class="fu">},</span></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;author&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;keyword&quot;</span></span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a>      <span class="fu">},</span></span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;publish_date&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;date&quot;</span></span>
+<span id="cb16-32"><a href="#cb16-32" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb16-33"><a href="#cb16-33" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb16-34"><a href="#cb16-34" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb16-35"><a href="#cb16-35" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+            <h3 id="倒排索引的性能特征">4.5 倒排索引的性能特征</h3>
+            <p>倒排索引的性能特征与 B+Tree 截然不同：</p>
+            <pre class="text"><code>┌──────────────────┬──────────────────────────────────────┐
+│ 操作             │ 性能特征                              │
+├──────────────────┼──────────────────────────────────────┤
+│ 单词项查找       │ O(1) 到 O(log T)，T 为词项总数       │
+│ 布尔查询         │ 取决于倒排列表长度和交/并集算法       │
+│ 短语查询         │ 需要位置信息，比布尔查询更慢          │
+│ 写入             │ 批量写入后刷写段，不支持实时单条更新  │
+│ 更新/删除        │ 标记删除 + 段合并，有延迟             │
+│ 空间占用         │ 通常为原始数据的 30%–50%              │
+│ 近实时搜索       │ 刷写间隔（默认 1 秒）决定可见延迟     │
+└──────────────────┴──────────────────────────────────────┘</code></pre>
+            <h3 id="mysql-中的全文索引">4.6 MySQL 中的全文索引</h3>
+            <p>MySQL 从 5.6 版本开始在 InnoDB 中支持全文索引（FULLTEXT
+            Index）。其实现基于倒排索引，但功能和性能与 Elasticsearch
+            差距较大。</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建全文索引</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> articles (</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> BIGINT AUTO_INCREMENT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>    title <span class="dt">VARCHAR</span>(<span class="dv">200</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>    content TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>    FULLTEXT <span class="kw">INDEX</span> ft_content (title, content) <span class="kw">WITH</span> PARSER ngram</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>InnoDB <span class="kw">DEFAULT</span> CHARSET<span class="op">=</span>utf8mb4;</span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 使用全文索引查询</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">id</span>, title,</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>       MATCH(title, content) AGAINST(<span class="st">&#39;分布式事务&#39;</span> <span class="kw">IN</span> <span class="dt">BOOLEAN</span> <span class="kw">MODE</span>) <span class="kw">AS</span> score</span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> articles</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> MATCH(title, content) AGAINST(<span class="st">&#39;分布式事务&#39;</span> <span class="kw">IN</span> <span class="dt">BOOLEAN</span> <span class="kw">MODE</span>)</span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> score <span class="kw">DESC</span></span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre></div>
+            <p>MySQL
+            全文索引的局限：不支持分布式搜索、聚合分析能力弱、分词器选择有限、大数据量下性能不佳。对于严肃的全文搜索需求，Elasticsearch
+            或 Apache Solr 是更合适的选择。</p>
+            <hr />
+            <h2 id="五bitmap-索引">五、Bitmap 索引</h2>
+            <h3 id="bitmap-索引的原理">5.1 Bitmap 索引的原理</h3>
+            <p>位图索引（Bitmap Index）的核心思想是用一个位图（Bit Array
+            /
+            Bitmap）来表示索引键的每个取值与数据行之间的对应关系。对于索引键的每个不同取值，维护一个与表行数等长的位图，第
+            i 位为 1 表示第 i 行的索引键等于该取值，为 0
+            表示不等于。</p>
+            <pre class="text"><code>Bitmap 索引示例：
+
+表 employees 有 8 行数据，gender 列只有 &#39;M&#39; 和 &#39;F&#39; 两个取值。
+
+行号  gender
+────  ──────
+  0   M
+  1   F
+  2   M
+  3   M
+  4   F
+  5   M
+  6   F
+  7   M
+
+gender=&#39;M&#39; 的位图：  1 0 1 1 0 1 0 1
+gender=&#39;F&#39; 的位图：  0 1 0 0 1 0 1 0</code></pre>
+            <h3 id="位运算实现多条件过滤">5.2 位运算实现多条件过滤</h3>
+            <p>Bitmap 索引最强大的特性是通过位运算（Bitwise
+            Operation）高效地实现多条件过滤。多个条件的 AND、OR、NOT
+            操作直接对应位图的按位与（AND）、按位或（OR）、按位取反（NOT）运算。</p>
+            <pre class="text"><code>示例：查找部门为 &#39;工程部&#39; 且 性别为 &#39;M&#39; 的员工
+
+department=&#39;工程部&#39; 的位图：  1 0 1 0 0 1 1 0
+gender=&#39;M&#39; 的位图：          1 0 1 1 0 1 0 1
+
+AND 运算：                   1 0 1 0 0 1 0 0
+                             ↑       ↑
+                           行0     行5 满足条件
+
+CPU 可以用一条指令对 64 位（8 字节）的位图做 AND 运算。
+对于 100 万行的表，位图大小只有 ~122 KB，整个过滤过程在微秒级完成。</code></pre>
+            <h3 id="bitmap-索引的适用场景">5.3 Bitmap
+            索引的适用场景</h3>
+            <p>Bitmap 索引最适合以下场景：</p>
+            <ol type="1">
+            <li><strong>低基数（Low
+            Cardinality）列</strong>：列的不同取值数量远小于行数。比如性别（2
+            个值）、状态（5–10 个值）、省份（34
+            个值）。如果基数很高（比如用户
+            ID），每个取值对应的位图中大部分位都是
+            0，空间利用率极低。</li>
+            <li><strong>OLAP
+            查询</strong>：数据仓库中的多维分析查询，通常需要对多个维度列做
+            AND/OR 过滤。Bitmap 索引的位运算完美匹配这种查询模式。</li>
+            <li><strong>读多写少</strong>：Bitmap
+            索引的更新代价较高——修改一行数据可能需要更新多个位图。在高并发写入的
+            OLTP 场景下，Bitmap 索引会成为性能瓶颈。</li>
+            </ol>
+            <pre class="text"><code>Bitmap 索引适用场景矩阵：
+
+               低基数列  高基数列
+读多写少（OLAP） ✓✓✓      ✗
+读写均衡（OLTP） ✗        ✗
+写多读少         ✗        ✗
+
+✓✓✓ = 强烈推荐
+✗   = 不推荐</code></pre>
+            <h3 id="bitmap-索引的压缩">5.4 Bitmap 索引的压缩</h3>
+            <p>当列的基数不是特别低时，位图中会有大量连续的 0
+            位，导致空间浪费。位图压缩算法可以显著减少存储空间：</p>
+            <p><strong>WAH（Word-Aligned
+            Hybrid）</strong>：将位图按机器字（Word）分组，对连续的全 0
+            字和全 1 字进行游程编码（Run-Length Encoding）。WAH
+            压缩后的位图仍然支持直接进行按位运算，不需要先解压。</p>
+            <p><strong>Roaring
+            Bitmap</strong>：现代位图压缩的事实标准。Roaring Bitmap
+            将位图按
+            2^16（65536）个位分成若干容器（Container），每个容器根据稠密程度选择不同的存储方式：</p>
+            <pre class="text"><code>Roaring Bitmap 容器类型：
+
+- Array Container：当容器中设置了不到 4096 个位时，
+                   使用排序数组存储位的编号。
+- Bitmap Container：当容器中设置了 4096 个以上的位时，
+                    使用原始位图存储（8 KB 固定大小）。
+- Run Container：  当容器中的位呈现连续运行模式时，
+                   使用游程编码。
+
+切换阈值 4096 的选择：
+  4096 × 2 bytes（Array） = 8192 bytes ≈ 8 KB（Bitmap Container 大小）
+  当位数超过 4096 时，Array 占用空间超过 Bitmap，自动切换。</code></pre>
+            <p>Roaring Bitmap 在 Apache Spark、Apache
+            Druid、ClickHouse、Elasticsearch 等系统中被广泛使用。</p>
+            <h3 id="oracle-与-bitmap-索引">5.5 Oracle 与 Bitmap
+            索引</h3>
+            <p>Oracle 数据库是最早和最成熟支持 Bitmap
+            索引的关系数据库。Oracle 的 Bitmap
+            索引实现包含锁管理机制，但在高并发 DML
+            场景下仍然容易出现锁争用。</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- Oracle 创建 Bitmap 索引</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">BITMAP</span> <span class="kw">INDEX</span> idx_emp_gender <span class="kw">ON</span> employees(gender);</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">BITMAP</span> <span class="kw">INDEX</span> idx_emp_dept <span class="kw">ON</span> employees(department);</span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 多条件查询自动使用 Bitmap AND 运算</span></span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> employees</span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> gender <span class="op">=</span> <span class="st">&#39;M&#39;</span> <span class="kw">AND</span> department <span class="op">=</span> <span class="st">&#39;工程部&#39;</span>;</span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 执行计划中可以看到 BITMAP AND 操作</span></span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- | BITMAP CONVERSION TO ROWIDS |</span></span>
+<span id="cb23-11"><a href="#cb23-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- |  BITMAP AND                 |</span></span>
+<span id="cb23-12"><a href="#cb23-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- |   BITMAP INDEX idx_emp_gender|</span></span>
+<span id="cb23-13"><a href="#cb23-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- |   BITMAP INDEX idx_emp_dept  |</span></span></code></pre></div>
+            <p>MySQL InnoDB 不支持 Bitmap 索引。ClickHouse 支持 Bitmap
+            函数，但不直接支持 Bitmap 索引类型。PostgreSQL
+            不支持持久化的 Bitmap 索引，但查询执行器中有 Bitmap Index
+            Scan 和 Bitmap Heap Scan
+            操作——这是运行时临时构建的位图，用于合并多个 B-Tree
+            索引的结果，与持久化的 Bitmap 索引是不同的概念。</p>
+            <hr />
+            <h2 id="六空间索引r-tree">六、空间索引：R-Tree</h2>
+            <h3 id="空间数据的索引挑战">6.1 空间数据的索引挑战</h3>
+            <p>空间数据（Spatial
+            Data）是指具有地理位置属性的数据，比如经纬度坐标、多边形区域、路线轨迹。空间查询的典型问题包括：</p>
+            <ul>
+            <li><strong>最近邻查询（Nearest Neighbor
+            Query）</strong>：找到离我最近的 10 家餐厅。</li>
+            <li><strong>范围查询（Range
+            Query）</strong>：找到某个矩形区域内的所有加油站。</li>
+            <li><strong>包含查询（Containment
+            Query）</strong>：判断一个点是否在某个多边形区域内。</li>
+            <li><strong>相交查询（Intersection
+            Query）</strong>：找到与某条道路相交的所有河流。</li>
+            </ul>
+            <p>B+Tree
+            只能沿一个维度排序。如果用经度建索引，可以快速筛选经度范围，但无法同时约束纬度。用两个单独的
+            B+Tree
+            索引分别索引经度和纬度，然后取交集，效率也不高——因为两个一维范围的交集不等于二维空间的范围。</p>
+            <h3 id="r-tree-的结构">6.2 R-Tree 的结构</h3>
+            <p>R-Tree（Rectangle Tree，矩形树）由 Antonin Guttman 于
+            1984 年提出，专门解决多维空间数据的索引问题。R-Tree
+            的基本思想是用最小外接矩形（MBR，Minimum Bounding
+            Rectangle）层层包裹空间对象，构建一棵平衡树。</p>
+            <pre class="text"><code>R-Tree 结构示意：
+
+根节点 MBR: [整个空间]
+├── 子节点 MBR: [左上区域]
+│   ├── 叶子: 餐厅A (x1,y1)
+│   ├── 叶子: 餐厅B (x2,y2)
+│   └── 叶子: 公园C [多边形]
+└── 子节点 MBR: [右下区域]
+    ├── 叶子: 加油站D (x3,y3)
+    ├── 叶子: 学校E [多边形]
+    └── 叶子: 医院F (x4,y4)
+
+查找&quot;矩形 R 内的所有空间对象&quot;：
+  1. 从根节点开始，检查子节点的 MBR 是否与 R 相交
+  2. 只递归进入 MBR 与 R 相交的子树
+  3. 在叶子节点进行精确几何判断</code></pre>
+            <p>R-Tree 的变体包括：</p>
+            <ul>
+            <li>**R*-Tree**：改进了插入和分裂算法，减少 MBR
+            的重叠和覆盖面积，提高查询效率。PostgreSQL 的 GiST
+            索引底层就使用了 R*-Tree 的思想。</li>
+            <li><strong>R+-Tree</strong>：不允许同一层的 MBR
+            重叠，通过将跨越多个 MBR
+            的对象复制到多个节点来消除重叠。</li>
+            <li><strong>Hilbert
+            R-Tree</strong>：利用空间填充曲线（Hilbert
+            Curve）对空间对象排序后构建
+            R-Tree，提高空间局部性和缓存效率。</li>
+            </ul>
+            <h3 id="r-tree-操作的复杂度">6.3 R-Tree 操作的复杂度</h3>
+            <pre class="text"><code>┌──────────────┬────────────────────────────────────┐
+│ 操作         │ 时间复杂度                         │
+├──────────────┼────────────────────────────────────┤
+│ 点查         │ O(log_m N)，m 为最小子节点数       │
+│ 范围查询     │ O(log_m N + K)，K 为结果集大小     │
+│ 最近邻       │ O(log_m N)（优先级搜索）           │
+│ 插入         │ O(log_m N)                         │
+│ 删除         │ O(log_m N)                         │
+│ 最坏情况     │ 所有 MBR 重叠时退化为 O(N)         │
+└──────────────┴────────────────────────────────────┘</code></pre>
+            <h3 id="postgis-中的空间索引">6.4 PostGIS 中的空间索引</h3>
+            <p>PostGIS 是 PostgreSQL 的空间扩展，使用 GiST（Generalized
+            Search Tree，通用搜索树）索引实现空间索引。GiST
+            是一个可扩展的索引框架，R-Tree 只是 GiST
+            支持的索引策略之一。</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- PostGIS 创建空间索引</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> restaurants (</span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a>    name TEXT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a>    location GEOMETRY(Point, <span class="dv">4326</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>  <span class="co">-- WGS84 坐标系</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建 GiST 空间索引</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_restaurants_location</span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ON</span> restaurants <span class="kw">USING</span> GIST (location);</span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-12"><a href="#cb26-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 范围查询：查找某矩形区域内的餐厅</span></span>
+<span id="cb26-13"><a href="#cb26-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> name, ST_AsText(location)</span>
+<span id="cb26-14"><a href="#cb26-14" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> restaurants</span>
+<span id="cb26-15"><a href="#cb26-15" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> ST_Within(</span>
+<span id="cb26-16"><a href="#cb26-16" aria-hidden="true" tabindex="-1"></a>    location,</span>
+<span id="cb26-17"><a href="#cb26-17" aria-hidden="true" tabindex="-1"></a>    ST_MakeEnvelope(<span class="fl">116.3</span>, <span class="fl">39.9</span>, <span class="fl">116.5</span>, <span class="fl">40.0</span>, <span class="dv">4326</span>)</span>
+<span id="cb26-18"><a href="#cb26-18" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb26-19"><a href="#cb26-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-20"><a href="#cb26-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- 最近邻查询：查找离指定点最近的 5 家餐厅</span></span>
+<span id="cb26-21"><a href="#cb26-21" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> name,</span>
+<span id="cb26-22"><a href="#cb26-22" aria-hidden="true" tabindex="-1"></a>       ST_Distance(location:<span class="ch">:geography</span>,</span>
+<span id="cb26-23"><a href="#cb26-23" aria-hidden="true" tabindex="-1"></a>                   ST_MakePoint(<span class="fl">116.4</span>, <span class="fl">39.95</span>):<span class="ch">:geography</span>) <span class="kw">AS</span> dist_meters</span>
+<span id="cb26-24"><a href="#cb26-24" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> restaurants</span>
+<span id="cb26-25"><a href="#cb26-25" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> location <span class="op">&lt;-&gt;</span> ST_MakePoint(<span class="fl">116.4</span>, <span class="fl">39.95</span>):<span class="ch">:geometry</span></span>
+<span id="cb26-26"><a href="#cb26-26" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">5</span>;</span>
+<span id="cb26-27"><a href="#cb26-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- &lt;-&gt; 操作符利用 GiST 索引做高效的最近邻搜索</span></span></code></pre></div>
+            <h3 id="mongodb-地理空间索引">6.5 MongoDB 地理空间索引</h3>
+            <p>MongoDB 提供两种地理空间索引：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode javascript"><code class="sourceCode javascript"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 2dsphere 索引：支持 GeoJSON 格式，用于球面几何计算</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a>db<span class="op">.</span><span class="at">restaurants</span><span class="op">.</span><span class="fu">createIndex</span>({ <span class="dt">location</span><span class="op">:</span> <span class="st">&quot;2dsphere&quot;</span> })<span class="op">;</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 插入带有地理坐标的文档</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a>db<span class="op">.</span><span class="at">restaurants</span><span class="op">.</span><span class="fu">insertOne</span>({</span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">name</span><span class="op">:</span> <span class="st">&quot;某某餐厅&quot;</span><span class="op">,</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">location</span><span class="op">:</span> {</span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a>        <span class="dt">type</span><span class="op">:</span> <span class="st">&quot;Point&quot;</span><span class="op">,</span></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a>        <span class="dt">coordinates</span><span class="op">:</span> [<span class="fl">116.4</span><span class="op">,</span> <span class="fl">39.95</span>]  <span class="co">// [经度, 纬度]</span></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a>})<span class="op">;</span></span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-13"><a href="#cb27-13" aria-hidden="true" tabindex="-1"></a><span class="co">// 查找 2 公里范围内的餐厅</span></span>
+<span id="cb27-14"><a href="#cb27-14" aria-hidden="true" tabindex="-1"></a>db<span class="op">.</span><span class="at">restaurants</span><span class="op">.</span><span class="fu">find</span>({</span>
+<span id="cb27-15"><a href="#cb27-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">location</span><span class="op">:</span> {</span>
+<span id="cb27-16"><a href="#cb27-16" aria-hidden="true" tabindex="-1"></a>        <span class="dt">$near</span><span class="op">:</span> {</span>
+<span id="cb27-17"><a href="#cb27-17" aria-hidden="true" tabindex="-1"></a>            <span class="dt">$geometry</span><span class="op">:</span> {</span>
+<span id="cb27-18"><a href="#cb27-18" aria-hidden="true" tabindex="-1"></a>                <span class="dt">type</span><span class="op">:</span> <span class="st">&quot;Point&quot;</span><span class="op">,</span></span>
+<span id="cb27-19"><a href="#cb27-19" aria-hidden="true" tabindex="-1"></a>                <span class="dt">coordinates</span><span class="op">:</span> [<span class="fl">116.4</span><span class="op">,</span> <span class="fl">39.95</span>]</span>
+<span id="cb27-20"><a href="#cb27-20" aria-hidden="true" tabindex="-1"></a>            }<span class="op">,</span></span>
+<span id="cb27-21"><a href="#cb27-21" aria-hidden="true" tabindex="-1"></a>            <span class="dt">$maxDistance</span><span class="op">:</span> <span class="dv">2000</span>  <span class="co">// 单位：米</span></span>
+<span id="cb27-22"><a href="#cb27-22" aria-hidden="true" tabindex="-1"></a>        }</span>
+<span id="cb27-23"><a href="#cb27-23" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb27-24"><a href="#cb27-24" aria-hidden="true" tabindex="-1"></a>})<span class="op">.</span><span class="fu">limit</span>(<span class="dv">10</span>)<span class="op">;</span></span>
+<span id="cb27-25"><a href="#cb27-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-26"><a href="#cb27-26" aria-hidden="true" tabindex="-1"></a><span class="co">// 查找多边形区域内的餐厅</span></span>
+<span id="cb27-27"><a href="#cb27-27" aria-hidden="true" tabindex="-1"></a>db<span class="op">.</span><span class="at">restaurants</span><span class="op">.</span><span class="fu">find</span>({</span>
+<span id="cb27-28"><a href="#cb27-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">location</span><span class="op">:</span> {</span>
+<span id="cb27-29"><a href="#cb27-29" aria-hidden="true" tabindex="-1"></a>        <span class="dt">$geoWithin</span><span class="op">:</span> {</span>
+<span id="cb27-30"><a href="#cb27-30" aria-hidden="true" tabindex="-1"></a>            <span class="dt">$geometry</span><span class="op">:</span> {</span>
+<span id="cb27-31"><a href="#cb27-31" aria-hidden="true" tabindex="-1"></a>                <span class="dt">type</span><span class="op">:</span> <span class="st">&quot;Polygon&quot;</span><span class="op">,</span></span>
+<span id="cb27-32"><a href="#cb27-32" aria-hidden="true" tabindex="-1"></a>                <span class="dt">coordinates</span><span class="op">:</span> [[</span>
+<span id="cb27-33"><a href="#cb27-33" aria-hidden="true" tabindex="-1"></a>                    [<span class="fl">116.3</span><span class="op">,</span> <span class="fl">39.9</span>]<span class="op">,</span></span>
+<span id="cb27-34"><a href="#cb27-34" aria-hidden="true" tabindex="-1"></a>                    [<span class="fl">116.5</span><span class="op">,</span> <span class="fl">39.9</span>]<span class="op">,</span></span>
+<span id="cb27-35"><a href="#cb27-35" aria-hidden="true" tabindex="-1"></a>                    [<span class="fl">116.5</span><span class="op">,</span> <span class="fl">40.0</span>]<span class="op">,</span></span>
+<span id="cb27-36"><a href="#cb27-36" aria-hidden="true" tabindex="-1"></a>                    [<span class="fl">116.3</span><span class="op">,</span> <span class="fl">40.0</span>]<span class="op">,</span></span>
+<span id="cb27-37"><a href="#cb27-37" aria-hidden="true" tabindex="-1"></a>                    [<span class="fl">116.3</span><span class="op">,</span> <span class="fl">39.9</span>]</span>
+<span id="cb27-38"><a href="#cb27-38" aria-hidden="true" tabindex="-1"></a>                ]]</span>
+<span id="cb27-39"><a href="#cb27-39" aria-hidden="true" tabindex="-1"></a>            }</span>
+<span id="cb27-40"><a href="#cb27-40" aria-hidden="true" tabindex="-1"></a>        }</span>
+<span id="cb27-41"><a href="#cb27-41" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb27-42"><a href="#cb27-42" aria-hidden="true" tabindex="-1"></a>})<span class="op">;</span></span></code></pre></div>
+            <p>MongoDB 的 2dsphere 索引底层使用 S2 Geometry Library
+            的空间分区算法，将地球表面划分为层级化的单元格（Cell），每个单元格用一个
+            64
+            位整数编码。这种编码方式将二维空间问题转化为一维索引问题，可以利用
+            B-Tree 索引的现有基础设施。</p>
+            <hr />
+            <h2 id="七bloom-filter">七、Bloom Filter</h2>
+            <h3 id="布隆过滤器的原理">7.1 布隆过滤器的原理</h3>
+            <p>布隆过滤器（Bloom Filter）是 Burton H. Bloom 于 1970
+            年提出的一种概率型数据结构（Probabilistic Data
+            Structure）。它用于快速判断一个元素是否属于一个集合，有以下特性：</p>
+            <ul>
+            <li><strong>如果 Bloom Filter
+            说”不存在”，则一定不存在</strong>（假阴性率为 0）。</li>
+            <li><strong>如果 Bloom Filter
+            说”可能存在”，则可能存在也可能不存在</strong>（有一定的假阳性率，False
+            Positive Rate）。</li>
+            </ul>
+            <p>Bloom Filter 由一个 m 位的位数组（Bit Array）和 k
+            个独立的哈希函数组成。</p>
+            <pre class="text"><code>Bloom Filter 的操作：
+
+插入元素 x：
+  计算 h1(x), h2(x), ..., hk(x)，得到 k 个位置
+  将位数组中这 k 个位置的位设为 1
+
+查询元素 y：
+  计算 h1(y), h2(y), ..., hk(y)，得到 k 个位置
+  检查位数组中这 k 个位置的位：
+    - 如果所有位都是 1 → 元素可能存在（可能是假阳性）
+    - 如果有任何一个位是 0 → 元素一定不存在
+
+示例（m=16, k=3）：
+
+位数组：  0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+插入 &quot;apple&quot;：
+  h1(&quot;apple&quot;)=2, h2(&quot;apple&quot;)=5, h3(&quot;apple&quot;)=11
+  位数组：  0 0 1 0 0 1 0 0 0 0 0 1 0 0 0 0
+
+插入 &quot;banana&quot;：
+  h1(&quot;banana&quot;)=3, h2(&quot;banana&quot;)=7, h3(&quot;banana&quot;)=11
+  位数组：  0 0 1 1 0 1 0 1 0 0 0 1 0 0 0 0
+
+查询 &quot;cherry&quot;：
+  h1(&quot;cherry&quot;)=2, h2(&quot;cherry&quot;)=7, h3(&quot;cherry&quot;)=14
+  位 2=1, 位 7=1, 位 14=0 → 不存在（确定）
+
+查询 &quot;date&quot;：
+  h1(&quot;date&quot;)=2, h2(&quot;date&quot;)=5, h3(&quot;date&quot;)=3
+  位 2=1, 位 5=1, 位 3=1 → 可能存在（假阳性！实际不存在）</code></pre>
+            <h3 id="假阳性率的数学分析">7.2 假阳性率的数学分析</h3>
+            <p>Bloom Filter 的假阳性率（False Positive
+            Probability，FPP）可以精确计算：</p>
+            <pre class="text"><code>假设：
+  m = 位数组的大小（位数）
+  n = 已插入的元素数量
+  k = 哈希函数个数
+
+插入 n 个元素后，某个特定位仍然是 0 的概率：
+  p = (1 - 1/m)^(kn) ≈ e^(-kn/m)
+
+假阳性率：
+  FPP = (1 - p)^k = (1 - e^(-kn/m))^k
+
+给定 m 和 n，最优的哈希函数个数：
+  k_opt = (m/n) × ln(2) ≈ 0.693 × (m/n)
+
+此时最低假阳性率：
+  FPP_min = (1/2)^k = (0.6185)^(m/n)
+
+每个元素占用的位数（bits per key）：
+  m/n = -k / ln(1 - FPP^(1/k))
+
+常用配置：
+  bits_per_key = 10  →  FPP ≈ 0.82%  （k=7）
+  bits_per_key = 15  →  FPP ≈ 0.02%  （k=10）
+  bits_per_key = 20  →  FPP ≈ 0.0005% （k=14）</code></pre>
+            <h3 id="bloom-filter-在-lsm-tree-中的应用">7.3 Bloom Filter
+            在 LSM-Tree 中的应用</h3>
+            <p>Bloom Filter 在日志结构合并树（LSM-Tree，Log-Structured
+            Merge-Tree）中扮演关键角色。LSM-Tree 是
+            LevelDB、RocksDB、Cassandra、HBase
+            等存储引擎的核心数据结构。</p>
+            <p>LSM-Tree 的读取流程需要依次检查内存中的 MemTable
+            和磁盘上的多层 SSTable（Sorted String Table）文件。如果没有
+            Bloom Filter，每次读取可能需要在多个 SSTable
+            文件中做二分查找，产生大量不必要的磁盘 I/O。</p>
+            <pre class="text"><code>LSM-Tree 读取流程（有 Bloom Filter）：
+
+读取 key=&quot;user:42&quot;
+  ↓
+检查 MemTable → 未找到
+  ↓
+检查 Level 0 SSTable:
+  Bloom Filter 判断 → &quot;不存在&quot; → 跳过（避免一次磁盘 I/O）
+  ↓
+检查 Level 1 SSTable-A:
+  Bloom Filter 判断 → &quot;不存在&quot; → 跳过
+  ↓
+检查 Level 1 SSTable-B:
+  Bloom Filter 判断 → &quot;可能存在&quot; → 读取数据块 → 找到！
+  ↓
+返回结果
+
+如果没有 Bloom Filter，需要在每个 SSTable 中做磁盘 I/O
+Bloom Filter 把读放大（Read Amplification）从 O(L) 降到接近 O(1)
+其中 L 是 LSM-Tree 的层数</code></pre>
+            <p>在 RocksDB 中，Bloom Filter 的配置如下：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co">// RocksDB Bloom Filter 配置</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions table_options<span class="op">;</span></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="co">// 设置每个键占用 10 位的 Bloom Filter</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 假阳性率约 0.82%</span></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>filter_policy<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewBloomFilterPolicy<span class="op">(</span><span class="dv">10</span><span class="op">,</span> <span class="kw">false</span><span class="op">)</span></span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a><span class="co">// 将 Bloom Filter 存储在 SSTable 的元数据块中</span></span>
+<span id="cb31-12"><a href="#cb31-12" aria-hidden="true" tabindex="-1"></a><span class="co">// 而不是独立的 filter 块中（full filter）</span></span>
+<span id="cb31-13"><a href="#cb31-13" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>format_version <span class="op">=</span> <span class="dv">5</span><span class="op">;</span></span>
+<span id="cb31-14"><a href="#cb31-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-15"><a href="#cb31-15" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>table_factory<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb31-16"><a href="#cb31-16" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewBlockBasedTableFactory<span class="op">(</span>table_options<span class="op">)</span></span>
+<span id="cb31-17"><a href="#cb31-17" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span></code></pre></div>
+            <h3 id="bloom-filter-的变体">7.4 Bloom Filter 的变体</h3>
+            <p><strong>Counting Bloom
+            Filter（计数布隆过滤器）</strong>：用 n 位计数器替代 1
+            位标志，支持删除操作。标准 Bloom Filter
+            不支持删除，因为清除一个位可能影响其他元素。Counting Bloom
+            Filter 用 4 位计数器（支持 0–15
+            的计数），删除时递减而非清零。代价是空间增大 4 倍。</p>
+            <p><strong>Cuckoo Filter（布谷鸟过滤器）</strong>：由 Fan
+            等人于 2014 年提出，使用布谷鸟哈希（Cuckoo
+            Hashing）替代传统的多哈希方案。Cuckoo Filter
+            支持删除操作，且在相同假阳性率下通常比 Bloom Filter
+            更省空间（尤其当假阳性率低于 3% 时）。</p>
+            <p><strong>Ribbon Filter</strong>：由 Dillinger 和 Walzer 于
+            2021 年提出，是 RocksDB 中的新一代过滤器。Ribbon Filter
+            的空间效率接近理论极限，构建时间比 Bloom Filter
+            更长，但查询速度相当，且空间节省约 30%。</p>
+            <pre class="text"><code>过滤器空间效率对比（FPP = 1%）：
+
+┌───────────────────┬───────────────┬──────────────┐
+│ 过滤器类型        │ bits per key  │ 相对空间     │
+├───────────────────┼───────────────┼──────────────┤
+│ Bloom Filter      │ 9.6           │ 1.0x         │
+│ Cuckoo Filter     │ 8.5           │ 0.89x        │
+│ Ribbon Filter     │ 7.0           │ 0.73x        │
+│ 信息论下限        │ 6.64          │ 0.69x        │
+└───────────────────┴───────────────┴──────────────┘</code></pre>
+            <hr />
+            <h2 id="八列存索引与-zone-maps">八、列存索引与 Zone
+            Maps</h2>
+            <h3 id="列式存储中的索引思路">8.1 列式存储中的索引思路</h3>
+            <p>在列式存储（Columnar
+            Storage）系统中，数据按列而非按行组织。一列的所有值连续存储在一起，这天然带来了两个好处：</p>
+            <ol type="1">
+            <li><strong>压缩效率高</strong>：同一列的值类型相同、分布相似，压缩比远高于行存。</li>
+            <li><strong>扫描效率高</strong>：分析查询通常只需要少数几列，列存只需要读取相关列的数据，跳过无关列。</li>
+            </ol>
+            <p>但列存也带来了新的索引需求：如何快速跳过不包含目标值的数据块？这就是
+            Zone Map（区域映射）和 Data
+            Skipping（数据跳过）的核心思想。</p>
+            <h3 id="zone-map-的原理">8.2 Zone Map 的原理</h3>
+            <p>Zone Map（也叫 Min/Max Index、Small Materialized
+            Aggregates）为每个数据块（Block / Row Group /
+            Stripe）维护该列的统计信息，至少包括最小值（Min）和最大值（Max）。查询时，如果查询条件与某个数据块的
+            Min/Max
+            范围不相交，就可以直接跳过整个数据块，不需要读取和解压其中的数据。</p>
+            <pre class="text"><code>Zone Map 示例：
+
+表 orders，按 order_id 分块存储，每块 100 万行
+
+Block 0:  order_date MIN=2024-01-01  MAX=2024-03-31  amount MIN=10   MAX=9999
+Block 1:  order_date MIN=2024-04-01  MAX=2024-06-30  amount MIN=5    MAX=8888
+Block 2:  order_date MIN=2024-07-01  MAX=2024-09-30  amount MIN=15   MAX=12000
+Block 3:  order_date MIN=2024-10-01  MAX=2024-12-31  amount MIN=8    MAX=7777
+
+查询：WHERE order_date = &#39;2024-08-15&#39;
+  Block 0: MAX=2024-03-31 &lt; 2024-08-15 → 跳过 ✓
+  Block 1: MAX=2024-06-30 &lt; 2024-08-15 → 跳过 ✓
+  Block 2: MIN=2024-07-01 ≤ 2024-08-15 ≤ MAX=2024-09-30 → 需要扫描
+  Block 3: MIN=2024-10-01 &gt; 2024-08-15 → 跳过 ✓
+
+只需扫描 1/4 的数据块，跳过了 75% 的 I/O。</code></pre>
+            <h3 id="parquet-与-orc-的索引机制">8.3 Parquet 与 ORC
+            的索引机制</h3>
+            <p><strong>Apache Parquet</strong>
+            是大数据生态中最流行的列式文件格式，广泛用于
+            Spark、Hive、Presto/Trino 等系统。Parquet
+            文件的结构包含行组（Row Group）、列块（Column
+            Chunk）和数据页（Data Page）三个层级。</p>
+            <pre class="text"><code>Parquet 文件结构：
+
+┌─────────────────────────────────────┐
+│            File Header              │
+├─────────────────────────────────────┤
+│ Row Group 0                         │
+│  ├── Column Chunk: order_id         │
+│  │    ├── Data Page 0               │
+│  │    └── Data Page 1               │
+│  ├── Column Chunk: order_date       │
+│  │    ├── Data Page 0               │
+│  │    └── Data Page 1               │
+│  └── Column Chunk: amount           │
+│       ├── Data Page 0               │
+│       └── Data Page 1               │
+├─────────────────────────────────────┤
+│ Row Group 1                         │
+│  └── ...                            │
+├─────────────────────────────────────┤
+│ Footer (Metadata)                   │
+│  ├── Schema                         │
+│  ├── Row Group Metadata             │
+│  │    ├── Column Chunk Metadata     │
+│  │    │    ├── Min/Max statistics   │  ← Zone Map
+│  │    │    ├── Null count           │
+│  │    │    └── Distinct count       │
+│  │    └── ...                       │
+│  └── ...                            │
+└─────────────────────────────────────┘</code></pre>
+            <p>Parquet 在两个层级提供统计信息：</p>
+            <ol type="1">
+            <li><strong>Column Chunk 级别</strong>：每个行组中每列的
+            Min/Max/Null Count。这是最基本的 Zone Map。</li>
+            <li><strong>Data Page 级别</strong>（Parquet
+            2.0+）：每个数据页中每列的
+            Min/Max。粒度更细，数据跳过更精确。</li>
+            </ol>
+            <p><strong>Apache ORC</strong>（Optimized Row
+            Columnar）是另一种列式文件格式，主要在 Hive 生态中使用。ORC
+            的索引机制比 Parquet 更丰富：</p>
+            <pre class="text"><code>ORC 索引层级：
+
+1. File Level Statistics：整个文件的 Min/Max
+2. Stripe Level Statistics：每个条带（Stripe，类似行组）的 Min/Max
+3. Row Group Index（Row Index Entries）：每 10000 行的 Min/Max
+4. Bloom Filter Index（可选）：每个条带可以附加 Bloom Filter</code></pre>
+            <h3 id="clickhouse-的主键索引与-data-skipping-索引">8.4
+            ClickHouse 的主键索引与 Data Skipping 索引</h3>
+            <p>ClickHouse 是一个高性能列式 OLAP
+            数据库，其索引设计与传统行存数据库有本质区别。</p>
+            <p><strong>主键索引（Primary Key
+            Index）</strong>：ClickHouse 的主键不是
+            B+Tree，而是一个稀疏索引（Sparse
+            Index）。数据按主键排序存储，每隔
+            <code>index_granularity</code> 行（默认 8192
+            行）记录一个索引标记（Mark）。查询时，通过二分查找索引标记确定需要扫描的数据范围（Granule），然后只读取这些范围内的数据。</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- ClickHouse 建表示例</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a>    event_date <span class="dt">Date</span>,</span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a>    user_id UInt64,</span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a>    event_type String,</span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a>    payload String</span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a>) ENGINE <span class="op">=</span> MergeTree()</span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> (event_date, user_id, event_type)</span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a>SETTINGS index_granularity <span class="op">=</span> <span class="dv">8192</span>;</span></code></pre></div>
+            <p><strong>Data Skipping
+            索引（跳数索引）</strong>：ClickHouse
+            支持在主键之外创建额外的 Data Skipping
+            索引，用于加速非主键列的过滤。</p>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- minmax 索引：记录每个 Granule 块的 Min/Max</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> <span class="kw">events</span> <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_amount minmax(amount) GRANULARITY <span class="dv">4</span>;</span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- GRANULARITY 4 表示每 4 个 Granule（4×8192=32768 行）计算一次 Min/Max</span></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- set 索引：记录每个 Granule 块中出现的所有不同值（限制最大数量）</span></span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> <span class="kw">events</span> <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_status <span class="kw">set</span>(status, <span class="dv">100</span>) GRANULARITY <span class="dv">1</span>;</span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 最多记录 100 个不同值</span></span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- bloom_filter 索引：使用 Bloom Filter 做存在性判断</span></span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> <span class="kw">events</span> <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_payload bloom_filter(<span class="fl">0.01</span>) GRANULARITY <span class="dv">1</span>;</span>
+<span id="cb37-11"><a href="#cb37-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 假阳性率 1%</span></span>
+<span id="cb37-12"><a href="#cb37-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-13"><a href="#cb37-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- ngrambf_v1 索引：基于 N-gram 的 Bloom Filter，用于模糊匹配</span></span>
+<span id="cb37-14"><a href="#cb37-14" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> <span class="kw">events</span> <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_content ngrambf_v1(<span class="dv">3</span>, <span class="dv">256</span>, <span class="dv">2</span>, <span class="dv">0</span>) GRANULARITY <span class="dv">1</span>;</span>
+<span id="cb37-15"><a href="#cb37-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3-gram，256 字节位数组，2 个哈希函数</span></span></code></pre></div>
+            <h3 id="数据排序对-zone-map-效果的影响">8.5 数据排序对 Zone
+            Map 效果的影响</h3>
+            <p>Zone Map
+            的效果高度依赖于数据在物理存储上的排列顺序。如果数据按查询条件列排序，Zone
+            Map 可以跳过大量数据块；如果数据随机排列，每个数据块的
+            Min/Max 范围都会很大，Zone Map 几乎无效。</p>
+            <pre class="text"><code>排序 vs 未排序的 Zone Map 效果：
+
+场景：100 万行数据，每块 10 万行，查询 WHERE date = &#39;2024-06-15&#39;
+
+未排序（按插入时间存储）：
+  Block 0: date MIN=2024-01-03  MAX=2024-12-28  → 需要扫描
+  Block 1: date MIN=2024-01-05  MAX=2024-12-30  → 需要扫描
+  ...所有 10 个块都需要扫描 → 跳过率 0%
+
+按 date 排序后：
+  Block 0: date MIN=2024-01-01  MAX=2024-02-06  → 跳过
+  Block 1: date MIN=2024-02-06  MAX=2024-04-16  → 跳过
+  ...
+  Block 5: date MIN=2024-06-04  MAX=2024-08-03  → 需要扫描
+  ...
+  → 跳过率 90%</code></pre>
+            <p>这就是为什么 ClickHouse 的 <code>ORDER BY</code>
+            子句如此重要——它不仅决定了主键索引的结构，还直接影响了所有
+            Data Skipping 索引和 Zone Map 的有效性。</p>
+            <hr />
+            <h2 id="九索引设计最佳实践">九、索引设计最佳实践</h2>
+            <h3 id="复合索引的列顺序">9.1 复合索引的列顺序</h3>
+            <p>复合索引（Composite Index / Multi-Column
+            Index）中列的顺序至关重要。B+Tree
+            复合索引遵循最左前缀原则（Leftmost Prefix
+            Rule）——只有查询条件从索引的最左列开始连续匹配，索引才能被使用。</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 复合索引 (a, b, c) 的最左前缀匹配规则：</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_abc <span class="kw">ON</span> t(a, b, c);</span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可以使用索引的查询：</span></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> a <span class="op">=</span> <span class="dv">1</span>                     <span class="co">-- 使用列 a</span></span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> a <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> b <span class="op">=</span> <span class="dv">2</span>           <span class="co">-- 使用列 a, b</span></span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> a <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> b <span class="op">=</span> <span class="dv">2</span> <span class="kw">AND</span> c <span class="op">=</span> <span class="dv">3</span> <span class="co">-- 使用列 a, b, c（完全匹配）</span></span>
+<span id="cb39-8"><a href="#cb39-8" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> a <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> b <span class="op">&gt;</span> <span class="dv">2</span>           <span class="co">-- 使用列 a, b（b 是范围条件，c 无法使用）</span></span>
+<span id="cb39-9"><a href="#cb39-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> a <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> c <span class="op">=</span> <span class="dv">3</span>           <span class="co">-- 只使用列 a（b 缺失，c 无法使用）</span></span>
+<span id="cb39-10"><a href="#cb39-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-11"><a href="#cb39-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 无法使用索引的查询：</span></span>
+<span id="cb39-12"><a href="#cb39-12" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> b <span class="op">=</span> <span class="dv">2</span>                     <span class="co">-- 缺少最左列 a</span></span>
+<span id="cb39-13"><a href="#cb39-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> b <span class="op">=</span> <span class="dv">2</span> <span class="kw">AND</span> c <span class="op">=</span> <span class="dv">3</span>           <span class="co">-- 缺少最左列 a</span></span>
+<span id="cb39-14"><a href="#cb39-14" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c <span class="op">=</span> <span class="dv">3</span>                     <span class="co">-- 缺少最左列 a 和 b</span></span></code></pre></div>
+            <p>复合索引的列顺序设计原则：</p>
+            <ol type="1">
+            <li><strong>等值查询列在前，范围查询列在后</strong>：等值条件（=,
+            IN）不会中断索引的最左前缀匹配，而范围条件（&gt;, &lt;,
+            BETWEEN）会中断后续列的使用。</li>
+            <li><strong>高选择性列在前</strong>：选择性（Selectivity）=
+            不同值的数量 /
+            总行数。选择性高的列放在前面可以更快地缩小扫描范围。</li>
+            <li><strong>考虑排序需求</strong>：如果查询包含 ORDER
+            BY，把排序列纳入索引可以避免额外的排序操作（Filesort）。</li>
+            <li><strong>考虑覆盖索引</strong>：把 SELECT
+            需要的列也纳入索引尾部，实现索引覆盖扫描。</li>
+            </ol>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 示例：设计复合索引</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询模式：</span></span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a><span class="co">--   SELECT order_id, amount</span></span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a><span class="co">--   FROM orders</span></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a><span class="co">--   WHERE user_id = ? AND status = ? AND created_at &gt; ?</span></span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a><span class="co">--   ORDER BY created_at DESC</span></span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a><span class="co">--   LIMIT 20;</span></span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-9"><a href="#cb40-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 分析：</span></span>
+<span id="cb40-10"><a href="#cb40-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- user_id: 等值查询，高选择性 → 放第一位</span></span>
+<span id="cb40-11"><a href="#cb40-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- status:  等值查询，低选择性 → 放第二位</span></span>
+<span id="cb40-12"><a href="#cb40-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- created_at: 范围查询 + 排序 → 放第三位</span></span>
+<span id="cb40-13"><a href="#cb40-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- order_id, amount: SELECT 列 → 尾部用于覆盖索引</span></span>
+<span id="cb40-14"><a href="#cb40-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-15"><a href="#cb40-15" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_orders_optimized</span>
+<span id="cb40-16"><a href="#cb40-16" aria-hidden="true" tabindex="-1"></a><span class="kw">ON</span> orders (user_id, status, created_at, order_id, amount);</span>
+<span id="cb40-17"><a href="#cb40-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 这个索引可以：</span></span>
+<span id="cb40-18"><a href="#cb40-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 用 user_id 和 status 做等值过滤</span></span>
+<span id="cb40-19"><a href="#cb40-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 用 created_at 做范围过滤和排序（避免 filesort）</span></span>
+<span id="cb40-20"><a href="#cb40-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 覆盖 SELECT 的所有列（避免回表）</span></span></code></pre></div>
+            <h3 id="选择性分析">9.2 选择性分析</h3>
+            <p>在设计索引之前，应该先分析列的选择性，判断索引是否有价值：</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 计算列的选择性</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> user_id) <span class="op">/</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> selectivity_user_id,</span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> status) <span class="op">/</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> selectivity_status,</span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> city) <span class="op">/</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> selectivity_city</span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders;</span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 结果示例：</span></span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- selectivity_user_id = 0.85   ← 高选择性，适合建索引</span></span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- selectivity_status  = 0.0001 ← 低选择性，单独建索引价值不大</span></span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- selectivity_city    = 0.01   ← 中等选择性，需要看查询模式</span></span>
+<span id="cb41-12"><a href="#cb41-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-13"><a href="#cb41-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 前缀索引的选择性分析</span></span>
+<span id="cb41-14"><a href="#cb41-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对于长字符串列，可以只索引前 N 个字符以节省空间</span></span>
+<span id="cb41-15"><a href="#cb41-15" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb41-16"><a href="#cb41-16" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> <span class="kw">LEFT</span>(email, <span class="dv">5</span>)) <span class="op">/</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> sel_5,</span>
+<span id="cb41-17"><a href="#cb41-17" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> <span class="kw">LEFT</span>(email, <span class="dv">7</span>)) <span class="op">/</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> sel_7,</span>
+<span id="cb41-18"><a href="#cb41-18" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> <span class="kw">LEFT</span>(email, <span class="dv">10</span>)) <span class="op">/</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> sel_10,</span>
+<span id="cb41-19"><a href="#cb41-19" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="kw">DISTINCT</span> email) <span class="op">/</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> sel_full</span>
+<span id="cb41-20"><a href="#cb41-20" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> users;</span>
+<span id="cb41-21"><a href="#cb41-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-22"><a href="#cb41-22" aria-hidden="true" tabindex="-1"></a><span class="co">-- 选择选择性接近完整列、但长度尽可能短的前缀</span></span>
+<span id="cb41-23"><a href="#cb41-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 sel_7 ≈ sel_full，则使用 7 字符前缀索引</span></span>
+<span id="cb41-24"><a href="#cb41-24" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_email_prefix <span class="kw">ON</span> users (email(<span class="dv">7</span>));</span></code></pre></div>
+            <h3 id="索引合并与交叉">9.3 索引合并与交叉</h3>
+            <p>当一个查询条件涉及多个列，且每个列都有独立的索引，MySQL
+            优化器可能会使用索引合并（Index
+            Merge）策略：分别使用各自的索引获取 ROWID
+            集合，然后做交集（Intersect）或并集（Union）操作。</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 索引合并示例</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 表上有两个独立索引：idx_status(status) 和 idx_city(city)</span></span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> city <span class="op">=</span> <span class="st">&#39;北京&#39;</span>;</span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可能的执行计划：</span></span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- type: index_merge</span></span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- key: idx_status,idx_city</span></span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: Using intersect(idx_status,idx_city); Using where</span></span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 索引合并通常不如一个复合索引高效</span></span>
+<span id="cb42-11"><a href="#cb42-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 更好的方案：创建复合索引</span></span>
+<span id="cb42-12"><a href="#cb42-12" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_status_city <span class="kw">ON</span> orders (status, city);</span></code></pre></div>
+            <p>索引合并在大多数场景下都不如设计良好的复合索引高效。如果
+            EXPLAIN 输出中看到
+            <code>index_merge</code>，通常意味着索引设计需要优化。</p>
+            <h3 id="explain-分析方法论">9.4 EXPLAIN 分析方法论</h3>
+            <p>EXPLAIN 是分析查询执行计划最重要的工具。理解 EXPLAIN
+            输出的每一列是索引调优的基础。</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- EXPLAIN 关键字段解读</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1001</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="dv">1</span>\G</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- id:            查询序号</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- select_type:   查询类型（SIMPLE, PRIMARY, SUBQUERY, DERIVED...）</span></span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- table:         访问的表</span></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- partitions:    匹配的分区</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- type:          访问类型（从好到差）</span></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a><span class="co">--   system &gt; const &gt; eq_ref &gt; ref &gt; range &gt; index &gt; ALL</span></span>
+<span id="cb43-10"><a href="#cb43-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- possible_keys: 可能使用的索引</span></span>
+<span id="cb43-11"><a href="#cb43-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- key:           实际使用的索引</span></span>
+<span id="cb43-12"><a href="#cb43-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- key_len:       使用的索引长度（字节数，判断用了复合索引的几列）</span></span>
+<span id="cb43-13"><a href="#cb43-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- ref:           索引匹配的列或常量</span></span>
+<span id="cb43-14"><a href="#cb43-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- rows:          预估扫描行数</span></span>
+<span id="cb43-15"><a href="#cb43-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- filtered:      按条件过滤后的行百分比</span></span>
+<span id="cb43-16"><a href="#cb43-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra:         额外信息</span></span>
+<span id="cb43-17"><a href="#cb43-17" aria-hidden="true" tabindex="-1"></a><span class="co">--   Using index        → 索引覆盖扫描（好）</span></span>
+<span id="cb43-18"><a href="#cb43-18" aria-hidden="true" tabindex="-1"></a><span class="co">--   Using where        → 在存储引擎返回后再由 Server 层过滤</span></span>
+<span id="cb43-19"><a href="#cb43-19" aria-hidden="true" tabindex="-1"></a><span class="co">--   Using temporary    → 使用临时表（通常需要优化）</span></span>
+<span id="cb43-20"><a href="#cb43-20" aria-hidden="true" tabindex="-1"></a><span class="co">--   Using filesort     → 使用文件排序（通常需要优化）</span></span>
+<span id="cb43-21"><a href="#cb43-21" aria-hidden="true" tabindex="-1"></a><span class="co">--   Using index condition → 索引条件下推（ICP）</span></span></code></pre></div>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- EXPLAIN FORMAT=TREE 提供更直观的执行计划树</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> FORMAT<span class="op">=</span>TREE</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> o.order_id, o.amount, u.name</span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders o</span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> users u <span class="kw">ON</span> o.user_id <span class="op">=</span> u.user_id</span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> o.status <span class="op">=</span> <span class="dv">1</span> <span class="kw">AND</span> o.created_at <span class="op">&gt;</span> <span class="st">&#39;2024-01-01&#39;</span></span>
+<span id="cb44-7"><a href="#cb44-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> o.created_at <span class="kw">DESC</span></span>
+<span id="cb44-8"><a href="#cb44-8" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>\G</span>
+<span id="cb44-9"><a href="#cb44-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-10"><a href="#cb44-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- EXPLAIN ANALYZE 实际执行查询并显示每一步的真实耗时</span></span>
+<span id="cb44-11"><a href="#cb44-11" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">ANALYZE</span></span>
+<span id="cb44-12"><a href="#cb44-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> user_id, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> cnt</span>
+<span id="cb44-13"><a href="#cb44-13" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb44-14"><a href="#cb44-14" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> status <span class="op">=</span> <span class="dv">1</span></span>
+<span id="cb44-15"><a href="#cb44-15" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> user_id</span>
+<span id="cb44-16"><a href="#cb44-16" aria-hidden="true" tabindex="-1"></a><span class="kw">HAVING</span> cnt <span class="op">&gt;</span> <span class="dv">10</span>\G</span></code></pre></div>
+            <h3 id="何时不该建索引">9.5 何时不该建索引</h3>
+            <p>以下场景建索引是浪费甚至有害的：</p>
+            <ol type="1">
+            <li><strong>极小的表</strong>：几百行的配置表，全表扫描比走索引还快（因为索引查找本身也有开销）。</li>
+            <li><strong>频繁大批量写入的表</strong>：日志表每秒写入数千行，索引维护成本远大于查询收益。考虑先写入无索引的临时表，再批量导入有索引的正式表。</li>
+            <li><strong>低选择性的列</strong>：状态列只有 3
+            个值，索引扫描的行数与全表扫描差不多，但多了回表的随机
+            I/O。</li>
+            <li><strong>很少被查询条件引用的列</strong>：建了索引却从来没有查询用到，白白增加写入开销和存储空间。</li>
+            <li><strong>频繁更新的列</strong>：每次 UPDATE
+            都要维护索引，如果这个列的索引很少被查询使用，就是净亏。</li>
+            </ol>
+            <hr />
+            <h2 id="十mysql-索引实战">十、MySQL 索引实战</h2>
+            <h3 id="explain-输出详解">10.1 EXPLAIN 输出详解</h3>
+            <p>回到实战，以一个电商订单查询为例，完整演示 EXPLAIN
+            分析和索引优化过程。</p>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 建表</span></span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a>    order_id BIGINT AUTO_INCREMENT <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb45-4"><a href="#cb45-4" aria-hidden="true" tabindex="-1"></a>    user_id BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb45-5"><a href="#cb45-5" aria-hidden="true" tabindex="-1"></a>    product_id BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb45-6"><a href="#cb45-6" aria-hidden="true" tabindex="-1"></a>    amount <span class="dt">DECIMAL</span>(<span class="dv">10</span>, <span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb45-7"><a href="#cb45-7" aria-hidden="true" tabindex="-1"></a>    status TINYINT <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> <span class="dv">0</span> <span class="kw">COMMENT</span> <span class="st">&#39;0:待支付 1:已支付 2:已发货 3:已完成&#39;</span>,</span>
+<span id="cb45-8"><a href="#cb45-8" aria-hidden="true" tabindex="-1"></a>    city <span class="dt">VARCHAR</span>(<span class="dv">50</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb45-9"><a href="#cb45-9" aria-hidden="true" tabindex="-1"></a>    created_at DATETIME <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> <span class="fu">CURRENT_TIMESTAMP</span>,</span>
+<span id="cb45-10"><a href="#cb45-10" aria-hidden="true" tabindex="-1"></a>    updated_at DATETIME <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> <span class="fu">CURRENT_TIMESTAMP</span> <span class="kw">ON</span> <span class="kw">UPDATE</span> <span class="fu">CURRENT_TIMESTAMP</span>,</span>
+<span id="cb45-11"><a href="#cb45-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_user_id (user_id),</span>
+<span id="cb45-12"><a href="#cb45-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_status (status),</span>
+<span id="cb45-13"><a href="#cb45-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_created_at (created_at)</span>
+<span id="cb45-14"><a href="#cb45-14" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>InnoDB <span class="kw">DEFAULT</span> CHARSET<span class="op">=</span>utf8mb4;</span>
+<span id="cb45-15"><a href="#cb45-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-16"><a href="#cb45-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询：查找某用户最近 30 天已支付的订单</span></span>
+<span id="cb45-17"><a href="#cb45-17" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span></span>
+<span id="cb45-18"><a href="#cb45-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> order_id, amount, created_at</span>
+<span id="cb45-19"><a href="#cb45-19" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb45-20"><a href="#cb45-20" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1001</span></span>
+<span id="cb45-21"><a href="#cb45-21" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> status <span class="op">=</span> <span class="dv">1</span></span>
+<span id="cb45-22"><a href="#cb45-22" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> created_at <span class="op">&gt;</span> DATE_SUB(NOW(), <span class="dt">INTERVAL</span> <span class="dv">30</span> <span class="dt">DAY</span>)</span>
+<span id="cb45-23"><a href="#cb45-23" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span id="cb45-24"><a href="#cb45-24" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>\G</span>
+<span id="cb45-25"><a href="#cb45-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-26"><a href="#cb45-26" aria-hidden="true" tabindex="-1"></a><span class="co">-- 未优化时的执行计划：</span></span>
+<span id="cb45-27"><a href="#cb45-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- type: ref</span></span>
+<span id="cb45-28"><a href="#cb45-28" aria-hidden="true" tabindex="-1"></a><span class="co">-- key: idx_user_id</span></span>
+<span id="cb45-29"><a href="#cb45-29" aria-hidden="true" tabindex="-1"></a><span class="co">-- rows: 5000</span></span>
+<span id="cb45-30"><a href="#cb45-30" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: Using where; Using filesort  ← 需要文件排序！</span></span></code></pre></div>
+            <p>问题分析：</p>
+            <ol type="1">
+            <li>优化器选择了 <code>idx_user_id</code> 索引，过滤了
+            <code>user_id = 1001</code> 的行。</li>
+            <li><code>status = 1</code> 和
+            <code>created_at &gt; ...</code> 条件在 Server 层通过
+            <code>Using where</code> 过滤。</li>
+            <li><code>ORDER BY created_at DESC</code>
+            需要额外的文件排序（<code>Using filesort</code>）。</li>
+            <li>需要回表获取 <code>amount</code> 和
+            <code>created_at</code> 列的值。</li>
+            </ol>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 优化方案：创建复合覆盖索引</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_user_status_created</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="kw">ON</span> orders (user_id, status, created_at, order_id, amount);</span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 优化后的执行计划：</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- type: range</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- key: idx_user_status_created</span></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- rows: 150</span></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: Using where; Using index; Backward index scan  ← 索引覆盖 + 无 filesort</span></span></code></pre></div>
+            <p>优化后：</p>
+            <ol type="1">
+            <li>复合索引的最左前缀匹配
+            <code>user_id = 1001 AND status = 1</code>，然后在
+            <code>created_at</code> 上做范围扫描。</li>
+            <li><code>ORDER BY created_at DESC</code>
+            直接利用索引的有序性（反向扫描），无需 filesort。</li>
+            <li><code>SELECT</code>
+            的所有列（<code>order_id, amount, created_at</code>）都在索引中，不需要回表。</li>
+            <li>预估扫描行数从 5000 降到 150。</li>
+            </ol>
+            <h3 id="index-merge">10.2 Index Merge</h3>
+            <p>索引合并（Index Merge）是 MySQL
+            优化器在某些场景下使用多个索引的策略。有三种类型：</p>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. Index Merge Intersect（交集）</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 适用于 AND 连接的多个索引条件</span></span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1001</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- type: index_merge</span></span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- key: idx_user_id,idx_status</span></span>
+<span id="cb47-7"><a href="#cb47-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: Using intersect(idx_user_id,idx_status); Using where</span></span>
+<span id="cb47-8"><a href="#cb47-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-9"><a href="#cb47-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. Index Merge Union（并集）</span></span>
+<span id="cb47-10"><a href="#cb47-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 适用于 OR 连接的多个索引条件</span></span>
+<span id="cb47-11"><a href="#cb47-11" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span id="cb47-12"><a href="#cb47-12" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1001</span> <span class="kw">OR</span> status <span class="op">=</span> <span class="dv">3</span>;</span>
+<span id="cb47-13"><a href="#cb47-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- type: index_merge</span></span>
+<span id="cb47-14"><a href="#cb47-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- key: idx_user_id,idx_status</span></span>
+<span id="cb47-15"><a href="#cb47-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: Using union(idx_user_id,idx_status); Using where</span></span>
+<span id="cb47-16"><a href="#cb47-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-17"><a href="#cb47-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. Index Merge Sort-Union（排序并集）</span></span>
+<span id="cb47-18"><a href="#cb47-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 适用于 OR 连接的范围条件</span></span>
+<span id="cb47-19"><a href="#cb47-19" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span id="cb47-20"><a href="#cb47-20" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">&lt;</span> <span class="dv">100</span> <span class="kw">OR</span> created_at <span class="op">&gt;</span> <span class="st">&#39;2024-12-01&#39;</span>;</span>
+<span id="cb47-21"><a href="#cb47-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- type: index_merge</span></span>
+<span id="cb47-22"><a href="#cb47-22" aria-hidden="true" tabindex="-1"></a><span class="co">-- key: idx_user_id,idx_created_at</span></span>
+<span id="cb47-23"><a href="#cb47-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- Extra: Using sort_union(idx_user_id,idx_created_at); Using where</span></span></code></pre></div>
+            <p>如前所述，Index Merge
+            通常意味着需要优化索引设计。但在某些场景下（特别是 OR
+            条件），Index Merge Union
+            可能是唯一可用的优化手段，因为复合索引无法加速 OR 条件。</p>
+            <h3 id="索引条件下推index-condition-pushdown">10.3
+            索引条件下推（Index Condition Pushdown）</h3>
+            <p>索引条件下推（ICP，Index Condition Pushdown）是 MySQL 5.6
+            引入的优化。在没有 ICP
+            的情况下，存储引擎通过索引找到匹配的行后，将完整的行返回给
+            Server 层，由 Server 层再做 WHERE 条件过滤。有了
+            ICP，存储引擎在索引层就可以对 WHERE
+            条件中能用索引列判断的条件做过滤，减少回表次数。</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- ICP 示例</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_user_status <span class="kw">ON</span> orders (user_id, status);</span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询</span></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">&gt;</span> <span class="dv">1000</span> <span class="kw">AND</span> user_id <span class="op">&lt;</span> <span class="dv">2000</span> <span class="kw">AND</span> status <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb48-7"><a href="#cb48-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-8"><a href="#cb48-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 没有 ICP 的执行流程：</span></span>
+<span id="cb48-9"><a href="#cb48-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 用索引 idx_user_status 扫描 user_id 在 (1000, 2000) 范围的所有行</span></span>
+<span id="cb48-10"><a href="#cb48-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 对每一行回表获取完整数据</span></span>
+<span id="cb48-11"><a href="#cb48-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. Server 层过滤 status = 1</span></span>
+<span id="cb48-12"><a href="#cb48-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-13"><a href="#cb48-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 有 ICP 的执行流程：</span></span>
+<span id="cb48-14"><a href="#cb48-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 用索引 idx_user_status 扫描 user_id 在 (1000, 2000) 范围</span></span>
+<span id="cb48-15"><a href="#cb48-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 在索引层直接检查 status = 1 ← ICP 在此过滤</span></span>
+<span id="cb48-16"><a href="#cb48-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 只对满足条件的行回表</span></span>
+<span id="cb48-17"><a href="#cb48-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-18"><a href="#cb48-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- EXPLAIN Extra 列：Using index condition ← 表示使用了 ICP</span></span></code></pre></div>
+            <p>为什么 ICP 有效？因为复合索引
+            <code>(user_id, status)</code>
+            中，<code>user_id &gt; 1000 AND user_id &lt; 2000</code>
+            是范围条件，按照最左前缀规则，<code>status</code>
+            列无法用于索引的范围缩小。但索引中确实包含了
+            <code>status</code> 的值——ICP
+            就是在索引层利用这个值提前过滤，避免不必要的回表。</p>
+            <h3 id="不可见索引invisible-indexes">10.4
+            不可见索引（Invisible Indexes）</h3>
+            <p>不可见索引（Invisible Index）是 MySQL 8.0
+            引入的特性。将一个索引设为不可见后，优化器不会使用它来生成执行计划，但索引本身仍然会被维护（INSERT/UPDATE/DELETE
+            仍然会更新它）。</p>
+            <p>这个特性的主要用途是<strong>安全地测试删除索引的影响</strong>：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 将索引设为不可见</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">ALTER</span> <span class="kw">INDEX</span> idx_status INVISIBLE;</span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 验证优化器是否还会使用它</span></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此时不会使用 idx_status</span></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在业务低峰期观察一段时间：</span></span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- - 如果没有慢查询出现 → 说明这个索引确实没用，可以安全删除</span></span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- - 如果出现慢查询 → 立即恢复可见性</span></span>
+<span id="cb49-11"><a href="#cb49-11" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">ALTER</span> <span class="kw">INDEX</span> idx_status VISIBLE;</span>
+<span id="cb49-12"><a href="#cb49-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-13"><a href="#cb49-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 确认安全后，删除索引</span></span>
+<span id="cb49-14"><a href="#cb49-14" aria-hidden="true" tabindex="-1"></a><span class="kw">DROP</span> <span class="kw">INDEX</span> idx_status <span class="kw">ON</span> orders;</span></code></pre></div>
+            <p>不可见索引比直接删除索引安全得多：</p>
+            <ol type="1">
+            <li>恢复可见性是瞬间操作，不需要重建索引。</li>
+            <li>删除索引后恢复需要重建，对于大表可能需要数小时。</li>
+            <li>可以配合 <code>performance_schema</code>
+            监控受影响的查询。</li>
+            </ol>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 通过 optimizer_switch 临时让优化器使用不可见索引</span></span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 用于在单个会话中测试索引效果</span></span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> optimizer_switch <span class="op">=</span> <span class="st">&#39;use_invisible_indexes=on&#39;</span>;</span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此时会使用不可见索引 idx_status</span></span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> optimizer_switch <span class="op">=</span> <span class="st">&#39;use_invisible_indexes=off&#39;</span>;</span></code></pre></div>
+            <h3 id="索引监控与维护">10.5 索引监控与维护</h3>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看索引使用情况（需要开启 performance_schema）</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a>    object_schema,</span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a>    object_name,</span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a>    index_name,</span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a>    count_read,</span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a>    count_write,</span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a>    count_fetch</span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> performance_schema.table_io_waits_summary_by_index_usage</span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> object_schema <span class="op">=</span> <span class="st">&#39;mydb&#39;</span></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> object_name <span class="op">=</span> <span class="st">&#39;orders&#39;</span></span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> count_read <span class="kw">DESC</span>;</span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- count_read = 0 的索引可能是从未使用的&quot;僵尸索引&quot;，考虑删除</span></span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看索引大小</span></span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb51-18"><a href="#cb51-18" aria-hidden="true" tabindex="-1"></a>    table_name,</span>
+<span id="cb51-19"><a href="#cb51-19" aria-hidden="true" tabindex="-1"></a>    index_name,</span>
+<span id="cb51-20"><a href="#cb51-20" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ROUND</span>(stat_value <span class="op">*</span> @@innodb_page_size <span class="op">/</span> <span class="dv">1024</span> <span class="op">/</span> <span class="dv">1024</span>, <span class="dv">2</span>) <span class="kw">AS</span> size_mb</span>
+<span id="cb51-21"><a href="#cb51-21" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> mysql.innodb_index_stats</span>
+<span id="cb51-22"><a href="#cb51-22" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> database_name <span class="op">=</span> <span class="st">&#39;mydb&#39;</span></span>
+<span id="cb51-23"><a href="#cb51-23" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> table_name <span class="op">=</span> <span class="st">&#39;orders&#39;</span></span>
+<span id="cb51-24"><a href="#cb51-24" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> stat_name <span class="op">=</span> <span class="st">&#39;size&#39;</span>;</span>
+<span id="cb51-25"><a href="#cb51-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-26"><a href="#cb51-26" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看索引碎片率</span></span>
+<span id="cb51-27"><a href="#cb51-27" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb51-28"><a href="#cb51-28" aria-hidden="true" tabindex="-1"></a>    table_name,</span>
+<span id="cb51-29"><a href="#cb51-29" aria-hidden="true" tabindex="-1"></a>    index_name,</span>
+<span id="cb51-30"><a href="#cb51-30" aria-hidden="true" tabindex="-1"></a>    stat_value <span class="kw">AS</span> pages,</span>
+<span id="cb51-31"><a href="#cb51-31" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ROUND</span>(stat_value <span class="op">*</span> @@innodb_page_size <span class="op">/</span> <span class="dv">1024</span> <span class="op">/</span> <span class="dv">1024</span>, <span class="dv">2</span>) <span class="kw">AS</span> size_mb</span>
+<span id="cb51-32"><a href="#cb51-32" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> mysql.innodb_index_stats</span>
+<span id="cb51-33"><a href="#cb51-33" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> database_name <span class="op">=</span> <span class="st">&#39;mydb&#39;</span></span>
+<span id="cb51-34"><a href="#cb51-34" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> table_name <span class="op">=</span> <span class="st">&#39;orders&#39;</span></span>
+<span id="cb51-35"><a href="#cb51-35" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> stat_name <span class="op">=</span> <span class="st">&#39;size&#39;</span>;</span>
+<span id="cb51-36"><a href="#cb51-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-37"><a href="#cb51-37" aria-hidden="true" tabindex="-1"></a><span class="co">-- 重建索引以消除碎片</span></span>
+<span id="cb51-38"><a href="#cb51-38" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders ENGINE<span class="op">=</span>InnoDB;</span>
+<span id="cb51-39"><a href="#cb51-39" aria-hidden="true" tabindex="-1"></a><span class="co">-- 或者针对单个索引（MySQL 8.0.12+）</span></span>
+<span id="cb51-40"><a href="#cb51-40" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">ALTER</span> <span class="kw">INDEX</span> idx_user_id VISIBLE;  <span class="co">-- 触发索引统计信息更新</span></span>
+<span id="cb51-41"><a href="#cb51-41" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> <span class="kw">TABLE</span> orders;  <span class="co">-- 更新索引统计信息</span></span></code></pre></div>
+            <h3 id="常见索引陷阱">10.6 常见索引陷阱</h3>
+            <div class="sourceCode" id="cb52"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb52-1"><a href="#cb52-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 陷阱 1：对索引列使用函数，导致索引失效</span></span>
+<span id="cb52-2"><a href="#cb52-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 错误写法：</span></span>
+<span id="cb52-3"><a href="#cb52-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> <span class="dt">YEAR</span>(created_at) <span class="op">=</span> <span class="dv">2024</span>;</span>
+<span id="cb52-4"><a href="#cb52-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 正确写法：</span></span>
+<span id="cb52-5"><a href="#cb52-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders</span>
+<span id="cb52-6"><a href="#cb52-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> created_at <span class="op">&gt;=</span> <span class="st">&#39;2024-01-01&#39;</span> <span class="kw">AND</span> created_at <span class="op">&lt;</span> <span class="st">&#39;2025-01-01&#39;</span>;</span>
+<span id="cb52-7"><a href="#cb52-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-8"><a href="#cb52-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 陷阱 2：隐式类型转换导致索引失效</span></span>
+<span id="cb52-9"><a href="#cb52-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- phone_number 是 VARCHAR 类型</span></span>
+<span id="cb52-10"><a href="#cb52-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 错误写法（数值比较，触发隐式转换）：</span></span>
+<span id="cb52-11"><a href="#cb52-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="dv">13800138000</span>;</span>
+<span id="cb52-12"><a href="#cb52-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 正确写法（字符串比较）：</span></span>
+<span id="cb52-13"><a href="#cb52-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> phone_number <span class="op">=</span> <span class="st">&#39;13800138000&#39;</span>;</span>
+<span id="cb52-14"><a href="#cb52-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-15"><a href="#cb52-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 陷阱 3：OR 条件可能导致索引失效</span></span>
+<span id="cb52-16"><a href="#cb52-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 OR 的某个条件没有索引，整个查询可能退化为全表扫描</span></span>
+<span id="cb52-17"><a href="#cb52-17" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">1001</span> <span class="kw">OR</span> remark <span class="kw">LIKE</span> <span class="st">&#39;%紧急%&#39;</span>;</span>
+<span id="cb52-18"><a href="#cb52-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- remark 列没有索引（且无法使用前缀匹配），整个查询全表扫描</span></span>
+<span id="cb52-19"><a href="#cb52-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-20"><a href="#cb52-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- 陷阱 4：LIKE 前导通配符导致索引失效</span></span>
+<span id="cb52-21"><a href="#cb52-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 错误写法：</span></span>
+<span id="cb52-22"><a href="#cb52-22" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">&#39;%张%&#39;</span>;</span>
+<span id="cb52-23"><a href="#cb52-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- 正确写法（如果业务允许）：</span></span>
+<span id="cb52-24"><a href="#cb52-24" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">&#39;张%&#39;</span>;</span>
+<span id="cb52-25"><a href="#cb52-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-26"><a href="#cb52-26" aria-hidden="true" tabindex="-1"></a><span class="co">-- 陷阱 5：NOT IN / NOT EXISTS 可能无法使用索引</span></span>
+<span id="cb52-27"><a href="#cb52-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 取决于优化器版本和统计信息</span></span>
+<span id="cb52-28"><a href="#cb52-28" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="kw">NOT</span> <span class="kw">IN</span> (<span class="dv">0</span>, <span class="dv">4</span>);</span>
+<span id="cb52-29"><a href="#cb52-29" aria-hidden="true" tabindex="-1"></a><span class="co">-- 改写为范围查询可能更好：</span></span>
+<span id="cb52-30"><a href="#cb52-30" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> status <span class="kw">IN</span> (<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>);</span>
+<span id="cb52-31"><a href="#cb52-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-32"><a href="#cb52-32" aria-hidden="true" tabindex="-1"></a><span class="co">-- 陷阱 6：ORDER BY 方向与索引不一致</span></span>
+<span id="cb52-33"><a href="#cb52-33" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_a_b <span class="kw">ON</span> t(a <span class="kw">ASC</span>, b <span class="kw">DESC</span>);</span>
+<span id="cb52-34"><a href="#cb52-34" aria-hidden="true" tabindex="-1"></a><span class="co">-- 以下 ORDER BY 可以使用索引：</span></span>
+<span id="cb52-35"><a href="#cb52-35" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> t <span class="kw">WHERE</span> a <span class="op">=</span> <span class="dv">1</span> <span class="kw">ORDER</span> <span class="kw">BY</span> b <span class="kw">DESC</span>;</span>
+<span id="cb52-36"><a href="#cb52-36" aria-hidden="true" tabindex="-1"></a><span class="co">-- 以下 ORDER BY 无法使用索引（MySQL 8.0 之前）：</span></span>
+<span id="cb52-37"><a href="#cb52-37" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> t <span class="kw">WHERE</span> a <span class="op">=</span> <span class="dv">1</span> <span class="kw">ORDER</span> <span class="kw">BY</span> b <span class="kw">ASC</span>;</span>
+<span id="cb52-38"><a href="#cb52-38" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL 8.0 支持降序索引（Descending Index），可以显式指定方向</span></span></code></pre></div>
+            <hr />
+            <h2 id="参考文献">参考文献</h2>
+            <ol type="1">
+            <li>Graefe, G. (2011). “Modern B-Tree Techniques.”
+            <em>Foundations and Trends in Databases</em>, 3(4),
+            203–402.</li>
+            <li>Guttman, A. (1984). “R-Trees: A Dynamic Index Structure
+            for Spatial Searching.” <em>Proceedings of ACM SIGMOD</em>,
+            47–57.</li>
+            <li>Bloom, B. H. (1970). “Space/Time Trade-offs in Hash
+            Coding with Allowable Errors.” <em>Communications of the
+            ACM</em>, 13(7), 422–426.</li>
+            <li>Fan, B., Andersen, D. G., Kaminsky, M., &amp;
+            Mitzenmacher, M. (2014). “Cuckoo Filter: Practically Better
+            Than Bloom.” <em>Proceedings of ACM CoNEXT</em>, 75–88.</li>
+            <li>Dillinger, P. C. &amp; Walzer, S. (2021). “Ribbon
+            Filter: Practically Smaller Than Bloom and Xor.” <em>arXiv
+            preprint arXiv:2103.02515</em>.</li>
+            <li>O’Neil, P. &amp; Quass, D. (1997). “Improved Query
+            Performance with Variant Indexes.” <em>Proceedings of ACM
+            SIGMOD</em>, 38–49.</li>
+            <li>Chamberlin, D. D. et al. (1981). “A History and
+            Evaluation of System R.” <em>Communications of the ACM</em>,
+            24(10), 632–646.</li>
+            <li>MySQL 8.0 Reference Manual. “InnoDB Index Types.” <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-index-types.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/innodb-index-types.html</a></li>
+            <li>MySQL 8.0 Reference Manual. “Invisible Indexes.” <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/invisible-indexes.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/invisible-indexes.html</a></li>
+            <li>Elasticsearch Reference. “Mapping.” <a
+            href="https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping.html"
+            class="uri">https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping.html</a></li>
+            <li>Apache Lucene Documentation. “Index File Formats.” <a
+            href="https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/codecs/lucene90/package-summary.html"
+            class="uri">https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/codecs/lucene90/package-summary.html</a></li>
+            <li>PostGIS Documentation. “Spatial Indexing.” <a
+            href="https://postgis.net/docs/using_postgis_dbmanagement.html#idm2269"
+            class="uri">https://postgis.net/docs/using_postgis_dbmanagement.html#idm2269</a></li>
+            <li>ClickHouse Documentation. “Data Skipping Indexes.” <a
+            href="https://clickhouse.com/docs/en/optimize/skipping-indexes"
+            class="uri">https://clickhouse.com/docs/en/optimize/skipping-indexes</a></li>
+            <li>Apache Parquet Format Specification. <a
+            href="https://parquet.apache.org/documentation/latest/"
+            class="uri">https://parquet.apache.org/documentation/latest/</a></li>
+            <li>Apache ORC Specification. <a
+            href="https://orc.apache.org/specification/"
+            class="uri">https://orc.apache.org/specification/</a></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../28-transaction-isolation/transaction-isolation.html">事务隔离级别的存储实现</a>
+            <strong>下一篇</strong>: <a
+            href="../30-bitcask/bitcask.html">Bitcask
+            与日志结构哈希表</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/02-parquet-format/02-parquet-format.html">【数据湖与开放表格式】Parquet 文件格式深拆</a></h3>
+                    <p>拆 Parquet 的物理结构：file → row group → column chunk → page，footer 里的 FileMetaData（Thrift）与 PAR1 magic。讲清 PLAIN/RLE-bitpacking/字典/DELTA_BINARY_PACKED/BYTE_STREAM_SPLIT 各自压谁，Dremel 的 repetition/definition level 如何表达嵌套，column index/offset index 与 split-block bloom filter 怎样让谓词在读盘前裁掉 page。基于本机 pyarrow 24.0.0 真实 dump footer 与编码。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / storage</p>
+                    <h3><a href="/post/db/columnar-engine/07-index-skipping/07-index-skipping.html">【列存引擎内核】索引与跳数索引</a></h3>
+                    <p>ClickHouse PRIMARY KEY 排序键稀疏索引语义、Data Skipping Index（minmax/set/bloom_filter）与 Mark Range 协同；对照 PostgreSQL B-Tree。24.x LTS。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-16 · storage</p>
+                    <h3><a href="/post/storage/68-read-optimization/read-optimization.html">【存储工程】读取性能优化</a></h3>
+                    <p>深入分析存储读取性能优化——索引设计、Bloom Filter 调优、块缓存、压缩的 CPU-I/O 权衡、预读策略与读放大测量</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

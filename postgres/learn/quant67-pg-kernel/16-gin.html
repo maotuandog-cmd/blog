@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】GIN 索引：倒排索引的内部机制与 Fast Update | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL GIN
+索引的内部结构：entry tree、posting list、posting tree
+三者各在什么条件下使用；Fast Update 的 pending list 设计与
+gin_clean_pending_list 合并时机；gingetbitmap() 的 bitmap AND/OR
+多关键词搜索合并流程；全文搜索 tsvector 与数组 _int4 的 GIN 实现；以及
+GIN 与 GiST
+在写性能、读性能、存储开销上的三角权衡和具体场景下的选择建议。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, gin, inverted-index, full-text-search, tsvector, fast-update, pending-list, bitmap-scan, intarray, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/16-gin/16-gin.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】GIN 索引：倒排索引的内部机制与 Fast Update" />
+    <meta property="og:description" content="拆解 PostgreSQL GIN 索引的内部结构：entry tree、posting list、posting tree 三者各在什么条件下使用；Fast Update 的 pending list 设计与 gin_clean_pending_list 合并时机；gingetbitmap() 的 bitmap AND/OR 多关键词搜索合并流程；全文搜索 tsvector 与数组 _int4 的 GIN 实现；以及 GIN 与 GiST 在写性能、读性能、存储开销上的三角权衡和具体场景下的选择建议。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/16-gin/16-gin.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="gin" />
+    <meta property="article:tag" content="inverted-index" />
+    <meta property="article:tag" content="full-text-search" />
+    <meta property="article:tag" content="tsvector" />
+    <meta property="article:tag" content="fast-update" />
+    <meta property="article:tag" content="pending-list" />
+    <meta property="article:tag" content="bitmap-scan" />
+    <meta property="article:tag" content="intarray" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】GIN 索引：倒排索引的内部机制与 Fast Update" />
+    <meta name="twitter:description" content="拆解 PostgreSQL GIN 索引的内部结构：entry tree、posting list、posting tree 三者各在什么条件下使用；Fast Update 的 pending list 设计与 gin_clean_pending_list 合并时机；gingetbitmap() 的 bitmap AND/OR 多关键词搜索合并流程；全文搜索 tsvector 与数组 _int4 的 GIN 实现；以及 GIN 与 GiST 在写性能、读性能、存储开销上的三角权衡和具体场景下的选择建议。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】GIN 索引：倒排索引的内部机制与 Fast Update", "description": "拆解 PostgreSQL GIN 索引的内部结构：entry tree、posting list、posting tree 三者各在什么条件下使用；Fast Update 的 pending list 设计与 gin_clean_pending_list 合并时机；gingetbitmap() 的 bitmap AND/OR 多关键词搜索合并流程；全文搜索 tsvector 与数组 _int4 的 GIN 实现；以及 GIN 与 GiST 在写性能、读性能、存储开销上的三角权衡和具体场景下的选择建议。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/16-gin/16-gin.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "gin", "inverted-index", "full-text-search", "tsvector", "fast-update", "pending-list", "bitmap-scan", "intarray"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】GIN 索引：倒排索引的内部机制与 Fast Update</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#gin</span> <span>#inverted-index</span> <span>#full-text-search</span> <span>#tsvector</span> <span>#fast-update</span> <span>#pending-list</span> <span>#bitmap-scan</span> <span>#intarray</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/gin.html">#gin</a><a class="chip-link" href="/tags/inverted-index.html">#inverted-index</a><a class="chip-link" href="/tags/full-text-search.html">#full-text-search</a><a class="chip-link" href="/tags/tsvector.html">#tsvector</a><a class="chip-link" href="/tags/fast-update.html">#fast-update</a><a class="chip-link" href="/tags/pending-list.html">#pending-list</a><a class="chip-link" href="/tags/bitmap-scan.html">#bitmap-scan</a><a class="chip-link" href="/tags/intarray.html">#intarray</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#gin-索引倒排索引的内部机制与-fast-update"
+                id="toc-gin-索引倒排索引的内部机制与-fast-update">GIN
+                索引：倒排索引的内部机制与 Fast Update</a>
+                <ul>
+                <li><a
+                href="#一倒排结构entry-tree-与-posting-list-posting-tree"
+                id="toc-一倒排结构entry-tree-与-posting-list-posting-tree">一、倒排结构：Entry
+                Tree 与 Posting List / Posting Tree</a>
+                <ul>
+                <li><a href="#为什么是倒排" id="toc-为什么是倒排">1.1
+                为什么是倒排</a></li>
+                <li><a href="#entry-treeb-tree-over-keys"
+                id="toc-entry-treeb-tree-over-keys">1.2 Entry
+                Tree：B-Tree over Keys</a></li>
+                <li><a href="#posting-list-与-posting-tree大小的分界线"
+                id="toc-posting-list-与-posting-tree大小的分界线">1.3
+                Posting List 与 Posting Tree：大小的分界线</a></li>
+                <li><a href="#合并时机" id="toc-合并时机">2.3
+                合并时机</a></li>
+                <li><a href="#搜索的代价" id="toc-搜索的代价">2.4
+                搜索的代价</a></li>
+                <li><a href="#关闭-fast-update"
+                id="toc-关闭-fast-update">2.5 关闭 Fast Update</a></li>
+                <li><a href="#阶段一提取查询键"
+                id="toc-阶段一提取查询键">3.2
+                阶段一：提取查询键</a></li>
+                <li><a href="#阶段二扫描主索引和-pending-list"
+                id="toc-阶段二扫描主索引和-pending-list">3.3
+                阶段二：扫描主索引和 Pending List</a></li>
+                <li><a href="#阶段三bitmap-合并"
+                id="toc-阶段三bitmap-合并">3.4 阶段三：Bitmap
+                合并</a></li>
+                <li><a href="#阶段四consistent-过滤"
+                id="toc-阶段四consistent-过滤">3.5 阶段四：consistent
+                过滤</a></li>
+                </ul></li>
+                <li><a href="#四全文搜索-tsvector-与数组-_int4-的实现"
+                id="toc-四全文搜索-tsvector-与数组-_int4-的实现">四、全文搜索
+                tsvector 与数组 _int4 的实现</a>
+                <ul>
+                <li><a href="#tsvector-的-gin-操作符类"
+                id="toc-tsvector-的-gin-操作符类">4.1 tsvector 的 GIN
+                操作符类</a></li>
+                <li><a href="#intarray-的-gin-操作符类"
+                id="toc-intarray-的-gin-操作符类">4.2 intarray 的 GIN
+                操作符类</a></li>
+                <li><a href="#jsonb-的-gin-索引"
+                id="toc-jsonb-的-gin-索引">4.3 JSONB 的 GIN
+                索引</a></li>
+                </ul></li>
+                <li><a href="#五gin-vs-gist三角权衡与选择建议"
+                id="toc-五gin-vs-gist三角权衡与选择建议">五、GIN vs
+                GiST：三角权衡与选择建议</a>
+                <ul>
+                <li><a href="#结构差异带来的性能差异"
+                id="toc-结构差异带来的性能差异">5.1
+                结构差异带来的性能差异</a></li>
+                <li><a href="#全文搜索gin-vs-gist"
+                id="toc-全文搜索gin-vs-gist">5.2 全文搜索：GIN vs
+                GiST</a></li>
+                </ul></li>
+                <li><a href="#七关键要点"
+                id="toc-七关键要点">七、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#扩展模块"
+                id="toc-扩展模块">扩展模块</a></li>
+                <li><a href="#相关文章"
+                id="toc-相关文章">相关文章</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="gin-索引倒排索引的内部机制与-fast-update">GIN
+            索引：倒排索引的内部机制与 Fast Update</h1>
+            <p>PG 有四种内置索引类型：B-Tree
+            是主键和等值查询的默认选择，GiST
+            为几何和全文搜索提供平衡树的抽象框架，BRIN
+            为超大表提供极简的范围摘要。而 GIN（Generalized Inverted
+            Index）处理的是这三种都不擅长的问题：<strong>一个数据行包含多个索引键</strong>。</p>
+            <p>典型场景随处可见。一个 <code>tsvector</code>
+            字段从文档中提取出几十个词，每个词都是搜索入口；一个
+            <code>integer[]</code>
+            字段包含几十个元素，每个元素都可能出现在 <code>@&gt;</code>
+            查询中；一个 JSONB 字段的顶层键和值都需要索引。</p>
+            <p>如果你用 B-Tree 索引数组字段，<code>ANY</code>
+            查询会把每个元素当成独立的索引查找，效率随元素数量线性退化。GiST
+            可以做，但 GIN
+            在”键多而行少”的场景下结构化优势更明显——它的倒排结构把”键到行”的映射直接写死在索引里，搜索时不需要遍历数据行。</p>
+            <p>本文将逐层拆解 GIN 的内部结构、Fast Update
+            机制、搜索流程，以及 GIN 和 GiST 的选择权衡。</p>
+            <hr />
+            <h2
+            id="一倒排结构entry-tree-与-posting-list-posting-tree">一、倒排结构：Entry
+            Tree 与 Posting List / Posting Tree</h2>
+            <h3 id="为什么是倒排">1.1 为什么是倒排</h3>
+            <p>B-Tree 索引的数据模型是”一行 →
+            一个键”：一行表数据最多对应一个索引条目。GIN
+            的数据模型是”一个键 →
+            多行”：一个键值（如一个词、一个数组元素）可能出现在大量行的索引字段中。这是倒排索引（inverted
+            index）的基础模型——不是从行找键，而是从键找行。</p>
+            <p>GIN 把这种映射拆成两层结构：<strong>Entry Tree</strong>
+            负责”键值到键条目”的查找，<strong>Posting List / Posting
+            Tree</strong> 负责”键条目到行 ID”的映射。</p>
+            <h3 id="entry-treeb-tree-over-keys">1.2 Entry Tree：B-Tree
+            over Keys</h3>
+            <p>Entry Tree 是 GIN 的顶层结构：一个标准
+            B-Tree，其键是被索引复合值中提取出的每一个原子元素。对于
+            <code>tsvector</code> 索引，键是每一个词位（lexeme）；对于
+            <code>intarray</code> 索引，键是数组中的每个整数。</p>
+            <p>Entry Tree 的叶子节点存放的不是数据行的指针，而是指向
+            Posting List 或 Posting Tree
+            的引用。关键特性：<strong>每个键值在 Entry Tree
+            中只存储一次</strong>。如果一个词 “database” 出现在 10000
+            行中，Entry Tree 中只有一条记录指向包含 10000 个行 ID 的
+            Posting 结构。这使得 GIN
+            在键值重复度高的场景（全文搜索是典型）下非常紧凑。</p>
+            <p>多列 GIN 索引将多列合并到一个 Entry Tree 中，键值被组织为
+            <code>(column_number, key_value)</code>
+            复合值，通过列编号区分不同列的同名键。</p>
+            <h3 id="posting-list-与-posting-tree大小的分界线">1.3
+            Posting List 与 Posting Tree：大小的分界线</h3>
+            <p>GIN 用两种不同的结构存储键对应的行 ID
+            列表，选择取决于列表的大小：</p>
+            <p><strong>Posting
+            List</strong>：当某个键出现的行数较少，所有行 ID
+            能放进一个索引页面时，GIN 将它们直接内联存储在 Entry Tree
+            的叶子元组中。这是一个紧凑的、平铺的 TID
+            列表。优点是只需要一次 Entry Tree 叶子页的 I/O
+            就能拿到全部匹配行的位置；缺点是对于高频键，列表可能变得非常大。</p>
+            <p><strong>Posting Tree</strong>：当 Posting List
+            增长到无法放入单个页面时，GIN 将它扩展为一棵独立的
+            B-Tree，以行 ID（TID）为键。Posting Tree 也是一个标准
+            B-Tree，但与 Entry Tree 不同的是，它的节点只存
+            TID，不存键值。Entry Tree 叶子元组此时存储的是一个指向
+            Posting Tree 根页的指针。</p>
+            <p>一条简单的判断规则：建索引时一个键对应的行数决定初始用
+            Posting List 还是 Posting Tree；后续插入可能将 Posting List
+            升级为 Posting Tree。</p>
+            <pre class="text"><code>Entry Tree (B-tree over keys)
+  |
+  ├── key: &quot;database&quot;  ──→  Posting List: [TID1, TID3, TID7]    ← 出现 3 次，内联存储
+  ├── key: &quot;postgres&quot;  ──→  Posting Tree (B-tree of TIDs)        ← 出现 10000 次，独立 B-Tree
+  │                              ├── 页 1: TID1...TID500
+  │                              ├── 页 2: TID501...TID1000
+  │                              └── ...
+  └── key: &quot;index&quot;     ──→  Posting List: [TID2, TID5, TID9]
+```bash
+
+### 1.4 NULL 和空值的处理
+
+GIN 对&quot;索引字段为 NULL 或空数组/空文档&quot;的行会插入一个占位符键。这保证了对于 `NOT EXISTS` 或否定查询（如&quot;所有不包含某关键词的行&quot;），GIN 也能通过这个占位符找到候选行。对于包含 NULL 元素的非空复合值（如一个部分为 NULL 的 JSONB），GIN 将 NULL 键插入 Entry Tree，而 `extractValue` 通过 `nullFlags` 数组标记哪些键值为 NULL。
+
+---
+
+## 二、Fast Update：Pending List 的设计与后台合并
+
+### 2.1 问题：逐键插入的代价
+
+GIN 索引的插入有一个先天劣势：向表中插入一行数据时，如果该行的索引字段提取出 $n$ 个键，GIN 就需要向索引中插入 $n$ 次——Entry Tree 要查找或分裂 $n$ 次，Posting List / Posting Tree 也要各更新 $n$ 次。对于 `tsvector` 索引，一个中等长度的文档可能提取 30-80 个词，每次插入就是 30-80 次 B-Tree 操作。
+
+直接逐键插入的代价太高。GIN 的解决方案是 Fast Update。
+
+### 2.2 Pending List：延迟合并
+
+Fast Update 的核心思路简单：新插入的条目不立即合并到主索引结构（Entry Tree + Posting List/Tree），而是追加到一个临时的、未排序的 pending list 中。这个 pending list 是一个简单的线性页面链表，新条目写入时只需要向链尾追加，不需要查找、不需要分裂、不需要更新 Posting 结构。
+
+插入流程变为：
+
+```text
+INSERT 一行 → extractValue() 提取出 n 个键
+  → 对每个键, 追加(key, TID)到 pending list 尾部（仅追加，不查找不排序）
+  → 完成</code></pre>
+            <p>O(<span class="math inline">\(n\)</span>) 次 B-Tree
+            操作变成了 O(<span class="math inline">\(n\)</span>)
+            次线性追加。对大量小插入的场景，这是数量级的提升。</p>
+            <h3 id="合并时机">2.3 合并时机</h3>
+            <p>Pending list 不会无限增长。在以下时机，pending list
+            中的条目被批量合并到主索引结构：</p>
+            <ol type="1">
+            <li><strong>VACUUM（手动或 autovacuum）</strong>：VACUUM
+            任务在清理完 dead tuple 后，会自动调用 GIN 的 pending list
+            清理逻辑。</li>
+            <li><strong>autoanalyze</strong>：自动统计信息收集也会触发合并。</li>
+            <li><strong>显式调用 <code>gin_clean_pending_list()</code>
+            函数</strong>：<code>SELECT gin_clean_pending_list('index_name'::regclass)</code>
+            强制立即合并。</li>
+            <li><strong>Pending list 超过
+            <code>gin_pending_list_limit</code></strong>：如果下次插入会让
+            pending list
+            超过此阈值，当前插入会在前台触发一次完整的合并清理。</li>
+            </ol>
+            <p>关键洞见在第 4 条：如果日常插入量小于
+            <code>gin_pending_list_limit</code>，合并工作总是由 VACUUM
+            在后台完成，用户的 INSERT
+            永远不会被合并操作阻塞。但一旦某次插入踩线触发了阈值，这次插入就会承担全部合并工作的代价——延迟显著增加。这是
+            Fast Update 最核心的 trade-off。</p>
+            <p>合并操作本身使用与建索引相同的批量插入算法（bulk
+            insert），利用 <code>maintenance_work_mem</code>
+            作为排序缓冲区：先读出 pending list
+            的所有条目，按键排序后批量写入 Entry Tree 和 Posting
+            结构。<code>maintenance_work_mem</code>
+            越大，排序趟数越少，合并越快。</p>
+            <h3 id="搜索的代价">2.4 搜索的代价</h3>
+            <p>Pending list
+            带来的代价是搜索时必须扫描两块数据：主索引结构 + pending
+            list。Pending list
+            是线性的、未排序的，扫描它的代价与列表大小成正比。</p>
+            <p>这个代价可以用 <code>gin_pending_list_limit</code>
+            来控制： - 调大：合并频率降低，但搜索时 pending list
+            更大，查询更慢。 -
+            调小：搜索更快，但合并更频繁，极端情况下可能频繁在前台触发清理。</p>
+            <p>对于以查询为主的只读/少写表，最佳实践是在批量导入数据后立即调用
+            <code>gin_clean_pending_list()</code>，清空 pending
+            list，确保后续查询只扫描主索引结构。</p>
+            <h3 id="关闭-fast-update">2.5 关闭 Fast Update</h3>
+            <p>当插入性能不是瓶颈，更关心查询延迟的可预测性时，可以通过存储参数关闭
+            Fast Update：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_name <span class="kw">ON</span> table_name <span class="kw">USING</span> gin (<span class="kw">column</span>)</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WITH</span> (fastupdate <span class="op">=</span> <span class="kw">off</span>);</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>关闭后每次插入直接写主索引结构，没有任何延迟的 pending <span class="kw">list</span> 扫描。适用于插入频率低、查询延迟要求严格的场景。</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>## 三、搜索流程：gingetbitmap() 的 <span class="kw">Bitmap</span> <span class="kw">AND</span><span class="op">/</span><span class="kw">OR</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>### <span class="fl">3.1</span> 整体架构</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>GIN 的搜索入口是 `gingetbitmap()`（`src<span class="op">/</span>backend<span class="op">/</span><span class="kw">access</span><span class="op">/</span>gin<span class="op">/</span>ginget.c`）。GIN 没有 `gettuple` 方法——它只支持 <span class="kw">bitmap</span> <span class="kw">index</span> scan，不支持传统的逐行 <span class="kw">index</span> scan。这是因为 GIN 的倒排结构天然适合<span class="ot">&quot;给定 N 个键，找出所有包含它们的行并集/交集&quot;</span>，而不是<span class="ot">&quot;给定一个起点，遍历所有索引行&quot;</span>。</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>搜索分四个阶段：</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>flowchart TD</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>  Q[<span class="ot">&quot;查询条件&lt;br/&gt;(如 to_tsquery(&#39;a &amp; b&#39;))&quot;</span>] <span class="co">--&gt; EX[&quot;extractQuery()&lt;br/&gt;提取查询键&quot;]</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>  EX <span class="co">--&gt; K1[&quot;key[0]=&#39;a&#39;&lt;br/&gt;key[1]=&#39;b&#39;&quot;]</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>  K1 <span class="co">--&gt; SCAN[&quot;启动扫描&lt;br/&gt;对每个 key&quot;]</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SCAN</span> <span class="co">--&gt; MAIN[&quot;扫描 Entry Tree&lt;br/&gt;+ Posting List/Tree&quot;]</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SCAN</span> <span class="co">--&gt; PENDING[&quot;扫描 Pending List&quot;]</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>  MAIN <span class="co">--&gt; BM[&quot;构建 TID Bitmap&lt;br/&gt;per-key&quot;]</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>  PENDING <span class="co">--&gt; BM</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>  BM <span class="co">--&gt; MERGE[&quot;Bitmap AND/OR&lt;br/&gt;按查询语义合并&quot;]</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>  <span class="kw">MERGE</span> <span class="co">--&gt; CON{&quot;consistent(check[])&quot;}</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>  CON <span class="co">-- &quot;true&quot; --&gt; RESULT[&quot;Bitmap Heap Scan&lt;br/&gt;返回匹配行&quot;]</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>  CON <span class="co">-- &quot;recheck=true&quot; --&gt; RECHECK[&quot;对 heap tuple&lt;br/&gt;重检查原始值&quot;]</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>  CON <span class="co">-- &quot;false&quot; --&gt; DROP[&quot;丢弃&quot;]</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>  RECHECK <span class="co">--&gt; RESULT</span></span></code></pre></div>
+            <h3 id="阶段一提取查询键">3.2 阶段一：提取查询键</h3>
+            <p><code>extractQuery()</code> 是 GIN
+            操作符类提供的回调函数。它接收查询条件（如
+            <code>to_tsquery('database &amp; postgres')</code>），返回一组查询键（<code>"database"</code>、<code>"postgres"</code>）和键之间的逻辑关系（AND）。对于
+            <code>@@</code> 全文搜索，<code>extractQuery</code> 将
+            tsquery 的解析树展平为键列表；对于 <code>@&gt;</code>
+            数组包含查询，将数组元素展平为键列表。</p>
+            <p>如果查询支持部分匹配（prefix search，如
+            <code>'data:*'</code>），<code>extractQuery</code>
+            只返回一个下界键并设置 <code>pmatch</code> 标志，后续扫描由
+            <code>comparePartial</code> 函数控制范围。</p>
+            <h3 id="阶段二扫描主索引和-pending-list">3.3
+            阶段二：扫描主索引和 Pending List</h3>
+            <p>对每个查询键，GIN 同时扫描两个来源：</p>
+            <p><strong>主索引扫描</strong>：在 Entry Tree
+            中查找该键，找到后读取其 Posting List 或遍历其 Posting
+            Tree，将找到的所有 TID 收集到一个 per-key 的 bitmap 中。</p>
+            <p><strong>Pending List 扫描</strong>：线性遍历整个 pending
+            list 的页面链表，把其中匹配该键的所有 TID 也加入同一个
+            per-key bitmap。</p>
+            <p>每个查询键得到一个 bitmap。如果有 3 个查询键，就得到 3 个
+            bitmap。</p>
+            <h3 id="阶段三bitmap-合并">3.4 阶段三：Bitmap 合并</h3>
+            <p>根据查询的语义（AND/OR），将这组 per-key bitmap
+            合并：</p>
+            <ul>
+            <li><strong>AND</strong>（如
+            <code>'a &amp; b'</code>）：对两个 bitmap
+            做交集，只保留在两个 bitmap 中都出现的 TID。</li>
+            <li><strong>OR</strong>（如 <code>'a | b'</code>）：对两个
+            bitmap 做并集，保留出现在任意一个 bitmap 中的 TID。</li>
+            <li><strong>NOT</strong>（如
+            <code>'!a'</code>）：需要知道”不包含键 a
+            的所有行”，这需要全表扫描——这也是为什么 PG
+            的全文搜索不原生支持纯否定查询的高效索引扫描。</li>
+            </ul>
+            <p>合并后的 bitmap 是候选行 TID 的集合。此时还没有读取任何
+            heap tuple。</p>
+            <h3 id="阶段四consistent-过滤">3.5 阶段四：consistent
+            过滤</h3>
+            <p>Candidate bitmap 中的 TID
+            只是”所有查询键在其中出现的行”的集合。但在 AND 查询中，GIN
+            可能还需要确认这些键是否出现在同一行中（而不是同一行的不同索引字段），或者需要确认更多细节（如匹配的位置信息）。</p>
+            <p><code>consistent(check[], query, ...)</code> 是 GIN
+            操作符类提供的回调。它接收一个布尔数组
+            <code>check[]</code>，第 i 个元素表示第 i
+            个查询键是否出现在当前候选行中。<code>consistent</code>
+            返回三种可能的结果：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>返回值</th>
+            <th><code>*recheck</code></th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>false</code></td>
+            <td>–</td>
+            <td>该行不匹配，丢弃</td>
+            </tr>
+            <tr>
+            <td><code>true</code></td>
+            <td><code>false</code></td>
+            <td>该行确定匹配，直接返回</td>
+            </tr>
+            <tr>
+            <td><code>true</code></td>
+            <td><code>true</code></td>
+            <td>该行可能匹配，需要从 heap 读取原始数据后重检查</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>recheck = true</code> 的场景：GIN
+            索引不存储原始的索引值，<code>consistent</code>
+            只能根据键的存在/缺失做判断。当判断需要更多的上下文（如词典中词的位置关系）时，GIN
+            无法仅从索引做出确定性判断，必须标记
+            <code>recheck = true</code>，由执行器在读取 heap tuple
+            后用原始数据重新计算。</p>
+            <p>PG 9.4 引入的 <code>triConsistent</code>
+            回调进一步优化了这个流程：<code>triConsistent</code> 可以让
+            GIN 在还没读完某个键的全部 TID
+            时就能提前判断某些候选行是否可能匹配。如果
+            <code>triConsistent</code> 返回 <code>GIN_FALSE</code>，GIN
+            可以跳过对该行剩余键的扫描。</p>
+            <hr />
+            <h2
+            id="四全文搜索-tsvector-与数组-_int4-的实现">四、全文搜索
+            tsvector 与数组 _int4 的实现</h2>
+            <h3 id="tsvector-的-gin-操作符类">4.1 tsvector 的 GIN
+            操作符类</h3>
+            <p>全文搜索是 GIN 最典型的应用场景。PG 内置的
+            <code>tsvector_ops</code> 操作符类支持
+            <code>@@</code>（匹配）、<code>@@@</code>（短语匹配）等操作符。</p>
+            <p><code>extractValue</code> 从 <code>tsvector</code>
+            中提取所有词位（lexeme），并附带每个词位的位置信息（position）。位置信息存储在
+            Posting List/Tree 的 TID 条目中，用于短语搜索（“A 紧邻
+            B”）的 <code>recheck</code> 阶段。具体来说，Posting Tree
+            中每个 TID 条目除了存储 heap
+            行指针外，还存储该键在该行中出现的位置列表（positions）。</p>
+            <p><code>extractQuery</code> 从 <code>tsquery</code>（如
+            <code>to_tsquery('database &amp; postgres')</code>）中提取查询键及其逻辑关系。两个词的
+            AND 产生 2 个键，查询逻辑为 <code>nkeys == 2</code> 且
+            <code>consistent</code> 要求
+            <code>check[0] &amp;&amp; check[1]</code>。</p>
+            <p><code>consistent</code>
+            对基本关键词匹配做简单的键存在性判断（AND =
+            所有键都存在），对短语搜索（<code>'&lt;-&gt;'</code>
+            操作符）则需要检查位置信息，这个检查发生在
+            <code>recheck = true</code> 路径上——heap tuple 被读回后，用
+            tsvector 中存储的完整位置列表验证邻接关系。</p>
+            <h3 id="intarray-的-gin-操作符类">4.2 intarray 的 GIN
+            操作符类</h3>
+            <p><code>intarray</code> 扩展提供 <code>gin__int_ops</code>
+            操作符类，支持数组比较操作符：</p>
+            <ul>
+            <li><code>@&gt;</code>（包含）：左边的数组是否包含右边的所有元素。<code>extractQuery</code>
+            将右边数组的元素展平为查询键，<code>consistent</code> 要求
+            <code>check[i]</code> 全为 true（AND 语义）。</li>
+            <li><code>&amp;&amp;</code>（重叠）：两边是否有交集。<code>extractQuery</code>
+            将右边数组元素展平，<code>consistent</code> 要求至少一个
+            <code>check[i]</code> 为 true（OR 语义）。</li>
+            <li><code>=</code>（相等）：两边是否完全相同。使用 AND 语义
+            +
+            需要计数验证（<code>recheck = true</code>），因为索引只记录”该键在行中是否存在”，而不是”该键在行中出现几次”。</li>
+            </ul>
+            <p>对于 <code>_int4</code> 这样元素类型固定的数组，GIN
+            索引的 <code>extractValue</code>
+            很简单：遍历数组的每个元素，将其作为一个独立的键插入索引。</p>
+            <h3 id="jsonb-的-gin-索引">4.3 JSONB 的 GIN 索引</h3>
+            <p>JSONB 的 GIN 支持通过不同的操作符类实现：</p>
+            <ul>
+            <li><code>jsonb_ops</code>（默认）：将每个 JSON
+            键和值的组合提取为索引键（如 <code>{"a": 1}</code> 提取键
+            <code>"a"</code> 和 <code>"1"</code>
+            作为两个独立条目）。支持
+            <code>@&gt;</code>、<code>?</code>、<code>?|</code>、<code>?&amp;</code>
+            操作符。</li>
+            <li><code>jsonb_path_ops</code>：只索引 JSON
+            路径（键的序列），不索引值。更紧凑，只支持
+            <code>@&gt;</code> 操作符，但不支持 <code>?</code>
+            键存在查询。</li>
+            </ul>
+            <p><code>jsonb_path_ops</code> 比 <code>jsonb_ops</code>
+            更小更快的原因是它不索引值，从而大幅减少键的总数——对于有大量不同
+            JSON 值的场景尤其显著。</p>
+            <hr />
+            <h2 id="五gin-vs-gist三角权衡与选择建议">五、GIN vs
+            GiST：三角权衡与选择建议</h2>
+            <h3 id="结构差异带来的性能差异">5.1
+            结构差异带来的性能差异</h3>
+            <p>GIN 和 GiST 的差异源于索引结构的设计哲学不同：</p>
+            <table>
+            <colgroup>
+            <col style="width: 35%" />
+            <col style="width: 29%" />
+            <col style="width: 35%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>GIN</th>
+            <th>GiST</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>索引结构</td>
+            <td>Entry Tree (B-Tree over keys) + Posting List/Tree
+            (per-key B-Tree of TIDs)</td>
+            <td>单棵平衡树，节点存储 bounding information</td>
+            </tr>
+            <tr>
+            <td>键的存储</td>
+            <td>每个键值只存一次，通过 Posting
+            结构指向所有出现该键的行</td>
+            <td>每行数据在树中可能产生多条记录（取决于内部节点分裂）</td>
+            </tr>
+            <tr>
+            <td>读性能</td>
+            <td>搜索快——键值查找 O(log N_keys)，扫描 Posting
+            结构拿到全部 TID</td>
+            <td>搜索较慢——需要遍历树并在每个内部节点做 Consistent
+            判断</td>
+            </tr>
+            <tr>
+            <td>写性能（原生）</td>
+            <td>慢——插入一行产生 O(N_keys) 次 B-Tree 更新</td>
+            <td>中等——插入一次，走一次树搜索 + 可能分裂</td>
+            </tr>
+            <tr>
+            <td>写性能（Fast Update）</td>
+            <td>快——延迟合并把 O(N_keys) 次 B-Tree 操作变成线性追加</td>
+            <td>无等效机制</td>
+            </tr>
+            <tr>
+            <td>存储开销</td>
+            <td>低——重复键只存一次；但 Posting Tree 有额外 B-Tree
+            页面开销</td>
+            <td>中——每行数据的索引条目可能多于一行</td>
+            </tr>
+            <tr>
+            <td>索引构建速度</td>
+            <td>慢——需要汇集所有键的所有 TID，排序后批量构建</td>
+            <td>快——逐行插入构建</td>
+            </tr>
+            <tr>
+            <td>构建对 work_mem 的敏感度</td>
+            <td>高——<code>maintenance_work_mem</code>
+            直接影响排序趟数</td>
+            <td>低——不依赖大排序</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>GIN 在本质上是”为搜索优化”的索引。它把写操作的复杂度通过
+            pending list 延迟分摊了。</p>
+            <h3 id="全文搜索gin-vs-gist">5.2 全文搜索：GIN vs GiST</h3>
+            <p>对于 <code>tsvector</code> 全文搜索，GIN 和 GiST
+            都可以用，但表现有显著差异：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 场景：10GB 的文档表，100 万行，每行平均 50 个词</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_gist <span class="kw">ON</span> docs <span class="kw">USING</span> gist (content_tsv);</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_gin  <span class="kw">ON</span> docs <span class="kw">USING</span> gin  (content_tsv);</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> docs <span class="kw">WHERE</span> content_tsv @@ to_tsquery(<span class="st">&#39;database &amp; postgres&#39;</span>);</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>读性能<span class="op">**</span>：GIN 领先。因为词 <span class="ot">&quot;database&quot;</span> 和 <span class="ot">&quot;postgres&quot;</span> 在 <span class="kw">Entry</span> Tree 中只有各一条记录，搜索时只需要两次 B<span class="op">-</span>Tree 查找 <span class="op">+</span> 扫描 Posting 结构拿到 TID <span class="kw">bitmap</span> <span class="op">+</span> <span class="kw">AND</span> 操作。GiST 需要遍历树，在每个内部节点调用 <span class="kw">Consistent</span> 判断该节点的 bounding region 是否可能包含匹配行。</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>写性能<span class="op">**</span>：GiST 原始写入更快（单次插入无需分解为多次键操作），但 GIN 通过 <span class="kw">Fast</span> <span class="kw">Update</span> 在批量导入中反超。对于持续写入的 OLTP 场景，GiST 的写延迟更可预测（没有 pending <span class="kw">list</span> 时大时小的问题）；对于以读为主的报表<span class="op">/</span>搜索场景，GIN 的读性能优势明显。</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>存储<span class="op">**</span>：GIN 索引通常比同场景的 GiST 索引大 <span class="dv">2</span><span class="op">-</span><span class="dv">3</span> 倍。因为 GIN 为每个 Posting Tree 维护完整的 B<span class="op">-</span>Tree 页面结构，而 GiST 的节点密度更高。</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>一句话总结：GIN 是为读优化的倒排索引，适用于<span class="ot">&quot;写一次、读很多次&quot;</span>的全文搜索；GiST 是通用平衡树，适用于<span class="ot">&quot;读写均衡&quot;</span>或<span class="ot">&quot;写频繁&quot;</span>的全文搜索。</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>### <span class="fl">5.3</span> 数组和 JSONB：GIN 几乎总是更优</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>对于 `intarray` 和 JSONB 索引，GIN 是事实标准。GiST 也有对应的操作符类（`gist__int_ops`、`gist_jsonb_ops`），但在这些场景下 GIN 的倒排模型是天然匹配的——数组的元素和 JSON 的键天然就是倒排索引的<span class="ot">&quot;键&quot;</span>。</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>唯一值得用 GiST 的场景是：数组很短（如 <span class="dv">2</span><span class="op">-</span><span class="dv">3</span> 个元素）且写入频率高。在这种情况下 GIN 的 O(N_keys) 逐键插入开销与 GiST 的 O(<span class="dv">1</span>) 插入差距不大，但 GiST 的更低存储开销和更快构建速度可能有优势。</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>### <span class="fl">5.4</span> 选择建议</span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>| 场景 | 推荐 | 原因 |</span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|------|</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>| 全文搜索、读多写少 | GIN | 搜索性能最优，通过 VACUUM 后台清理 pending <span class="kw">list</span> |</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>| 全文搜索、写多读少 | GiST | 写延迟可预测，不需要维护 pending <span class="kw">list</span> |</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>| 全文搜索、写入量大但有批量写窗口 | GIN <span class="op">+</span> 定期 `gin_clean_pending_list()` | 批量写完后清理，之后查询跑得飞快 |</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>| 数组包含查询 (`@<span class="op">&gt;</span>`, `&amp;&amp;`) | GIN | 倒排模型天然匹配，`intarray` 的 GIN 操作符类成熟 |</span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>| JSONB 键存在查询 (`?`, `?|`, `?&amp;`) | GIN (`jsonb_ops`) | GiST 不支持这些操作符 |</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>| JSONB 路径包含 (`@<span class="op">&gt;</span>`) 且对索引大小敏感 | GIN (`jsonb_path_ops`) | 比 `jsonb_ops` 小很多，因为不索引值 |</span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>| 几何类型、KNN 最近邻搜索 | GiST | GIN 不支持距离排序，GiST 有内置的 `sortsupport` |</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>| 小数组（<span class="op">&lt;</span> <span class="dv">5</span> 元素）<span class="op">+</span> 高频写入 | GiST | 倒排优势不明显，GiST 更低存储开销 |</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>## 六、关键参数与运维考量</span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>### <span class="fl">6.1</span> 构建期间的 work_mem</span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>GIN 索引构建使用 `maintenance_work_mem`（不是 `work_mem`）作为排序缓冲区。构建时的工作流程是：扫描全表 → 对每一行调用 `extractValue` 提取键 → 收集所有 (<span class="kw">key</span>, TID) 对 → 按键排序 → 批量构建 <span class="kw">Entry</span> Tree 和 Posting 结构。`maintenance_work_mem` 决定了排序时可以同时处理多少条目。官方文档明确指出：<span class="ot">&quot;don&#39;t skimp on work memory during index creation&quot;</span>。</span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>### <span class="fl">6.2</span> gin_pending_list_limit 的调优</span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>默认值为 <span class="dv">4</span>MB。调优思路：</span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>读多写少的搜索表<span class="op">**</span>：调小（如 <span class="dv">1</span>MB），降低 pending <span class="kw">list</span> 扫描代价。</span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>高频小写入的 OLTP 表<span class="op">**</span>：调大（如 <span class="dv">16</span>MB），减少前台触发合并的概率。</span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>批量写后读的表<span class="op">**</span>：保持默认，写入完成后显式调用 `gin_clean_pending_list()`。</span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>### <span class="fl">6.3</span> 监控 Pending <span class="kw">List</span> 大小</span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 GIN 索引的 pending list 页面数</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> indexrelname,</span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>       pg_relation_size(indexrelid) <span class="kw">AS</span> total_size,</span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>       <span class="co">-- pending list 页面可以通过 pgstatginindex() 查看（需要 pgstattuple 扩展）</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>       pgstatginindex(indexrelid)</span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_indexes</span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> indexrelname <span class="kw">LIKE</span> <span class="st">&#39;%gin%&#39;</span>;</span></code></pre></div>
+            <p><code>pgstattuple</code> 扩展提供
+            <code>pgstatginindex()</code> 函数，返回
+            <code>pending_pages</code> 和 <code>pending_tuples</code>
+            两个字段，直接监控 pending list 的实际大小。</p>
+            <hr />
+            <h2 id="七关键要点">七、关键要点</h2>
+            <ol type="1">
+            <li><strong>GIN
+            是倒排索引</strong>——从键映射到行，而不是从行映射到键。Entry
+            Tree 是 B-Tree over keys，每个键只存一次；Posting
+            List（紧凑，单页内）和 Posting Tree（独立
+            B-Tree）存储该键出现的所有行 ID。</li>
+            <li><strong>Fast Update 通过 pending list
+            延迟合并</strong>——插入时只做线性追加，合并留给 VACUUM 或
+            <code>gin_clean_pending_list()</code>。代价是搜索时必须额外扫描
+            pending list。</li>
+            <li><strong>gingetbitmap() 是 GIN
+            唯一的搜索路径</strong>——对每个查询键收集 TID bitmap，按
+            AND/OR 语义合并，通过 <code>consistent()</code>
+            回调做最终过滤。<code>recheck = true</code> 时从 heap
+            重读原始数据。</li>
+            <li><strong>tsvector 和 intarray 是 GIN
+            的最优场景</strong>——键的重复度高、查询为包含/匹配语义，与倒排模型天然吻合。</li>
+            <li><strong>GIN 为读优化，GiST 为写均衡</strong>——GIN
+            搜索快、存储大、原始写入慢但 Fast Update 弥补；GiST
+            搜索较慢、存储小、写入延迟可预测。全文搜索读多选 GIN，写多选
+            GiST；数组和 JSONB 几乎总是 GIN。</li>
+            </ol>
+            <p>上一章：<a href="../15-gist/15-gist.html">GiST 索引</a>
+            下一章：<a href="../17-brin/17-brin.html">BRIN
+            与其他索引</a>，拆解 BRIN 的范围摘要哲学、revmap
+            结构、超大表 IO 优化，以及 Hash 和 Bloom
+            索引的使用边界。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/access/gin/gininsert.c</code>：gininsert()、ginInsertCleanup()
+            插入与 pending list 清理</li>
+            <li><code>src/backend/access/gin/ginget.c</code>：gingetbitmap()
+            bitmap scan 搜索路径</li>
+            <li><code>src/backend/access/gin/ginbtree.c</code>：Entry
+            Tree 和 Posting Tree 的 B-Tree 操作</li>
+            <li><code>src/backend/access/gin/gindatapage.c</code>：Posting
+            List/Tree 的数据页操作</li>
+            <li><code>src/backend/access/gin/ginentrypage.c</code>：Entry
+            Tree 叶子页操作</li>
+            <li><code>src/backend/access/gin/ginvacuum.c</code>：VACUUM
+            触发的 pending list 清理与页面回收</li>
+            <li><code>src/backend/access/gin/ginutil.c</code>：通用工具函数与回调</li>
+            <li><code>src/include/access/gin.h</code>：GIN
+            核心数据结构定义</li>
+            <li><code>src/include/access/gin_private.h</code>：GIN
+            内部数据结构（GinBtreeData、GinPostingTreeScan 等）</li>
+            <li><code>src/backend/access/gin/ginxlog.c</code>：GIN 的
+            WAL 记录类型</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL 17 Documentation, Chapter 66: GIN
+            Indexes</li>
+            <li>PostgreSQL 17 Documentation, Section 66.3: GIN
+            Extensibility（extractValue、extractQuery、consistent
+            回调接口）</li>
+            </ul>
+            <h3 id="扩展模块">扩展模块</h3>
+            <ul>
+            <li><code>contrib/intarray/</code>：intarray GIN
+            操作符类的实现</li>
+            <li><code>contrib/pg_trgm/</code>：三元组 GIN
+            索引（LIKE/ILIKE 模糊搜索）</li>
+            <li><code>contrib/btree_gin/</code>：为普通标量类型提供 GIN
+            操作符</li>
+            </ul>
+            <h3 id="相关文章">相关文章</h3>
+            <ul>
+            <li>Oleg Bartunov, Teodor Sigaev. “GIN — A Generalized
+            Inverted iNdex for PostgreSQL.” PGCon 2006. — GIN
+            的原始设计论文</li>
+            <li>Egor Rogov. <em>PostgreSQL 16 Internals</em>, Part V,
+            Chapter: GIN.</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/15-gist/15-gist.html">【PG 内核】GiST 索引：一套接口搞定几何、全文、数组——通用搜索树怎么把&quot;像什么&quot;变成索引查找</a></h3>
+                    <p>拆解 PostgreSQL GiST 索引的抽象算子接口（Consistent/Union/Penalty/PickSplit）、深度优先搜索与 Consistent 过滤的组合逻辑、Penalty 引导插入路径与 PickSplit 决定分裂策略的完整流程，以及 point_ops 的几何距离搜索和 tsvector_ops 的全文搜索两种典型实现。读完你会理解为什么 GiST 能用一个通用框架支持十几种数据类型，以及它什么时候比 B-Tree 好、什么时候该用 GIN 替代。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html">【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性</a></h3>
+                    <p>在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

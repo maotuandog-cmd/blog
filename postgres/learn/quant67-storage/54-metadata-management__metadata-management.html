@@ -1,0 +1,1863 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】元数据管理 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="深入分析分布式存储的元数据架构——集中式
+vs 分布式 vs 无元数据方案、元数据分片与缓存、HDFS NameNode 与 Ceph CRUSH
+的工程实践" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="metadata, namenode, crush, distributed-metadata, metadata-caching, metadata-sharding, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/54-metadata-management/metadata-management.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】元数据管理" />
+    <meta property="og:description" content="深入分析分布式存储的元数据架构——集中式 vs 分布式 vs 无元数据方案、元数据分片与缓存、HDFS NameNode 与 Ceph CRUSH 的工程实践" />
+    <meta property="og:url" content="https://quant67.com/post/storage/54-metadata-management/metadata-management.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="metadata" />
+    <meta property="article:tag" content="namenode" />
+    <meta property="article:tag" content="crush" />
+    <meta property="article:tag" content="distributed-metadata" />
+    <meta property="article:tag" content="metadata-caching" />
+    <meta property="article:tag" content="metadata-sharding" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】元数据管理" />
+    <meta name="twitter:description" content="深入分析分布式存储的元数据架构——集中式 vs 分布式 vs 无元数据方案、元数据分片与缓存、HDFS NameNode 与 Ceph CRUSH 的工程实践" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】元数据管理", "description": "深入分析分布式存储的元数据架构——集中式 vs 分布式 vs 无元数据方案、元数据分片与缓存、HDFS NameNode 与 Ceph CRUSH 的工程实践", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/54-metadata-management/metadata-management.html"}, "datePublished": "2025-10-02T00:00:00+00:00", "dateModified": "2026-04-15T12:25:54+00:00", "keywords": ["metadata", "namenode", "crush", "distributed-metadata", "metadata-caching", "metadata-sharding"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】元数据管理</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-10-02</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#metadata</span> <span>#namenode</span> <span>#crush</span> <span>#distributed-metadata</span> <span>#metadata-caching</span> <span>#metadata-sharding</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/53-replication/replication.html">上一篇：【存储工程】副本与复制策略</a><a class="post-series-nav__link" href="/post/storage/55-data-balancing/data-balancing.html">下一篇：【存储工程】数据均衡与在线迁移</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/metadata.html">#metadata</a><a class="chip-link" href="/tags/namenode.html">#namenode</a><a class="chip-link" href="/tags/crush.html">#crush</a><a class="chip-link" href="/tags/distributed-metadata.html">#distributed-metadata</a><a class="chip-link" href="/tags/metadata-caching.html">#metadata-caching</a><a class="chip-link" href="/tags/metadata-sharding.html">#metadata-sharding</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一元数据在存储系统中的角色"
+                id="toc-一元数据在存储系统中的角色">一、元数据在存储系统中的角色</a>
+                <ul>
+                <li><a href="#什么是元数据" id="toc-什么是元数据">1.1
+                什么是元数据</a></li>
+                <li><a href="#元数据的访问模式"
+                id="toc-元数据的访问模式">1.2 元数据的访问模式</a></li>
+                <li><a href="#元数据与数据路径的分离"
+                id="toc-元数据与数据路径的分离">1.3
+                元数据与数据路径的分离</a></li>
+                </ul></li>
+                <li><a href="#二集中式元数据hdfs-namenode单点瓶颈"
+                id="toc-二集中式元数据hdfs-namenode单点瓶颈">二、集中式元数据（HDFS
+                NameNode、单点瓶颈）</a>
+                <ul>
+                <li><a href="#hdfs-namenode-的内存模型"
+                id="toc-hdfs-namenode-的内存模型">2.1 HDFS NameNode
+                的内存模型</a></li>
+                <li><a href="#单点瓶颈的四个维度"
+                id="toc-单点瓶颈的四个维度">2.2
+                单点瓶颈的四个维度</a></li>
+                <li><a href="#namenode-的持久化机制"
+                id="toc-namenode-的持久化机制">2.3 NameNode
+                的持久化机制</a></li>
+                <li><a href="#集中式方案的优势"
+                id="toc-集中式方案的优势">2.4 集中式方案的优势</a></li>
+                </ul></li>
+                <li><a href="#三分布式元数据ceph-crushcephfs-mds"
+                id="toc-三分布式元数据ceph-crushcephfs-mds">三、分布式元数据（Ceph
+                CRUSH、CephFS MDS）</a>
+                <ul>
+                <li><a href="#crush-算法的核心思想"
+                id="toc-crush-算法的核心思想">3.1 CRUSH
+                算法的核心思想</a></li>
+                <li><a href="#cluster-map-与故障域"
+                id="toc-cluster-map-与故障域">3.2 Cluster Map
+                与故障域</a></li>
+                <li><a href="#crush-的伪随机选择"
+                id="toc-crush-的伪随机选择">3.3 CRUSH
+                的伪随机选择</a></li>
+                <li><a href="#cephfs-mds文件系统元数据的分布式管理"
+                id="toc-cephfs-mds文件系统元数据的分布式管理">3.4 CephFS
+                MDS：文件系统元数据的分布式管理</a></li>
+                <li><a href="#集中式-vs-分布式元数据对比"
+                id="toc-集中式-vs-分布式元数据对比">3.5 集中式 vs
+                分布式元数据对比</a></li>
+                </ul></li>
+                <li><a href="#四无元数据方案dynamo-风格客户端计算"
+                id="toc-四无元数据方案dynamo-风格客户端计算">四、无元数据方案（Dynamo
+                风格、客户端计算）</a>
+                <ul>
+                <li><a href="#一致性哈希定位"
+                id="toc-一致性哈希定位">4.1 一致性哈希定位</a></li>
+                <li><a href="#客户端直接计算定位"
+                id="toc-客户端直接计算定位">4.2
+                客户端直接计算定位</a></li>
+                <li><a href="#无元数据方案的代价"
+                id="toc-无元数据方案的代价">4.3
+                无元数据方案的代价</a></li>
+                <li><a href="#三种方案的全景对比"
+                id="toc-三种方案的全景对比">4.4
+                三种方案的全景对比</a></li>
+                </ul></li>
+                <li><a href="#五元数据分片策略哈希范围目录树分片"
+                id="toc-五元数据分片策略哈希范围目录树分片">五、元数据分片策略（哈希/范围/目录树分片）</a>
+                <ul>
+                <li><a href="#为什么需要元数据分片"
+                id="toc-为什么需要元数据分片">5.1
+                为什么需要元数据分片</a></li>
+                <li><a href="#哈希分片" id="toc-哈希分片">5.2
+                哈希分片</a></li>
+                <li><a href="#范围分片" id="toc-范围分片">5.3
+                范围分片</a></li>
+                <li><a href="#目录树分片" id="toc-目录树分片">5.4
+                目录树分片</a></li>
+                <li><a href="#三种分片策略对比"
+                id="toc-三种分片策略对比">5.5 三种分片策略对比</a></li>
+                </ul></li>
+                <li><a href="#六元数据缓存客户端缓存一致性维护"
+                id="toc-六元数据缓存客户端缓存一致性维护">六、元数据缓存（客户端缓存、一致性维护）</a>
+                <ul>
+                <li><a href="#为什么需要元数据缓存"
+                id="toc-为什么需要元数据缓存">6.1
+                为什么需要元数据缓存</a></li>
+                <li><a href="#hdfs-客户端的块位置缓存"
+                id="toc-hdfs-客户端的块位置缓存">6.2 HDFS
+                客户端的块位置缓存</a></li>
+                <li><a href="#cephfs-的元数据缓存与能力capabilities"
+                id="toc-cephfs-的元数据缓存与能力capabilities">6.3
+                CephFS 的元数据缓存与能力（Capabilities）</a></li>
+                <li><a href="#缓存一致性的代价"
+                id="toc-缓存一致性的代价">6.4 缓存一致性的代价</a></li>
+                </ul></li>
+                <li><a href="#七元数据一致性保证强一致最终一致"
+                id="toc-七元数据一致性保证强一致最终一致">七、元数据一致性保证（强一致/最终一致）</a>
+                <ul>
+                <li><a href="#一致性问题的来源"
+                id="toc-一致性问题的来源">7.1 一致性问题的来源</a></li>
+                <li><a href="#强一致性方案" id="toc-强一致性方案">7.2
+                强一致性方案</a></li>
+                <li><a href="#最终一致性方案"
+                id="toc-最终一致性方案">7.3 最终一致性方案</a></li>
+                <li><a href="#一致性与性能的权衡"
+                id="toc-一致性与性能的权衡">7.4
+                一致性与性能的权衡</a></li>
+                </ul></li>
+                <li><a href="#八namenode-高可用与联邦hafederation"
+                id="toc-八namenode-高可用与联邦hafederation">八、NameNode
+                高可用与联邦（HA、Federation）</a>
+                <ul>
+                <li><a href="#namenode-ha-架构"
+                id="toc-namenode-ha-架构">8.1 NameNode HA 架构</a></li>
+                <li><a href="#故障切换流程" id="toc-故障切换流程">8.2
+                故障切换流程</a></li>
+                <li><a href="#namenode-federation"
+                id="toc-namenode-federation">8.3 NameNode
+                Federation</a></li>
+                <li><a href="#router-based-federationhdfs-rbf"
+                id="toc-router-based-federationhdfs-rbf">8.4
+                Router-Based Federation（HDFS RBF）</a></li>
+                <li><a href="#federation-的局限"
+                id="toc-federation-的局限">8.5 Federation
+                的局限</a></li>
+                </ul></li>
+                <li><a href="#九元数据容量规划与监控"
+                id="toc-九元数据容量规划与监控">九、元数据容量规划与监控</a>
+                <ul>
+                <li><a href="#容量规划公式" id="toc-容量规划公式">9.1
+                容量规划公式</a></li>
+                <li><a href="#关键监控指标" id="toc-关键监控指标">9.2
+                关键监控指标</a></li>
+                <li><a href="#prometheus-监控实战"
+                id="toc-prometheus-监控实战">9.3 Prometheus
+                监控实战</a></li>
+                <li><a href="#元数据增长趋势分析"
+                id="toc-元数据增长趋势分析">9.4
+                元数据增长趋势分析</a></li>
+                <li><a href="#元数据审计与治理"
+                id="toc-元数据审计与治理">9.5 元数据审计与治理</a></li>
+                </ul></li>
+                <li><a href="#十参考文献"
+                id="toc-十参考文献">十、参考文献</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>分布式存储系统中，数据本身的读写性能往往不是最难的问题。真正卡脖子的，常常是元数据（Metadata）。元数据决定了”数据在哪里”、“这个文件有多大”、“谁有权限读写”——每一次数据访问，都要先查元数据。当集群规模从几十台机器扩展到几千台，元数据服务的吞吐量和延迟就成了整个系统的天花板。</p>
+            <p>HDFS 的 NameNode
+            把全部元数据放在单机内存里，简单高效，但单点瓶颈明显：文件数上亿之后，NameNode
+            的堆内存可以吃掉上百 GB，重启一次需要几十分钟加载镜像。Ceph
+            走了另一条路，用 CRUSH
+            算法把数据定位计算推到客户端，完全去掉了集中式元数据服务。Dynamo
+            风格的系统更激进，连单独的元数据层都不需要，直接用一致性哈希（Consistent
+            Hashing）让客户端算出数据位置。</p>
+            <p>三种方案各有代价。集中式方案运维简单但扩展难，分布式方案扩展好但一致性复杂，无元数据方案看似轻量却把复杂性转嫁给了客户端和数据分布策略。理解这些权衡，需要从元数据的本质出发，逐层拆解架构选择背后的工程逻辑。</p>
+            <p>本文从元数据的角色定义开始，依次分析集中式、分布式、无元数据三种架构方案，深入元数据分片策略、缓存机制与一致性保证，最后落到
+            HDFS NameNode 高可用与容量规划的工程实践。</p>
+            <blockquote>
+            <p><strong>适用范围</strong>
+            本文讨论的元数据管理主要针对分布式文件系统和对象存储场景。涉及的软件版本：Hadoop
+            3.3.x、Ceph 18.x（Reef）、Amazon DynamoDB 2024
+            年版本。数据库系统的元数据管理（如 catalog、schema
+            管理）不在讨论范围内。</p>
+            </blockquote>
+            <hr />
+            <h2
+            id="一元数据在存储系统中的角色">一、元数据在存储系统中的角色</h2>
+            <h3 id="什么是元数据">1.1 什么是元数据</h3>
+            <p>元数据是”描述数据的数据”。在存储系统中，元数据至少包含三类信息：</p>
+            <ul>
+            <li><strong>命名空间信息</strong>：文件名、目录层级、路径到数据块的映射</li>
+            <li><strong>位置信息</strong>：数据块存储在哪些物理节点、哪些磁盘上</li>
+            <li><strong>属性信息</strong>：文件大小、创建时间、修改时间、权限、所有者、副本数、校验和</li>
+            </ul>
+            <p>以 HDFS 为例，一个 1 GB 的文件被切分成 8 个 128 MB
+            的数据块（Block），每个块有 3 个副本分布在不同的 DataNode
+            上。NameNode 需要维护的元数据包括：</p>
+            <pre class="text"><code>文件 /user/data/logs/access.log
+  大小: 1,073,741,824 字节
+  块大小: 134,217,728 字节 (128 MB)
+  副本因子: 3
+  块列表:
+    Block-001 -&gt; [DataNode-05, DataNode-12, DataNode-23]
+    Block-002 -&gt; [DataNode-07, DataNode-18, DataNode-31]
+    Block-003 -&gt; [DataNode-02, DataNode-14, DataNode-27]
+    Block-004 -&gt; [DataNode-09, DataNode-21, DataNode-33]
+    Block-005 -&gt; [DataNode-03, DataNode-16, DataNode-28]
+    Block-006 -&gt; [DataNode-11, DataNode-19, DataNode-30]
+    Block-007 -&gt; [DataNode-06, DataNode-15, DataNode-25]
+    Block-008 -&gt; [DataNode-08, DataNode-22, DataNode-29]
+  权限: rw-r--r--
+  所有者: hdfs / supergroup
+  修改时间: 2025-09-15 14:32:00</code></pre>
+            <p>每个文件对应一条 INode 记录，每个数据块对应一条 Block
+            记录加上若干副本位置信息。当集群中有 1
+            亿个文件、平均每个文件 3 个块时，NameNode 需要维护约 1 亿条
+            INode 和 3 亿条 Block 位置记录。</p>
+            <h3 id="元数据的访问模式">1.2 元数据的访问模式</h3>
+            <p>元数据的读写比例极度不对称。在典型的大数据集群中，元数据的读操作占总操作的
+            90% 以上：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>操作类型</th>
+            <th>元数据读写</th>
+            <th>频率占比</th>
+            <th>延迟要求</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>文件打开（open）</td>
+            <td>读命名空间 + 读块位置</td>
+            <td>35~40%</td>
+            <td>&lt; 10 ms</td>
+            </tr>
+            <tr>
+            <td>目录列举（ls）</td>
+            <td>读命名空间</td>
+            <td>25~30%</td>
+            <td>&lt; 50 ms</td>
+            </tr>
+            <tr>
+            <td>文件状态查询（stat）</td>
+            <td>读属性</td>
+            <td>15~20%</td>
+            <td>&lt; 5 ms</td>
+            </tr>
+            <tr>
+            <td>文件创建（create）</td>
+            <td>写命名空间 + 写块记录</td>
+            <td>5~8%</td>
+            <td>&lt; 20 ms</td>
+            </tr>
+            <tr>
+            <td>文件删除（delete）</td>
+            <td>写命名空间 + 写块记录</td>
+            <td>3~5%</td>
+            <td>&lt; 20 ms</td>
+            </tr>
+            <tr>
+            <td>文件重命名（rename）</td>
+            <td>写命名空间</td>
+            <td>1~2%</td>
+            <td>&lt; 10 ms</td>
+            </tr>
+            <tr>
+            <td>权限修改（chmod）</td>
+            <td>写属性</td>
+            <td>&lt; 1%</td>
+            <td>&lt; 10 ms</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这种读多写少的模式决定了元数据系统的优化方向：读性能比写性能更重要，缓存是最有效的手段。</p>
+            <h3 id="元数据与数据路径的分离">1.3
+            元数据与数据路径的分离</h3>
+            <p>几乎所有分布式存储系统都把元数据路径（Metadata
+            Path）和数据路径（Data
+            Path）分开。客户端要读一个文件，先走元数据路径获取数据块的位置信息，再直接连接存储节点走数据路径读取实际数据。</p>
+            <pre class="text"><code>元数据路径与数据路径分离
+
+  客户端                    元数据服务                    存储节点
+    |                          |                          |
+    |  1. 打开文件请求          |                          |
+    |-------------------------&gt;|                          |
+    |                          |                          |
+    |  2. 返回块位置列表        |                          |
+    |&lt;-------------------------|                          |
+    |                          |                          |
+    |  3. 直接读取数据块（绕过元数据服务）                   |
+    |--------------------------------------------------&gt;  |
+    |                          |                          |
+    |  4. 返回数据                                        |
+    |&lt;--------------------------------------------------- |</code></pre>
+            <p>这种分离的好处是：数据传输不经过元数据服务，避免元数据服务成为数据带宽的瓶颈。HDFS、Ceph、GlusterFS、Lustre
+            都采用了这种设计。元数据服务只处理轻量的控制面请求，数据面的大流量直接在客户端和存储节点之间流转。</p>
+            <p>但分离也意味着：元数据服务的可用性直接决定整个存储系统的可用性。如果元数据服务宕机，即使所有存储节点都正常，客户端也无法定位数据，整个系统等同于不可用。</p>
+            <hr />
+            <h2
+            id="二集中式元数据hdfs-namenode单点瓶颈">二、集中式元数据（HDFS
+            NameNode、单点瓶颈）</h2>
+            <h3 id="hdfs-namenode-的内存模型">2.1 HDFS NameNode
+            的内存模型</h3>
+            <p>HDFS 是集中式元数据方案的典型代表。NameNode
+            把全部命名空间和块映射信息保存在 Java
+            堆内存中，用一棵树形结构（INode
+            树）表示文件系统的目录层级，用一个哈希表维护 BlockID 到
+            DataNode 列表的映射。</p>
+            <pre class="text"><code>NameNode 内存数据结构
+
+INode 树（命名空间）:
+┌──────────────────────────────────────────────────┐
+│  / (根目录)                                       │
+│  ├── user/                                        │
+│  │   ├── alice/                                   │
+│  │   │   ├── data.csv    [Block-001, Block-002]   │
+│  │   │   └── model.bin   [Block-003]              │
+│  │   └── bob/                                     │
+│  │       └── logs/                                │
+│  │           └── app.log [Block-004, Block-005]   │
+│  └── system/                                      │
+│      └── config.xml      [Block-006]              │
+└──────────────────────────────────────────────────┘
+
+Block 映射表:
+┌────────────┬────────────────────────────────────┐
+│  BlockID   │  DataNode 列表                      │
+├────────────┼────────────────────────────────────┤
+│  Block-001 │  [DN-05, DN-12, DN-23]             │
+│  Block-002 │  [DN-07, DN-18, DN-31]             │
+│  Block-003 │  [DN-02, DN-14, DN-27]             │
+│  Block-004 │  [DN-09, DN-21, DN-33]             │
+│  Block-005 │  [DN-03, DN-16, DN-28]             │
+│  Block-006 │  [DN-11, DN-19, DN-30]             │
+└────────────┴────────────────────────────────────┘</code></pre>
+            <p>每个 INode（文件或目录）在内存中大约占用 150 字节，每个
+            Block 记录大约占用 150 字节（包括 3
+            个副本的位置信息）。据此估算：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>文件数量</th>
+            <th>平均块数/文件</th>
+            <th>INode 内存</th>
+            <th>Block 内存</th>
+            <th>总计</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>1000 万</td>
+            <td>2</td>
+            <td>1.4 GB</td>
+            <td>2.8 GB</td>
+            <td>4.2 GB</td>
+            </tr>
+            <tr>
+            <td>1 亿</td>
+            <td>2</td>
+            <td>14 GB</td>
+            <td>28 GB</td>
+            <td>42 GB</td>
+            </tr>
+            <tr>
+            <td>5 亿</td>
+            <td>3</td>
+            <td>70 GB</td>
+            <td>210 GB</td>
+            <td>280 GB</td>
+            </tr>
+            <tr>
+            <td>10 亿</td>
+            <td>3</td>
+            <td>140 GB</td>
+            <td>420 GB</td>
+            <td>560 GB</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>当文件数达到数亿级别，NameNode 的堆内存需求轻松突破 100
+            GB。这不仅是硬件成本问题，更是运维风险——Java GC（Garbage
+            Collection）在大堆内存上的表现非常不稳定，Full GC
+            可能导致几十秒甚至几分钟的停顿。</p>
+            <h3 id="单点瓶颈的四个维度">2.2 单点瓶颈的四个维度</h3>
+            <p>NameNode
+            的单点瓶颈不仅仅是”宕机后不可用”这一个问题，至少体现在四个维度：</p>
+            <p><strong>内存容量瓶颈</strong>：如上所述，元数据总量受限于单机内存上限。即便使用
+            512 GB 内存的物理机，也只能支撑约 10 亿个文件。</p>
+            <p><strong>吞吐量瓶颈</strong>：NameNode
+            用一把全局读写锁（FSNamesystem
+            Lock）保护内存中的命名空间。所有元数据读写操作都需要获取这把锁。在高并发场景下，锁竞争成为吞吐量的天花板。实测中，单个
+            NameNode 的元数据操作吞吐量上限约为每秒 10 万~20 万次。</p>
+            <p><strong>启动时间瓶颈</strong>：NameNode
+            重启时需要从磁盘加载 FsImage（命名空间快照）和
+            EditLog（操作日志），然后进入安全模式（Safe Mode）等待
+            DataNode 上报块信息。一个 1 亿文件的集群，NameNode
+            重启通常需要 20~40 分钟。</p>
+            <p><strong>网络瓶颈</strong>：所有客户端的元数据请求都发往同一个
+            NameNode。当集群有数千个计算节点同时提交 MapReduce
+            任务时，NameNode 可能面临每秒数十万次 RPC 请求。</p>
+            <pre class="text"><code>NameNode 的四个瓶颈维度
+
+                        ┌─────────────────────┐
+                        │     NameNode         │
+                        │                     │
+  内存瓶颈 ──────────&gt;  │  INode 树 + Block表  │  &lt;── 吞吐瓶颈
+  (单机内存上限)         │  (全局锁保护)        │      (RPC 上限)
+                        │                     │
+  启动瓶颈 ──────────&gt;  │  FsImage + EditLog   │  &lt;── 网络瓶颈
+  (加载 + SafeMode)     │  (DataNode 上报)     │      (客户端并发)
+                        └─────────────────────┘</code></pre>
+            <h3 id="namenode-的持久化机制">2.3 NameNode
+            的持久化机制</h3>
+            <p>NameNode 用两种文件实现元数据持久化：</p>
+            <ul>
+            <li><strong>FsImage</strong>：命名空间的完整快照，包含所有
+            INode 和目录结构的序列化表示。FsImage 不包含块到 DataNode
+            的映射——这部分信息在每次启动时由 DataNode 主动上报。</li>
+            <li><strong>EditLog</strong>：自上次 FsImage
+            生成以来的所有命名空间变更操作日志，采用追加写入（Append-Only）方式。</li>
+            </ul>
+            <p>NameNode 的持久化流程：</p>
+            <pre class="text"><code>启动阶段:
+  1. 加载最新的 FsImage 到内存
+  2. 回放 FsImage 之后的所有 EditLog
+  3. 进入安全模式，等待 DataNode 上报块信息
+  4. 当 99.9% 的块都有至少一个副本上报后，退出安全模式
+
+运行阶段:
+  1. 每次元数据变更，先写 EditLog（同步刷盘）
+  2. 再更新内存中的数据结构
+  3. 定期触发 Checkpoint：合并 FsImage + EditLog -&gt; 新的 FsImage
+
+CheckpointNode / SecondaryNameNode:
+  1. 定期从 NameNode 下载 FsImage 和 EditLog
+  2. 在本地合并生成新的 FsImage
+  3. 上传新的 FsImage 到 NameNode</code></pre>
+            <p>EditLog
+            的写入是同步的，每次操作都要确保日志落盘后才返回给客户端。这保证了元数据不会因为
+            NameNode 崩溃而丢失，但也意味着 EditLog
+            的写入延迟直接影响元数据操作的响应时间。Hadoop 3.x 默认使用
+            QJM（Quorum Journal Manager）将 EditLog 写入到多个
+            JournalNode 上，兼顾持久性和高可用。</p>
+            <h3 id="集中式方案的优势">2.4 集中式方案的优势</h3>
+            <p>尽管有上述瓶颈，集中式元数据方案在工程上仍然有明显优势：</p>
+            <p><strong>强一致性天然保证</strong>：所有元数据都在一个节点上，不存在跨节点一致性问题。文件重命名、目录移动等操作天然是原子的。</p>
+            <p><strong>全局视图可用</strong>：集群管理员可以在一个节点上看到整个文件系统的全貌，方便做容量规划、配额管理、权限审计。</p>
+            <p><strong>实现简单</strong>：不需要分布式共识协议，不需要处理元数据分片和路由，代码复杂度远低于分布式元数据方案。</p>
+            <p><strong>查询灵活</strong>：目录列举、递归统计文件数量、模糊匹配文件名等操作都可以在单机内存中高效完成。</p>
+            <p>这些优势解释了为什么 HDFS 在明知 NameNode
+            是单点瓶颈的情况下，仍然选择了集中式方案——对于大多数 Hadoop
+            集群来说，文件数量在千万到亿级别，单机内存完全可以承受。</p>
+            <hr />
+            <h2
+            id="三分布式元数据ceph-crushcephfs-mds">三、分布式元数据（Ceph
+            CRUSH、CephFS MDS）</h2>
+            <h3 id="crush-算法的核心思想">3.1 CRUSH 算法的核心思想</h3>
+            <p>Ceph 的 CRUSH（Controlled Replication Under Scalable
+            Hashing）算法代表了另一种元数据管理思路：不维护数据到存储节点的显式映射表，而是通过确定性的算法计算数据的存储位置。</p>
+            <p>CRUSH 的核心输入是三个要素：</p>
+            <ul>
+            <li><strong>对象标识符</strong>（Object
+            ID）：要存储的数据对象的唯一标识</li>
+            <li><strong>集群拓扑图</strong>（Cluster
+            Map）：描述集群中所有存储设备的层级结构和权重</li>
+            <li><strong>放置规则</strong>（Placement
+            Rules）：定义副本如何分布在不同的故障域中</li>
+            </ul>
+            <p>CRUSH 的计算过程：</p>
+            <pre class="text"><code>CRUSH 数据定位流程
+
+步骤 1: 对象到 PG 的映射（哈希）
+  PG_ID = hash(object_name) mod num_PGs
+
+步骤 2: PG 到 OSD 的映射（CRUSH 算法）
+  输入: PG_ID, Cluster Map, Placement Rules
+  输出: [OSD-primary, OSD-replica1, OSD-replica2]
+
+具体计算过程:
+  object: &quot;rbd0.000001a4&quot;
+      |
+      | hash(object_name) mod 1024
+      v
+  PG: 3.2a4
+      |
+      | CRUSH(PG_ID, cluster_map, rules)
+      v
+  OSD 列表: [osd.15, osd.42, osd.73]</code></pre>
+            <p>关键点在于：这个计算过程是确定性的。给定相同的输入（对象名、集群拓扑、放置规则），任何节点——包括客户端——都能独立计算出相同的结果。不需要查询中央元数据服务，不需要维护对象到存储位置的映射表。</p>
+            <h3 id="cluster-map-与故障域">3.2 Cluster Map 与故障域</h3>
+            <p>CRUSH 的 Cluster Map
+            用一棵层级树描述集群拓扑。每个叶子节点是一个 OSD（Object
+            Storage
+            Daemon，对应一块磁盘），非叶子节点表示故障域（Failure
+            Domain）：</p>
+            <pre class="text"><code>CRUSH Map 层级结构
+
+                          root (default)
+                              |
+              ┌───────────────┼───────────────┐
+              |               |               |
+          datacenter-1    datacenter-2    datacenter-3
+              |               |               |
+         ┌────┴────┐     ┌───┴────┐      ┌───┴────┐
+         |         |     |        |      |        |
+       rack-1   rack-2  rack-3  rack-4  rack-5  rack-6
+         |         |     |        |      |        |
+      ┌──┴──┐   ┌─┴──┐  ...     ...    ...      ...
+      |     |   |    |
+    host-1 host-2 host-3 host-4
+      |     |     |      |
+   ┌──┴──┐ ...   ...    ...
+   |     |
+ osd.0  osd.1</code></pre>
+            <p>放置规则定义了副本在故障域中的分布策略。例如，“三副本分布在三个不同的机架上”这条规则用
+            CRUSH 语法表示为：</p>
+            <pre class="text"><code>rule replicated_rack {
+    id 0
+    type replicated
+    min_size 1
+    max_size 10
+    step take default
+    step chooseleaf firstn 0 type rack
+    step emit
+}</code></pre>
+            <p><code>step chooseleaf firstn 0 type rack</code>
+            的含义是：从根节点开始，选择 N 个不同的 rack（N
+            由副本因子决定），在每个 rack
+            中各选择一个叶子节点（OSD）。</p>
+            <h3 id="crush-的伪随机选择">3.3 CRUSH 的伪随机选择</h3>
+            <p>CRUSH
+            使用伪随机函数在故障域中选择存储节点。具体来说，对于每个副本
+            r，CRUSH 计算：</p>
+            <pre class="text"><code>选择第 r 个副本的 OSD:
+  draw = hash(PG_ID, r)
+  选择 = draw mod 候选节点数量（按权重加权）</code></pre>
+            <p>权重决定了每个节点被选中的概率。一个 4 TB 磁盘的权重是 2
+            TB 磁盘的两倍，因此被分配到的数据量也大约是两倍。当某个 OSD
+            下线或加入集群时，只需要更新 Cluster Map，CRUSH
+            的计算结果会自动变化，但只有少量数据需要迁移——因为大多数 PG
+            的计算结果不受影响。</p>
+            <h3 id="cephfs-mds文件系统元数据的分布式管理">3.4 CephFS
+            MDS：文件系统元数据的分布式管理</h3>
+            <p>CRUSH
+            解决了对象存储（RADOS）层面的数据定位问题，但文件系统需要额外的元数据服务来维护目录树、文件属性和权限。CephFS
+            的 MDS（Metadata Server）就是为此设计的。</p>
+            <p>MDS 把整个目录树动态分片（Dynamic Subtree
+            Partitioning）到多个 MDS 节点上。每个 MDS
+            负责管理目录树的一个子树：</p>
+            <pre class="text"><code>CephFS MDS 动态子树分片
+
+初始状态（单 MDS）:
+  MDS-0 管理整个目录树:
+  /
+  ├── home/
+  │   ├── alice/  (高负载)
+  │   └── bob/
+  └── data/
+      ├── logs/   (高负载)
+      └── tmp/
+
+负载均衡后（多 MDS）:
+  MDS-0 管理: /
+  MDS-1 管理: /home/alice/  (热点子树迁移)
+  MDS-2 管理: /data/logs/   (热点子树迁移)
+
+  客户端访问 /home/alice/photo.jpg:
+    1. 联系 MDS-0 获知 /home/alice/ 由 MDS-1 管理
+    2. 联系 MDS-1 完成文件元数据操作
+    3. 直接连接 OSD 读写数据</code></pre>
+            <p>MDS
+            的动态子树分片根据负载自动调整。当某个目录的访问量激增时，MDS
+            会把这个子树迁移到另一个 MDS
+            节点上，实现负载均衡。这种动态迁移的代价是目录跨 MDS
+            操作（如跨目录的 rename）的一致性变得复杂。</p>
+            <h3 id="集中式-vs-分布式元数据对比">3.5 集中式 vs
+            分布式元数据对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 11%" />
+            <col style="width: 40%" />
+            <col style="width: 48%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>集中式（HDFS NameNode）</th>
+            <th>分布式（Ceph CRUSH + MDS）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>数据定位方式</td>
+            <td>查询 NameNode 获取块位置</td>
+            <td>客户端本地 CRUSH 计算</td>
+            </tr>
+            <tr>
+            <td>元数据容量</td>
+            <td>受限于单机内存</td>
+            <td>理论无上限（多 MDS 分片）</td>
+            </tr>
+            <tr>
+            <td>元数据吞吐</td>
+            <td>单机 10~20 万 ops/s</td>
+            <td>多 MDS 水平扩展</td>
+            </tr>
+            <tr>
+            <td>一致性模型</td>
+            <td>强一致（单点序列化）</td>
+            <td>MDS 强一致，RADOS 最终一致</td>
+            </tr>
+            <tr>
+            <td>文件系统语义</td>
+            <td>完整 POSIX（原子 rename 等）</td>
+            <td>接近 POSIX（跨 MDS rename 受限）</td>
+            </tr>
+            <tr>
+            <td>故障影响</td>
+            <td>NameNode 宕机 = 全集群不可用</td>
+            <td>单 MDS 宕机只影响其管辖子树</td>
+            </tr>
+            <tr>
+            <td>运维复杂度</td>
+            <td>低（单组件）</td>
+            <td>高（CRUSH Map 维护 + MDS 调优）</td>
+            </tr>
+            <tr>
+            <td>扩容影响</td>
+            <td>不影响元数据层</td>
+            <td>更新 CRUSH Map 触发数据迁移</td>
+            </tr>
+            <tr>
+            <td>适用规模</td>
+            <td>数亿文件以内</td>
+            <td>数十亿文件以上</td>
+            </tr>
+            <tr>
+            <td>典型用户</td>
+            <td>Hadoop 生态（批处理）</td>
+            <td>块存储/对象存储/混合负载</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2
+            id="四无元数据方案dynamo-风格客户端计算">四、无元数据方案（Dynamo
+            风格、客户端计算）</h2>
+            <h3 id="一致性哈希定位">4.1 一致性哈希定位</h3>
+            <p>Dynamo 风格的存储系统（如 Amazon
+            DynamoDB、Riak、Cassandra）采用了更极端的去中心化策略：没有独立的元数据服务，数据的位置完全由一致性哈希（Consistent
+            Hashing）决定。</p>
+            <p>一致性哈希的核心思想是把整个哈希空间组织成一个逻辑环（Hash
+            Ring），每个存储节点在环上占据一个或多个位置。数据对象的键被哈希到环上的某个点，然后顺时针找到第一个存储节点，由该节点负责存储这个对象。</p>
+            <pre class="text"><code>一致性哈希环
+
+          hash(key) = 位置
+              |
+              v
+    ┌─────────────────────┐
+    │                     │
+    │    0                │
+    │   / \               │
+    │  /   \              │
+    │ Node-A  Node-B      │
+    │  \       /          │
+    │   \     /           │
+    │    Node-C           │
+    │     |               │
+    │    Node-D           │
+    │                     │
+    └─────────────────────┘
+
+  虚拟节点映射（每个物理节点 256 个虚拟节点）:
+  ┌─────────────┬──────────────────────────────┐
+  │ 物理节点     │ 虚拟节点在环上的位置           │
+  ├─────────────┼──────────────────────────────┤
+  │ Node-A      │ hash(&quot;A-0&quot;), hash(&quot;A-1&quot;), ..., hash(&quot;A-255&quot;) │
+  │ Node-B      │ hash(&quot;B-0&quot;), hash(&quot;B-1&quot;), ..., hash(&quot;B-255&quot;) │
+  │ Node-C      │ hash(&quot;C-0&quot;), hash(&quot;C-1&quot;), ..., hash(&quot;C-255&quot;) │
+  │ Node-D      │ hash(&quot;D-0&quot;), hash(&quot;D-1&quot;), ..., hash(&quot;D-255&quot;) │
+  └─────────────┴──────────────────────────────┘</code></pre>
+            <p>每个物理节点被映射为多个虚拟节点（Virtual
+            Node），分散在环上的不同位置。虚拟节点的数量通常设置为 256
+            个左右，这样即使只有几个物理节点，数据分布也足够均匀。</p>
+            <h3 id="客户端直接计算定位">4.2 客户端直接计算定位</h3>
+            <p>无元数据方案的核心优势是客户端可以完全独立计算数据位置，不依赖任何中央服务。客户端只需要维护一份集群成员列表（Membership
+            List），就能通过哈希计算定位数据：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 示意：一致性哈希客户端定位逻辑</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> hashlib</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> bisect</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> ConsistentHashRing:</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> <span class="fu">__init__</span>(<span class="va">self</span>, nodes, virtual_nodes<span class="op">=</span><span class="dv">256</span>):</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.ring <span class="op">=</span> {}</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.sorted_keys <span class="op">=</span> []</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> node <span class="kw">in</span> nodes:</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(virtual_nodes):</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>                key <span class="op">=</span> <span class="va">self</span>._hash(<span class="ss">f&quot;</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss">-</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>                <span class="va">self</span>.ring[key] <span class="op">=</span> node</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>                <span class="va">self</span>.sorted_keys.append(key)</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>        <span class="va">self</span>.sorted_keys.sort()</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> _hash(<span class="va">self</span>, key):</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">int</span>(hashlib.sha256(key.encode()).hexdigest(), <span class="dv">16</span>)</span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> get_node(<span class="va">self</span>, data_key):</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>        <span class="co">&quot;&quot;&quot;计算数据应该存储在哪个节点&quot;&quot;&quot;</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>._hash(data_key)</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>        idx <span class="op">=</span> bisect.bisect_right(<span class="va">self</span>.sorted_keys, h)</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> idx <span class="op">==</span> <span class="bu">len</span>(<span class="va">self</span>.sorted_keys):</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>            idx <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">self</span>.ring[<span class="va">self</span>.sorted_keys[idx]]</span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">def</span> get_preference_list(<span class="va">self</span>, data_key, n<span class="op">=</span><span class="dv">3</span>):</span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>        <span class="co">&quot;&quot;&quot;获取 N 个副本应该存储的节点列表（偏好列表）&quot;&quot;&quot;</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>        h <span class="op">=</span> <span class="va">self</span>._hash(data_key)</span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>        idx <span class="op">=</span> bisect.bisect_right(<span class="va">self</span>.sorted_keys, h)</span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a>        nodes <span class="op">=</span> []</span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>        seen <span class="op">=</span> <span class="bu">set</span>()</span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="bu">len</span>(nodes) <span class="op">&lt;</span> n:</span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> idx <span class="op">&gt;=</span> <span class="bu">len</span>(<span class="va">self</span>.sorted_keys):</span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>                idx <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a>            node <span class="op">=</span> <span class="va">self</span>.ring[<span class="va">self</span>.sorted_keys[idx]]</span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> node <span class="kw">not</span> <span class="kw">in</span> seen:</span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>                nodes.append(node)</span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a>                seen.add(node)</span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a>            idx <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> nodes</span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用示例</span></span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a>ring <span class="op">=</span> ConsistentHashRing([<span class="st">&quot;node-1&quot;</span>, <span class="st">&quot;node-2&quot;</span>, <span class="st">&quot;node-3&quot;</span>, <span class="st">&quot;node-4&quot;</span>])</span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a>target <span class="op">=</span> ring.get_node(<span class="st">&quot;user/photo-001.jpg&quot;</span>)</span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a>replicas <span class="op">=</span> ring.get_preference_list(<span class="st">&quot;user/photo-001.jpg&quot;</span>, n<span class="op">=</span><span class="dv">3</span>)</span></code></pre></div>
+            <h3 id="无元数据方案的代价">4.3 无元数据方案的代价</h3>
+            <p>无元数据方案并非没有代价。取消了集中式元数据服务之后，一些在集中式方案中很容易的操作变得困难或不可能：</p>
+            <p><strong>无法高效列举</strong>：没有命名空间索引，列举”某个前缀下的所有对象”需要遍历集群中所有节点。DynamoDB
+            通过 GSI（Global Secondary
+            Index）部分解决了这个问题，但本质上是额外维护了一层索引元数据。</p>
+            <p><strong>无法原子重命名</strong>：对象的键决定了它的存储位置。重命名一个对象意味着把数据从旧位置搬到新位置，这是一个跨节点的非原子操作。</p>
+            <p><strong>扩缩容数据迁移</strong>：增减节点会改变哈希环的拓扑，导致部分数据需要在节点间迁移。虚拟节点机制减轻了这个问题（每次只迁移
+            1/N 的数据），但迁移期间的数据一致性仍需额外协议保证。</p>
+            <p><strong>全局信息缺失</strong>：没有中央服务来回答”集群总共存了多少数据”、“哪些数据即将过期”这类全局查询。</p>
+            <h3 id="三种方案的全景对比">4.4 三种方案的全景对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 15%" />
+            <col style="width: 30%" />
+            <col style="width: 30%" />
+            <col style="width: 23%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>集中式元数据</th>
+            <th>分布式元数据</th>
+            <th>无元数据</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>代表系统</td>
+            <td>HDFS, GFS</td>
+            <td>CephFS MDS, Lustre</td>
+            <td>Dynamo, Cassandra, Riak</td>
+            </tr>
+            <tr>
+            <td>数据定位</td>
+            <td>查表（查询元数据服务）</td>
+            <td>计算（CRUSH 算法）</td>
+            <td>计算（一致性哈希）</td>
+            </tr>
+            <tr>
+            <td>元数据存储</td>
+            <td>单机内存</td>
+            <td>分片到多个 MDS</td>
+            <td>无独立存储</td>
+            </tr>
+            <tr>
+            <td>扩展上限</td>
+            <td>单机内存/CPU 上限</td>
+            <td>MDS 节点数 x 单机容量</td>
+            <td>理论无上限</td>
+            </tr>
+            <tr>
+            <td>一致性</td>
+            <td>强一致（天然）</td>
+            <td>可配置（通常强一致）</td>
+            <td>可配置（通常最终一致）</td>
+            </tr>
+            <tr>
+            <td>目录列举</td>
+            <td>高效（内存遍历）</td>
+            <td>较高效（MDS 管辖范围内）</td>
+            <td>低效（需遍历所有节点）</td>
+            </tr>
+            <tr>
+            <td>文件系统语义</td>
+            <td>完整 POSIX</td>
+            <td>接近 POSIX</td>
+            <td>无（键值语义）</td>
+            </tr>
+            <tr>
+            <td>运维复杂度</td>
+            <td>低</td>
+            <td>高</td>
+            <td>中</td>
+            </tr>
+            <tr>
+            <td>故障爆炸半径</td>
+            <td>全集群</td>
+            <td>受影响子树</td>
+            <td>受影响哈希范围</td>
+            </tr>
+            <tr>
+            <td>典型场景</td>
+            <td>批处理大文件</td>
+            <td>通用分布式存储</td>
+            <td>键值存储/对象存储</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2
+            id="五元数据分片策略哈希范围目录树分片">五、元数据分片策略（哈希/范围/目录树分片）</h2>
+            <h3 id="为什么需要元数据分片">5.1 为什么需要元数据分片</h3>
+            <p>当元数据量超过单机承载能力时，必须把元数据分片（Sharding）到多个节点上。元数据分片的目标是：</p>
+            <ol type="1">
+            <li><strong>均匀分布</strong>：每个节点承载大致相等的元数据量</li>
+            <li><strong>热点分散</strong>：高频访问的元数据不集中在同一个节点上</li>
+            <li><strong>局部性保留</strong>：同一目录下的文件元数据尽量在同一个节点上，减少跨节点操作</li>
+            <li><strong>动态调整</strong>：能根据负载变化重新分配元数据，不需要停机</li>
+            </ol>
+            <p>这四个目标之间存在冲突。哈希分片能做到均匀分布和热点分散，但破坏了局部性；目录树分片保留了局部性，但可能导致热点集中。</p>
+            <h3 id="哈希分片">5.2 哈希分片</h3>
+            <p>哈希分片（Hash Partitioning）对文件的全路径或 inode
+            号做哈希，然后按哈希值分配到不同的元数据节点。</p>
+            <pre class="text"><code>哈希分片示例
+
+  文件路径                       hash(path) mod 4     元数据节点
+  /user/alice/data.csv           hash(...) = 2        MDS-2
+  /user/alice/model.bin          hash(...) = 0        MDS-0
+  /user/bob/logs/app.log         hash(...) = 3        MDS-3
+  /data/warehouse/table1/part-0  hash(...) = 1        MDS-1
+  /data/warehouse/table1/part-1  hash(...) = 2        MDS-2</code></pre>
+            <p>哈希分片的优点是均匀性好——不会因为某个目录下文件特别多而导致一个节点过载。缺点是同一目录下的文件被分散到不同的元数据节点上，<code>ls /user/alice/</code>
+            这个操作需要向所有 MDS
+            节点发起查询然后合并结果，延迟和开销都很大。</p>
+            <h3 id="范围分片">5.3 范围分片</h3>
+            <p>范围分片（Range
+            Partitioning）按照文件路径的字典序把命名空间切分成连续的区间，每个区间由一个元数据节点负责。</p>
+            <pre class="text"><code>范围分片示例
+
+  MDS-0: [/,        /data/logs)
+  MDS-1: [/data/logs, /home)
+  MDS-2: [/home,      /user/bob)
+  MDS-3: [/user/bob,  ∞)
+
+  文件路径                       元数据节点
+  /data/images/photo.jpg         MDS-0
+  /data/logs/app.log             MDS-1
+  /home/alice/doc.txt            MDS-2
+  /user/bob/code/main.py         MDS-3
+  /user/charlie/notes.md         MDS-3</code></pre>
+            <p>范围分片保留了局部性——相邻路径的文件在同一个节点上，目录列举操作只需要查询一个节点。但热点问题严重：如果所有用户都在
+            <code>/data/logs/</code> 下写日志，MDS-1 会被压垮。</p>
+            <h3 id="目录树分片">5.4 目录树分片</h3>
+            <p>目录树分片（Directory Subtree
+            Partitioning）以目录为粒度进行分片，每个 MDS
+            节点负责管理目录树的一个或多个子树。CephFS 的 MDS
+            采用的就是这种方案。</p>
+            <pre class="text"><code>目录树分片示例
+
+              /（MDS-0 管理）
+              |
+     ┌────────┼────────┐
+     |        |        |
+   home/    data/    system/
+  (MDS-1)  (MDS-2)  (MDS-0)
+     |        |
+  ┌──┴──┐  ┌─┴──┐
+  |     |  |    |
+alice/ bob/ logs/ images/
+(MDS-1)(MDS-1)(MDS-3)(MDS-2)
+
+目录树分片的路由表:
+┌──────────────┬────────┐
+│ 子树前缀      │ MDS    │
+├──────────────┼────────┤
+│ /            │ MDS-0  │
+│ /home/       │ MDS-1  │
+│ /data/       │ MDS-2  │
+│ /data/logs/  │ MDS-3  │
+│ /system/     │ MDS-0  │
+└──────────────┴────────┘</code></pre>
+            <p>目录树分片结合了范围分片的局部性和哈希分片的灵活性。当某个目录成为热点时，可以把它拆分为一个独立的子树并迁移到空闲的
+            MDS 节点上。CephFS
+            的动态子树分片就是这种机制的自动化实现。</p>
+            <h3 id="三种分片策略对比">5.5 三种分片策略对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 17%" />
+            <col style="width: 25%" />
+            <col style="width: 25%" />
+            <col style="width: 31%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>哈希分片</th>
+            <th>范围分片</th>
+            <th>目录树分片</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>均匀性</td>
+            <td>好</td>
+            <td>取决于数据分布</td>
+            <td>取决于目录结构</td>
+            </tr>
+            <tr>
+            <td>目录列举效率</td>
+            <td>差（需查询所有节点）</td>
+            <td>好（单节点查询）</td>
+            <td>好（单节点查询）</td>
+            </tr>
+            <tr>
+            <td>热点处理</td>
+            <td>天然分散</td>
+            <td>差（热点目录集中）</td>
+            <td>可动态拆分</td>
+            </tr>
+            <tr>
+            <td>跨目录操作</td>
+            <td>总是跨节点</td>
+            <td>可能跨节点</td>
+            <td>可能跨节点</td>
+            </tr>
+            <tr>
+            <td>动态调整</td>
+            <td>需重新哈希</td>
+            <td>需分裂/合并区间</td>
+            <td>子树迁移</td>
+            </tr>
+            <tr>
+            <td>实现复杂度</td>
+            <td>低</td>
+            <td>中</td>
+            <td>高</td>
+            </tr>
+            <tr>
+            <td>代表系统</td>
+            <td>IndexFS</td>
+            <td>HBase 元数据</td>
+            <td>CephFS MDS</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2
+            id="六元数据缓存客户端缓存一致性维护">六、元数据缓存（客户端缓存、一致性维护）</h2>
+            <h3 id="为什么需要元数据缓存">6.1 为什么需要元数据缓存</h3>
+            <p>元数据操作虽然数据量小，但频率极高。一个 Spark
+            作业启动时可能需要列举数万个输入文件的元数据，如果每次都要查询远程元数据服务，网络延迟会显著拖慢作业的启动速度。</p>
+            <p>元数据缓存存在于多个层次：</p>
+            <pre class="text"><code>元数据缓存层次
+
+┌───────────────────────────────────────────────┐
+│               应用层缓存                        │
+│  (如 Spark Driver 缓存文件列表和分片信息)       │
+├───────────────────────────────────────────────┤
+│               客户端库缓存                      │
+│  (如 HDFS Client 缓存 Block Location)         │
+├───────────────────────────────────────────────┤
+│               元数据服务缓存                    │
+│  (如 NameNode 内存缓存, MDS 缓存)              │
+├───────────────────────────────────────────────┤
+│               持久化存储                        │
+│  (如 FsImage, RADOS 元数据池)                  │
+└───────────────────────────────────────────────┘</code></pre>
+            <h3 id="hdfs-客户端的块位置缓存">6.2 HDFS
+            客户端的块位置缓存</h3>
+            <p>HDFS
+            客户端在打开文件后会缓存块位置信息。后续读取同一文件的不同偏移量时，客户端直接使用缓存的块位置，不需要再次查询
+            NameNode。</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode java"><code class="sourceCode java"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">// HDFS 客户端块位置缓存的简化逻辑（示意代码）</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">class</span> DFSInputStream <span class="op">{</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 缓存：文件偏移量 -&gt; 块位置信息</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> LocatedBlocks locatedBlocks<span class="op">;</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 缓存的有效期</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">long</span> cacheExpireMs <span class="op">=</span> <span class="dv">60_000</span><span class="op">;</span> <span class="co">// 60 秒</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">int</span> <span class="fu">read</span><span class="op">(</span><span class="dt">long</span> position<span class="op">,</span> <span class="dt">byte</span><span class="op">[]</span> buffer<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>        LocatedBlock block <span class="op">=</span> <span class="fu">findBlockInCache</span><span class="op">(</span>position<span class="op">);</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>block <span class="op">==</span> <span class="kw">null</span> <span class="op">||</span> <span class="fu">isCacheExpired</span><span class="op">())</span> <span class="op">{</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 缓存未命中或过期，向 NameNode 请求块位置</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>            locatedBlocks <span class="op">=</span> namenode<span class="op">.</span><span class="fu">getBlockLocations</span><span class="op">(</span>path<span class="op">,</span> position<span class="op">,</span> length<span class="op">);</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>            block <span class="op">=</span> <span class="fu">findBlockInCache</span><span class="op">(</span>position<span class="op">);</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 直接连接 DataNode 读取数据</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="fu">readFromDataNode</span><span class="op">(</span>block<span class="op">.</span><span class="fu">getLocations</span><span class="op">()[</span><span class="dv">0</span><span class="op">],</span> buffer<span class="op">);</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>缓存的失效策略通常包括：</p>
+            <ul>
+            <li><strong>TTL（Time-To-Live）过期</strong>：块位置缓存在固定时间后失效，默认
+            60 秒</li>
+            <li><strong>显式失效</strong>：当客户端检测到 DataNode
+            不可达时，主动刷新缓存</li>
+            <li><strong>NameNode 推送</strong>：某些实现中，NameNode
+            可以在块位置变更时通知客户端</li>
+            </ul>
+            <h3 id="cephfs-的元数据缓存与能力capabilities">6.3 CephFS
+            的元数据缓存与能力（Capabilities）</h3>
+            <p>CephFS 使用能力（Capability）机制来管理元数据缓存。MDS
+            向客户端颁发
+            Capability，授权客户端在本地缓存和操作特定目录或文件的元数据。</p>
+            <pre class="text"><code>CephFS Capability 类型
+
+┌────────────┬────────────────────────────────────────────┐
+│ Capability │ 含义                                       │
+├────────────┼────────────────────────────────────────────┤
+│ As         │ 允许读取文件属性（stat）                     │
+│ Ar         │ 允许读取文件数据                            │
+│ Aw         │ 允许修改文件数据                            │
+│ Ax         │ 允许执行文件                                │
+│ Fs         │ 允许读取目录内容（readdir）并缓存             │
+│ Fw         │ 允许在目录中创建/删除文件                    │
+│ Ls         │ 允许缓存文件大小和修改时间                   │
+│ Lw         │ 允许修改文件大小（truncate）                 │
+│ Xr         │ 允许读取扩展属性                            │
+│ Xw         │ 允许修改扩展属性                            │
+└────────────┴────────────────────────────────────────────┘</code></pre>
+            <p>当多个客户端同时访问同一个文件时，MDS 需要协调 Capability
+            的分配。例如，当一个客户端持有写入能力（Aw）时，其他客户端不能同时持有读取缓存能力（Ar），否则可能读到过期数据。MDS
+            通过回收（Revoke）和降级（Downgrade）Capability
+            来维护一致性。</p>
+            <h3 id="缓存一致性的代价">6.4 缓存一致性的代价</h3>
+            <p>元数据缓存引入了一致性问题。客户端缓存的元数据可能与元数据服务上的最新状态不一致。根据不同的一致性要求，缓存策略也不同：</p>
+            <p><strong>强一致缓存</strong>：每次读取都先验证缓存是否有效（如发送
+            If-Modified-Since
+            请求）。这种方式保证了一致性，但增加了网络往返次数，削弱了缓存的性能收益。</p>
+            <p><strong>弱一致缓存</strong>：客户端信任缓存直到 TTL
+            过期。这种方式性能好，但可能读到过期数据。HDFS
+            的块位置缓存就是弱一致的——如果一个块在 TTL 内被移动到了新的
+            DataNode，客户端可能尝试连接旧的 DataNode
+            并失败，然后再刷新缓存。</p>
+            <p><strong>租约（Lease）缓存</strong>：元数据服务向客户端颁发租约，在租约有效期内客户端可以使用缓存数据。租约到期前，如果元数据发生变更，服务端需要等待所有持有租约的客户端确认或租约过期。HDFS
+            的写入租约（Write
+            Lease）就是这种机制——一个文件同一时间只能有一个客户端持有写入租约。</p>
+            <hr />
+            <h2
+            id="七元数据一致性保证强一致最终一致">七、元数据一致性保证（强一致/最终一致）</h2>
+            <h3 id="一致性问题的来源">7.1 一致性问题的来源</h3>
+            <p>元数据一致性问题出现在以下场景：</p>
+            <ul>
+            <li><strong>多 MDS
+            分片</strong>：文件的重命名涉及源目录和目标目录两个 MDS
+            节点，需要跨节点的原子操作</li>
+            <li><strong>客户端缓存</strong>：客户端 A
+            修改了文件属性，客户端 B 的缓存中仍是旧值</li>
+            <li><strong>主备切换</strong>：NameNode
+            主节点宕机后，备节点接管时可能丢失最后几条 EditLog</li>
+            <li><strong>网络分区</strong>：MDS
+            节点之间网络中断，各自继续服务可能导致脑裂（Split
+            Brain）</li>
+            </ul>
+            <h3 id="强一致性方案">7.2 强一致性方案</h3>
+            <p>强一致性（Strong
+            Consistency）要求任何时刻，所有客户端看到的元数据都是相同的最新版本。实现强一致性的常见方法：</p>
+            <p><strong>单点序列化</strong>：HDFS NameNode
+            通过单点处理所有元数据操作，天然实现了强一致性。所有操作按照到达
+            NameNode
+            的顺序串行执行，不存在并发冲突。代价是吞吐量受限于单机。</p>
+            <p><strong>分布式共识</strong>：多个 MDS 节点通过 Paxos 或
+            Raft
+            协议对元数据变更达成共识。每次元数据写入需要半数以上节点确认。CephFS
+            的 MDS 在跨子树操作时使用两阶段提交（2PC）保证原子性。</p>
+            <pre class="text"><code>跨 MDS 的原子 rename 操作（两阶段提交）
+
+  客户端: rename(/home/alice/doc.txt, /data/shared/doc.txt)
+
+  阶段一: Prepare
+    客户端 -&gt; MDS-1 (管辖 /home/alice/):
+      &quot;准备删除 /home/alice/doc.txt&quot;
+    客户端 -&gt; MDS-2 (管辖 /data/shared/):
+      &quot;准备创建 /data/shared/doc.txt&quot;
+
+    MDS-1: 锁定 /home/alice/doc.txt, 记录 prepare 日志, 回复 OK
+    MDS-2: 检查目标路径不冲突, 记录 prepare 日志, 回复 OK
+
+  阶段二: Commit
+    客户端 -&gt; MDS-1: commit
+    客户端 -&gt; MDS-2: commit
+
+    MDS-1: 删除 /home/alice/doc.txt, 释放锁
+    MDS-2: 创建 /data/shared/doc.txt
+
+  如果任一 MDS 在 Prepare 阶段回复失败:
+    向所有 MDS 发送 Abort, 回滚操作</code></pre>
+            <h3 id="最终一致性方案">7.3 最终一致性方案</h3>
+            <p>最终一致性（Eventual
+            Consistency）允许短暂的不一致窗口，但保证在没有新写入的情况下，所有副本最终会收敛到相同的状态。Dynamo
+            风格的系统广泛使用最终一致性。</p>
+            <p>最终一致性的元数据更新流程：</p>
+            <pre class="text"><code>最终一致性的元数据更新
+
+  客户端写入:
+    写入 N 个副本中的 W 个（Write Quorum）
+    W &lt; N, 部分副本暂时落后
+
+  后台反熵修复:
+    节点间周期性比对元数据版本
+    用向量时钟（Vector Clock）或版本号检测冲突
+    自动同步落后的副本
+
+  读取时修复:
+    客户端读取 R 个副本（Read Quorum）
+    返回版本号最大的结果
+    同时修复版本落后的副本
+
+  NRW 规则:
+    N = 副本总数
+    W = 写入确认数
+    R = 读取确认数
+    当 W + R &gt; N 时，读写有交集，保证读到最新值（强读）
+    当 W + R &lt;= N 时，可能读到旧值（弱读）</code></pre>
+            <h3 id="一致性与性能的权衡">7.4 一致性与性能的权衡</h3>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 26%" />
+            <col style="width: 17%" />
+            <col style="width: 17%" />
+            <col style="width: 17%" />
+            <col style="width: 21%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>一致性级别</th>
+            <th>写延迟</th>
+            <th>读延迟</th>
+            <th>可用性</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>强一致（W=N, R=1）</td>
+            <td>高（等所有副本）</td>
+            <td>低</td>
+            <td>低（任一副本故障阻塞写入）</td>
+            <td>金融交易记录</td>
+            </tr>
+            <tr>
+            <td>仲裁一致（W=N/2+1, R=N/2+1）</td>
+            <td>中</td>
+            <td>中</td>
+            <td>中</td>
+            <td>通用元数据服务</td>
+            </tr>
+            <tr>
+            <td>弱一致（W=1, R=1）</td>
+            <td>低</td>
+            <td>低</td>
+            <td>高</td>
+            <td>日志收集、监控</td>
+            </tr>
+            <tr>
+            <td>最终一致（W=1, R=1, 后台同步）</td>
+            <td>极低</td>
+            <td>极低</td>
+            <td>极高</td>
+            <td>CDN 缓存、DNS</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>大多数分布式存储系统的元数据服务选择仲裁一致性作为默认策略，在性能和正确性之间取得平衡。</p>
+            <hr />
+            <h2 id="八namenode-高可用与联邦hafederation">八、NameNode
+            高可用与联邦（HA、Federation）</h2>
+            <h3 id="namenode-ha-架构">8.1 NameNode HA 架构</h3>
+            <p>HDFS NameNode 的高可用（High
+            Availability，HA）方案通过部署一对 Active-Standby NameNode
+            解决单点故障问题：</p>
+            <pre class="text"><code>NameNode HA 架构
+
+  ┌──────────────────────────────────────────────────────────┐
+  │                    共享存储（QJM）                        │
+  │                                                          │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
+  │  │ JN-1     │  │ JN-2     │  │ JN-3     │               │
+  │  │(Journal  │  │(Journal  │  │(Journal  │               │
+  │  │ Node)    │  │ Node)    │  │ Node)    │               │
+  │  └────┬─────┘  └────┬─────┘  └────┬─────┘               │
+  │       │              │              │                     │
+  └───────┼──────────────┼──────────────┼─────────────────────┘
+          │              │              │
+     ┌────┴──────────────┴──────────────┴────┐
+     │                                        │
+  ┌──┴─────────────┐            ┌─────────────┴──┐
+  │ Active         │            │ Standby         │
+  │ NameNode       │            │ NameNode        │
+  │                │            │                 │
+  │ - 处理客户端   │            │ - 从 JN 拉取    │
+  │   请求         │            │   EditLog       │
+  │ - 写 EditLog   │            │ - 回放到内存    │
+  │   到 JN        │  故障切换   │ - 随时准备      │
+  │                │ &lt;--------&gt; │   接管          │
+  └────────────────┘            └─────────────────┘
+          |                            |
+          |        ┌──────────┐        |
+          +-------&gt;│ ZooKeeper│&lt;-------+
+                   │ (选主)    │
+                   └──────────┘</code></pre>
+            <p>HA 架构的关键组件：</p>
+            <p><strong>QJM（Quorum Journal Manager）</strong>：一组
+            JournalNode（通常 3 个或 5 个）组成的日志服务。Active
+            NameNode 把 EditLog 同步写入到多数 JournalNode 上。Standby
+            NameNode 持续从 JournalNode 拉取 EditLog
+            并回放，保持内存状态与 Active 节点接近同步。</p>
+            <p><strong>ZooKeeper</strong>：用于 Active/Standby
+            选主。每个 NameNode 启动一个 ZKFC（ZooKeeper Failover
+            Controller）进程，通过 ZooKeeper 的临时节点（Ephemeral
+            Node）实现选举和故障检测。</p>
+            <p><strong>Fencing 机制</strong>：防止脑裂。当 Active
+            NameNode 被判定为故障时，在 Standby 接管之前，必须确保旧的
+            Active 不再处理请求。常见的 Fencing 方法包括 SSH 远程 kill
+            进程、STONITH（Shoot The Other Node In The
+            Head）硬件级隔离。</p>
+            <h3 id="故障切换流程">8.2 故障切换流程</h3>
+            <pre class="text"><code>NameNode 故障切换时序
+
+  时间 ─────────────────────────────────────────────────────&gt;
+
+  Active NN:   运行 ──── 故障 x
+  ZKFC-Active: 心跳 ──── 检测到 NN 失败 ── 释放 ZK 锁
+  ZooKeeper:   Active 锁 ─────── 锁释放 ── 通知 Standby ZKFC
+  ZKFC-Standby:                            获取锁 ── Fencing ── 提升 Standby
+  Standby NN:  回放 EditLog ──────────── 完成回放 ── 切换为 Active ── 开始服务
+
+  切换时间（典型值）:
+    故障检测:    ~10 秒（ZooKeeper 会话超时）
+    Fencing:     ~5 秒
+    EditLog 回放: ~1-30 秒（取决于落后的日志量）
+    总计:        ~20-45 秒</code></pre>
+            <p>故障切换期间，所有客户端请求会被阻塞或返回错误。客户端通常配置了重试机制，在新的
+            Active NameNode 就绪后自动重新连接。</p>
+            <h3 id="namenode-federation">8.3 NameNode Federation</h3>
+            <p>NameNode HA
+            解决了可用性问题，但没有解决容量和吞吐量的扩展性问题——Active-Standby
+            模式下仍然只有一个 NameNode 在处理请求。NameNode
+            Federation（联邦）通过引入多个独立的 NameNode，每个 NameNode
+            管理命名空间的一个子集，实现了水平扩展。</p>
+            <pre class="text"><code>NameNode Federation 架构
+
+  ┌────────────────────────────────────────────────────────┐
+  │                    客户端                               │
+  │                                                        │
+  │  挂载表（ViewFS / Router-Based Federation）             │
+  │  ┌──────────────────────────────────────────────────┐  │
+  │  │ /user/  -&gt; NameNode-1 (ClusterID: ns1)           │  │
+  │  │ /data/  -&gt; NameNode-2 (ClusterID: ns2)           │  │
+  │  │ /tmp/   -&gt; NameNode-3 (ClusterID: ns3)           │  │
+  │  └──────────────────────────────────────────────────┘  │
+  └──────┬──────────────────┬──────────────────┬───────────┘
+         │                  │                  │
+  ┌──────┴──────┐    ┌──────┴──────┐    ┌──────┴──────┐
+  │ NameNode-1  │    │ NameNode-2  │    │ NameNode-3  │
+  │ ns1         │    │ ns2         │    │ ns3         │
+  │ /user/*     │    │ /data/*     │    │ /tmp/*      │
+  │             │    │             │    │             │
+  │ Block Pool 1│    │ Block Pool 2│    │ Block Pool 3│
+  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+         │                  │                  │
+         └──────────────────┼──────────────────┘
+                            │
+              ┌─────────────┴─────────────┐
+              │       DataNode 集群        │
+              │  (所有 DataNode 共享，     │
+              │   每个 DataNode 存储多个   │
+              │   Block Pool 的数据)      │
+              └───────────────────────────┘</code></pre>
+            <p>Federation 的关键概念：</p>
+            <ul>
+            <li><strong>命名空间卷（Namespace Volume）</strong>：每个
+            NameNode 管理一个独立的命名空间，对应一个 Block Pool。多个
+            NameNode 之间不共享命名空间状态。</li>
+            <li><strong>Block Pool</strong>：属于同一个命名空间的所有
+            Block 组成一个 Block Pool。一个 DataNode 可以同时存储多个
+            Block Pool 的数据。</li>
+            <li><strong>ViewFS</strong>：客户端通过 ViewFS
+            配置一个全局挂载表，把不同的路径前缀映射到不同的
+            NameNode。对客户端来说，仍然看到一个统一的文件系统视图。</li>
+            </ul>
+            <h3 id="router-based-federationhdfs-rbf">8.4 Router-Based
+            Federation（HDFS RBF）</h3>
+            <p>Hadoop 3.x 引入了 RBF（Router-Based Federation），用一组
+            Router 进程替代了客户端的 ViewFS 配置，实现了对 Federation
+            的透明代理：</p>
+            <pre class="text"><code>RBF 架构
+
+  客户端（无需感知 Federation）
+     |
+     v
+  ┌──────────────────────┐
+  │    Router 集群        │
+  │  (无状态代理)         │
+  │                      │
+  │  State Store          │
+  │  (ZooKeeper 或       │
+  │   数据库存储          │
+  │   挂载表)             │
+  └──────────┬───────────┘
+             |
+     ┌───────┼───────┐
+     |       |       |
+  NameNode-1  NN-2  NN-3</code></pre>
+            <p>Router 进程是无状态的，可以水平扩展。客户端连接到任意一个
+            Router，Router 根据 State Store
+            中的挂载表决定把请求转发给哪个
+            NameNode。这种方式的好处是客户端不需要任何配置变更，Federation
+            的路由逻辑完全在服务端完成。</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 配置 HDFS RBF 挂载点</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsrouteradmin <span class="at">-add</span> /user ns1 /user</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsrouteradmin <span class="at">-add</span> /data ns2 /data</span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsrouteradmin <span class="at">-add</span> /tmp  ns3 /tmp</span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看挂载表</span></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsrouteradmin <span class="at">-ls</span></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看子集群状态</span></span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsrouteradmin <span class="at">-safemode</span> get</span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsrouteradmin <span class="at">-getDisabledNameservices</span></span></code></pre></div>
+            <h3 id="federation-的局限">8.5 Federation 的局限</h3>
+            <p>Federation
+            并非银弹。它解决了容量和吞吐量问题，但引入了新的限制：</p>
+            <p><strong>跨命名空间操作不支持</strong>：<code>rename /user/alice/data.csv /data/shared/data.csv</code>
+            如果 <code>/user/</code> 和 <code>/data/</code> 在不同的
+            NameNode 上，这个操作无法执行。应用层需要改成”拷贝 +
+            删除”两步操作。</p>
+            <p><strong>配额管理分散</strong>：每个 NameNode
+            独立管理自己命名空间的配额，全局配额需要额外的聚合层。</p>
+            <p><strong>负载不均</strong>：路径到 NameNode
+            的映射是静态的。如果某个命名空间的负载远高于其他命名空间，需要手动拆分或迁移挂载点。</p>
+            <hr />
+            <h2
+            id="九元数据容量规划与监控">九、元数据容量规划与监控</h2>
+            <h3 id="容量规划公式">9.1 容量规划公式</h3>
+            <p>NameNode
+            的内存规划需要根据集群的文件数、块数和副本因子来估算。核心公式：</p>
+            <pre class="text"><code>NameNode 堆内存估算
+
+  每个 INode（文件或目录）:     ~150 字节
+  每个 Block（含副本位置）:     ~150 字节
+  安全余量系数:                 1.5x（考虑 Java 对象头、GC 开销）
+
+  所需堆内存 = (文件数 x 150 + 块总数 x 150) x 1.5
+
+  示例:
+    文件数:      2 亿
+    平均块数/文件: 2.5
+    块总数:      5 亿
+    INode 内存:  2 亿 x 150 B = 30 GB
+    Block 内存:  5 亿 x 150 B = 75 GB
+    安全余量:    (30 + 75) x 1.5 = 157.5 GB
+    推荐堆内存:  160 GB（-Xmx160g）</code></pre>
+            <p>JVM 配置建议：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># NameNode JVM 配置（hadoop-env.sh）</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 堆内存根据集群规模调整</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">HADOOP_NAMENODE_OPTS</span><span class="op">=</span><span class="st">&quot;-Xmx160g -Xms160g </span><span class="dt">\</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="st">  -XX:+UseG1GC </span><span class="dt">\</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="st">  -XX:MaxGCPauseMillis=200 </span><span class="dt">\</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a><span class="st">  -XX:InitiatingHeapOccupancyPercent=45 </span><span class="dt">\</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a><span class="st">  -XX:G1HeapRegionSize=32m </span><span class="dt">\</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a><span class="st">  -XX:+ParallelRefProcEnabled </span><span class="dt">\</span></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a><span class="st">  -verbose:gc </span><span class="dt">\</span></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a><span class="st">  -Xlog:gc*:file=/var/log/hadoop/namenode-gc.log:time,uptime:filecount=10,filesize=100m&quot;</span></span></code></pre></div>
+            <p>G1GC 在大堆内存场景下表现优于
+            CMS，<code>MaxGCPauseMillis=200</code> 目标把 GC 停顿控制在
+            200 毫秒以内。<code>G1HeapRegionSize=32m</code>
+            适配大堆内存，避免 Region 过多导致的管理开销。</p>
+            <h3 id="关键监控指标">9.2 关键监控指标</h3>
+            <pre class="text"><code>NameNode 监控指标体系
+
+性能指标:
+  ├── RPC 处理时间 (p50/p99/p999)
+  │     正常值: p99 &lt; 50ms
+  │     告警阈值: p99 &gt; 200ms
+  ├── RPC 队列长度
+  │     正常值: &lt; 100
+  │     告警阈值: &gt; 1000
+  ├── FSNamesystem Lock 等待时间
+  │     正常值: &lt; 10ms
+  │     告警阈值: &gt; 100ms
+  └── 每秒处理的操作数
+        正常值: 5~15 万 ops/s
+        告警阈值: 接近 20 万（接近上限）
+
+容量指标:
+  ├── 文件数 / 目录数 / 块数
+  ├── 堆内存使用率
+  │     告警阈值: &gt; 80%
+  ├── EditLog 段大小和滚动频率
+  └── FsImage 大小和加载时间
+
+可用性指标:
+  ├── HA 状态（Active / Standby）
+  ├── JournalNode 同步延迟
+  ├── SafeMode 状态
+  └── DataNode 心跳丢失数</code></pre>
+            <h3 id="prometheus-监控实战">9.3 Prometheus 监控实战</h3>
+            <p>HDFS NameNode 原生支持通过 JMX 暴露指标。使用 JMX
+            Exporter 可以把这些指标转为 Prometheus 格式：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># jmx_exporter_config.yaml（NameNode JMX 指标采集配置）</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="fu">rules</span><span class="kw">:</span></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">pattern</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Hadoop&lt;service=NameNode, name=FSNamesystem&gt;&lt;&gt;(FilesTotal|BlocksTotal|CapacityTotalGB|CapacityUsedGB|CapacityRemainingGB|NumLiveDataNodes|NumDeadDataNodes)&quot;</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;hdfs_namenode_$1&quot;</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">type</span><span class="kw">:</span><span class="at"> GAUGE</span></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">pattern</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Hadoop&lt;service=NameNode, name=RpcActivityForPort</span><span class="sc">\\</span><span class="st">d+&gt;&lt;&gt;(RpcProcessingTimeAvgTime|RpcQueueTimeAvgTime|NumOpenConnections|CallQueueLength)&quot;</span></span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;hdfs_namenode_rpc_$1&quot;</span></span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">type</span><span class="kw">:</span><span class="at"> GAUGE</span></span>
+<span id="cb29-10"><a href="#cb29-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-11"><a href="#cb29-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">pattern</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Hadoop&lt;service=NameNode, name=FSNamesystem&gt;&lt;&gt;(TotalSyncCount|TransactionsSinceLastCheckpoint|LastCheckpointTime)&quot;</span></span>
+<span id="cb29-12"><a href="#cb29-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;hdfs_namenode_editlog_$1&quot;</span></span>
+<span id="cb29-13"><a href="#cb29-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">type</span><span class="kw">:</span><span class="at"> GAUGE</span></span>
+<span id="cb29-14"><a href="#cb29-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-15"><a href="#cb29-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">pattern</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Hadoop&lt;service=NameNode, name=JvmMetrics&gt;&lt;&gt;(MemHeapUsedM|MemHeapMaxM|GcTimeMillis|GcCount)&quot;</span></span>
+<span id="cb29-16"><a href="#cb29-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;hdfs_namenode_jvm_$1&quot;</span></span>
+<span id="cb29-17"><a href="#cb29-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">type</span><span class="kw">:</span><span class="at"> GAUGE</span></span></code></pre></div>
+            <p>关键告警规则：</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Prometheus 告警规则（prometheus-rules.yaml）</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="fu">groups</span><span class="kw">:</span></span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> hdfs_namenode</span></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">rules</span><span class="kw">:</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> NameNodeHeapUsageHigh</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">expr</span><span class="kw">:</span><span class="at"> hdfs_namenode_jvm_MemHeapUsedM / hdfs_namenode_jvm_MemHeapMaxM &gt; 0.85</span></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 10m</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> warning</span></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;NameNode 堆内存使用率超过 85%&quot;</span></span>
+<span id="cb30-12"><a href="#cb30-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-13"><a href="#cb30-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> NameNodeRpcLatencyHigh</span></span>
+<span id="cb30-14"><a href="#cb30-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">expr</span><span class="kw">:</span><span class="at"> hdfs_namenode_rpc_RpcProcessingTimeAvgTime &gt; 200</span></span>
+<span id="cb30-15"><a href="#cb30-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 5m</span></span>
+<span id="cb30-16"><a href="#cb30-16" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb30-17"><a href="#cb30-17" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> critical</span></span>
+<span id="cb30-18"><a href="#cb30-18" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb30-19"><a href="#cb30-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;NameNode RPC 平均处理时间超过 200ms&quot;</span></span>
+<span id="cb30-20"><a href="#cb30-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-21"><a href="#cb30-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> NameNodeBlocksMissing</span></span>
+<span id="cb30-22"><a href="#cb30-22" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">expr</span><span class="kw">:</span><span class="at"> hdfs_namenode_MissingBlocks &gt; 0</span></span>
+<span id="cb30-23"><a href="#cb30-23" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 1m</span></span>
+<span id="cb30-24"><a href="#cb30-24" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb30-25"><a href="#cb30-25" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> critical</span></span>
+<span id="cb30-26"><a href="#cb30-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb30-27"><a href="#cb30-27" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;存在缺失块，可能有数据丢失风险&quot;</span></span>
+<span id="cb30-28"><a href="#cb30-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-29"><a href="#cb30-29" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> DataNodeDead</span></span>
+<span id="cb30-30"><a href="#cb30-30" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">expr</span><span class="kw">:</span><span class="at"> hdfs_namenode_NumDeadDataNodes &gt; 0</span></span>
+<span id="cb30-31"><a href="#cb30-31" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 5m</span></span>
+<span id="cb30-32"><a href="#cb30-32" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb30-33"><a href="#cb30-33" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> warning</span></span>
+<span id="cb30-34"><a href="#cb30-34" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb30-35"><a href="#cb30-35" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;有 DataNode 失联超过 5 分钟&quot;</span></span></code></pre></div>
+            <h3 id="元数据增长趋势分析">9.4 元数据增长趋势分析</h3>
+            <p>生产环境中，元数据的增长通常与业务数据量成正比。定期分析元数据的增长趋势，可以提前做容量规划和架构升级的准备：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 获取 HDFS 元数据统计信息</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsadmin <span class="at">-report</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-20</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 获取文件和块的计数</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> dfsadmin <span class="at">-metasave</span> meta_report.txt</span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 分析 fsimage 中的目录大小分布</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> oiv <span class="at">-p</span> Delimited <span class="at">-i</span> /path/to/fsimage <span class="at">-o</span> fsimage_analysis.csv</span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出包含: 路径, 文件数, 目录数, 总大小等信息</span></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 监控 EditLog 的滚动频率和大小</span></span>
+<span id="cb31-12"><a href="#cb31-12" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-la</span> /path/to/journal/current/ <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-10</span></span></code></pre></div>
+            <p>当以下信号出现时，应考虑从单 NameNode 升级到
+            Federation：</p>
+            <ul>
+            <li>NameNode 堆内存使用率持续高于 80%</li>
+            <li>RPC p99 延迟持续高于 100ms</li>
+            <li>FsImage 加载时间超过 30 分钟</li>
+            <li>NameNode Full GC 频率超过每小时 1 次</li>
+            <li>文件总数超过 5 亿且仍在快速增长</li>
+            </ul>
+            <h3 id="元数据审计与治理">9.5 元数据审计与治理</h3>
+            <p>大规模集群中的元数据碎片化是一个被低估的问题。大量小文件（Small
+            File Problem）不仅浪费 DataNode
+            的存储空间，更重要的是每个小文件都会消耗 NameNode 的一条
+            INode 和至少一条 Block 记录。</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 分析 HDFS 中的小文件分布</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> fsck / <span class="at">-files</span> <span class="at">-blocks</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">awk</span> <span class="st">&#39;/^\//{path=$1} /Total blocks/{print path, $NF}&#39;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sort</span> <span class="at">-k2</span> <span class="at">-n</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">head</span> <span class="at">-20</span></span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 oiv 工具分析 fsimage 中的文件大小分布</span></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> oiv <span class="at">-p</span> FileDistribution <span class="at">-i</span> /path/to/fsimage <span class="at">-o</span> file_distribution.txt</span>
+<span id="cb32-9"><a href="#cb32-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出各大小区间的文件数量</span></span>
+<span id="cb32-10"><a href="#cb32-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-11"><a href="#cb32-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 统计每个用户/目录的文件数量（识别元数据消耗大户）</span></span>
+<span id="cb32-12"><a href="#cb32-12" aria-hidden="true" tabindex="-1"></a><span class="ex">hdfs</span> oiv <span class="at">-p</span> Delimited <span class="at">-i</span> /path/to/fsimage <span class="at">-delimiter</span> <span class="st">&quot;\t&quot;</span> <span class="at">-o</span> fsimage.tsv</span>
+<span id="cb32-13"><a href="#cb32-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 然后用 awk/sort 分析</span></span></code></pre></div>
+            <p>常见的小文件治理策略：</p>
+            <ul>
+            <li><strong>HAR（Hadoop
+            Archive）归档</strong>：把大量小文件合并成一个归档文件，减少
+            INode 数量</li>
+            <li><strong>合并写入</strong>：在应用层积攒数据后批量写入，避免产生大量小文件</li>
+            <li><strong>定期清理</strong>：设置目录级别的文件数量配额和
+            TTL，自动清理过期数据</li>
+            <li><strong>CombineFileInputFormat</strong>：MapReduce
+            层面合并小文件输入分片，减少 Map 任务数量</li>
+            </ul>
+            <hr />
+            <h2 id="十参考文献">十、参考文献</h2>
+            <p>论文与技术报告：</p>
+            <pre class="text"><code>[1] Ghemawat, S., Gobioff, H., and Leung, S.-T.
+    &quot;The Google File System.&quot; SOSP 2003.
+    （GFS 的集中式元数据设计原型）
+
+[2] Weil, S., Brandt, S., Miller, E., et al.
+    &quot;CRUSH: Controlled, Scalable, Decentralized Placement
+    of Replicated Data.&quot; SC 2006.
+    （CRUSH 算法的原始论文）
+
+[3] Weil, S., Brandt, S., Miller, E., et al.
+    &quot;Ceph: A Scalable, High-Performance Distributed File System.&quot;
+    OSDI 2006.
+    （Ceph 整体架构，包括 MDS 动态子树分片）
+
+[4] DeCandia, G., Hastorun, D., Jampani, M., et al.
+    &quot;Dynamo: Amazon&#39;s Highly Available Key-value Store.&quot;
+    SOSP 2007.
+    （一致性哈希与无元数据架构的工业实践）
+
+[5] Shvachko, K., Kuang, H., Radia, S., and Chansler, R.
+    &quot;The Hadoop Distributed File System.&quot; MSST 2010.
+    （HDFS NameNode 架构与内存模型）
+
+[6] Ren, K., Zheng, Q., Patil, S., and Gibson, G.
+    &quot;IndexFS: Scaling File System Metadata Performance
+    with Stateless Caching and Bulk Insertion.&quot; SC 2014.
+    （哈希分片元数据的高性能实现）</code></pre>
+            <p>官方文档：</p>
+            <pre class="text"><code>[7] Apache Hadoop Documentation. &quot;HDFS High Availability.&quot;
+    https://hadoop.apache.org/docs/stable/hadoop-project-dist/
+    hadoop-hdfs/HDFSHighAvailabilityWithQJM.html
+
+[8] Apache Hadoop Documentation. &quot;HDFS Federation.&quot;
+    https://hadoop.apache.org/docs/stable/hadoop-project-dist/
+    hadoop-hdfs/Federation.html
+
+[9] Apache Hadoop Documentation. &quot;Router-Based Federation.&quot;
+    https://hadoop.apache.org/docs/stable/hadoop-project-dist/
+    hadoop-hdfs-rbf/HDFSRouterFederation.html
+
+[10] Ceph Documentation. &quot;CRUSH Maps.&quot;
+     https://docs.ceph.com/en/reef/rados/operations/crush-map/
+
+[11] Ceph Documentation. &quot;CephFS MDS.&quot;
+     https://docs.ceph.com/en/reef/cephfs/mds-config-ref/
+
+[12] Ceph Documentation. &quot;CephFS Client Capabilities.&quot;
+     https://docs.ceph.com/en/reef/cephfs/capabilities/</code></pre>
+            <p>书籍：</p>
+            <pre class="text"><code>[13] White, T. &quot;Hadoop: The Definitive Guide.&quot; O&#39;Reilly, 4th Edition.
+     （HDFS NameNode 内存模型与 HA 配置的详细讲解）
+
+[14] van der Veen, J. &quot;Learning Ceph.&quot; Packt Publishing.
+     （CRUSH 算法与 MDS 配置的实践指导）</code></pre>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../53-replication/replication.html">副本与复制策略</a>
+            <strong>下一篇</strong>: <a
+            href="../55-data-balancing/data-balancing.html">数据均衡与在线迁移</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/08-iceberg-metadata/08-iceberg-metadata.html">【数据湖与开放表格式】Iceberg 元数据树</a></h3>
+                    <p>拆解 Iceberg 的四层元数据：catalog 指针 → metadata.json → manifest list（snapshot）→ manifest file → data file。讲清 snapshot 与 manifest 里的分区数据和列级 stats（lower/upper bound、null/value count）如何让一次查询不 list 目录就收敛到文件集合，并给出表规范 V1/V2/V3 的版本边界。基于 pyiceberg 0.11.1 真实建表逐层 dump。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/75-small-file-problem/small-file-problem.html">【存储工程】小文件问题：为什么文件数量比文件大小更致命</a></h3>
+                    <p>系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-24 · storage</p>
+                    <h3><a href="/post/storage/46-object-storage-model/object-storage-model.html">【存储工程】对象存储模型：从文件到对象的范式转变</a></h3>
+                    <p>深入分析对象存储的设计哲学——文件系统与对象存储的本质差异、CAP 权衡、最终一致性到强一致性的演进，以及 S3 API 核心操作实战</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

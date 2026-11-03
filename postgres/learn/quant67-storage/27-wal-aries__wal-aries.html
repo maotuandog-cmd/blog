@@ -1,0 +1,2015 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】WAL 与崩溃恢复：ARIES 协议 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="WAL 是数据库持久性的基石，ARIES
+是工业界公认最完备的崩溃恢复协议。本文从 WAL 三条规则出发，逐步拆解
+ARIES 的 Analysis-Redo-Undo 三阶段，结合 InnoDB 实现分析恢复全流程。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="wal, aries, crash-recovery, checkpoint, lsn, redo, undo, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/27-wal-aries/wal-aries.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】WAL 与崩溃恢复：ARIES 协议" />
+    <meta property="og:description" content="WAL 是数据库持久性的基石，ARIES 是工业界公认最完备的崩溃恢复协议。本文从 WAL 三条规则出发，逐步拆解 ARIES 的 Analysis-Redo-Undo 三阶段，结合 InnoDB 实现分析恢复全流程。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/27-wal-aries/wal-aries.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="wal" />
+    <meta property="article:tag" content="aries" />
+    <meta property="article:tag" content="crash-recovery" />
+    <meta property="article:tag" content="checkpoint" />
+    <meta property="article:tag" content="lsn" />
+    <meta property="article:tag" content="redo" />
+    <meta property="article:tag" content="undo" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】WAL 与崩溃恢复：ARIES 协议" />
+    <meta name="twitter:description" content="WAL 是数据库持久性的基石，ARIES 是工业界公认最完备的崩溃恢复协议。本文从 WAL 三条规则出发，逐步拆解 ARIES 的 Analysis-Redo-Undo 三阶段，结合 InnoDB 实现分析恢复全流程。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】WAL 与崩溃恢复：ARIES 协议", "description": "WAL 是数据库持久性的基石，ARIES 是工业界公认最完备的崩溃恢复协议。本文从 WAL 三条规则出发，逐步拆解 ARIES 的 Analysis-Redo-Undo 三阶段，结合 InnoDB 实现分析恢复全流程。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/27-wal-aries/wal-aries.html"}, "datePublished": "2025-09-05T00:00:00+00:00", "dateModified": "2026-07-23T15:46:43+00:00", "keywords": ["wal", "aries", "crash-recovery", "checkpoint", "lsn", "redo", "undo"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】WAL 与崩溃恢复：ARIES 协议</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-05</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#wal</span> <span>#aries</span> <span>#crash-recovery</span> <span>#checkpoint</span> <span>#lsn</span> <span>#redo</span> <span>#undo</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/wal.html">#wal</a><a class="chip-link" href="/tags/aries.html">#aries</a><a class="chip-link" href="/tags/crash-recovery.html">#crash-recovery</a><a class="chip-link" href="/tags/checkpoint.html">#checkpoint</a><a class="chip-link" href="/tags/lsn.html">#lsn</a><a class="chip-link" href="/tags/redo.html">#redo</a><a class="chip-link" href="/tags/undo.html">#undo</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/26-buffer-pool/buffer-pool.html">上一篇：【存储工程】Buffer Pool：数据库的内存管理</a><a class="post-series-nav__link" href="/post/storage/28-transaction-isolation/transaction-isolation.html">下一篇：【存储工程】事务隔离级别的存储实现</a></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一崩溃恢复问题"
+                id="toc-一崩溃恢复问题">一、崩溃恢复问题</a>
+                <ul>
+                <li><a href="#为什么崩溃恢复困难"
+                id="toc-为什么崩溃恢复困难">1.1
+                为什么崩溃恢复困难</a></li>
+                <li><a href="#部分写入问题" id="toc-部分写入问题">1.2
+                部分写入问题</a></li>
+                <li><a href="#写入顺序保证" id="toc-写入顺序保证">1.3
+                写入顺序保证</a></li>
+                <li><a href="#崩溃恢复的目标"
+                id="toc-崩溃恢复的目标">1.4 崩溃恢复的目标</a></li>
+                </ul></li>
+                <li><a href="#二wal-三条规则"
+                id="toc-二wal-三条规则">二、WAL 三条规则</a>
+                <ul>
+                <li><a href="#预写规则write-ahead-rule"
+                id="toc-预写规则write-ahead-rule">2.1
+                预写规则（Write-Ahead Rule）</a></li>
+                <li><a href="#重做规则redo-rule"
+                id="toc-重做规则redo-rule">2.2 重做规则（Redo
+                Rule）</a></li>
+                <li><a href="#撤销规则undo-rule"
+                id="toc-撤销规则undo-rule">2.3 撤销规则（Undo
+                Rule）</a></li>
+                <li><a href="#force-vs-no-force"
+                id="toc-force-vs-no-force">2.4 Force vs
+                No-Force</a></li>
+                <li><a href="#steal-vs-no-steal"
+                id="toc-steal-vs-no-steal">2.5 Steal vs
+                No-Steal</a></li>
+                <li><a href="#策略组合" id="toc-策略组合">2.6
+                策略组合</a></li>
+                </ul></li>
+                <li><a href="#三日志记录格式"
+                id="toc-三日志记录格式">三、日志记录格式</a>
+                <ul>
+                <li><a href="#日志序列号lsn" id="toc-日志序列号lsn">3.1
+                日志序列号（LSN）</a></li>
+                <li><a href="#普通日志记录结构"
+                id="toc-普通日志记录结构">3.2 普通日志记录结构</a></li>
+                <li><a href="#日志记录类型" id="toc-日志记录类型">3.3
+                日志记录类型</a></li>
+                <li><a href="#补偿日志记录clr"
+                id="toc-补偿日志记录clr">3.4
+                补偿日志记录（CLR）</a></li>
+                <li><a href="#物理日志-vs-逻辑日志"
+                id="toc-物理日志-vs-逻辑日志">3.5 物理日志 vs
+                逻辑日志</a></li>
+                </ul></li>
+                <li><a href="#四aries-协议概览"
+                id="toc-四aries-协议概览">四、ARIES 协议概览</a>
+                <ul>
+                <li><a href="#三大设计原则" id="toc-三大设计原则">4.1
+                三大设计原则</a></li>
+                <li><a href="#三阶段概览" id="toc-三阶段概览">4.2
+                三阶段概览</a></li>
+                <li><a href="#核心数据结构" id="toc-核心数据结构">4.3
+                核心数据结构</a></li>
+                <li><a href="#为什么-aries-是黄金标准"
+                id="toc-为什么-aries-是黄金标准">4.4 为什么 ARIES
+                是黄金标准</a></li>
+                <li><a href="#学术谱系aries-与现代实现分叉"
+                id="toc-学术谱系aries-与现代实现分叉">4.5
+                学术谱系：ARIES 与现代实现分叉</a></li>
+                <li><a href="#与-postgresql-walinnodb-redoundo-的对照"
+                id="toc-与-postgresql-walinnodb-redoundo-的对照">4.6 与
+                PostgreSQL WAL、InnoDB Redo/Undo 的对照</a></li>
+                </ul></li>
+                <li><a href="#五analysis-阶段"
+                id="toc-五analysis-阶段">五、Analysis 阶段</a>
+                <ul>
+                <li><a href="#analysis-阶段的目标"
+                id="toc-analysis-阶段的目标">5.1 Analysis
+                阶段的目标</a></li>
+                <li><a href="#扫描起点" id="toc-扫描起点">5.2
+                扫描起点</a></li>
+                <li><a href="#analysis-算法" id="toc-analysis-算法">5.3
+                Analysis 算法</a></li>
+                <li><a href="#analysis-的精确性"
+                id="toc-analysis-的精确性">5.4 Analysis
+                的精确性</a></li>
+                </ul></li>
+                <li><a href="#六redo-阶段" id="toc-六redo-阶段">六、Redo
+                阶段</a>
+                <ul>
+                <li><a href="#重放历史repeating-history"
+                id="toc-重放历史repeating-history">6.1
+                重放历史（Repeating History）</a></li>
+                <li><a href="#redo-算法" id="toc-redo-算法">6.2 Redo
+                算法</a></li>
+                <li><a href="#redo-的优化lsn-比较"
+                id="toc-redo-的优化lsn-比较">6.3 Redo 的优化：LSN
+                比较</a></li>
+                <li><a href="#redo-的幂等性" id="toc-redo-的幂等性">6.4
+                Redo 的幂等性</a></li>
+                </ul></li>
+                <li><a href="#七undo-阶段" id="toc-七undo-阶段">七、Undo
+                阶段</a>
+                <ul>
+                <li><a href="#undo-阶段的目标"
+                id="toc-undo-阶段的目标">7.1 Undo 阶段的目标</a></li>
+                <li><a href="#undo-算法" id="toc-undo-算法">7.2 Undo
+                算法</a></li>
+                <li><a href="#为什么用最大堆"
+                id="toc-为什么用最大堆">7.3 为什么用最大堆</a></li>
+                <li><a href="#clr-防止重复-undo"
+                id="toc-clr-防止重复-undo">7.4 CLR 防止重复
+                Undo</a></li>
+                </ul></li>
+                <li><a href="#八检查点checkpoint"
+                id="toc-八检查点checkpoint">八、检查点（Checkpoint）</a>
+                <ul>
+                <li><a href="#为什么需要检查点"
+                id="toc-为什么需要检查点">8.1 为什么需要检查点</a></li>
+                <li><a href="#简单检查点simple-checkpoint"
+                id="toc-简单检查点simple-checkpoint">8.2
+                简单检查点（Simple Checkpoint）</a></li>
+                <li><a href="#模糊检查点fuzzy-checkpoint"
+                id="toc-模糊检查点fuzzy-checkpoint">8.3
+                模糊检查点（Fuzzy Checkpoint）</a></li>
+                <li><a href="#检查点频率与恢复时间的权衡"
+                id="toc-检查点频率与恢复时间的权衡">8.4
+                检查点频率与恢复时间的权衡</a></li>
+                <li><a href="#检查点与日志回收"
+                id="toc-检查点与日志回收">8.5 检查点与日志回收</a></li>
+                </ul></li>
+                <li><a href="#九mysql-innodb-崩溃恢复"
+                id="toc-九mysql-innodb-崩溃恢复">九、MySQL InnoDB
+                崩溃恢复</a>
+                <ul>
+                <li><a href="#innodb-的日志架构"
+                id="toc-innodb-的日志架构">9.1 InnoDB
+                的日志架构</a></li>
+                <li><a href="#redo-log-结构" id="toc-redo-log-结构">9.2
+                Redo Log 结构</a></li>
+                <li><a href="#innodb-的-lsn" id="toc-innodb-的-lsn">9.3
+                InnoDB 的 LSN</a></li>
+                <li><a href="#双写缓冲区doublewrite-buffer"
+                id="toc-双写缓冲区doublewrite-buffer">9.4
+                双写缓冲区（Doublewrite Buffer）</a></li>
+                <li><a href="#innodb-崩溃恢复流程"
+                id="toc-innodb-崩溃恢复流程">9.5 InnoDB
+                崩溃恢复流程</a></li>
+                <li><a href="#innodb-redo-log-记录类型"
+                id="toc-innodb-redo-log-记录类型">9.6 InnoDB Redo Log
+                记录类型</a></li>
+                <li><a href="#后台-undo-回滚"
+                id="toc-后台-undo-回滚">9.7 后台 Undo 回滚</a></li>
+                </ul></li>
+                <li><a href="#十wal-写放大与优化"
+                id="toc-十wal-写放大与优化">十、WAL 写放大与优化</a>
+                <ul>
+                <li><a href="#wal-的写放大问题"
+                id="toc-wal-的写放大问题">10.1 WAL 的写放大问题</a></li>
+                <li><a href="#组提交group-commit"
+                id="toc-组提交group-commit">10.2 组提交（Group
+                Commit）</a></li>
+                <li><a href="#日志压缩" id="toc-日志压缩">10.3
+                日志压缩</a></li>
+                <li><a href="#并行恢复parallel-recovery"
+                id="toc-并行恢复parallel-recovery">10.4
+                并行恢复（Parallel Recovery）</a></li>
+                <li><a href="#其他优化手段" id="toc-其他优化手段">10.5
+                其他优化手段</a></li>
+                </ul></li>
+                <li><a href="#十一开放问题"
+                id="toc-十一开放问题">十一、开放问题</a></li>
+                <li><a href="#参考文献" id="toc-参考文献">参考文献</a>
+                <ul>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#规范与设计文档"
+                id="toc-规范与设计文档">规范与设计文档</a></li>
+                <li><a href="#源码" id="toc-源码">源码</a></li>
+                <li><a href="#系列内对照阅读"
+                id="toc-系列内对照阅读">系列内对照阅读</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>数据库最核心的承诺之一是持久性（Durability）：事务一旦提交，其修改不会因系统崩溃而丢失。实现这一承诺的关键技术是预写式日志（Write-Ahead
+            Logging，WAL）。WAL
+            的思想极其简单——先写日志，再改数据页——但围绕它构建一套完整的崩溃恢复协议，却需要处理大量的边界情况：部分写入、事务回滚、检查点、并发控制之间的交互等。</p>
+            <p>ARIES（Algorithm for Recovery and Isolation Exploiting
+            Semantics）是 IBM 研究院在 1992
+            年提出的崩溃恢复协议。三十多年过去，它仍然是工业界数据库（DB2、SQL
+            Server、PostgreSQL、MySQL InnoDB）崩溃恢复的理论基础。理解
+            ARIES，就等于理解了绝大多数关系型数据库在断电、进程崩溃后如何恢复到一致状态。</p>
+            <p>本文从崩溃恢复的核心难题出发，依次讲解 WAL
+            的三条规则、日志记录格式、ARIES 协议的三个阶段，再以 MySQL
+            InnoDB 为实例分析工业级实现，最后讨论 WAL
+            的写放大问题与优化手段。关于 WAL 在 LSM-Tree
+            场景下的应用，可参考 <a
+            href="../../db/lsm-tree/wal-memtable.html">WAL 与
+            MemTable</a>。</p>
+            <blockquote>
+            <p><strong>适用范围说明</strong>
+            本文聚焦于基于页（page-oriented）的存储引擎。LSM-Tree
+            类引擎的 WAL 机制有所不同，不在本文讨论范围内。ARIES
+            协议的描述基于原始论文（Mohan et al., 1992），具体实现（如
+            InnoDB）会在细节上有所调整。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一崩溃恢复问题">一、崩溃恢复问题</h2>
+            <h3 id="为什么崩溃恢复困难">1.1 为什么崩溃恢复困难</h3>
+            <p>数据库系统在正常运行时，大量数据页缓存在缓冲池（Buffer
+            Pool）中。事务对数据的修改首先发生在内存中的脏页（Dirty
+            Page）上，然后在某个时刻才刷写到磁盘。这种设计带来了巨大的性能优势——随机写变成了顺序写加上延迟的批量刷盘——但也引入了一个根本性问题：如果系统在脏页刷写到磁盘之前崩溃，这些修改就会丢失。</p>
+            <p>更糟糕的是，崩溃可能发生在任何时刻：</p>
+            <ul>
+            <li>一个事务修改了 10 个数据页，只有 3 个被刷到磁盘；</li>
+            <li>操作系统正在写一个 16 KB 的数据页，只写了前 8 KB
+            就断电了；</li>
+            <li>一个长事务正在执行
+            <code>ROLLBACK</code>，回滚到一半时系统崩溃。</li>
+            </ul>
+            <p>崩溃恢复协议需要处理所有这些情况，保证两个不变量（Invariant）：</p>
+            <ol type="1">
+            <li><strong>已提交事务的修改必须持久化</strong>——即使它们还没来得及刷盘。</li>
+            <li><strong>未提交事务的修改必须被撤销</strong>——即使它们的部分脏页已经刷到了磁盘。</li>
+            </ol>
+            <h3 id="部分写入问题">1.2 部分写入问题</h3>
+            <p>磁盘的原子写入单元通常是 512 字节（传统扇区）或 4
+            KB（高级格式扇区），而数据库的页大小通常是 8
+            KB（PostgreSQL）或 16
+            KB（InnoDB）。这意味着一次页面写入需要多次扇区写入，断电可能导致页面只写了一半，产生所谓的「撕裂页」（Torn
+            Page）。</p>
+            <pre class="text"><code>数据页写入过程（16 KB 页 = 4 × 4 KB 扇区）：
+
+正常写入：
+  扇区 1 [✓] → 扇区 2 [✓] → 扇区 3 [✓] → 扇区 4 [✓]
+  结果：完整页面，数据一致
+
+断电时的撕裂写：
+  扇区 1 [✓] → 扇区 2 [✓] → 扇区 3 [部分] → 扇区 4 [✗]
+  结果：页面损坏，前半部分是新数据，后半部分是旧数据</code></pre>
+            <p>撕裂页问题不能仅靠 WAL 解决——WAL
+            的重做（Redo）操作假设目标页面本身是完好的（要么是旧版本，要么是新版本，但不能是半新半旧）。InnoDB
+            通过双写缓冲区（Doublewrite
+            Buffer）来解决这个问题，我们在第九节详细讨论。</p>
+            <h3 id="写入顺序保证">1.3 写入顺序保证</h3>
+            <p>现代存储栈有多层缓存：CPU 缓存、文件系统页缓存（Page
+            Cache）、磁盘控制器写缓存、磁盘本身的写缓存。任何一层都可能对写入进行重排序。对于
+            WAL 来说，关键的顺序保证是：</p>
+            <p><strong>日志记录必须在对应的数据页之前到达持久化存储。</strong></p>
+            <p>如果数据页先于日志被刷到磁盘，然后系统崩溃，恢复程序就无法得知这个数据页被修改过，也就无法判断它是否需要被撤销。</p>
+            <p>实现这一保证的手段包括：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 典型的 WAL 写入流程（伪代码）</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> write_and_flush_wal<span class="op">(</span>LogRecord <span class="op">*</span>record<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 将日志记录追加到 WAL 缓冲区</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    wal_buffer_append<span class="op">(</span>record<span class="op">);</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 将 WAL 缓冲区写入文件</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    write<span class="op">(</span>wal_fd<span class="op">,</span> wal_buffer<span class="op">,</span> wal_buffer_size<span class="op">);</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 强制刷盘：fsync 保证数据到达持久化存储</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    而非停留在操作系统的页缓存中</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    fsync<span class="op">(</span>wal_fd<span class="op">);</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co">// 只有在 WAL 刷盘完成后，才允许数据页被刷出缓冲池</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> flush_dirty_page<span class="op">(</span>Page <span class="op">*</span>page<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 检查：该页面的最新修改对应的日志是否已经刷盘</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>page<span class="op">-&gt;</span>page_lsn <span class="op">&gt;</span> wal_flushed_lsn<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 先刷日志</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>        flush_wal_up_to<span class="op">(</span>page<span class="op">-&gt;</span>page_lsn<span class="op">);</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 现在可以安全地刷数据页</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    write<span class="op">(</span>data_fd<span class="op">,</span> page<span class="op">,</span> PAGE_SIZE<span class="op">);</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    fsync<span class="op">(</span>data_fd<span class="op">);</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>fsync()</code>
+            系统调用是保证写入持久化的核心手段。需要注意的是，某些文件系统（如
+            ext3 的 <code>data=writeback</code> 模式）的
+            <code>fsync</code> 行为可能不符合预期，生产环境中通常使用
+            <code>O_DIRECT</code> + <code>O_DSYNC</code> 或者明确的
+            <code>fdatasync()</code> 来确保写入顺序。</p>
+            <h3 id="崩溃恢复的目标">1.4 崩溃恢复的目标</h3>
+            <p>总结来说，崩溃恢复协议需要达成以下目标：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>目标</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>原子性（Atomicity）</td>
+            <td>事务的所有修改要么全部生效，要么全部不生效</td>
+            </tr>
+            <tr>
+            <td>持久性（Durability）</td>
+            <td>已提交事务的修改在崩溃后仍然存在</td>
+            </tr>
+            <tr>
+            <td>一致性（Consistency）</td>
+            <td>恢复后的数据库处于一个逻辑一致的状态</td>
+            </tr>
+            <tr>
+            <td>高性能</td>
+            <td>正常运行时的开销尽可能小</td>
+            </tr>
+            <tr>
+            <td>快速恢复</td>
+            <td>崩溃后的恢复时间尽可能短</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="二wal-三条规则">二、WAL 三条规则</h2>
+            <h3 id="预写规则write-ahead-rule">2.1 预写规则（Write-Ahead
+            Rule）</h3>
+            <p>预写规则是 WAL 的核心，也是它名字的由来：</p>
+            <blockquote>
+            <p><strong>在将修改后的数据页写入磁盘之前，必须先将对应的日志记录写入持久化存储。</strong></p>
+            </blockquote>
+            <p>形式化地表述：对于数据页 P 上的任何修改 M，如果 M
+            对应的日志记录为 L，那么 L 必须在 P 之前被写入磁盘。</p>
+            <p>这条规则保证了撤销（Undo）的可能性：如果系统崩溃，恢复程序可以通过日志记录中的前像（Before-Image）将未提交事务的修改回滚。</p>
+            <pre class="text"><code>预写规则保证的时序：
+
+时间线：──────────────────────────────────→
+
+正确的顺序：
+  日志写入磁盘 ─────────────→ 数据页写入磁盘
+       ↑                            ↑
+    日志 fsync                  数据页 fsync
+
+违反预写规则（危险！）：
+  数据页写入磁盘 ─→ 崩溃！─→ 日志还在内存中
+       ↑                         ↑
+    无法撤销这个修改         日志丢失了</code></pre>
+            <h3 id="重做规则redo-rule">2.2 重做规则（Redo Rule）</h3>
+            <blockquote>
+            <p><strong>事务提交时，其所有日志记录必须已经写入持久化存储。</strong></p>
+            </blockquote>
+            <p>这条规则也称为「强制日志」（Force-Log-at-Commit）。它保证了持久性：即使事务提交后数据页还没有刷盘，恢复程序也可以通过日志记录中的后像（After-Image）重新应用这些修改。</p>
+            <pre class="text"><code>事务提交流程：
+
+BEGIN TRANSACTION T1
+  UPDATE account SET balance = balance - 100 WHERE id = 1;
+  → 生成日志记录 L1: &lt;T1, account_page_5, before=1000, after=900&gt;
+
+  UPDATE account SET balance = balance + 100 WHERE id = 2;
+  → 生成日志记录 L2: &lt;T1, account_page_8, before=500, after=600&gt;
+
+COMMIT T1
+  → 将 L1、L2（以及 COMMIT 记录）刷盘
+  → fsync(wal_fd)
+  → 返回「提交成功」给客户端
+
+  此时 account_page_5 和 account_page_8 可能还在缓冲池中，
+  尚未刷入磁盘——这是允许的，因为日志已经持久化了。</code></pre>
+            <h3 id="撤销规则undo-rule">2.3 撤销规则（Undo Rule）</h3>
+            <blockquote>
+            <p><strong>如果数据库允许未提交事务的脏页被刷入磁盘（Steal
+            策略），那么日志中必须包含足够的信息来撤销这些修改。</strong></p>
+            </blockquote>
+            <p>这条规则的前提是 Steal 策略。理解它需要先理解 Force/Steal
+            缓冲池策略。</p>
+            <h3 id="force-vs-no-force">2.4 Force vs No-Force</h3>
+            <p>Force
+            策略决定的是：<strong>事务提交时，是否强制将所有脏页刷入磁盘？</strong></p>
+            <table>
+            <colgroup>
+            <col style="width: 25%" />
+            <col style="width: 25%" />
+            <col style="width: 25%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>策略</th>
+            <th>行为</th>
+            <th>优点</th>
+            <th>缺点</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Force</td>
+            <td>提交时强制刷所有脏页</td>
+            <td>恢复简单：不需要 Redo</td>
+            <td>提交延迟高，大量随机 I/O</td>
+            </tr>
+            <tr>
+            <td>No-Force</td>
+            <td>提交时只刷日志，脏页延迟刷写</td>
+            <td>提交速度快</td>
+            <td>恢复时需要 Redo</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>几乎所有现代数据库都采用 No-Force
+            策略。提交时只需要一次顺序写（日志刷盘），而不是多次随机写（数据页刷盘），性能差距可以达到一个数量级。</p>
+            <h3 id="steal-vs-no-steal">2.5 Steal vs No-Steal</h3>
+            <p>Steal
+            策略决定的是：<strong>是否允许将未提交事务修改过的脏页刷入磁盘？</strong></p>
+            <table>
+            <colgroup>
+            <col style="width: 25%" />
+            <col style="width: 25%" />
+            <col style="width: 25%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>策略</th>
+            <th>行为</th>
+            <th>优点</th>
+            <th>缺点</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Steal</td>
+            <td>允许刷未提交事务的脏页</td>
+            <td>缓冲池管理灵活，内存压力小</td>
+            <td>恢复时需要 Undo</td>
+            </tr>
+            <tr>
+            <td>No-Steal</td>
+            <td>不允许刷未提交事务的脏页</td>
+            <td>恢复简单：不需要 Undo</td>
+            <td>长事务可能撑爆缓冲池</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Steal 策略在内存受限的环境下至关重要。如果采用
+            No-Steal，一个修改了百万行数据的长事务会把所有相关脏页「钉」在缓冲池中，可能导致内存耗尽。</p>
+            <h3 id="策略组合">2.6 策略组合</h3>
+            <p>四种组合的对比：</p>
+            <pre class="text"><code>                    Steal               No-Steal
+              ┌──────────────────┬──────────────────┐
+              │                  │                  │
+   No-Force   │  需要 Redo+Undo  │   只需要 Redo    │
+              │  （ARIES 采用）   │                  │
+              │                  │                  │
+              ├──────────────────┼──────────────────┤
+              │                  │                  │
+   Force      │  只需要 Undo     │  不需要恢复日志   │
+              │                  │  （但性能最差）   │
+              │                  │                  │
+              └──────────────────┴──────────────────┘</code></pre>
+            <p>ARIES 采用 <strong>Steal + No-Force</strong>
+            组合，获得最大的灵活性和性能，代价是恢复逻辑最复杂——需要同时支持
+            Redo 和 Undo。这正是 ARIES 存在的意义。</p>
+            <hr />
+            <h2 id="三日志记录格式">三、日志记录格式</h2>
+            <h3 id="日志序列号lsn">3.1 日志序列号（LSN）</h3>
+            <p>日志序列号（Log Sequence Number，LSN）是 WAL
+            系统中最关键的概念。每条日志记录都有一个唯一的、单调递增的
+            LSN。LSN 的具体含义因实现而异：</p>
+            <ul>
+            <li><strong>InnoDB</strong>：LSN
+            是日志文件中的字节偏移量（Byte Offset）</li>
+            <li><strong>PostgreSQL</strong>：LSN 也是 WAL
+            文件中的字节位置</li>
+            <li><strong>学术描述</strong>：通常简化为整数序号</li>
+            </ul>
+            <p>LSN 贯穿整个恢复协议，充当了多个关键角色：</p>
+            <pre class="text"><code>LSN 的用途：
+
+1. 数据页头部的 page_lsn：
+   记录「最后一次修改该页面的日志记录的 LSN」
+   → 用于 Redo 阶段判断是否需要重做
+
+2. 日志记录中的 prev_lsn：
+   指向「同一事务的上一条日志记录」
+   → 用于 Undo 阶段沿事务链回滚
+
+3. 全局的 flushed_lsn：
+   记录「已经刷入磁盘的日志的最大 LSN」
+   → 用于判断数据页是否可以安全刷盘（预写规则）
+
+4. 检查点中的 checkpoint_lsn：
+   记录「检查点开始时的 LSN」
+   → 用于 Analysis 阶段确定扫描起点</code></pre>
+            <h3 id="普通日志记录结构">3.2 普通日志记录结构</h3>
+            <p>一条完整的更新日志记录（Update Log
+            Record）包含以下字段：</p>
+            <pre class="text"><code>┌──────────────────────────────────────────────────────────┐
+│                    Update Log Record                      │
+├──────────┬───────────┬───────────┬───────────────────────┤
+│  LSN     │  TransID  │  PrevLSN  │  Type                 │
+│  (日志   │  (事务    │  (同一事务│  (UPDATE/INSERT/       │
+│   序列号) │   标识符)  │  上一条   │   DELETE/COMMIT/      │
+│          │           │   LSN)    │   ABORT/CLR/...)      │
+├──────────┴───────────┴───────────┴───────────────────────┤
+│  PageID          │  Offset       │  Length               │
+│  (被修改的页面ID) │  (页内偏移)    │  (修改数据长度)       │
+├──────────────────┴───────────────┴───────────────────────┤
+│  Before-Image (修改前的数据，用于 Undo)                    │
+├──────────────────────────────────────────────────────────┤
+│  After-Image  (修改后的数据，用于 Redo)                    │
+└──────────────────────────────────────────────────────────┘</code></pre>
+            <p>字段详解：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>字段</th>
+            <th>大小（典型）</th>
+            <th>用途</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>LSN</td>
+            <td>8 字节</td>
+            <td>唯一标识这条日志记录</td>
+            </tr>
+            <tr>
+            <td>TransID</td>
+            <td>4-8 字节</td>
+            <td>标识产生这条记录的事务</td>
+            </tr>
+            <tr>
+            <td>PrevLSN</td>
+            <td>8 字节</td>
+            <td>指向同一事务的上一条日志，构成事务链</td>
+            </tr>
+            <tr>
+            <td>Type</td>
+            <td>1 字节</td>
+            <td>记录类型</td>
+            </tr>
+            <tr>
+            <td>PageID</td>
+            <td>4-8 字节</td>
+            <td>被修改的数据页编号</td>
+            </tr>
+            <tr>
+            <td>Offset</td>
+            <td>2 字节</td>
+            <td>页内偏移</td>
+            </tr>
+            <tr>
+            <td>Length</td>
+            <td>2 字节</td>
+            <td>修改的数据长度</td>
+            </tr>
+            <tr>
+            <td>Before-Image</td>
+            <td>可变</td>
+            <td>修改前的数据值（物理 Undo）</td>
+            </tr>
+            <tr>
+            <td>After-Image</td>
+            <td>可变</td>
+            <td>修改后的数据值（物理 Redo）</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="日志记录类型">3.3 日志记录类型</h3>
+            <p>ARIES 定义了多种日志记录类型：</p>
+            <pre class="text"><code>日志记录类型：
+
+UPDATE     ── 普通的数据修改（包含 before-image 和 after-image）
+COMMIT     ── 事务提交标记（无数据内容）
+ABORT      ── 事务中止标记
+CLR        ── 补偿日志记录（Compensation Log Record）
+BEGIN_CKPT ── 检查点开始
+END_CKPT   ── 检查点结束（包含脏页表和活动事务表）</code></pre>
+            <h3 id="补偿日志记录clr">3.4 补偿日志记录（CLR）</h3>
+            <p>补偿日志记录（Compensation Log Record，CLR）是 ARIES
+            最精妙的设计之一。当系统执行 Undo
+            操作（无论是正常回滚还是崩溃恢复期间的 Undo
+            阶段）时，每撤销一条日志记录，就会写入一条 CLR。</p>
+            <p>CLR 的关键字段：</p>
+            <pre class="text"><code>┌──────────────────────────────────────────────────────────┐
+│             Compensation Log Record (CLR)                 │
+├──────────┬───────────┬───────────┬───────────────────────┤
+│  LSN     │  TransID  │  PrevLSN  │  Type = CLR           │
+├──────────┴───────────┴───────────┴───────────────────────┤
+│  PageID          │  Undo-Data (撤销操作的内容)            │
+├──────────────────┴───────────────────────────────────────┤
+│  UndoNextLSN：指向下一条需要被撤销的日志记录              │
+│  （即被撤销记录的 PrevLSN）                               │
+└──────────────────────────────────────────────────────────┘</code></pre>
+            <p>CLR 的核心价值在于 <code>UndoNextLSN</code>
+            字段。它指向「下一条需要被 Undo 的日志记录」，使得：</p>
+            <ol type="1">
+            <li><strong>CLR 自身永远不需要被
+            Undo</strong>——如果回滚过程中又崩溃了，恢复程序通过
+            <code>UndoNextLSN</code>
+            跳过已经撤销的记录，从断点继续。</li>
+            <li><strong>Undo
+            操作是幂等的</strong>——无论崩溃和恢复发生多少次，最终结果都是正确的。</li>
+            </ol>
+            <p>举一个具体的例子：</p>
+            <pre class="text"><code>事务 T1 的日志链与回滚过程：
+
+原始日志（从上到下 LSN 递增）：
+  LSN=10: &lt;T1, UPDATE, PageA, before=X, after=Y, PrevLSN=NULL&gt;
+  LSN=20: &lt;T1, UPDATE, PageB, before=M, after=N, PrevLSN=10&gt;
+  LSN=30: &lt;T1, UPDATE, PageC, before=P, after=Q, PrevLSN=20&gt;
+
+T1 执行 ABORT，开始回滚：
+
+Step 1: 撤销 LSN=30，写入 CLR
+  LSN=35: &lt;T1, CLR, PageC, undo Q→P, UndoNextLSN=20&gt;
+
+Step 2: 撤销 LSN=20，写入 CLR
+  LSN=40: &lt;T1, CLR, PageB, undo N→M, UndoNextLSN=10&gt;
+
+     ──── 此时系统崩溃！ ────
+
+恢复时的 Undo 阶段：
+  发现 T1 未提交，需要继续回滚。
+  找到 T1 最新的日志记录 LSN=40（CLR）。
+  UndoNextLSN=10，直接跳到 LSN=10 继续撤销。
+  不需要重新撤销 LSN=30 和 LSN=20。
+
+Step 3: 撤销 LSN=10，写入 CLR
+  LSN=45: &lt;T1, CLR, PageA, undo Y→X, UndoNextLSN=NULL&gt;
+
+  UndoNextLSN=NULL，表示 T1 的所有修改已经撤销完毕。
+  写入 ABORT 记录，T1 回滚完成。</code></pre>
+            <h3 id="物理日志-vs-逻辑日志">3.5 物理日志 vs 逻辑日志</h3>
+            <p>ARIES
+            使用的是<strong>物理逻辑日志</strong>（Physiological
+            Logging）：</p>
+            <ul>
+            <li><strong>物理的</strong>：日志记录绑定到具体的页面（PageID）。</li>
+            <li><strong>逻辑的</strong>：页面内部的修改用逻辑操作描述（如「在
+            B+ 树叶子节点中插入键值
+            K」），而非记录整个页面的前后像。</li>
+            </ul>
+            <p>这种混合方式的优点：</p>
+            <pre class="text"><code>纯物理日志（Page-Level）：
+  记录整个 16 KB 页面的 before-image 和 after-image
+  → 日志量巨大（每次修改 32 KB 日志）
+  → 但 Redo/Undo 简单：直接覆盖页面
+
+纯逻辑日志（Operation-Level）：
+  记录 &quot;INSERT INTO table VALUES (1, &#39;Alice&#39;)&quot;
+  → 日志量小
+  → 但 Redo 需要重新执行 SQL，依赖索引结构等上下文
+  → 且不能保证幂等性
+
+物理逻辑日志（Physiological）：
+  记录 &quot;在 PageID=42 的偏移 200 处写入 8 字节: 0x...&quot;
+  → 日志量适中
+  → Redo/Undo 只需定位到具体页面，操作明确
+  → 这是 ARIES 和大多数工业实现的选择</code></pre>
+            <hr />
+            <h2 id="四aries-协议概览">四、ARIES 协议概览</h2>
+            <h3 id="三大设计原则">4.1 三大设计原则</h3>
+            <p>ARIES 协议建立在三大设计原则之上：</p>
+            <ol type="1">
+            <li><strong>Write-Ahead
+            Logging</strong>：日志先于数据页写入磁盘。</li>
+            <li><strong>Repeating History During
+            Redo</strong>：重做阶段重放所有日志记录（包括未提交事务的），将数据库恢复到崩溃前一刻的精确状态。</li>
+            <li><strong>Logging Changes During
+            Undo</strong>：撤销操作本身也会被记录（CLR），防止重复撤销。</li>
+            </ol>
+            <p>第二条原则——「重放历史」——是 ARIES
+            与早期恢复算法的关键区别。早期算法在 Redo
+            阶段只重做已提交事务的修改，这看似高效，实际上会导致复杂的正确性问题（如锁的恢复）。ARIES
+            选择了更简单的路径：先完全重放历史，再撤销未提交事务。</p>
+            <h3 id="三阶段概览">4.2 三阶段概览</h3>
+            <p>ARIES 的崩溃恢复分为三个阶段，按顺序执行：</p>
+            <pre class="text"><code>崩溃恢复三阶段：
+
+     日志文件
+     ┌─────────────────────────────────────────────────────┐
+     │  ...  │ CKPT │  ...  │  ...  │  ...  │  ... │ 崩溃  │
+     └───────┼──────┼───────┼───────┼───────┼──────┼───────┘
+             │      │                              │
+             │      │←──── Analysis 阶段 ─────────→│
+             │      │  从检查点开始，正向扫描日志     │
+             │      │  重建脏页表和活动事务表         │
+             │      │                              │
+             │      │←──── Redo 阶段 ─────────────→│
+             │      │  从最小 recLSN 开始，正向扫描  │
+             │      │  重做所有日志记录              │
+             │      │                              │
+             │      │←──── Undo 阶段 ─────────────→│
+             │      │  从最大 LSN 开始，反向扫描     │
+             │      │  撤销所有未提交事务             │
+             │      │                              │</code></pre>
+            <h3 id="核心数据结构">4.3 核心数据结构</h3>
+            <p>ARIES
+            依赖两个关键的内存数据结构，它们在正常运行时由事务管理器维护，在恢复的
+            Analysis 阶段被重建：</p>
+            <p><strong>脏页表（Dirty Page Table，DPT）</strong></p>
+            <pre class="text"><code>脏页表：记录所有在缓冲池中被修改但尚未刷入磁盘的页面
+
+┌──────────┬──────────┐
+│  PageID  │  recLSN  │
+├──────────┼──────────┤
+│  Page_5  │  LSN=100 │  ← 该页面第一次被弄脏时的 LSN
+│  Page_8  │  LSN=150 │
+│  Page_12 │  LSN=200 │
+│  Page_3  │  LSN=250 │
+└──────────┴──────────┘
+
+recLSN（Recovery LSN）：
+  该页面自上次刷盘以来，第一次被修改时对应的日志 LSN。
+  Redo 阶段用 recLSN 来确定「这个页面最早可能需要从哪条日志开始重做」。</code></pre>
+            <p><strong>活动事务表（Active Transaction
+            Table，ATT）</strong></p>
+            <pre class="text"><code>活动事务表：记录所有正在执行的事务
+
+┌──────────┬──────────┬───────────┐
+│ TransID  │  Status  │  LastLSN  │
+├──────────┼──────────┼───────────┤
+│  T1      │  Running │  LSN=300  │  ← T1 最近一条日志的 LSN
+│  T2      │  Running │  LSN=280  │
+│  T3      │  Aborting│  LSN=310  │  ← T3 正在回滚中
+└──────────┴──────────┴───────────┘
+
+LastLSN：
+  事务最近一条日志记录的 LSN。
+  Undo 阶段从这里开始，沿 PrevLSN 链反向回滚。</code></pre>
+            <h3 id="为什么-aries-是黄金标准">4.4 为什么 ARIES
+            是黄金标准</h3>
+            <p>ARIES
+            之所以成为工业标准，是因为它在正确性、性能和灵活性之间取得了最佳平衡：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>特性</th>
+            <th>ARIES 的做法</th>
+            <th>优势</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Steal + No-Force</td>
+            <td>允许最灵活的缓冲池管理</td>
+            <td>正常运行时高性能</td>
+            </tr>
+            <tr>
+            <td>Physiological Logging</td>
+            <td>页面级定位 + 逻辑操作</td>
+            <td>日志量适中且可并发</td>
+            </tr>
+            <tr>
+            <td>CLR</td>
+            <td>撤销操作也记日志</td>
+            <td>支持嵌套回滚，恢复幂等</td>
+            </tr>
+            <tr>
+            <td>Repeating History</td>
+            <td>Redo 所有操作</td>
+            <td>简化恢复逻辑，支持细粒度锁恢复</td>
+            </tr>
+            <tr>
+            <td>Fuzzy Checkpoint</td>
+            <td>检查点不阻塞事务</td>
+            <td>正常运行时几乎零开销</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="学术谱系aries-与现代实现分叉">4.5 学术谱系：ARIES
+            与现代实现分叉</h3>
+            <p>ARIES 不是单一产品，而是一族崩溃恢复协议的理论起点：</p>
+            <pre class="text"><code>Mohan et al. (TODS 1992) — ARIES 主论文
+    Steal + No-Force + Physiological Logging + CLR + Repeating History
+         │
+         ├─→ Mohan &amp; Levine (SIGMOD 1992) — ARIES/IM（B+ 树索引恢复）
+         ├─→ Mohan (VLDB 1999) — Repeating History Beyond ARIES（扩展讨论）
+         │
+         └─→ 生产实现分叉（均继承 WAL + LSN + Checkpoint 思想，细节各异）
+                ├─ IBM DB2 / SQL Server — 最接近论文三阶段框架
+                ├─ PostgreSQL — REDO 中心 + CLOG/MVCC 处理未提交事务（见下节对照）
+                └─ MySQL InnoDB — Redo + 独立 Undo 表空间 + 异步回滚</code></pre>
+            <p>理解 ARIES
+            的价值在于把握<strong>不变量</strong>（预写、幂等重做、撤销可续作），而非要求每个数据库逐行复现
+            Analysis/Redo/Undo
+            伪代码。Mohan（1999）已指出：新存储介质（NVRAM、远程复制）会改变「何谓刷盘」的前提，但
+            WAL 顺序与 LSN 单调性仍是共识。</p>
+            <h3 id="与-postgresql-walinnodb-redoundo-的对照">4.6 与
+            PostgreSQL WAL、InnoDB Redo/Undo 的对照</h3>
+            <p>下文对照 ARIES 论文抽象、PostgreSQL 17 WAL 实现与 InnoDB
+            8.0 实现。内核细节分别见 <a
+            href="../../db/postgresql-kernel/04-wal-internals/04-wal-internals.html">PG
+            WAL 内部机制</a>、<a
+            href="../../db/mysql-innodb/04-redo-log/04-redo-log.html">InnoDB
+            Redo Log</a>、<a
+            href="../../db/mysql-innodb/05-undo-log/05-undo-log.html">InnoDB
+            Undo Log</a>。</p>
+            <table>
+            <colgroup>
+            <col style="width: 7%" />
+            <col style="width: 39%" />
+            <col style="width: 21%" />
+            <col style="width: 31%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>ARIES（Mohan et al., 1992）</th>
+            <th>PostgreSQL WAL</th>
+            <th>InnoDB（Redo + Undo）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>恢复阶段</td>
+            <td>Analysis → Redo → Undo 三阶段显式分离</td>
+            <td><code>StartupXLOG()</code> 以 checkpoint REDO
+            指针为起点做 REDO；未提交事务依赖
+            CLOG/快照语义清理，<strong>无独立 Analysis/Undo
+            阶段</strong></td>
+            <td>启动时 Redo 扫描 + Undo 回滚未提交事务；<strong>Redo
+            完成后可先对外服务，Undo 可后台执行</strong></td>
+            </tr>
+            <tr>
+            <td>Undo 信息存放</td>
+            <td>UPDATE 记录的 before-image；Undo 写 CLR</td>
+            <td>不在 WAL 存行级 before-image；多版本与 abort 由 heap +
+            CLOG + 可见性规则处理</td>
+            <td><strong>独立 Undo Tablespace</strong>；Undo
+            页修改本身也产生 Redo</td>
+            </tr>
+            <tr>
+            <td>检查点</td>
+            <td>Fuzzy：<code>BEGIN_CKPT</code> / <code>END_CKPT</code>
+            携带 DPT+ATT 快照</td>
+            <td>两阶段 checkpoint：<code>GetRedoRecPtr()</code> 定 REDO
+            点 → 刷脏页 → 写 checkpoint record → 更新
+            <code>pg_control</code></td>
+            <td>按 Redo 空间使用率（约 75%）自适应推进 checkpoint</td>
+            </tr>
+            <tr>
+            <td>幂等重做键</td>
+            <td>页面 <code>page_lsn</code> vs 记录 LSN</td>
+            <td>页面 <code>pd_lsn</code> vs record LSN</td>
+            <td>页面 <code>page_lsn</code> vs record LSN</td>
+            </tr>
+            <tr>
+            <td>补偿记录</td>
+            <td><strong>CLR</strong>（<code>UndoNextLSN</code>
+            跳过已撤销项）</td>
+            <td>无 CLR；崩溃后依赖 WAL 重放 + 事务状态位</td>
+            <td>Undo 链 + Purge；回滚进度可续作但结构不同于 ARIES
+            CLR</td>
+            </tr>
+            <tr>
+            <td>撕裂页</td>
+            <td>论文假设页级原子性或外部分机制</td>
+            <td><strong>FPW</strong>（Full Page Write）写入 WAL</td>
+            <td><strong>Doublewrite Buffer</strong></td>
+            </tr>
+            <tr>
+            <td>Steal + No-Force</td>
+            <td>论文标准组合</td>
+            <td>支持（脏页可先于 commit 落盘，commit 强制 WAL
+            flush）</td>
+            <td>支持（<code>innodb_flush_log_at_trx_commit</code>
+            控制持久化语义）</td>
+            </tr>
+            <tr>
+            <td>逻辑/物理日志</td>
+            <td>Physiological（页定位 + 操作描述）</td>
+            <td>RMGR 分发；heap/btree 等逻辑操作 + 可选 FPW</td>
+            <td>MLOG 类型码（<code>MLOG_REC_INSERT</code> 等）+
+            物理偏移</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>PostgreSQL 与 InnoDB 都满足 WAL 预写与 LSN 单调性，但
+            <strong>Undo 放在哪里、恢复分几个阶段</strong>
+            是最显著的分叉：PG 把「谁提交了」交给 CLOG/MVCC，InnoDB 把
+            before-image 放进 Undo 段并为之写
+            Redo——读内核文时应对照这一列，避免用 ARIES
+            伪代码生搬硬套。</p>
+            <hr />
+            <h2 id="五analysis-阶段">五、Analysis 阶段</h2>
+            <h3 id="analysis-阶段的目标">5.1 Analysis 阶段的目标</h3>
+            <p>Analysis
+            阶段是恢复的第一步，它的目标是通过正向扫描日志，重建崩溃时刻的两个关键数据结构：</p>
+            <ol type="1">
+            <li><strong>脏页表（DPT）</strong>：确定哪些页面可能需要被重做。</li>
+            <li><strong>活动事务表（ATT）</strong>：确定哪些事务需要被撤销。</li>
+            </ol>
+            <p>此外，Analysis 还确定了 Redo 阶段的起始点——DPT 中最小的
+            <code>recLSN</code>。</p>
+            <h3 id="扫描起点">5.2 扫描起点</h3>
+            <p>Analysis 从最近一次成功的检查点（Checkpoint）的
+            <code>BEGIN_CKPT</code> 记录开始扫描。检查点的
+            <code>END_CKPT</code> 记录中包含了检查点时刻的 DPT 和 ATT
+            快照，作为 Analysis 的初始值。</p>
+            <pre class="text"><code>Analysis 阶段的扫描范围：
+
+日志文件：
+  ┌──────┬──────────┬───────────────────────────────────┬──────┐
+  │ ...  │BEGIN_CKPT│      END_CKPT                     │      │
+  │      │ LSN=500  │ LSN=510                           │      │
+  │      │          │ DPT: {P5:100, P8:150}             │ 崩溃 │
+  │      │          │ ATT: {T1:Running:300, T2:Run:280} │      │
+  └──────┴──────────┴───────────────────────────────────┴──────┘
+                     ↑                                    ↑
+               Analysis 起点                        Analysis 终点</code></pre>
+            <h3 id="analysis-算法">5.3 Analysis 算法</h3>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Analysis 阶段伪代码</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> analysis_phase(checkpoint_lsn):</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 1. 从检查点的 END_CKPT 记录中读取初始 DPT 和 ATT</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>    end_ckpt <span class="op">=</span> read_log_record(checkpoint_lsn)</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>    dirty_page_table <span class="op">=</span> end_ckpt.dpt.copy()  <span class="co"># 脏页表</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>    active_trans_table <span class="op">=</span> end_ckpt.att.copy()  <span class="co"># 活动事务表</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 2. 从检查点之后的第一条日志开始，正向扫描到日志末尾</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>    lsn <span class="op">=</span> checkpoint_lsn <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> lsn <span class="op">&lt;=</span> last_lsn_in_log:</span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>        record <span class="op">=</span> read_log_record(lsn)</span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> record.<span class="bu">type</span> <span class="op">==</span> <span class="st">&#39;END&#39;</span>:  <span class="co"># 事务结束记录</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 事务已经完成（提交或中止），从 ATT 中移除</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>            active_trans_table.remove(record.trans_id)</span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>:</span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 其他类型的记录：UPDATE, COMMIT, ABORT, CLR, ...</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> record.trans_id <span class="kw">not</span> <span class="kw">in</span> active_trans_table:</span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>                <span class="co"># 新事务：加入 ATT</span></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>                active_trans_table.add(</span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>                    record.trans_id, status<span class="op">=</span><span class="st">&#39;Running&#39;</span>, last_lsn<span class="op">=</span>lsn</span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>                )</span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span>:</span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>                <span class="co"># 已有事务：更新 LastLSN</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>                active_trans_table[record.trans_id].last_lsn <span class="op">=</span> lsn</span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 如果是 COMMIT 记录，标记事务状态</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> record.<span class="bu">type</span> <span class="op">==</span> <span class="st">&#39;COMMIT&#39;</span>:</span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>                active_trans_table[record.trans_id].status <span class="op">=</span> <span class="st">&#39;Committing&#39;</span></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 如果记录涉及数据页修改（UPDATE 或 CLR）</span></span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> record.<span class="bu">type</span> <span class="kw">in</span> (<span class="st">&#39;UPDATE&#39;</span>, <span class="st">&#39;CLR&#39;</span>) <span class="kw">and</span> record.page_id <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> record.page_id <span class="kw">not</span> <span class="kw">in</span> dirty_page_table:</span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a>                    <span class="co"># 页面首次出现在 DPT 中，记录 recLSN</span></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a>                    dirty_page_table.add(record.page_id, rec_lsn<span class="op">=</span>lsn)</span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a>        lsn <span class="op">=</span> next_lsn(lsn)</span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 3. 返回重建的 DPT 和 ATT</span></span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> dirty_page_table, active_trans_table</span></code></pre></div>
+            <h3 id="analysis-的精确性">5.4 Analysis 的精确性</h3>
+            <p>需要注意的是，Analysis 阶段重建的 DPT
+            是<strong>保守的</strong>（Conservative）：它可能包含一些实际上已经刷盘的页面。这是因为在检查点之后，后台线程可能已经将某些脏页刷入了磁盘，但
+            Analysis 无法得知这一点（日志中不记录刷盘事件）。</p>
+            <p>这种保守性是安全的：Redo
+            阶段在处理每个页面时，会比较页面上的 <code>page_lsn</code>
+            和日志记录的
+            LSN，如果页面已经包含了这次修改（<code>page_lsn &gt;= record.lsn</code>），就跳过重做。多余的页面只会导致一些不必要的页面读取和
+            LSN 比较，不会影响正确性。</p>
+            <hr />
+            <h2 id="六redo-阶段">六、Redo 阶段</h2>
+            <h3 id="重放历史repeating-history">6.1 重放历史（Repeating
+            History）</h3>
+            <p>Redo 阶段的核心原则是<strong>重放历史</strong>：从 DPT
+            中最小的 <code>recLSN</code>
+            开始，正向扫描日志，重做所有需要重做的修改——包括未提交事务的修改。</p>
+            <p>这个设计看起来违反直觉：为什么要重做即将被撤销的修改？原因有两个：</p>
+            <ol type="1">
+            <li><p><strong>简化恢复逻辑</strong>：重放所有历史后，数据库回到崩溃前一刻的精确状态。此时所有锁、所有数据页都和崩溃前一样，Undo
+            阶段可以像正常回滚一样工作，无需特殊处理。</p></li>
+            <li><p><strong>支持细粒度锁恢复</strong>：如果只重做已提交事务，那些被未提交事务持有的锁信息就丢失了。在多用户环境中，这可能导致恢复后的数据库暴露不一致状态。</p></li>
+            </ol>
+            <h3 id="redo-算法">6.2 Redo 算法</h3>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Redo 阶段伪代码</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> redo_phase(dirty_page_table):</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 1. 确定 Redo 起点：DPT 中最小的 recLSN</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>    redo_lsn <span class="op">=</span> <span class="bu">min</span>(page.rec_lsn <span class="cf">for</span> page <span class="kw">in</span> dirty_page_table.values())</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 2. 从 redo_lsn 开始，正向扫描日志</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>    lsn <span class="op">=</span> redo_lsn</span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> lsn <span class="op">&lt;=</span> last_lsn_in_log:</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>        record <span class="op">=</span> read_log_record(lsn)</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 3. 只处理涉及页面修改的记录（UPDATE 和 CLR）</span></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> record.<span class="bu">type</span> <span class="kw">in</span> (<span class="st">&#39;UPDATE&#39;</span>, <span class="st">&#39;CLR&#39;</span>) <span class="kw">and</span> record.page_id <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a>            page_id <span class="op">=</span> record.page_id</span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 4. 检查是否需要重做（三个条件都满足才跳过）</span></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a>            need_redo <span class="op">=</span> <span class="va">True</span></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 条件 A：页面在 DPT 中</span></span>
+<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> page_id <span class="kw">not</span> <span class="kw">in</span> dirty_page_table:</span>
+<span id="cb18-21"><a href="#cb18-21" aria-hidden="true" tabindex="-1"></a>                need_redo <span class="op">=</span> <span class="va">False</span>  <span class="co"># 页面不脏，无需重做</span></span>
+<span id="cb18-22"><a href="#cb18-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-23"><a href="#cb18-23" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 条件 B：记录的 LSN &gt;= 页面的 recLSN</span></span>
+<span id="cb18-24"><a href="#cb18-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">elif</span> lsn <span class="op">&lt;</span> dirty_page_table[page_id].rec_lsn:</span>
+<span id="cb18-25"><a href="#cb18-25" aria-hidden="true" tabindex="-1"></a>                need_redo <span class="op">=</span> <span class="va">False</span>  <span class="co"># 这条修改在页面上次刷盘之前</span></span>
+<span id="cb18-26"><a href="#cb18-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-27"><a href="#cb18-27" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span>:</span>
+<span id="cb18-28"><a href="#cb18-28" aria-hidden="true" tabindex="-1"></a>                <span class="co"># 条件 C：需要读取页面，比较 page_lsn</span></span>
+<span id="cb18-29"><a href="#cb18-29" aria-hidden="true" tabindex="-1"></a>                page <span class="op">=</span> read_page_from_disk(page_id)</span>
+<span id="cb18-30"><a href="#cb18-30" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> page.page_lsn <span class="op">&gt;=</span> lsn:</span>
+<span id="cb18-31"><a href="#cb18-31" aria-hidden="true" tabindex="-1"></a>                    need_redo <span class="op">=</span> <span class="va">False</span>  <span class="co"># 页面已包含此修改</span></span>
+<span id="cb18-32"><a href="#cb18-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-33"><a href="#cb18-33" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 5. 执行重做</span></span>
+<span id="cb18-34"><a href="#cb18-34" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> need_redo:</span>
+<span id="cb18-35"><a href="#cb18-35" aria-hidden="true" tabindex="-1"></a>                page <span class="op">=</span> read_page_from_disk(page_id)</span>
+<span id="cb18-36"><a href="#cb18-36" aria-hidden="true" tabindex="-1"></a>                apply_redo(page, record)  <span class="co"># 应用 after-image</span></span>
+<span id="cb18-37"><a href="#cb18-37" aria-hidden="true" tabindex="-1"></a>                page.page_lsn <span class="op">=</span> lsn       <span class="co"># 更新页面 LSN</span></span>
+<span id="cb18-38"><a href="#cb18-38" aria-hidden="true" tabindex="-1"></a>                <span class="co"># 注意：不立即刷盘，由缓冲池管理器后续处理</span></span>
+<span id="cb18-39"><a href="#cb18-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-40"><a href="#cb18-40" aria-hidden="true" tabindex="-1"></a>        lsn <span class="op">=</span> next_lsn(lsn)</span></code></pre></div>
+            <h3 id="redo-的优化lsn-比较">6.3 Redo 的优化：LSN 比较</h3>
+            <p>Redo 阶段最重要的优化是通过 LSN
+            比较跳过不必要的重做：</p>
+            <pre class="text"><code>LSN 比较的三层过滤：
+
+第一层：DPT 过滤
+  页面不在 DPT 中 → 跳过
+  （该页面在检查点后没有被修改过，或已经刷盘）
+
+第二层：recLSN 过滤
+  record.LSN &lt; page.recLSN → 跳过
+  （该修改发生在页面上次刷盘之前，已经持久化了）
+
+第三层：page_lsn 过滤（需要读磁盘）
+  page.page_lsn &gt;= record.LSN → 跳过
+  （该修改已经体现在磁盘上的页面中）
+
+示例：
+  DPT: {Page_5: recLSN=100, Page_8: recLSN=200}
+
+  LSN=90,  Page_5: 第一层通过，第二层过滤（90 &lt; 100）→ 跳过
+  LSN=150, Page_5: 第一层通过，第二层通过（150 &gt;= 100）
+                   → 读取 Page_5，发现 page_lsn=180
+                   → 第三层过滤（180 &gt;= 150）→ 跳过
+  LSN=190, Page_5: 第一层通过，第二层通过
+                   → 读取 Page_5，发现 page_lsn=180
+                   → 190 &gt; 180 → 需要重做！</code></pre>
+            <p>这种多层过滤使得 Redo
+            阶段在大多数情况下只需要重做少量日志记录，大大缩短了恢复时间。</p>
+            <h3 id="redo-的幂等性">6.4 Redo 的幂等性</h3>
+            <p>Redo
+            操作是幂等的（Idempotent）：对同一条日志记录重做多次，结果和重做一次相同。这由
+            <code>page_lsn</code>
+            机制保证——第一次重做后，<code>page_lsn</code>
+            被更新为该记录的 LSN，后续重做会被 LSN 比较跳过。</p>
+            <p>幂等性意味着即使恢复过程中再次崩溃，重新执行恢复也是安全的。</p>
+            <hr />
+            <h2 id="七undo-阶段">七、Undo 阶段</h2>
+            <h3 id="undo-阶段的目标">7.1 Undo 阶段的目标</h3>
+            <p>经过 Redo
+            阶段，数据库已经恢复到崩溃前一刻的状态——包括所有未提交事务的修改。Undo
+            阶段的目标是撤销所有未提交事务的修改，使数据库回到一致状态。</p>
+            <p>ATT 中所有状态不是 <code>Committing</code>
+            的事务都需要被撤销。</p>
+            <h3 id="undo-算法">7.2 Undo 算法</h3>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Undo 阶段伪代码</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> undo_phase(active_trans_table):</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 1. 收集所有需要撤销的事务的 LastLSN</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    to_undo <span class="op">=</span> []</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> trans_id, info <span class="kw">in</span> active_trans_table.items():</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> info.status <span class="op">!=</span> <span class="st">&#39;Committing&#39;</span>:</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>            to_undo.append(info.last_lsn)</span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 2. 构建一个最大堆（按 LSN 降序处理）</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>    undo_heap <span class="op">=</span> MaxHeap(to_undo)</span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 3. 从最大 LSN 开始，反向处理</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> undo_heap.is_not_empty():</span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>        lsn <span class="op">=</span> undo_heap.pop_max()</span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a>        record <span class="op">=</span> read_log_record(lsn)</span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> record.<span class="bu">type</span> <span class="op">==</span> <span class="st">&#39;CLR&#39;</span>:</span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a>            <span class="co"># CLR 记录不需要被撤销</span></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 但需要继续沿链回滚：跟随 UndoNextLSN</span></span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> record.undo_next_lsn <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a>                undo_heap.push(record.undo_next_lsn)</span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span>:</span>
+<span id="cb20-24"><a href="#cb20-24" aria-hidden="true" tabindex="-1"></a>                <span class="co"># UndoNextLSN = NULL，该事务的所有修改已撤销</span></span>
+<span id="cb20-25"><a href="#cb20-25" aria-hidden="true" tabindex="-1"></a>                write_end_record(record.trans_id)</span>
+<span id="cb20-26"><a href="#cb20-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-27"><a href="#cb20-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> record.<span class="bu">type</span> <span class="op">==</span> <span class="st">&#39;UPDATE&#39;</span>:</span>
+<span id="cb20-28"><a href="#cb20-28" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 撤销这条更新：应用 before-image</span></span>
+<span id="cb20-29"><a href="#cb20-29" aria-hidden="true" tabindex="-1"></a>            page <span class="op">=</span> read_page_from_disk(record.page_id)</span>
+<span id="cb20-30"><a href="#cb20-30" aria-hidden="true" tabindex="-1"></a>            apply_undo(page, record)  <span class="co"># 恢复 before-image</span></span>
+<span id="cb20-31"><a href="#cb20-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-32"><a href="#cb20-32" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 写入 CLR 记录</span></span>
+<span id="cb20-33"><a href="#cb20-33" aria-hidden="true" tabindex="-1"></a>            clr <span class="op">=</span> CLR(</span>
+<span id="cb20-34"><a href="#cb20-34" aria-hidden="true" tabindex="-1"></a>                trans_id<span class="op">=</span>record.trans_id,</span>
+<span id="cb20-35"><a href="#cb20-35" aria-hidden="true" tabindex="-1"></a>                page_id<span class="op">=</span>record.page_id,</span>
+<span id="cb20-36"><a href="#cb20-36" aria-hidden="true" tabindex="-1"></a>                undo_data<span class="op">=</span>record.before_image,</span>
+<span id="cb20-37"><a href="#cb20-37" aria-hidden="true" tabindex="-1"></a>                undo_next_lsn<span class="op">=</span>record.prev_lsn  <span class="co"># 指向上一条需要撤销的记录</span></span>
+<span id="cb20-38"><a href="#cb20-38" aria-hidden="true" tabindex="-1"></a>            )</span>
+<span id="cb20-39"><a href="#cb20-39" aria-hidden="true" tabindex="-1"></a>            write_log_record(clr)</span>
+<span id="cb20-40"><a href="#cb20-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-41"><a href="#cb20-41" aria-hidden="true" tabindex="-1"></a>            <span class="co"># 继续沿事务链回滚</span></span>
+<span id="cb20-42"><a href="#cb20-42" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> record.prev_lsn <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span>:</span>
+<span id="cb20-43"><a href="#cb20-43" aria-hidden="true" tabindex="-1"></a>                undo_heap.push(record.prev_lsn)</span>
+<span id="cb20-44"><a href="#cb20-44" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span>:</span>
+<span id="cb20-45"><a href="#cb20-45" aria-hidden="true" tabindex="-1"></a>                <span class="co"># 事务的所有修改已撤销</span></span>
+<span id="cb20-46"><a href="#cb20-46" aria-hidden="true" tabindex="-1"></a>                write_end_record(record.trans_id)</span></code></pre></div>
+            <h3 id="为什么用最大堆">7.3 为什么用最大堆</h3>
+            <p>Undo 阶段使用最大堆（Max-Heap）按 LSN
+            降序处理多个事务的回滚。这个设计使得多个事务可以「交错」撤销，而日志文件只需要一次反向扫描。</p>
+            <pre class="text"><code>多事务并行 Undo 示例：
+
+日志文件中的记录（按 LSN 递增）：
+  LSN=100: T1, UPDATE, PageA
+  LSN=110: T2, UPDATE, PageB
+  LSN=120: T1, UPDATE, PageC
+  LSN=130: T2, UPDATE, PageD
+  LSN=140: T1, UPDATE, PageE
+
+ATT: {T1: LastLSN=140, T2: LastLSN=130}
+
+最大堆初始状态：[140, 130]
+
+Step 1: pop 140 → 撤销 T1 的 LSN=140，写 CLR
+        push T1.PrevLSN=120 → 堆: [130, 120]
+
+Step 2: pop 130 → 撤销 T2 的 LSN=130，写 CLR
+        push T2.PrevLSN=110 → 堆: [120, 110]
+
+Step 3: pop 120 → 撤销 T1 的 LSN=120，写 CLR
+        push T1.PrevLSN=100 → 堆: [110, 100]
+
+Step 4: pop 110 → 撤销 T2 的 LSN=110，写 CLR
+        T2.PrevLSN=NULL → T2 撤销完成，写 END
+        堆: [100]
+
+Step 5: pop 100 → 撤销 T1 的 LSN=100，写 CLR
+        T1.PrevLSN=NULL → T1 撤销完成，写 END
+        堆: 空
+
+Undo 阶段完成。</code></pre>
+            <h3 id="clr-防止重复-undo">7.4 CLR 防止重复 Undo</h3>
+            <p>CLR 的 <code>UndoNextLSN</code>
+            字段解决了一个关键问题：如果 Undo
+            阶段执行到一半时系统再次崩溃，恢复程序不需要重新撤销已经处理过的记录。</p>
+            <pre class="text"><code>Undo 阶段中崩溃的处理：
+
+第一次恢复的 Undo 阶段：
+  撤销 LSN=140 → 写 CLR(LSN=150, UndoNext=120)
+  撤销 LSN=130 → 写 CLR(LSN=155, UndoNext=110)
+  ──── 崩溃！ ────
+
+第二次恢复：
+  Analysis 阶段：发现 T1(LastLSN=150)、T2(LastLSN=155) 未提交
+  Redo 阶段：重做包括 CLR 在内的所有记录
+  Undo 阶段：
+    pop LSN=155 → CLR，UndoNext=110 → push 110
+    pop LSN=150 → CLR，UndoNext=120 → push 120
+    pop LSN=120 → UPDATE，撤销，写新 CLR
+    pop LSN=110 → UPDATE，撤销，写新 CLR
+    ...
+
+  注意：LSN=140 和 LSN=130 不会被重复撤销！
+  CLR 的 UndoNextLSN 跳过了它们。</code></pre>
+            <p>这就是「Logging Changes During Undo」原则的威力：通过记录
+            Undo 操作本身，ARIES
+            保证了恢复过程的幂等性，无论崩溃发生多少次。</p>
+            <hr />
+            <h2 id="八检查点checkpoint">八、检查点（Checkpoint）</h2>
+            <h3 id="为什么需要检查点">8.1 为什么需要检查点</h3>
+            <p>没有检查点，每次崩溃恢复都需要从日志文件的最开头扫描——如果系统已经运行了数月，日志可能有数百
+            GB，恢复时间不可接受。</p>
+            <p>检查点的作用是在日志中插入一个「快照标记」，告诉恢复程序：「在这个点之前的所有已提交事务的修改都已经持久化了，你只需要从这里开始扫描。」</p>
+            <h3 id="简单检查点simple-checkpoint">8.2 简单检查点（Simple
+            Checkpoint）</h3>
+            <p>最简单的检查点策略：</p>
+            <pre class="text"><code>简单检查点流程：
+
+1. 暂停所有事务执行（Stop the World）
+2. 将缓冲池中所有脏页刷入磁盘
+3. 将当前 DPT 和 ATT 写入日志
+4. 恢复事务执行
+
+优点：恢复简单——只需要处理检查点之后的日志
+缺点：暂停事务执行 → 不可接受的延迟峰值
+      刷所有脏页 → 大量 I/O，可能需要数秒到数分钟</code></pre>
+            <p>简单检查点在生产环境中基本不可用。如果缓冲池有 128
+            GB，脏页比例 30%，刷写 38 GB 数据即使在 SSD
+            上也需要数十秒。</p>
+            <h3 id="模糊检查点fuzzy-checkpoint">8.3 模糊检查点（Fuzzy
+            Checkpoint）</h3>
+            <p>ARIES 采用模糊检查点，它不暂停事务，也不强制刷脏页：</p>
+            <pre class="text"><code>模糊检查点流程：
+
+1. 写入 BEGIN_CKPT 记录到日志
+2. 获取当前 DPT 和 ATT 的快照（短暂加锁）
+3. 写入 END_CKPT 记录到日志，内含 DPT 和 ATT 快照
+4. 将 BEGIN_CKPT 的 LSN 记录到特殊的 master record 中
+   （master record 在固定的磁盘位置，恢复时首先读取）
+
+整个过程：
+- 不暂停事务
+- 不刷脏页
+- 只写两条日志记录 + 更新 master record
+- 开销极小</code></pre>
+            <p>模糊检查点的「模糊」体现在：检查点记录的 DPT 和 ATT
+            只是一个近似快照，不精确。但这没关系——Analysis
+            阶段会从这个快照出发，通过扫描后续日志来修正它。</p>
+            <h3 id="检查点频率与恢复时间的权衡">8.4
+            检查点频率与恢复时间的权衡</h3>
+            <p>检查点间隔与崩溃恢复工作量呈单调关系：间隔越长，两次
+            checkpoint 之间累积的 WAL 越多，Analysis/Redo
+            需要扫描的范围越大；间隔越短，正常运行时 checkpoint
+            触发的刷脏 I/O 越频繁。InnoDB 不按固定时间做
+            checkpoint，而是根据 Redo Log
+            使用率触发——当使用量达到总容量约 75% 时加速刷脏并推进
+            checkpoint（详见 <a
+            href="../../db/mysql-innodb/04-redo-log/04-redo-log.html">InnoDB
+            Redo Log 内部机制</a>）。PostgreSQL 则由
+            <code>checkpoint_timeout</code> 与 <code>max_wal_size</code>
+            共同决定触发时机；<code>max_wal_size</code> 过小会导致 WAL
+            段频繁切换并引发 checkpoint I/O 聚集（见 <a
+            href="../../db/postgresql-kernel/04-wal-internals/04-wal-internals.html">PG
+            WAL 内部机制</a> 第九节）。</p>
+            <p><strong>本文不给出恢复秒级估算</strong>——恢复时间取决于
+            WAL 体积、存储吞吐、并行度、是否需要 FPW/Doublewrite
+            修复以及工作负载，未在同一环境实测前不宜写死数字。</p>
+            <h3 id="检查点与日志回收">8.5 检查点与日志回收</h3>
+            <p>检查点还有另一个关键作用：确定哪些日志可以被安全回收。</p>
+            <pre class="text"><code>日志回收规则：
+
+  检查点 LSN 之前的日志 → 可以回收（覆盖重用）
+  检查点 LSN 之后的日志 → 必须保留
+
+日志文件（环形缓冲区）：
+  ┌─────────────────────────────────────────────────────────┐
+  │ 可回收 │ 可回收 │  CKPT  │ 活跃日志 │  活跃日志  │ 可回收 │
+  │ （旧）  │ （旧）  │        │          │           │ （旧） │
+  └────────┴────────┴────────┴──────────┴───────────┴───────┘
+                      ↑                               ↑
+                 checkpoint_lsn                   current_lsn
+
+  如果活跃日志追上了 checkpoint_lsn → 必须强制做检查点
+  否则日志空间耗尽，所有事务阻塞</code></pre>
+            <hr />
+            <h2 id="九mysql-innodb-崩溃恢复">九、MySQL InnoDB
+            崩溃恢复</h2>
+            <h3 id="innodb-的日志架构">9.1 InnoDB 的日志架构</h3>
+            <p>InnoDB 的崩溃恢复机制基于
+            ARIES，但在实现上有自己的特点。InnoDB 有两种日志：</p>
+            <table>
+            <colgroup>
+            <col style="width: 29%" />
+            <col style="width: 19%" />
+            <col style="width: 51%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>日志类型</th>
+            <th>功能</th>
+            <th>对应 ARIES 概念</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Redo Log</td>
+            <td>记录页面的物理修改，用于崩溃后重做</td>
+            <td>ARIES 的 Redo 日志</td>
+            </tr>
+            <tr>
+            <td>Undo Log</td>
+            <td>记录事务的逻辑反操作，用于回滚和 MVCC</td>
+            <td>ARIES 的 Undo 信息</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>注意 InnoDB 的一个重要区别：Undo Log
+            存储在数据文件的特殊段（Undo Tablespace）中，而非 WAL
+            文件中。这意味着 Undo Log 本身的修改也会产生 Redo Log
+            记录。</p>
+            <pre class="text"><code>InnoDB 的日志交互：
+
+  事务执行 UPDATE：
+  ┌─────────────────────────────────────────────────────┐
+  │ 1. 在 Undo 段中分配空间，写入 Undo 记录              │
+  │    （记录修改前的数据，供回滚和 MVCC 使用）           │
+  │                                                     │
+  │ 2. 修改数据页（Buffer Pool 中的脏页）                │
+  │                                                     │
+  │ 3. 生成 Redo Log 记录：                              │
+  │    a) Undo 段页面的修改 → Redo 记录                  │
+  │    b) 数据页的修改 → Redo 记录                       │
+  │                                                     │
+  │ 4. Redo 记录写入 Log Buffer                          │
+  └─────────────────────────────────────────────────────┘</code></pre>
+            <h3 id="redo-log-结构">9.2 Redo Log 结构</h3>
+            <p>InnoDB 的 Redo Log 是一组固定大小的文件，循环使用：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 InnoDB Redo Log 配置</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mysql</span> <span class="at">-e</span> <span class="st">&quot;SHOW VARIABLES LIKE &#39;innodb_redo_log%&#39;;&quot;</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="co"># innodb_redo_log_capacity    104857600  (100 MB，MySQL 8.0.30+ 统一配置)</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 旧版配置方式（MySQL 8.0.30 之前）</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a><span class="co"># innodb_log_file_size    50331648   (48 MB per file)</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a><span class="co"># innodb_log_files_in_group  2      (2 files)</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 总容量 = 48 MB × 2 = 96 MB</span></span></code></pre></div>
+            <pre class="text"><code>Redo Log 文件布局（循环写入）：
+
+  ib_logfile0                    ib_logfile1
+  ┌─────────────────────┐      ┌─────────────────────┐
+  │  Log Block 1 (512B) │      │  Log Block N+1      │
+  │  Log Block 2 (512B) │      │  Log Block N+2      │
+  │  ...                │ ───→ │  ...                │ ───→ 回到 file0
+  │  Log Block N        │      │  Log Block 2N       │
+  └─────────────────────┘      └─────────────────────┘
+
+  每个 Log Block = 512 字节（匹配磁盘扇区大小）
+  头部 12 字节 + 数据区 496 字节 + 尾部 4 字节
+
+  Log Block Header：
+  ┌──────────────┬───────────┬──────────────────────┐
+  │ Block Number │ Data Len  │ First Record Offset  │
+  │  (4 bytes)   │ (2 bytes) │ (2 bytes)            │
+  ├──────────────┴───────────┴──────────────────────┤
+  │             Log Record Data (496 bytes)          │
+  ├─────────────────────────────────────────────────┤
+  │             Checksum (4 bytes)                   │
+  └─────────────────────────────────────────────────┘</code></pre>
+            <h3 id="innodb-的-lsn">9.3 InnoDB 的 LSN</h3>
+            <p>InnoDB 的 LSN 是 Redo Log 中的字节偏移量，一个 8
+            字节的无符号整数：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前 LSN 状态</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="fu">LOG</span></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="fu">Log</span> <span class="kw">sequence</span> <span class="dt">number</span>          <span class="dv">3456789012</span></span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a><span class="fu">Log</span> buffer assigned up <span class="kw">to</span>    <span class="dv">3456789012</span></span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a><span class="fu">Log</span> buffer completed up <span class="kw">to</span>   <span class="dv">3456789012</span></span>
+<span id="cb29-10"><a href="#cb29-10" aria-hidden="true" tabindex="-1"></a><span class="fu">Log</span> written up <span class="kw">to</span>            <span class="dv">3456789012</span></span>
+<span id="cb29-11"><a href="#cb29-11" aria-hidden="true" tabindex="-1"></a><span class="fu">Log</span> flushed up <span class="kw">to</span>            <span class="dv">3456789000</span></span>
+<span id="cb29-12"><a href="#cb29-12" aria-hidden="true" tabindex="-1"></a>Added dirty pages up <span class="kw">to</span>      <span class="dv">3456789012</span></span>
+<span id="cb29-13"><a href="#cb29-13" aria-hidden="true" tabindex="-1"></a>Pages flushed up <span class="kw">to</span>          <span class="dv">3456780000</span></span>
+<span id="cb29-14"><a href="#cb29-14" aria-hidden="true" tabindex="-1"></a><span class="fu">Last</span> <span class="kw">checkpoint</span> <span class="kw">at</span>           <span class="dv">3456770000</span></span></code></pre></div>
+            <p>这些 LSN 值的含义：</p>
+            <pre class="text"><code>InnoDB LSN 层次：
+
+  Log sequence number     当前最新的 LSN（Log Buffer 中）
+         ↓
+  Log flushed up to       已经 fsync 到磁盘的 LSN
+         ↓
+  Pages flushed up to     对应脏页已刷盘的最大 LSN
+         ↓
+  Last checkpoint at      最近检查点的 LSN
+
+  恢复时需要 Redo 的日志范围：
+  [Last checkpoint at, Log flushed up to]</code></pre>
+            <h3 id="双写缓冲区doublewrite-buffer">9.4
+            双写缓冲区（Doublewrite Buffer）</h3>
+            <p>双写缓冲区是 InnoDB 解决撕裂页问题的方案：</p>
+            <pre class="text"><code>双写缓冲区机制：
+
+普通刷盘（有撕裂风险）：
+  Buffer Pool 脏页 ──→ 数据文件中的目标位置
+                         ↑ 断电导致撕裂
+
+双写缓冲区刷盘（安全）：
+  Buffer Pool 脏页
+       │
+       ├─→ 1. 写入 Doublewrite Buffer（系统表空间中的连续区域）
+       │      fsync()
+       │
+       └─→ 2. 写入数据文件中的实际位置
+              fsync()
+
+恢复时的处理：
+  a) 读取数据页，检查 checksum
+  b) 如果 checksum 正确 → 页面完整，正常恢复
+  c) 如果 checksum 错误 → 页面撕裂
+     → 从 Doublewrite Buffer 中读取该页面的完整副本
+     → 用完整副本覆盖损坏的页面
+     → 然后继续正常的 Redo 恢复</code></pre>
+            <p>双写缓冲区的写入是<strong>顺序的</strong>（连续磁盘区域），所以额外的
+            I/O 开销相对有限。在支持原子写入的存储设备（如某些企业级 SSD
+            或使用 <code>O_ATOMIC</code>
+            的文件系统）上，可以关闭双写缓冲区以提升性能：</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 关闭双写缓冲区（仅在存储层保证原子写入时）</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">GLOBAL</span> innodb_doublewrite <span class="op">=</span> <span class="kw">OFF</span>;</span></code></pre></div>
+            <h3 id="innodb-崩溃恢复流程">9.5 InnoDB 崩溃恢复流程</h3>
+            <p>InnoDB 的崩溃恢复在 <code>mysqld</code>
+            启动时自动执行：</p>
+            <pre class="text"><code>InnoDB 崩溃恢复流程：
+
+1. 读取 Redo Log 文件头部，找到 checkpoint LSN
+   ┌─────────────────────────────────────┐
+   │  读取 ib_logfile0 的头部            │
+   │  获取 checkpoint_1 和 checkpoint_2  │
+   │  选择 LSN 较大（较新）的那个         │
+   └─────────────────────────────────────┘
+
+2. 从 checkpoint LSN 开始扫描 Redo Log
+   ┌─────────────────────────────────────┐
+   │  正向扫描，解析每条 Redo 记录       │
+   │  按 space_id + page_no 分组         │
+   │  构建需要恢复的页面集合              │
+   └─────────────────────────────────────┘
+
+3. 应用 Redo Log（对应 ARIES 的 Redo 阶段）
+   ┌─────────────────────────────────────┐
+   │  对每个需要恢复的页面：              │
+   │  a) 从磁盘读取页面                  │
+   │  b) 检查 checksum，如失败则从        │
+   │     Doublewrite Buffer 恢复         │
+   │  c) 比较 page_lsn 和 record_lsn     │
+   │  d) 如果需要，应用 Redo 记录        │
+   └─────────────────────────────────────┘
+
+4. 回滚未提交事务（对应 ARIES 的 Undo 阶段）
+   ┌─────────────────────────────────────┐
+   │  打开 Undo Tablespace               │
+   │  找到所有活跃事务的 Undo 记录        │
+   │  逆序应用 Undo 记录                  │
+   │  标记事务为已回滚                    │
+   │                                     │
+   │  注意：InnoDB 可以先完成 Redo，      │
+   │  然后在后台线程中异步执行 Undo，     │
+   │  让数据库尽快对外提供服务            │
+   └─────────────────────────────────────┘
+
+5. 清理与初始化
+   ┌─────────────────────────────────────┐
+   │  推进 checkpoint                    │
+   │  启动 Purge 线程清理旧版本          │
+   │  数据库就绪，接受连接               │
+   └─────────────────────────────────────┘</code></pre>
+            <h3 id="innodb-redo-log-记录类型">9.6 InnoDB Redo Log
+            记录类型</h3>
+            <p>InnoDB 定义了大量的 Redo Log 记录类型（MySQL 8.0 中超过
+            60 种），以下是最常见的几类：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co">// InnoDB Redo Log 记录类型（storage/innobase/include/mtr0types.h）</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 以下为部分常见类型</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_1BYTE             </span><span class="dv">1</span><span class="pp">   </span><span class="co">// 写入 1 字节</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_2BYTES            </span><span class="dv">2</span><span class="pp">   </span><span class="co">// 写入 2 字节</span></span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_4BYTES            </span><span class="dv">4</span><span class="pp">   </span><span class="co">// 写入 4 字节</span></span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_8BYTES            </span><span class="dv">8</span><span class="pp">   </span><span class="co">// 写入 8 字节</span></span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_WRITE_STRING      </span><span class="dv">30</span><span class="pp">  </span><span class="co">// 写入任意长度字符串</span></span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-10"><a href="#cb34-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_REC_INSERT        </span><span class="dv">9</span><span class="pp">   </span><span class="co">// 插入紧凑格式记录</span></span>
+<span id="cb34-11"><a href="#cb34-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_REC_UPDATE        </span><span class="dv">14</span><span class="pp">  </span><span class="co">// 原地更新记录</span></span>
+<span id="cb34-12"><a href="#cb34-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-13"><a href="#cb34-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_UNDO_INSERT       </span><span class="dv">11</span><span class="pp">  </span><span class="co">// 插入 Undo 记录</span></span>
+<span id="cb34-14"><a href="#cb34-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_UNDO_INIT         </span><span class="dv">19</span><span class="pp">  </span><span class="co">// 初始化 Undo 页</span></span>
+<span id="cb34-15"><a href="#cb34-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-16"><a href="#cb34-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_PAGE_CREATE       </span><span class="dv">16</span><span class="pp">  </span><span class="co">// 创建新页</span></span>
+<span id="cb34-17"><a href="#cb34-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_INIT_FILE_PAGE    </span><span class="dv">24</span><span class="pp">  </span><span class="co">// 初始化数据文件页</span></span>
+<span id="cb34-18"><a href="#cb34-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-19"><a href="#cb34-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_COMP_REC_INSERT   </span><span class="dv">38</span><span class="pp">  </span><span class="co">// 紧凑行格式的插入</span></span>
+<span id="cb34-20"><a href="#cb34-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MLOG_COMP_REC_DELETE   </span><span class="dv">42</span><span class="pp">  </span><span class="co">// 紧凑行格式的删除</span></span></code></pre></div>
+            <p>每种类型都对应着不同的页面修改操作。Redo 恢复时，InnoDB
+            根据类型码分发到对应的重做函数。</p>
+            <h3 id="后台-undo-回滚">9.7 后台 Undo 回滚</h3>
+            <p>InnoDB 的一个重要优化是：<strong>Undo
+            阶段可以在后台执行</strong>。Redo
+            阶段完成后，数据库就可以接受新的连接和查询——未提交事务的回滚在后台线程中进行。</p>
+            <p>这一优化的可行性源于 InnoDB 的 MVCC
+            机制：未提交事务的修改对新事务不可见（通过 Undo Log
+            中的旧版本提供一致性读），所以即使回滚尚未完成，数据库对外也是一致的。</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看后台 Undo 回滚进度</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在 TRANSACTIONS 部分会显示：</span></span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- Trx id counter: 12345</span></span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- ...</span></span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- History list length: 1000</span></span>
+<span id="cb35-8"><a href="#cb35-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- ...</span></span>
+<span id="cb35-9"><a href="#cb35-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- ---TRANSACTION 12340, ACTIVE 5 sec recovering</span></span>
+<span id="cb35-10"><a href="#cb35-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- ...rolling back table `mydb`.`orders`...</span></span>
+<span id="cb35-11"><a href="#cb35-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 0 rows undo&#39;d</span></span></code></pre></div>
+            <hr />
+            <h2 id="十wal-写放大与优化">十、WAL 写放大与优化</h2>
+            <h3 id="wal-的写放大问题">10.1 WAL 的写放大问题</h3>
+            <p>WAL
+            本身引入了额外的写入量：每次数据修改都需要先写日志，然后在某个时刻再写数据页。加上检查点和
+            Undo Log，实际的写放大（Write
+            Amplification）可能相当可观：</p>
+            <pre class="text"><code>一次 UPDATE 操作的写入量分析：
+
+用户操作：UPDATE t SET val = &#39;new&#39; WHERE id = 1;
+修改数据量：~100 字节
+
+实际写入磁盘的数据：
+  1. Redo Log 记录          ~200 字节
+  2. Undo Log 记录          ~150 字节
+  3. Undo 页的 Redo 记录     ~100 字节
+  4. 最终的数据页刷盘        16,384 字节（整个 16 KB 页）
+  5. Doublewrite Buffer     16,384 字节（页面的副本）
+
+总写入量：~33 KB
+修改数据量：~100 字节
+写放大倍数：~330x
+
+注意：数据页刷盘和 Doublewrite 是延迟批量操作，
+     同一页面的多次修改可以合并为一次刷盘，
+     实际的摊销写放大远低于上述最坏情况。</code></pre>
+            <h3 id="组提交group-commit">10.2 组提交（Group Commit）</h3>
+            <p>组提交是减少 WAL <code>fsync</code>
+            开销的最有效手段。核心思想：将多个并发事务的日志合并为一次
+            <code>fsync</code>：</p>
+            <pre class="text"><code>无组提交（每个事务独立 fsync）：
+
+  T1: write log ─→ fsync ─→ 返回
+  T2:              write log ─→ fsync ─→ 返回
+  T3:                           write log ─→ fsync ─→ 返回
+
+  3 个事务 = 3 次 fsync（每次 ~1-10ms）
+
+有组提交（合并 fsync）：
+
+  T1: write log ──┐
+  T2: write log ──┼─→ 一次 fsync ─→ 全部返回
+  T3: write log ──┘
+
+  3 个事务 = 1 次 fsync</code></pre>
+            <p>InnoDB 的组提交实现：</p>
+            <pre class="text"><code>InnoDB Group Commit 流程（MySQL 8.0）：
+
+三阶段提交（与 Binlog 配合）：
+
+1. Flush 阶段
+   ┌───────────────────────────────────────┐
+   │  Leader 线程收集队列中所有等待的事务  │
+   │  将它们的 Redo Log 从 Log Buffer      │
+   │  写入（write）到日志文件              │
+   └───────────────────────────────────────┘
+
+2. Sync 阶段
+   ┌───────────────────────────────────────┐
+   │  对日志文件执行一次 fsync             │
+   │  一次 fsync 覆盖所有收集到的事务      │
+   └───────────────────────────────────────┘
+
+3. Commit 阶段
+   ┌───────────────────────────────────────┐
+   │  更新事务状态为已提交                 │
+   │  释放锁，通知所有等待的线程           │
+   └───────────────────────────────────────┘
+
+关键配置：
+  innodb_flush_log_at_trx_commit = 1  -- 每次提交都 fsync（最安全）
+  innodb_flush_log_at_trx_commit = 2  -- 每次提交 write，每秒 fsync
+  innodb_flush_log_at_trx_commit = 0  -- 每秒 write + fsync（最快但风险最高）</code></pre>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看组提交相关配置</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;innodb_flush_log_at_trx_commit&#39;</span>;</span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 值为 1（默认，最安全）</span></span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在主从复制场景中，binlog 的组提交配置：</span></span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;binlog_group_commit%&#39;</span>;</span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- binlog_group_commit_sync_delay = 0       (微秒)</span></span>
+<span id="cb39-8"><a href="#cb39-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- binlog_group_commit_sync_no_delay_count = 0</span></span></code></pre></div>
+            <h3 id="日志压缩">10.3 日志压缩</h3>
+            <p>对于写入密集的工作负载，WAL
+            的大小可能成为瓶颈。日志压缩可以减少日志量：</p>
+            <pre class="text"><code>日志压缩策略：
+
+1. 页面压缩（MySQL 8.0.30+）
+   InnoDB 可以在写入 Redo Log 前对日志记录进行压缩
+   压缩算法：zlib
+   适用场景：大量 BLOB/TEXT 类型的更新
+
+2. 逻辑压缩
+   将多条对同一页面的 Redo 记录合并为一条
+   例如：同一事务对同一行的多次更新 → 只保留最终状态
+
+3. 差量编码
+   对 before-image 和 after-image 只记录差异部分
+   而非完整的数据值
+   节省空间的效果取决于修改的数据类型</code></pre>
+            <h3 id="并行恢复parallel-recovery">10.4 并行恢复（Parallel
+            Recovery）</h3>
+            <p>传统的 ARIES
+            恢复是单线程的，对于大型数据库，恢复时间可能很长。现代实现引入了并行恢复：</p>
+            <pre class="text"><code>并行恢复策略：
+
+1. 按页面分区并行 Redo（InnoDB 的方式）
+   ┌──────────────────────────────────────────────┐
+   │  扫描 Redo Log，按 (space_id, page_no)        │
+   │  将记录分配到不同的工作线程                    │
+   │                                               │
+   │  Thread 1: Page_1, Page_5, Page_9, ...        │
+   │  Thread 2: Page_2, Page_6, Page_10, ...       │
+   │  Thread 3: Page_3, Page_7, Page_11, ...       │
+   │  Thread 4: Page_4, Page_8, Page_12, ...       │
+   │                                               │
+   │  约束：同一页面的所有 Redo 记录必须由           │
+   │       同一线程按 LSN 顺序处理                  │
+   └──────────────────────────────────────────────┘
+
+2. 分阶段并行
+   ┌──────────────────────────────────────────────┐
+   │  Analysis 阶段：单线程（通常很快）             │
+   │  Redo 阶段：多线程并行                        │
+   │  Undo 阶段：多事务并行                        │
+   └──────────────────────────────────────────────┘</code></pre>
+            <p>InnoDB 在 MySQL 8.0 中的并行恢复支持：</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看并行恢复相关配置</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;innodb_recovery_parallelism&#39;</span>;</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 默认值：1（单线程）</span></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL 8.0.30+ 支持多线程 Redo 扫描和应用</span></span></code></pre></div>
+            <h3 id="其他优化手段">10.5 其他优化手段</h3>
+            <p>除了上述主要优化外，还有一些值得关注的技术：</p>
+            <p><strong>异步 I/O</strong></p>
+            <pre class="text"><code>InnoDB 使用 Linux 原生异步 I/O（libaio）来加速页面读写：
+
+  innodb_use_native_aio = ON   （默认开启）
+
+  恢复时的页面读取可以并发进行：
+  多个 Redo 记录涉及不同页面 → 并发提交读 I/O → 批量等待完成</code></pre>
+            <p><strong>自适应检查点</strong></p>
+            <pre class="text"><code>InnoDB 的自适应检查点策略：
+
+  1. 监控 Redo Log 的使用率
+  2. 当使用率达到 75%，开始加速刷脏页
+  3. 当使用率达到接近 100%，进入「同步刷盘」模式
+     （所有事务阻塞直到腾出日志空间）
+
+  目标：避免日志空间耗尽，同时最小化正常运行时的刷盘开销
+
+  相关参数：
+  innodb_io_capacity       = 200    （正常刷盘 IOPS 上限）
+  innodb_io_capacity_max   = 2000   （紧急刷盘 IOPS 上限）
+  innodb_max_dirty_pages_pct = 90   （脏页比例上限）</code></pre>
+            <p><strong>WAL 预分配</strong></p>
+            <pre class="text"><code>预分配日志文件空间可以避免文件系统元数据更新带来的额外 fsync：
+
+  InnoDB 在启动时就预分配固定大小的 Redo Log 文件。
+  日志写入只是覆盖已有空间，不涉及文件扩展。
+
+  对比：
+  - 动态扩展的日志文件：write → extend file → fsync metadata → fsync data
+  - 预分配的日志文件：write → fsync data（省去了元数据更新）</code></pre>
+            <hr />
+            <h2 id="十一开放问题">十一、开放问题</h2>
+            <ol type="1">
+            <li><p><strong>ARIES 三阶段框架与 MVCC
+            引擎的边界在哪里？</strong> PostgreSQL 证明了「仅 REDO +
+            事务状态位 + 多版本读」可以支撑生产负载，但长事务
+            abort、逻辑复制与备库延迟场景下，缺 explicit Undo
+            链是否增加运维复杂度？InnoDB 的独立 Undo + 异步回滚是更贴近
+            ARIES 的折中，还是必要设计——目前缺少在<strong>同
+            workload</strong> 下可比的公开故障语义研究。</p></li>
+            <li><p><strong>并行恢复的上限由什么决定？</strong> InnoDB
+            8.0.30+ 支持多线程 Redo 应用，约束是「同一页面的 Redo 必须按
+            LSN
+            顺序由同一线程处理」。当单页热点（索引根页、元数据页）集中时，并行度收益可能迅速衰减——这与
+            ARIES 论文时代「单线程 Redo
+            足够」的假设是否仍成立，取决于硬件并行 I/O 与 workload
+            skew，而非单条经验法则。</p></li>
+            <li><p><strong>字节可寻址持久内存（NVM）会否改变 WAL
+            形态？</strong> Mohan（VLDB 1999）已讨论超越经典 ARIES
+            的方向；若数据页与日志可在同一持久域按 cache line
+            原子更新，Force/Steal 组合与 checkpoint
+            语义可能需要重新定义——这是研究愿景与生产部署之间的长期间隙。</p></li>
+            </ol>
+            <hr />
+            <h2 id="参考文献">参考文献</h2>
+            <h3 id="论文">论文</h3>
+            <ol type="1">
+            <li><p>C. Mohan, D. Haderle, B. Lindsay, H. Pirahesh, P.
+            Schwarz. “ARIES: A Transaction Recovery Method Supporting
+            Fine-Granularity Locking and Partial Rollbacks Using
+            Write-Ahead Logging.” <em>ACM Transactions on Database
+            Systems</em>, 17(1):94-162, March 1992.</p></li>
+            <li><p>C. Mohan, F. Levine. “ARIES/IM: An Efficient and High
+            Concurrency Index Management Method Using Write-Ahead
+            Logging.” <em>Proceedings of SIGMOD</em>, 1992.</p></li>
+            <li><p>C. Mohan. “Repeating History Beyond ARIES.”
+            <em>Proceedings of VLDB</em>, 1999.</p></li>
+            </ol>
+            <h3 id="规范与设计文档">规范与设计文档</h3>
+            <ol start="4" type="1">
+            <li><p>PostgreSQL Documentation, Chapter 30: <em>Reliability
+            and the Write-Ahead Log</em> — WAL
+            配置、checkpoint、崩溃恢复语义。</p></li>
+            <li><p>MySQL Reference Manual 8.0 — <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-recovery.html">InnoDB
+            Recovery</a>、<a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html">InnoDB
+            Redo Log</a>、<a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-doublewrite-buffer.html">InnoDB
+            Doublewrite Buffer</a>。</p></li>
+            </ol>
+            <h3 id="源码">源码</h3>
+            <ol start="6" type="1">
+            <li><p>PostgreSQL
+            17：<code>src/backend/access/transam/xlog.c</code>（<code>StartupXLOG()</code>、<code>CreateCheckPoint()</code>）；<code>src/include/access/xlogrecord.h</code>（<code>XLogRecord</code>、<code>pd_lsn</code>）。</p></li>
+            <li><p>MySQL/InnoDB
+            8.0：<code>storage/innobase/log/log0recv.cc</code>（崩溃恢复入口）；<code>storage/innobase/include/mtr0types.h</code>（Redo
+            记录类型）；<code>storage/innobase/trx/trx0undo.cc</code>（Undo
+            段管理）。</p></li>
+            </ol>
+            <h3 id="系列内对照阅读">系列内对照阅读</h3>
+            <ol start="8" type="1">
+            <li><p><a
+            href="../../db/postgresql-kernel/04-wal-internals/04-wal-internals.html">PG
+            WAL 内部机制：从事务提交到磁盘刷写</a> —
+            XLogInsert、checkpoint 两阶段、REDO 幂等。</p></li>
+            <li><p><a
+            href="../../db/mysql-innodb/04-redo-log/04-redo-log.html">InnoDB
+            Redo Log 内部机制</a> — LSN 层次、mtr、组提交。</p></li>
+            <li><p><a
+            href="../../db/mysql-innodb/05-undo-log/05-undo-log.html">InnoDB
+            Undo Log 与事务回滚</a> — Undo 段、Purge、长事务 history
+            list。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../26-buffer-pool/buffer-pool.html">Buffer
+            Pool：数据库的内存管理</a> <strong>下一篇</strong>: <a
+            href="../28-transaction-isolation/transaction-isolation.html">事务隔离级别的存储实现</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-15 · storage</p>
+                    <h3><a href="/post/storage/67-write-optimization/write-optimization.html">【存储工程】写入性能优化</a></h3>
+                    <p>深入分析存储写入性能优化——WAL 分组提交、批量写入、Write Buffer 调优、fsync 频率控制、写入限速与写停顿分析</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-09 · storage</p>
+                    <h3><a href="/post/storage/31-lsm-tree-tuning/lsm-tree-tuning.html">【存储工程】LSM-Tree 工程调优：三种放大的权衡</a></h3>
+                    <p>LSM-Tree 的核心设计是把随机写转换为顺序写，但这个转换不是免费的。写入经过 MemTable 刷盘、再经过多次 Compaction 合并，每一字节的用户数据在磁盘上可能被反复读写数十次。读取一个 key 时，最坏情况下需要逐层搜索，直到命中或遍历全部层级。与此同时，旧版本数据和墓碑标记占用的额外空间，在 Co…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-21 · storage</p>
+                    <h3><a href="/post/storage/12-data-integrity/data-integrity.html">【存储工程】数据完整性：从 fsync 到端到端校验</a></h3>
+                    <p>数据丢失最令人恐惧的形式不是磁盘报错——而是数据悄无声息地变了，没有任何告警，没有任何日志，直到几个月后你从备份里恢复出一堆损坏的文件，才发现&quot;完整性&quot;这个词从来就不是理所当然的。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-19 · storage</p>
+                    <h3><a href="/post/storage/10-direct-io/direct-io.html">【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</a></h3>
+                    <p>在 Linux 的传统 I/O 路径中，应用程序通过 read() 和 write() 系统调用与文件交互时，数据并不会直接在用户空间缓冲区（User Buffer）和磁盘之间传输。内核会在两者之间插入一层页缓存（Page Cache），作为磁盘数据在内存中的缓存副本。一次典型的写入流程如下：</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

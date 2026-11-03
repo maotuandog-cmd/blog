@@ -1,0 +1,1855 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】写入性能优化 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="深入分析存储写入性能优化——WAL
+分组提交、批量写入、Write Buffer 调优、fsync
+频率控制、写入限速与写停顿分析" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="write-optimization, group-commit, wal, memtable, write-stall, fsync, rate-limiting, batch-write, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/67-write-optimization/write-optimization.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】写入性能优化" />
+    <meta property="og:description" content="深入分析存储写入性能优化——WAL 分组提交、批量写入、Write Buffer 调优、fsync 频率控制、写入限速与写停顿分析" />
+    <meta property="og:url" content="https://quant67.com/post/storage/67-write-optimization/write-optimization.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="write-optimization" />
+    <meta property="article:tag" content="group-commit" />
+    <meta property="article:tag" content="wal" />
+    <meta property="article:tag" content="memtable" />
+    <meta property="article:tag" content="write-stall" />
+    <meta property="article:tag" content="fsync" />
+    <meta property="article:tag" content="rate-limiting" />
+    <meta property="article:tag" content="batch-write" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】写入性能优化" />
+    <meta name="twitter:description" content="深入分析存储写入性能优化——WAL 分组提交、批量写入、Write Buffer 调优、fsync 频率控制、写入限速与写停顿分析" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】写入性能优化", "description": "深入分析存储写入性能优化——WAL 分组提交、批量写入、Write Buffer 调优、fsync 频率控制、写入限速与写停顿分析", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/67-write-optimization/write-optimization.html"}, "datePublished": "2025-10-15T00:00:00+00:00", "dateModified": "2026-04-15T12:52:01+00:00", "keywords": ["write-optimization", "group-commit", "wal", "memtable", "write-stall", "fsync", "rate-limiting", "batch-write"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】写入性能优化</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-10-15</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#write-optimization</span> <span>#group-commit</span> <span>#wal</span> <span>#memtable</span> <span>#write-stall</span> <span>#fsync</span> <span>#rate-limiting</span> <span>#batch-write</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/66-cache-engineering/cache-engineering.html">上一篇：【存储工程】缓存工程：从 Page Cache 到应用层缓存</a><a class="post-series-nav__link" href="/post/storage/68-read-optimization/read-optimization.html">下一篇：【存储工程】读取性能优化</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/write-optimization.html">#write-optimization</a><a class="chip-link" href="/tags/group-commit.html">#group-commit</a><a class="chip-link" href="/tags/wal.html">#wal</a><a class="chip-link" href="/tags/memtable.html">#memtable</a><a class="chip-link" href="/tags/write-stall.html">#write-stall</a><a class="chip-link" href="/tags/fsync.html">#fsync</a><a class="chip-link" href="/tags/rate-limiting.html">#rate-limiting</a><a class="chip-link" href="/tags/batch-write.html">#batch-write</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一写入性能的工程挑战"
+                id="toc-一写入性能的工程挑战">一、写入性能的工程挑战</a>
+                <ul>
+                <li><a href="#写入路径的延迟构成"
+                id="toc-写入路径的延迟构成">1.1
+                写入路径的延迟构成</a></li>
+                <li><a href="#关键性能指标" id="toc-关键性能指标">1.2
+                关键性能指标</a></li>
+                <li><a href="#写放大问题" id="toc-写放大问题">1.3
+                写放大问题</a></li>
+                </ul></li>
+                <li><a href="#二wal-分组提交"
+                id="toc-二wal-分组提交">二、WAL 分组提交</a>
+                <ul>
+                <li><a href="#问题逐事务-fsync-的瓶颈"
+                id="toc-问题逐事务-fsync-的瓶颈">2.1 问题：逐事务 fsync
+                的瓶颈</a></li>
+                <li><a href="#分组提交的核心思想"
+                id="toc-分组提交的核心思想">2.2
+                分组提交的核心思想</a></li>
+                <li><a href="#leaderfollower-选举机制"
+                id="toc-leaderfollower-选举机制">2.3 Leader/Follower
+                选举机制</a></li>
+                <li><a href="#innodb-的三阶段-group-commit"
+                id="toc-innodb-的三阶段-group-commit">2.4 InnoDB
+                的三阶段 Group Commit</a></li>
+                <li><a href="#postgresql-的-group-commit"
+                id="toc-postgresql-的-group-commit">2.5 PostgreSQL 的
+                Group Commit</a></li>
+                <li><a href="#分组提交的效果量化"
+                id="toc-分组提交的效果量化">2.6
+                分组提交的效果量化</a></li>
+                </ul></li>
+                <li><a href="#三批量写入"
+                id="toc-三批量写入">三、批量写入</a>
+                <ul>
+                <li><a href="#writebatch-接口"
+                id="toc-writebatch-接口">3.1 WriteBatch 接口</a></li>
+                <li><a href="#pipeline-write"
+                id="toc-pipeline-write">3.2 Pipeline Write</a></li>
+                <li><a href="#应用层批量写入策略"
+                id="toc-应用层批量写入策略">3.3
+                应用层批量写入策略</a></li>
+                </ul></li>
+                <li><a href="#四write-buffer-与-memtable-调优"
+                id="toc-四write-buffer-与-memtable-调优">四、Write
+                Buffer 与 MemTable 调优</a>
+                <ul>
+                <li><a href="#memtable-的作用"
+                id="toc-memtable-的作用">4.1 MemTable 的作用</a></li>
+                <li><a href="#write-buffer-参数"
+                id="toc-write-buffer-参数">4.2 Write Buffer
+                参数</a></li>
+                <li><a href="#memtable-大小的工程权衡"
+                id="toc-memtable-大小的工程权衡">4.3 MemTable
+                大小的工程权衡</a></li>
+                <li><a href="#column-family-级别的-write-buffer"
+                id="toc-column-family-级别的-write-buffer">4.4 Column
+                Family 级别的 Write Buffer</a></li>
+                <li><a href="#memtable-工厂选择"
+                id="toc-memtable-工厂选择">4.5 MemTable
+                工厂选择</a></li>
+                </ul></li>
+                <li><a href="#五fsync-频率控制"
+                id="toc-五fsync-频率控制">五、fsync 频率控制</a>
+                <ul>
+                <li><a href="#fsync-的语义与开销"
+                id="toc-fsync-的语义与开销">5.1 fsync
+                的语义与开销</a></li>
+                <li><a href="#fsync-策略的频谱"
+                id="toc-fsync-策略的频谱">5.2 fsync 策略的频谱</a></li>
+                <li><a href="#mysql-的-fsync-控制"
+                id="toc-mysql-的-fsync-控制">5.3 MySQL 的 fsync
+                控制</a></li>
+                <li><a href="#postgresql-的-fsync-控制"
+                id="toc-postgresql-的-fsync-控制">5.4 PostgreSQL 的
+                fsync 控制</a></li>
+                <li><a href="#wal-写入方法" id="toc-wal-写入方法">5.5
+                WAL 写入方法</a></li>
+                </ul></li>
+                <li><a href="#六写入限速"
+                id="toc-六写入限速">六、写入限速</a>
+                <ul>
+                <li><a href="#为什么需要限速"
+                id="toc-为什么需要限速">6.1 为什么需要限速</a></li>
+                <li><a href="#rocksdb-的-rate-limiter"
+                id="toc-rocksdb-的-rate-limiter">6.2 RocksDB 的 Rate
+                Limiter</a></li>
+                <li><a href="#自动限速调整" id="toc-自动限速调整">6.3
+                自动限速调整</a></li>
+                <li><a href="#操作系统级-io-限速"
+                id="toc-操作系统级-io-限速">6.4 操作系统级 I/O
+                限速</a></li>
+                </ul></li>
+                <li><a href="#七写停顿分析"
+                id="toc-七写停顿分析">七、写停顿分析</a>
+                <ul>
+                <li><a href="#什么是写停顿" id="toc-什么是写停顿">7.1
+                什么是写停顿</a></li>
+                <li><a href="#rocksdb-的写停顿触发条件"
+                id="toc-rocksdb-的写停顿触发条件">7.2 RocksDB
+                的写停顿触发条件</a></li>
+                <li><a href="#写停顿的诊断" id="toc-写停顿的诊断">7.3
+                写停顿的诊断</a></li>
+                <li><a href="#写停顿的缓解策略"
+                id="toc-写停顿的缓解策略">7.4 写停顿的缓解策略</a></li>
+                </ul></li>
+                <li><a href="#八mysql-写入调优实战"
+                id="toc-八mysql-写入调优实战">八、MySQL 写入调优实战</a>
+                <ul>
+                <li><a href="#innodb-写入路径概览"
+                id="toc-innodb-写入路径概览">8.1 InnoDB
+                写入路径概览</a></li>
+                <li><a href="#关键写入参数" id="toc-关键写入参数">8.2
+                关键写入参数</a></li>
+                <li><a href="#实战调优示例" id="toc-实战调优示例">8.3
+                实战调优示例</a></li>
+                <li><a href="#调优效果验证" id="toc-调优效果验证">8.4
+                调优效果验证</a></li>
+                <li><a href="#双写与写入性能"
+                id="toc-双写与写入性能">8.5 双写与写入性能</a></li>
+                </ul></li>
+                <li><a href="#九postgresql-写入调优实战"
+                id="toc-九postgresql-写入调优实战">九、PostgreSQL
+                写入调优实战</a>
+                <ul>
+                <li><a href="#postgresql-写入路径"
+                id="toc-postgresql-写入路径">9.1 PostgreSQL
+                写入路径</a></li>
+                <li><a href="#关键写入参数-1"
+                id="toc-关键写入参数-1">9.2 关键写入参数</a></li>
+                <li><a href="#full-page-write-与写放大"
+                id="toc-full-page-write-与写放大">9.3 Full Page Write
+                与写放大</a></li>
+                <li><a href="#实战调优示例-1"
+                id="toc-实战调优示例-1">9.4 实战调优示例</a></li>
+                <li><a href="#pgbench-验证" id="toc-pgbench-验证">9.5
+                pgbench 验证</a></li>
+                </ul></li>
+                <li><a href="#十rocksdb-写入性能分析"
+                id="toc-十rocksdb-写入性能分析">十、RocksDB
+                写入性能分析</a>
+                <ul>
+                <li><a href="#写入路径全景" id="toc-写入路径全景">10.1
+                写入路径全景</a></li>
+                <li><a href="#写入选项" id="toc-写入选项">10.2
+                写入选项</a></li>
+                <li><a href="#compaction-策略对写入性能的影响"
+                id="toc-compaction-策略对写入性能的影响">10.3 Compaction
+                策略对写入性能的影响</a></li>
+                <li><a href="#direct-io-与写入性能"
+                id="toc-direct-io-与写入性能">10.4 Direct I/O
+                与写入性能</a></li>
+                <li><a href="#db_bench-实战" id="toc-db_bench-实战">10.5
+                db_bench 实战</a></li>
+                <li><a href="#写入性能调优检查清单"
+                id="toc-写入性能调优检查清单">10.6
+                写入性能调优检查清单</a></li>
+                </ul></li>
+                <li><a href="#十一参考文献"
+                id="toc-十一参考文献">十一、参考文献</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>存储系统的写入路径，表面上是”把数据写到磁盘”，实际上涉及一条从用户空间到持久化介质的复杂链路：应用层的写入请求先进入内存缓冲区（Write
+            Buffer），再序列化到预写日志（Write-Ahead
+            Log，WAL），然后等待操作系统将脏页刷盘（fsync），最终落到物理介质上。这条链路上的每一环都有延迟开销，每一环也都有优化空间。</p>
+            <p>写入优化的核心矛盾始终是持久性（Durability）与吞吐量（Throughput）之间的权衡。每次
+            fsync 都能保证数据不丢，但每次 fsync
+            也意味着一次磁盘同步操作——在 SATA SSD 上约 0.1 到 0.5
+            毫秒，在 HDD 上约 5 到 15 毫秒。如果每条记录都单独
+            fsync，写入吞吐量将被 fsync 延迟锁死。反过来，如果完全不
+            fsync，数据在断电时就会丢失。所有写入优化技术——分组提交（Group
+            Commit）、批量写入（Batched Write）、写缓冲区调优、fsync
+            频率控制、写入限速（Rate
+            Limiting）——本质上都是在这条权衡曲线上寻找更优的工作点。</p>
+            <p>本文从写入路径的工程挑战开始，逐一拆解上述优化技术的原理与实现，再落到
+            MySQL、PostgreSQL 和 RocksDB
+            三个具体系统的调优实践。讨论范围限定在单节点写入优化；分布式写入涉及的复制延迟和一致性问题不在本文范围内。</p>
+            <blockquote>
+            <p><strong>版本说明</strong> 本文涉及的软件版本：MySQL
+            8.0/8.4、PostgreSQL 16/17、RocksDB 9.x、Linux 6.x
+            内核。不同版本的配置项和默认行为可能有差异，涉及版本差异的地方会单独标注。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一写入性能的工程挑战">一、写入性能的工程挑战</h2>
+            <h3 id="写入路径的延迟构成">1.1 写入路径的延迟构成</h3>
+            <p>一次数据库写入操作从用户发起到数据真正持久化，经历的典型路径如下：</p>
+            <pre class="text"><code>应用层 → 网络层 → SQL 解析/事务管理 → WAL 写入 → fsync → 返回确认
+                                        ↓
+                                   MemTable 写入 → 后台刷盘 → SST 文件</code></pre>
+            <p>在这条路径中，延迟主要集中在三个环节：</p>
+            <p>第一，WAL 的 fsync。事务提交时必须确保 WAL
+            记录持久化，这要求至少一次 fsync 调用。单次 fsync
+            的延迟取决于存储介质：NVMe SSD 约 20 到 100 微秒，SATA SSD
+            约 100 到 500 微秒，HDD 约 5 到 15 毫秒。如果每个事务独立
+            fsync，那么 HDD 上单线程最多每秒提交 60 到 200 个事务。</p>
+            <p>第二，锁竞争。多个并发写入者争夺 WAL
+            写入权限时，需要某种形式的互斥。如果每个写入者都独立持锁、写入、fsync、释放锁，串行化开销会严重限制并发写入吞吐。</p>
+            <p>第三，后台刷盘的反压。当 MemTable 写满需要刷盘，或者
+            LSM-Tree（Log-Structured
+            Merge-Tree）的层级合并（Compaction）跟不上写入速度时，系统会触发写停顿（Write
+            Stall），强制减速甚至阻塞前台写入。</p>
+            <h3 id="关键性能指标">1.2 关键性能指标</h3>
+            <p>写入优化需要关注的指标不只是吞吐量。一个完整的写入性能画像至少包括：</p>
+            <table>
+            <colgroup>
+            <col style="width: 24%" />
+            <col style="width: 24%" />
+            <col style="width: 52%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>含义</th>
+            <th>典型关注场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>吞吐量（ops/s 或 MB/s）</td>
+            <td>单位时间完成的写入操作数或数据量</td>
+            <td>批量导入、日志写入</td>
+            </tr>
+            <tr>
+            <td>P50/P99/P999 延迟</td>
+            <td>写入延迟的分位数分布</td>
+            <td>在线事务处理（OLTP）</td>
+            </tr>
+            <tr>
+            <td>fsync 延迟</td>
+            <td>单次 fsync 调用的耗时</td>
+            <td>持久化瓶颈分析</td>
+            </tr>
+            <tr>
+            <td>写停顿次数与持续时间</td>
+            <td>Write Stall 事件的频率和影响时长</td>
+            <td>LSM 存储引擎调优</td>
+            </tr>
+            <tr>
+            <td>WAL 写入带宽</td>
+            <td>WAL 文件的写入速率</td>
+            <td>WAL 磁盘容量规划</td>
+            </tr>
+            <tr>
+            <td>Compaction 待处理字节数</td>
+            <td>等待合并的数据量</td>
+            <td>写放大（Write Amplification）监控</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="写放大问题">1.3 写放大问题</h3>
+            <p>写放大（Write
+            Amplification，WA）是写入优化绕不开的话题。用户写入 1
+            字节的数据，存储引擎实际可能写入数十字节到磁盘——WAL
+            写一次，MemTable 刷盘写一次，Compaction 再写若干次。以
+            RocksDB 为例，默认配置下 LSM-Tree 每层大小比例为
+            10，理论写放大约为层数乘以 10 左右（实际取决于数据分布和
+            Compaction 策略）。</p>
+            <p>写放大不仅消耗磁盘带宽，还加速 SSD 的磨损。对于 NAND
+            Flash
+            而言，每个存储单元（Cell）的擦写次数有限——TLC（Triple-Level
+            Cell） 通常在 1000 到 3000 次之间，QLC（Quad-Level
+            Cell）更低。高写放大意味着 SSD
+            的实际寿命远低于容量计算的理论值。</p>
+            <hr />
+            <h2 id="二wal-分组提交">二、WAL 分组提交</h2>
+            <h3 id="问题逐事务-fsync-的瓶颈">2.1 问题：逐事务 fsync
+            的瓶颈</h3>
+            <p>WAL 的设计目标是保证崩溃恢复（Crash
+            Recovery）。每个事务提交前，必须确保其 WAL
+            记录已经持久化到磁盘。最朴素的实现是：每个事务提交时，将 WAL
+            记录写入文件，然后调用 fsync 等待磁盘确认。</p>
+            <p>这种逐事务 fsync 的方式有一个严重的性能问题：fsync
+            是一个同步操作，调用者必须等待磁盘控制器确认数据已经从易失性缓存写到持久化介质。在此期间，调用线程被阻塞，其他等待提交的事务也无法推进。</p>
+            <p>假设 NVMe SSD 的 fsync 延迟为 50 微秒，逐事务 fsync
+            的理论上限是每秒 20000 次 fsync，即每秒最多提交 20000
+            个事务。但实际上，每次 fsync 之间还有 WAL
+            序列化、锁操作等开销，实测吞吐通常远低于理论值。如果换成
+            SATA SSD（fsync 延迟 200 微秒），上限降到每秒 5000
+            次；HDD（fsync 延迟 10 毫秒）更是只有每秒 100 次。</p>
+            <h3 id="分组提交的核心思想">2.2 分组提交的核心思想</h3>
+            <p>分组提交（Group Commit）的核心思想是：将多个并发事务的
+            WAL 记录合并到一次 fsync 中。多个事务各自将 WAL 记录写入 WAL
+            缓冲区（WAL Buffer），然后由其中一个事务（称为
+            leader）执行一次 fsync，这次 fsync
+            同时持久化所有已写入的记录。其他事务（称为 follower）等待
+            leader 的 fsync 完成后即可返回。</p>
+            <p>这样做的收益是显著的：如果 10
+            个事务同时等待提交，原本需要 10 次 fsync，分组提交只需要 1
+            次。fsync 的摊销成本从 1:1 降低到 1:N，其中 N
+            是每批次的事务数。N 越大，吞吐量越高。</p>
+            <pre class="mermaid"><code>sequenceDiagram
+    participant T1 as 事务 1（leader）
+    participant T2 as 事务 2（follower）
+    participant T3 as 事务 3（follower）
+    participant WAL as WAL Buffer
+    participant Disk as 磁盘
+
+    T1-&gt;&gt;WAL: 写入 WAL 记录
+    T2-&gt;&gt;WAL: 写入 WAL 记录
+    T3-&gt;&gt;WAL: 写入 WAL 记录
+    T1-&gt;&gt;Disk: fsync（合并刷盘）
+    Disk--&gt;&gt;T1: fsync 完成
+    T1--&gt;&gt;T2: 通知完成
+    T1--&gt;&gt;T3: 通知完成</code></pre>
+            <p>上图展示了分组提交的基本流程：事务 1 作为 leader
+            收集同一批次内所有事务的 WAL 记录，执行一次
+            fsync，然后通知所有 follower。三个事务只消耗了一次 fsync
+            的延迟。</p>
+            <h3 id="leaderfollower-选举机制">2.3 Leader/Follower
+            选举机制</h3>
+            <p>分组提交的关键实现细节是如何选举
+            leader。常见的做法有两种：</p>
+            <p><strong>队列头选举</strong>：所有等待提交的事务进入一个
+            FIFO 队列。队列头部的事务自动成为
+            leader，负责将队列中所有事务的 WAL 记录一次性 fsync。InnoDB
+            的 Group Commit
+            采用了这种思路（通过三阶段流水线实现，后文详述）。</p>
+            <p><strong>CAS
+            竞争</strong>：多个事务通过原子操作（Compare-And-Swap）竞争
+            leader 角色。竞争成功者成为 leader，失败者成为 follower
+            等待通知。PostgreSQL 的 WAL 写入流程采用了类似机制。</p>
+            <p>两种方式的核心目标一致：确保在 fsync
+            延迟窗口内，尽可能多的事务被合并到同一批次。</p>
+            <h3 id="innodb-的三阶段-group-commit">2.4 InnoDB 的三阶段
+            Group Commit</h3>
+            <p>MySQL InnoDB 的 Group Commit
+            实现采用了三阶段流水线（Pipeline）设计，这是为了同时解决
+            binlog 与 InnoDB redo log
+            的顺序一致性问题。三个阶段分别是：</p>
+            <p><strong>Flush 阶段</strong>：leader 收集一批事务的
+            binlog，将它们写入 binlog 文件（write 系统调用，写入 Page
+            Cache）。</p>
+            <p><strong>Sync 阶段</strong>：leader 对 binlog 文件执行
+            fsync，将数据持久化。这是最耗时的阶段。</p>
+            <p><strong>Commit 阶段</strong>：leader 将这批事务在 InnoDB
+            中标记为已提交，更新 redo log 的提交标记。</p>
+            <p>每个阶段都有自己的 leader 和 follower 队列。当一个 leader
+            在 Sync 阶段等待 fsync 返回时，新到达的事务可以进入 Flush
+            阶段的队列，由下一个 leader
+            开始收集。三个阶段形成流水线，提高了并发度。</p>
+            <pre class="text"><code>时间线 →
+
+Flush 阶段:  [Batch 1]          [Batch 2]          [Batch 3]
+Sync 阶段:            [Batch 1]          [Batch 2]
+Commit 阶段:                    [Batch 1]          [Batch 2]</code></pre>
+            <p>相关参数：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># MySQL 8.0</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">binlog_group_commit_sync_delay </span><span class="ot">=</span><span class="st"> 0       # Sync 阶段等待的最大微秒数</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">binlog_group_commit_sync_no_delay_count </span><span class="ot">=</span><span class="st"> 0  # 达到该事务数时立即触发 Sync</span></span></code></pre></div>
+            <p><code>binlog_group_commit_sync_delay</code> 控制 leader
+            在 Sync 阶段最多等待多少微秒再执行
+            fsync。增大此值可以让更多事务合并到同一批次，提高吞吐量，代价是单个事务的提交延迟增加。<code>binlog_group_commit_sync_no_delay_count</code>
+            设定一个事务数阈值，达到后无论是否超时都立即执行
+            fsync，避免在高并发场景下不必要的等待。</p>
+            <h3 id="postgresql-的-group-commit">2.5 PostgreSQL 的 Group
+            Commit</h3>
+            <p>PostgreSQL 的 Group Commit 实现更加隐式。PostgreSQL
+            没有一个显式的”分组”机制，而是依赖 WAL
+            写入流程本身的并发特性实现分组效果。</p>
+            <p>多个后端进程（Backend Process）并发地将 WAL
+            记录写入共享的 WAL 缓冲区（WAL
+            Buffers）。当一个进程准备提交事务时，它需要确保 WAL
+            缓冲区中截止到自己最后一条记录的所有数据都已经
+            fsync。如果此时另一个进程已经在执行
+            fsync，当前进程会等待那次 fsync 完成——如果那次 fsync
+            覆盖了自己的记录位置，就不需要再次 fsync。</p>
+            <p>这种”搭便车”（piggyback）的机制自然地实现了分组提交。并发度越高，每次
+            fsync 平均覆盖的事务越多。</p>
+            <p>PostgreSQL 还提供了 <code>commit_delay</code> 和
+            <code>commit_siblings</code>
+            两个参数来显式控制分组行为：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># postgresql.conf</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="dt">commit_delay </span><span class="ot">=</span><span class="st"> 0          # 提交前等待的微秒数（默认不等待）</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="dt">commit_siblings </span><span class="ot">=</span><span class="st"> 5        # 当活跃事务数达到此值时，commit_delay 才生效</span></span></code></pre></div>
+            <p><code>commit_delay</code> 的作用与 InnoDB 的
+            <code>binlog_group_commit_sync_delay</code> 类似：在 fsync
+            之前等待一小段时间，让更多事务的 WAL
+            记录进入缓冲区。<code>commit_siblings</code>
+            是触发条件——只有当系统中有足够多的并发事务时，等待才有意义。如果只有两三个并发事务，等待反而浪费时间。</p>
+            <h3 id="分组提交的效果量化">2.6 分组提交的效果量化</h3>
+            <p>分组提交的收益可以用一个简单的模型估算。设 fsync 延迟为
+            <span class="math inline">\(t_s\)</span>，每批次平均事务数为
+            <span class="math inline">\(N\)</span>，单个事务的 WAL
+            写入时间为 <span
+            class="math inline">\(t_w\)</span>，则：</p>
+            <ul>
+            <li>逐事务 fsync 的吞吐上限：<span class="math inline">\(1 /
+            (t_w + t_s)\)</span></li>
+            <li>分组提交的吞吐上限：<span class="math inline">\(N / (t_w
+            \times N + t_s) \approx N / t_s\)</span>（当 <span
+            class="math inline">\(N\)</span> 较大时）</li>
+            </ul>
+            <p>以 NVMe SSD 为例，<span class="math inline">\(t_s = 50\mu
+            s\)</span>，<span class="math inline">\(t_w = 5\mu
+            s\)</span>：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>批次大小 N</th>
+            <th>逐事务 fsync（ops/s）</th>
+            <th>分组提交（ops/s）</th>
+            <th>吞吐倍数</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>1</td>
+            <td>18,182</td>
+            <td>18,182</td>
+            <td>1.0x</td>
+            </tr>
+            <tr>
+            <td>10</td>
+            <td>18,182</td>
+            <td>100,000</td>
+            <td>5.5x</td>
+            </tr>
+            <tr>
+            <td>50</td>
+            <td>18,182</td>
+            <td>200,000</td>
+            <td>11.0x</td>
+            </tr>
+            <tr>
+            <td>100</td>
+            <td>18,182</td>
+            <td>181,818</td>
+            <td>10.0x</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>当 <span class="math inline">\(N = 50\)</span>
+            时，吞吐量达到逐事务模式的 11 倍。但 <span
+            class="math inline">\(N\)</span>
+            并非越大越好——过大的批次意味着 leader
+            需要更长时间收集事务，单个事务的等待延迟也随之增加。实际系统通常通过超时和计数双重阈值来平衡。</p>
+            <hr />
+            <h2 id="三批量写入">三、批量写入</h2>
+            <h3 id="writebatch-接口">3.1 WriteBatch 接口</h3>
+            <p>分组提交解决的是”多个独立事务如何共享
+            fsync”的问题。批量写入（Batched
+            Write）解决的是另一个问题：如何将多个键值对的写入合并为一次原子操作。</p>
+            <p>RocksDB 提供了 <code>WriteBatch</code>
+            接口，允许应用层将多个 Put、Delete
+            操作打包到一个批次中，然后一次性提交：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>WriteBatch batch<span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>batch<span class="op">.</span>Put<span class="op">(</span><span class="st">&quot;key1&quot;</span><span class="op">,</span> <span class="st">&quot;value1&quot;</span><span class="op">);</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>batch<span class="op">.</span>Put<span class="op">(</span><span class="st">&quot;key2&quot;</span><span class="op">,</span> <span class="st">&quot;value2&quot;</span><span class="op">);</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>batch<span class="op">.</span>Delete<span class="op">(</span><span class="st">&quot;key3&quot;</span><span class="op">);</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Status s <span class="op">=</span> db<span class="op">-&gt;</span>Write<span class="op">(</span>write_options<span class="op">,</span> <span class="op">&amp;</span>batch<span class="op">);</span></span></code></pre></div>
+            <p>WriteBatch 的好处有三个方面：</p>
+            <p>第一，原子性。一个 WriteBatch
+            中的所有操作要么全部成功，要么全部失败。这对应用层非常有用——例如，更新索引和更新数据需要原子完成。</p>
+            <p>第二，减少锁竞争。多次单独的 <code>Put</code>
+            调用每次都要获取写入锁，而一个 WriteBatch
+            只需要获取一次。</p>
+            <p>第三，减少 WAL 写入次数。一个 WriteBatch 对应一条 WAL
+            记录，而不是多条。WAL 的序列化、CRC
+            校验、写入开销都被摊销了。</p>
+            <h3 id="pipeline-write">3.2 Pipeline Write</h3>
+            <p>RocksDB 6.x 引入了流水线写入（Pipelined Write）机制，在
+            Group Commit 的基础上进一步提高并发度。</p>
+            <p>在传统的 Group Commit 中，leader 需要将所有 follower
+            的数据写入 WAL 并写入 MemTable，两个步骤串行执行。Pipelined
+            Write 将这两步拆开：leader 先将整批数据写入
+            WAL，然后让每个写入者并行地将自己的数据写入 MemTable。</p>
+            <pre class="text"><code>传统 Group Commit:
+  Leader:  [写 WAL -----][写 MemTable -----]
+
+Pipelined Write:
+  Leader:  [写 WAL -----]
+  Writer1:               [写 MemTable]
+  Writer2:               [写 MemTable]
+  Writer3:               [写 MemTable]</code></pre>
+            <p>Pipelined Write 通过 <code>enable_pipelined_write</code>
+            选项开启：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>enable_pipelined_write <span class="op">=</span> <span class="kw">true</span><span class="op">;</span>  <span class="co">// 默认 false</span></span></code></pre></div>
+            <p>需要注意的是，Pipelined Write 与
+            <code>unordered_write</code>
+            不兼容——后者允许更激进的乱序写入以换取更高吞吐，但牺牲了快照读的一致性保证。</p>
+            <h3 id="应用层批量写入策略">3.3 应用层批量写入策略</h3>
+            <p>在应用层，批量写入的策略需要根据业务场景调整。以日志采集为例，可以在内存中累积一批日志记录，达到批次大小或超时后一次性写入：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> BatchWriter <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    db       <span class="op">*</span>rocksdb<span class="op">.</span>DB</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    buffer   <span class="op">[]*</span>Record</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    maxBatch <span class="dt">int</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    timeout  time<span class="op">.</span>Duration</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    mu       sync<span class="op">.</span>Mutex</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    timer    <span class="op">*</span>time<span class="op">.</span>Timer</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>w <span class="op">*</span>BatchWriter<span class="op">)</span> Add<span class="op">(</span>r <span class="op">*</span>Record<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    w<span class="op">.</span>mu<span class="op">.</span>Lock<span class="op">()</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">defer</span> w<span class="op">.</span>mu<span class="op">.</span>Unlock<span class="op">()</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>    w<span class="op">.</span>buffer <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>w<span class="op">.</span>buffer<span class="op">,</span> r<span class="op">)</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>w<span class="op">.</span>buffer<span class="op">)</span> <span class="op">&gt;=</span> w<span class="op">.</span>maxBatch <span class="op">{</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>        w<span class="op">.</span>flush<span class="op">()</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> w<span class="op">.</span>timer <span class="op">==</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>        w<span class="op">.</span>timer <span class="op">=</span> time<span class="op">.</span>AfterFunc<span class="op">(</span>w<span class="op">.</span>timeout<span class="op">,</span> <span class="kw">func</span><span class="op">()</span> <span class="op">{</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>            w<span class="op">.</span>mu<span class="op">.</span>Lock<span class="op">()</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>            <span class="cf">defer</span> w<span class="op">.</span>mu<span class="op">.</span>Unlock<span class="op">()</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>            w<span class="op">.</span>flush<span class="op">()</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">})</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>w <span class="op">*</span>BatchWriter<span class="op">)</span> flush<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>w<span class="op">.</span>buffer<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>    batch <span class="op">:=</span> rocksdb<span class="op">.</span>NewWriteBatch<span class="op">()</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> r <span class="op">:=</span> <span class="kw">range</span> w<span class="op">.</span>buffer <span class="op">{</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>        batch<span class="op">.</span>Put<span class="op">(</span>r<span class="op">.</span>Key<span class="op">,</span> r<span class="op">.</span>Value<span class="op">)</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a>    w<span class="op">.</span>db<span class="op">.</span>Write<span class="op">(</span>rocksdb<span class="op">.</span>NewDefaultWriteOptions<span class="op">(),</span> batch<span class="op">)</span></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a>    w<span class="op">.</span>buffer <span class="op">=</span> w<span class="op">.</span>buffer<span class="op">[:</span><span class="dv">0</span><span class="op">]</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> w<span class="op">.</span>timer <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a>        w<span class="op">.</span>timer<span class="op">.</span>Stop<span class="op">()</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a>        w<span class="op">.</span>timer <span class="op">=</span> <span class="ot">nil</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>批次大小和超时的选择需要权衡：批次越大，吞吐越高，但单条记录的最大等待时间也越长。对于日志采集这种容忍几百毫秒延迟的场景，批次大小
+            1000、超时 200
+            毫秒是一个合理的起点。对于在线事务场景，批次大小通常在 10 到
+            50 之间，超时在 1 到 5 毫秒。</p>
+            <hr />
+            <h2 id="四write-buffer-与-memtable-调优">四、Write Buffer 与
+            MemTable 调优</h2>
+            <h3 id="memtable-的作用">4.1 MemTable 的作用</h3>
+            <p>在 LSM-Tree 存储引擎中，MemTable
+            是写入路径的第一站。所有写入操作先写入
+            WAL（保证持久性），然后插入内存中的
+            MemTable（保证读取性能）。当 MemTable
+            的大小达到阈值时，它被标记为不可变（Immutable
+            MemTable），后台线程将其刷盘为 SST（Sorted String
+            Table）文件。</p>
+            <p>MemTable 的实现通常基于跳表（SkipList），支持 O(log N)
+            的插入和查找。RocksDB
+            也支持基于哈希跳表（HashSkipList）和基于哈希链表（HashLinkList）的
+            MemTable，分别适合前缀查询和点查场景。</p>
+            <h3 id="write-buffer-参数">4.2 Write Buffer 参数</h3>
+            <p>RocksDB 中与 Write Buffer 相关的核心参数有三个：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>write_buffer_size <span class="op">=</span> <span class="dv">64</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>          <span class="co">// 单个 MemTable 大小，默认 64MB</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_write_buffer_number <span class="op">=</span> <span class="dv">3</span><span class="op">;</span>                    <span class="co">// 最大 MemTable 数量（含不可变）</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>min_write_buffer_number_to_merge <span class="op">=</span> <span class="dv">1</span><span class="op">;</span>           <span class="co">// 刷盘前合并的最小 MemTable 数</span></span></code></pre></div>
+            <p><strong><code>write_buffer_size</code></strong>：单个
+            MemTable 的大小上限。增大此值意味着每次 MemTable 刷盘产生的
+            SST 文件更大，减少了 L0 层的文件数量，降低了 Compaction
+            的频率。但也意味着更高的内存占用和更长的恢复时间——崩溃恢复时需要重放更多的
+            WAL 记录。</p>
+            <p><strong><code>max_write_buffer_number</code></strong>：MemTable
+            的最大数量。假设设为 3，则内存中最多有 1 个可写 MemTable 加
+            2 个不可变 MemTable 等待刷盘。如果不可变 MemTable
+            的刷盘速度跟不上写入速度，所有 MemTable
+            都被占满，写入将被阻塞——这就是 Write Stall
+            的触发条件之一。</p>
+            <p><strong><code>min_write_buffer_number_to_merge</code></strong>：刷盘前至少合并几个不可变
+            MemTable。设为 2 意味着等两个 MemTable
+            凑齐后再一次性刷盘，可以合并重复键（去重），减少写入 L0
+            层的数据量。代价是内存中会多保留一个 MemTable。</p>
+            <h3 id="memtable-大小的工程权衡">4.3 MemTable
+            大小的工程权衡</h3>
+            <p>MemTable 大小的选择是一个多维度权衡：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>增大 write_buffer_size 的影响</th>
+            <th>减小 write_buffer_size 的影响</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>写入吞吐</td>
+            <td>提高（减少刷盘频率）</td>
+            <td>降低（频繁刷盘）</td>
+            </tr>
+            <tr>
+            <td>L0 文件数</td>
+            <td>减少（每个文件更大）</td>
+            <td>增加（更多小文件）</td>
+            </tr>
+            <tr>
+            <td>Compaction 压力</td>
+            <td>减轻（L0 触发 Compaction 的频率降低）</td>
+            <td>加重</td>
+            </tr>
+            <tr>
+            <td>内存占用</td>
+            <td>增加</td>
+            <td>减少</td>
+            </tr>
+            <tr>
+            <td>恢复时间</td>
+            <td>增加（WAL 重放量更大）</td>
+            <td>减少</td>
+            </tr>
+            <tr>
+            <td>读性能</td>
+            <td>可能降低（单个 MemTable 内扫描范围更大）</td>
+            <td>可能提高</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>实际配置建议：如果系统内存充足且写入负载重，将
+            <code>write_buffer_size</code> 设为 128MB 到 256MB
+            通常能获得明显的吞吐提升。<code>max_write_buffer_number</code>
+            建议设为 3 到
+            6，给刷盘留出缓冲空间。对于写入量极大的场景（例如日志存储），可以将
+            <code>write_buffer_size</code> 进一步增大到
+            512MB，但需要确保 WAL 所在的磁盘能够承受对应的写入带宽。</p>
+            <h3 id="column-family-级别的-write-buffer">4.4 Column Family
+            级别的 Write Buffer</h3>
+            <p>RocksDB 的 Write Buffer 配置是按列族（Column
+            Family）独立的。一个数据库可以有多个列族，每个列族有自己的
+            MemTable 和刷盘策略。<code>db_write_buffer_size</code>
+            参数控制所有列族的 MemTable 总内存上限：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>db_write_buffer_size <span class="op">=</span> <span class="dv">512</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 所有列族 MemTable 总大小上限 512MB</span></span></code></pre></div>
+            <p>当所有列族的 MemTable 总大小达到
+            <code>db_write_buffer_size</code> 时，RocksDB
+            会选择内存占用最大的列族触发刷盘。这个参数对于多列族场景尤其重要——如果不设上限，某个写入量大的列族可能占满所有内存。</p>
+            <h3 id="memtable-工厂选择">4.5 MemTable 工厂选择</h3>
+            <p>RocksDB 支持多种 MemTable 实现，默认是
+            SkipList。不同实现的性能特征差异较大：</p>
+            <table>
+            <colgroup>
+            <col style="width: 23%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>MemTable 类型</th>
+            <th>写入性能</th>
+            <th>点查性能</th>
+            <th>范围查询</th>
+            <th>内存开销</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>SkipList（默认）</td>
+            <td>好</td>
+            <td>好</td>
+            <td>好</td>
+            <td>中</td>
+            <td>通用</td>
+            </tr>
+            <tr>
+            <td>HashSkipList</td>
+            <td>好</td>
+            <td>很好（同前缀）</td>
+            <td>前缀范围查询好</td>
+            <td>高</td>
+            <td>前缀查询为主</td>
+            </tr>
+            <tr>
+            <td>HashLinkList</td>
+            <td>很好</td>
+            <td>很好（同前缀）</td>
+            <td>不支持全序扫描</td>
+            <td>低</td>
+            <td>纯点查</td>
+            </tr>
+            <tr>
+            <td>Vector</td>
+            <td>最好（追加写入）</td>
+            <td>差（线性扫描）</td>
+            <td>差</td>
+            <td>低</td>
+            <td>批量加载</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>对于大多数在线服务，SkipList
+            是最安全的选择。只有在工作负载高度偏向点查或前缀查询时，才值得尝试
+            Hash 系列 MemTable。Vector MemTable
+            只适合批量加载场景——它的写入是 O(1) 追加，但读取是 O(N)
+            扫描，刷盘前需要排序。</p>
+            <hr />
+            <h2 id="五fsync-频率控制">五、fsync 频率控制</h2>
+            <h3 id="fsync-的语义与开销">5.1 fsync 的语义与开销</h3>
+            <p><code>fsync(fd)</code> 的语义是：确保文件描述符
+            <code>fd</code>
+            对应的文件的所有已修改数据和元数据都已经从操作系统的页缓存（Page
+            Cache）写到持久化存储介质。在 Linux
+            上，<code>fdatasync(fd)</code>
+            是一个轻量版本——它只保证数据持久化，不保证元数据（例如文件的修改时间）持久化。如果文件大小没有变化，<code>fdatasync</code>
+            通常比 <code>fsync</code> 更快。</p>
+            <p>fsync 的开销取决于几个因素：</p>
+            <ol type="1">
+            <li><strong>存储介质</strong>：NVMe SSD 的 fsync 延迟在 20
+            到 100 微秒级别，SATA SSD 在 100 到 500 微秒，HDD 在 5 到 15
+            毫秒。</li>
+            <li><strong>脏数据量</strong>：fsync 需要将从上次 fsync
+            以来的所有脏页写到磁盘。脏数据量越大，fsync 耗时越长。</li>
+            <li><strong>磁盘队列深度</strong>：如果磁盘正在处理其他 I/O
+            请求，fsync 可能需要等待排队。在高 I/O 负载下，fsync
+            延迟会显著增加。</li>
+            <li><strong>文件系统</strong>：ext4 的
+            <code>data=ordered</code> 模式（默认）在 fsync
+            时需要先写出所有与该文件相关的数据页，再更新日志。XFS
+            在某些场景下 fsync 性能更好。</li>
+            </ol>
+            <h3 id="fsync-策略的频谱">5.2 fsync 策略的频谱</h3>
+            <p>从最安全到最激进，fsync 策略形成一个频谱：</p>
+            <pre class="text"><code>每次写入都 fsync ←→ 按事务 fsync ←→ 分组 fsync ←→ 定时 fsync ←→ 从不 fsync
+  |                   |                |              |              |
+  最安全              数据库默认        高吞吐优化      可接受少量丢失   纯内存/缓存
+  最慢                                                              最快</code></pre>
+            <p><strong>每次写入都
+            fsync</strong>：适用于金融级严格持久性要求。每写入一条记录就
+            fsync 一次，保证任何时刻断电最多丢失正在写入的那条记录。</p>
+            <p><strong>按事务
+            fsync</strong>：数据库的默认行为。每个事务提交时 fsync 一次
+            WAL，保证已提交事务不丢失。分组提交可以将多个事务合并到一次
+            fsync。</p>
+            <p><strong>定时 fsync</strong>：每隔一定时间（例如 1
+            秒）fsync 一次。断电时最多丢失一个时间窗口内的数据。Redis 的
+            AOF
+            持久化（<code>appendfsync everysec</code>）采用这种策略。</p>
+            <p><strong>从不
+            fsync</strong>：完全依赖操作系统的脏页回写机制（<code>dirty_writeback_centisecs</code>，默认
+            5 秒）。适用于缓存或可丢失的临时数据。</p>
+            <h3 id="mysql-的-fsync-控制">5.3 MySQL 的 fsync 控制</h3>
+            <p>MySQL InnoDB 通过
+            <code>innodb_flush_log_at_trx_commit</code> 参数控制 redo
+            log 的 fsync 策略：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_flush_log_at_trx_commit </span><span class="ot">=</span><span class="st"> 1   # 默认值</span></span></code></pre></div>
+            <table>
+            <colgroup>
+            <col style="width: 16%" />
+            <col style="width: 25%" />
+            <col style="width: 33%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>值</th>
+            <th>行为</th>
+            <th>持久性</th>
+            <th>性能</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>1</td>
+            <td>每次事务提交时 fsync redo log</td>
+            <td>最强：已提交事务不丢</td>
+            <td>最慢</td>
+            </tr>
+            <tr>
+            <td>2</td>
+            <td>每次事务提交时 write 到 Page Cache，每秒 fsync 一次</td>
+            <td>操作系统崩溃可能丢 1 秒数据</td>
+            <td>中等</td>
+            </tr>
+            <tr>
+            <td>0</td>
+            <td>每秒 write + fsync 一次，事务提交时不做任何 I/O</td>
+            <td>MySQL 进程崩溃可能丢 1 秒数据</td>
+            <td>最快</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>sync_binlog</code> 控制 binlog 的 fsync 策略：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="dt">sync_binlog </span><span class="ot">=</span><span class="st"> 1   # 默认值：每次事务提交时 fsync binlog</span></span></code></pre></div>
+            <p>设为 0 表示 binlog 不主动 fsync，依赖操作系统回写。设为
+            N（N &gt; 1）表示每 N 个事务 fsync 一次。</p>
+            <p>我认为，在绝大多数生产环境中
+            <code>innodb_flush_log_at_trx_commit = 1</code> 和
+            <code>sync_binlog = 1</code> 是正确的默认值。将其改为 0 或 2
+            能带来 2 到 5 倍的写入吞吐提升，但代价是在断电时可能丢失最近
+            1
+            秒的已提交事务。这个风险在主从复制场景下尤其危险——如果主库丢失了一些事务但从库已经收到了对应的
+            binlog，主从数据会不一致。只有在从库可以作为数据权威源的场景下，才值得在主库上放松
+            fsync 策略。</p>
+            <h3 id="postgresql-的-fsync-控制">5.4 PostgreSQL 的 fsync
+            控制</h3>
+            <p>PostgreSQL 通过 <code>synchronous_commit</code>
+            参数控制事务提交时的 WAL fsync 行为：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="dt">synchronous_commit </span><span class="ot">=</span><span class="st"> on   # 默认值</span></span></code></pre></div>
+            <table>
+            <colgroup>
+            <col style="width: 22%" />
+            <col style="width: 33%" />
+            <col style="width: 44%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>值</th>
+            <th>行为</th>
+            <th>持久性</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>on</td>
+            <td>事务提交时等待 WAL fsync 完成</td>
+            <td>最强</td>
+            </tr>
+            <tr>
+            <td>remote_apply</td>
+            <td>等待 WAL 在至少一个同步备库上被应用</td>
+            <td>高（跨节点持久化）</td>
+            </tr>
+            <tr>
+            <td>remote_write</td>
+            <td>等待 WAL 在至少一个同步备库上写入 Page Cache</td>
+            <td>中等</td>
+            </tr>
+            <tr>
+            <td>local</td>
+            <td>等待本地 WAL fsync 完成，不等待备库</td>
+            <td>本地持久化</td>
+            </tr>
+            <tr>
+            <td>off</td>
+            <td>不等待 WAL fsync，异步写入</td>
+            <td>可能丢失最近几百毫秒数据</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>PostgreSQL 的一个设计优势是
+            <code>synchronous_commit</code> 可以按事务设置：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对于不重要的日志表，可以放松持久性要求</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">LOCAL</span> synchronous_commit <span class="op">=</span> <span class="kw">off</span>;</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> access_log (ts, path, status) <span class="kw">VALUES</span> (now(), <span class="st">&#39;/api/health&#39;</span>, <span class="dv">200</span>);</span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对于资金相关的表，使用最严格的持久性</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">LOCAL</span> synchronous_commit <span class="op">=</span> <span class="kw">on</span>;</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">42</span>;</span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="kw">COMMIT</span>;</span></code></pre></div>
+            <p>这种按事务粒度的控制非常实用：同一个数据库内，不同业务场景的持久性要求可能差别很大。审计日志可以容忍丢失几百毫秒的数据，但转账记录一条都不能丢。</p>
+            <h3 id="wal-写入方法">5.5 WAL 写入方法</h3>
+            <p>PostgreSQL 通过 <code>wal_sync_method</code> 参数选择 WAL
+            的持久化系统调用：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_sync_method </span><span class="ot">=</span><span class="st"> fdatasync   # Linux 默认值</span></span></code></pre></div>
+            <p>可选值包括：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>方法</th>
+            <th>系统调用</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>fsync</td>
+            <td>fsync()</td>
+            <td>同步数据和元数据</td>
+            </tr>
+            <tr>
+            <td>fdatasync</td>
+            <td>fdatasync()</td>
+            <td>只同步数据，不含元数据</td>
+            </tr>
+            <tr>
+            <td>open_datasync</td>
+            <td>open() with O_DSYNC</td>
+            <td>每次 write 都同步</td>
+            </tr>
+            <tr>
+            <td>open_sync</td>
+            <td>open() with O_SYNC</td>
+            <td>每次 write 都同步数据和元数据</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>在 Linux 上，<code>fdatasync</code>
+            通常是最优选择。<code>O_DSYNC</code>/<code>O_SYNC</code>
+            模式在每次 write 时都执行同步，无法利用分组提交的批量 fsync
+            优势。PostgreSQL 提供了 <code>pg_test_fsync</code>
+            工具来测量不同方法在当前硬件上的性能：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_test_fsync</span></span></code></pre></div>
+            <p>运行结果会显示各种 fsync 方法的
+            ops/s，帮助选择最优配置。</p>
+            <hr />
+            <h2 id="六写入限速">六、写入限速</h2>
+            <h3 id="为什么需要限速">6.1 为什么需要限速</h3>
+            <p>写入限速（Rate
+            Limiting）看起来与写入性能优化矛盾——既然要优化写入性能，为什么还要限速？原因在于存储系统的写入路径不是一个简单的管道，而是一个有多个阶段的流水线。如果前台写入速度长期超过后台处理能力（MemTable
+            刷盘、Compaction），系统最终会触发写停顿（Write
+            Stall），导致写入延迟从微秒级突然跳到秒级。</p>
+            <p>限速的目的不是降低平均吞吐量，而是平滑写入速率，避免突发写入导致的后台处理积压。这类似于网络中的流量整形（Traffic
+            Shaping）——允许短暂的突发，但长期速率不超过系统的处理能力。</p>
+            <h3 id="rocksdb-的-rate-limiter">6.2 RocksDB 的 Rate
+            Limiter</h3>
+            <p>RocksDB 内置了 Rate Limiter 机制，可以对 Compaction
+            和刷盘的磁盘写入带宽进行限速：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>rate_limiter<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewGenericRateLimiter<span class="op">(</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>        <span class="dv">100</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>          <span class="co">// rate_bytes_per_sec: 100MB/s</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>        <span class="dv">100</span> <span class="op">*</span> <span class="dv">1000</span><span class="op">,</span>                  <span class="co">// refill_period_us: 100ms</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>        <span class="dv">10</span><span class="op">,</span>                          <span class="co">// fairness: IO 优先级的公平性因子</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>        rocksdb<span class="op">::</span>RateLimiter<span class="op">::</span>Mode<span class="op">::</span>kWritesOnly  <span class="co">// 只限制写入</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">)</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span></code></pre></div>
+            <p>Rate Limiter 采用令牌桶（Token Bucket）算法：每个
+            <code>refill_period_us</code>
+            周期补充一批令牌，每次磁盘写入消耗相应数量的令牌。当令牌耗尽时，写入请求被阻塞直到下一次补充。</p>
+            <p>RocksDB 的 Rate Limiter 区分三种 I/O 优先级：</p>
+            <ul>
+            <li><strong>高优先级（Env::IO_HIGH）</strong>：前台写入（Flush
+            MemTable）</li>
+            <li><strong>低优先级（Env::IO_LOW）</strong>：后台
+            Compaction</li>
+            <li><strong>用户优先级（Env::IO_USER）</strong>：用户直接的读写操作</li>
+            </ul>
+            <p><code>fairness</code>
+            参数控制高低优先级之间的调度公平性。默认值 10
+            意味着低优先级请求每 10 次被高优先级抢占 1
+            次。在写入密集型场景下，可以适当降低此值，优先保障
+            Compaction 的磁盘带宽。</p>
+            <h3 id="自动限速调整">6.3 自动限速调整</h3>
+            <p>RocksDB 的 Rate Limiter
+            支持自动调整（Auto-tuned）模式。开启后，Rate Limiter
+            会根据系统当前的写入压力动态调整限速值：</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>rate_limiter<span class="op">.</span>reset<span class="op">(</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>NewGenericRateLimiter<span class="op">(</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>        <span class="dv">100</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>      <span class="co">// 初始速率</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>        <span class="dv">100</span> <span class="op">*</span> <span class="dv">1000</span><span class="op">,</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>        <span class="dv">10</span><span class="op">,</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>        rocksdb<span class="op">::</span>RateLimiter<span class="op">::</span>Mode<span class="op">::</span>kWritesOnly<span class="op">,</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">true</span>                     <span class="co">// auto_tuned = true</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">)</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span></code></pre></div>
+            <p>自动调整的逻辑基于一个反馈回路：如果最近没有发生 Write
+            Stall，逐步提高限速值（系统有余力）；如果最近发生了 Write
+            Stall，逐步降低限速值（系统过载）。调整步幅较为保守，避免剧烈波动。</p>
+            <h3 id="操作系统级-io-限速">6.4 操作系统级 I/O 限速</h3>
+            <p>除了存储引擎自身的 Rate Limiter，Linux cgroup v2
+            提供了操作系统级别的 I/O 带宽限制：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 cgroup 并设置 I/O 带宽限制</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /sys/fs/cgroup/db-write</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;259:0 wbps=104857600&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/db-write/io.max   <span class="co"># 100MB/s 写入限制</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="va">$DB_PID</span> <span class="op">&gt;</span> /sys/fs/cgroup/db-write/cgroup.procs</span></code></pre></div>
+            <p>cgroup
+            级别的限速优势在于它是透明的——应用程序不需要任何修改。但它的粒度较粗，无法区分
+            WAL 写入、Flush 和 Compaction
+            的优先级。在多租户环境中，cgroup I/O
+            限速是隔离不同数据库实例磁盘带宽的有效手段。</p>
+            <hr />
+            <h2 id="七写停顿分析">七、写停顿分析</h2>
+            <h3 id="什么是写停顿">7.1 什么是写停顿</h3>
+            <p>写停顿（Write Stall）是 LSM-Tree
+            存储引擎的一种保护机制：当后台处理能力跟不上前台写入速度时，引擎主动降低甚至暂停前台写入，防止系统进入不可恢复的状态。</p>
+            <p>Write Stall
+            对应用的影响是灾难性的——写入延迟从正常的微秒级突然跳到数百毫秒甚至数秒，P99
+            延迟出现尖刺。对于在线服务来说，这种延迟尖刺往往比平均吞吐下降更难以接受。</p>
+            <h3 id="rocksdb-的写停顿触发条件">7.2 RocksDB
+            的写停顿触发条件</h3>
+            <p>RocksDB 在三种情况下触发 Write Stall：</p>
+            <p><strong>条件一：L0 文件数过多</strong></p>
+            <p>当 Level 0 的 SST 文件数达到
+            <code>level0_slowdown_writes_trigger</code>（默认
+            20）时，RocksDB 开始降速写入。当 L0 文件数达到
+            <code>level0_stop_writes_trigger</code>（默认
+            36）时，完全停止写入，直到 Compaction 将 L0 文件合并到
+            L1。</p>
+            <p>L0 文件过多的直接影响是读性能下降——L0
+            的文件之间的键范围（Key
+            Range）可能重叠，读取一个键可能需要查询所有 L0 文件。</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>level0_slowdown_writes_trigger <span class="op">=</span> <span class="dv">20</span><span class="op">;</span>   <span class="co">// 开始降速</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>level0_stop_writes_trigger <span class="op">=</span> <span class="dv">36</span><span class="op">;</span>        <span class="co">// 完全停止</span></span></code></pre></div>
+            <p><strong>条件二：待 Compaction 字节数过多</strong></p>
+            <p>当需要 Compaction 的数据总量超过
+            <code>soft_pending_compaction_bytes_limit</code>（默认
+            64GB）时，开始降速。超过
+            <code>hard_pending_compaction_bytes_limit</code>（默认
+            256GB）时，完全停止。</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>soft_pending_compaction_bytes_limit <span class="op">=</span> <span class="dv">64</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>hard_pending_compaction_bytes_limit <span class="op">=</span> <span class="dv">256</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span></span></code></pre></div>
+            <p><strong>条件三：MemTable 数量达到上限</strong></p>
+            <p>当不可变 MemTable 的数量达到
+            <code>max_write_buffer_number</code>（减去正在写入的那个），且这些
+            MemTable
+            都在等待刷盘时，前台写入被阻塞。这通常意味着刷盘速度跟不上写入速度——可能是磁盘带宽不足，也可能是
+            Rate Limiter 限制过严。</p>
+            <p>下面用一张图来展示这三种触发条件在系统中的位置：</p>
+            <pre class="mermaid"><code>flowchart TB
+    subgraph 前台写入
+        W[Write 请求] --&gt; MB[MemTable]
+    end
+    subgraph MemTable 管理
+        MB --&gt; IMM[Immutable MemTable 队列]
+        IMM --&gt;|数量 &gt;= max_write_buffer_number| STALL1[Write Stall: MemTable 满]
+    end
+    subgraph 后台刷盘
+        IMM --&gt; FLUSH[Flush 线程]
+        FLUSH --&gt; L0[Level 0 SST]
+        L0 --&gt;|文件数 &gt;= slowdown_trigger| STALL2[Write Stall: L0 过多]
+        L0 --&gt;|文件数 &gt;= stop_trigger| STOP[Write Stop]
+    end
+    subgraph 后台 Compaction
+        L0 --&gt; COMP[Compaction 线程]
+        COMP --&gt; L1[Level 1]
+        L1 --&gt; L2[Level 2+]
+        COMP --&gt;|待处理 &gt; soft_limit| STALL3[Write Stall: Compaction 积压]
+    end</code></pre>
+            <p>上图中，写请求进入 MemTable，满后转为不可变 MemTable
+            排队等待 Flush。Flush 产生的 L0 文件过多或 Compaction
+            积压过多，都会触发写停顿，反压到前台写入。三种触发条件分别对应
+            MemTable 管理、L0 文件数量和 Compaction 积压三个环节。</p>
+            <h3 id="写停顿的诊断">7.3 写停顿的诊断</h3>
+            <p>RocksDB 通过 <code>GetProperty</code>
+            接口和日志提供了丰富的写停顿诊断信息：</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string value<span class="op">;</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.is-write-stopped&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>        <span class="co">// 是否已停止写入</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.actual-delayed-write-rate&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>  <span class="co">// 当前降速后的写入速率</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.num-immutable-mem-table&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>    <span class="co">// 不可变 MemTable 数量</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a>db<span class="op">-&gt;</span>GetProperty<span class="op">(</span><span class="st">&quot;rocksdb.compaction-pending&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span>         <span class="co">// 是否有待执行的 Compaction</span></span></code></pre></div>
+            <p>RocksDB 的 LOG 文件会记录每次 Write Stall
+            事件，包括触发原因和持续时间：</p>
+            <pre class="text"><code>2024/01/15-10:23:45.123456 7f8b2c000000 [WARN] [db/column_family.cc:932] 
+Stalling writes because we have 5 immutable memtables (waiting for flush), 
+max_write_buffer_number is set to 5</code></pre>
+            <p>在生产环境中，建议通过 RocksDB 的 Statistics 接口或
+            Prometheus Exporter 持续监控以下指标：</p>
+            <ul>
+            <li><code>rocksdb.stall.micros</code>：Write Stall
+            的累计时长</li>
+            <li><code>rocksdb.num.files.at.level0</code>：L0 文件数</li>
+            <li><code>rocksdb.compaction.pending.bytes</code>：待
+            Compaction 字节数</li>
+            <li><code>rocksdb.mem.table.flush.pending</code>：待刷盘的
+            MemTable 数</li>
+            </ul>
+            <h3 id="写停顿的缓解策略">7.4 写停顿的缓解策略</h3>
+            <p>针对三种触发条件，分别有对应的缓解思路：</p>
+            <p><strong>L0 文件过多</strong>：增加 Compaction
+            并发度（<code>max_background_compactions</code>），提高 L0
+            到 L1 的 Compaction 速度。或者增大
+            <code>write_buffer_size</code>，使每次 Flush 产生的 SST
+            文件更大，从而减少 L0 文件数量。</p>
+            <p><strong>Compaction 积压</strong>：增加 Compaction
+            线程数，升级到更快的磁盘（例如从 SATA SSD 换到 NVMe
+            SSD），或者调整 Compaction 策略——Level Compaction
+            的写放大较高但读性能好，Universal Compaction
+            的写放大较低但空间放大较高。</p>
+            <p><strong>MemTable 堆积</strong>：增大
+            <code>max_write_buffer_number</code>，给刷盘更多缓冲空间。检查
+            Rate Limiter 是否限制过严，导致 Flush I/O 带宽不足。增加
+            <code>max_background_flushes</code> 以提高 Flush
+            并发度。</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 针对写入密集型负载的参数示例</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_background_compactions <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_background_flushes <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>write_buffer_size <span class="op">=</span> <span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 256MB</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>max_write_buffer_number <span class="op">=</span> <span class="dv">6</span><span class="op">;</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>level0_slowdown_writes_trigger <span class="op">=</span> <span class="dv">40</span><span class="op">;</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>level0_stop_writes_trigger <span class="op">=</span> <span class="dv">56</span><span class="op">;</span></span></code></pre></div>
+            <p>需要注意的是，放宽 Write Stall 触发条件（例如提高
+            <code>level0_stop_writes_trigger</code>）只是推迟问题，不是解决问题。如果后台处理能力确实跟不上前台写入速度，积压最终会耗尽磁盘空间或内存。正确的做法是提高后台处理能力，而不是一味放宽阈值。</p>
+            <hr />
+            <h2 id="八mysql-写入调优实战">八、MySQL 写入调优实战</h2>
+            <h3 id="innodb-写入路径概览">8.1 InnoDB 写入路径概览</h3>
+            <p>MySQL InnoDB 的写入路径与通用 LSM-Tree 有所不同——InnoDB
+            使用 B+ Tree 作为存储结构，而不是 LSM-Tree。但核心的 WAL +
+            Buffer Pool 机制是类似的：</p>
+            <ol type="1">
+            <li>事务的修改先写入 redo log（InnoDB 的 WAL）</li>
+            <li>修改同时在 Buffer Pool 中的页面上原地更新</li>
+            <li>脏页由后台线程异步刷盘</li>
+            <li>binlog 记录逻辑层面的变更（用于复制和 PITR）</li>
+            </ol>
+            <h3 id="关键写入参数">8.2 关键写入参数</h3>
+            <p>以下是影响 MySQL 写入性能的核心参数：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Redo Log 相关</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_flush_log_at_trx_commit </span><span class="ot">=</span><span class="st"> 1   # 事务提交时 fsync redo log</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_log_buffer_size </span><span class="ot">=</span><span class="st"> 64M         # redo log 缓冲区大小（默认 16M）</span></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_redo_log_capacity </span><span class="ot">=</span><span class="st"> 2G        # MySQL 8.0.30+ redo log 总容量</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Binlog 相关</span></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a><span class="dt">sync_binlog </span><span class="ot">=</span><span class="st"> 1                      # 事务提交时 fsync binlog</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="dt">binlog_group_commit_sync_delay </span><span class="ot">=</span><span class="st"> 0   # Group Commit 等待微秒数</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a><span class="dt">binlog_group_commit_sync_no_delay_count </span><span class="ot">=</span><span class="st"> 0  # 达到此事务数立即提交</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Buffer Pool 与刷盘</span></span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_buffer_pool_size </span><span class="ot">=</span><span class="st"> 8G         # Buffer Pool 大小</span></span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_io_capacity </span><span class="ot">=</span><span class="st"> 200             # 后台 I/O 操作的基准速率（IOPS）</span></span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_io_capacity_max </span><span class="ot">=</span><span class="st"> 2000        # 后台 I/O 操作的最大速率</span></span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_flush_neighbors </span><span class="ot">=</span><span class="st"> 0           # SSD 环境关闭邻近页合并刷盘</span></span>
+<span id="cb28-16"><a href="#cb28-16" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_doublewrite </span><span class="ot">=</span><span class="st"> ON              # 双写保护（防止部分页写入）</span></span></code></pre></div>
+            <h3 id="实战调优示例">8.3 实战调优示例</h3>
+            <p>场景：一台配备 NVMe SSD 的数据库服务器，运行 OLTP
+            负载，当前写入吞吐约 8000 TPS，目标提升到 15000 TPS
+            以上。</p>
+            <p><strong>第一步：确认瓶颈。</strong> 使用
+            <code>SHOW ENGINE INNODB STATUS</code> 查看 redo log 和
+            Buffer Pool 的状态：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span></code></pre></div>
+            <p>关注 <code>LOG</code> 部分的
+            <code>Log sequence number</code>、<code>Log flushed up to</code>、<code>Pages flushed up to</code>
+            三个值。如果 <code>Log sequence number</code> 远超
+            <code>Log flushed up to</code>，说明 redo log 的 fsync
+            是瓶颈。</p>
+            <p><strong>第二步：增大 redo log 容量。</strong> redo log
+            容量太小会导致频繁的检查点（Checkpoint），强制刷脏页：</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_redo_log_capacity </span><span class="ot">=</span><span class="st"> 4G   # 从默认值增大</span></span></code></pre></div>
+            <p>MySQL 8.0.30 之前使用 <code>innodb_log_file_size</code>
+            和 <code>innodb_log_files_in_group</code> 两个参数控制 redo
+            log 大小。8.0.30 之后统一为
+            <code>innodb_redo_log_capacity</code>。</p>
+            <p><strong>第三步：启用 Group Commit 延迟。</strong>
+            在高并发 OLTP 场景下，适当增加 Group Commit
+            等待时间可以显著提升吞吐：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="dt">binlog_group_commit_sync_delay </span><span class="ot">=</span><span class="st"> 2000           # 等待 2ms</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="dt">binlog_group_commit_sync_no_delay_count </span><span class="ot">=</span><span class="st"> 32    # 或凑齐 32 个事务</span></span></code></pre></div>
+            <p>这两个参数的含义是：leader 在 Sync 阶段最多等待 2
+            毫秒，或者凑齐 32 个事务后立即
+            fsync，以先到者为准。对于并发连接数较高的场景（例如 100
+            以上），2 毫秒内通常能凑齐几十个事务，fsync
+            的分摊效果非常显著。</p>
+            <p><strong>第四步：调整 I/O 容量参数。</strong>
+            <code>innodb_io_capacity</code> 控制 InnoDB
+            后台刷脏页的速率。默认值 200 对应机械硬盘的 IOPS，NVMe SSD
+            应该大幅调高：</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_io_capacity </span><span class="ot">=</span><span class="st"> </span><span class="dv">10000</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_io_capacity_max </span><span class="ot">=</span><span class="st"> </span><span class="dv">20000</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_flush_neighbors </span><span class="ot">=</span><span class="st"> 0     # SSD 关闭邻近页合并</span></span></code></pre></div>
+            <p><code>innodb_flush_neighbors</code> 在 HDD
+            时代的作用是将相邻脏页合并成一次顺序写入，减少寻道次数。SSD
+            没有寻道问题，开启此选项反而增加不必要的写入放大。MySQL 8.0
+            在 SSD 上默认已设为 0。</p>
+            <p><strong>第五步：增大 redo log buffer。</strong>
+            对于大事务（例如批量 INSERT），更大的 redo log buffer
+            可以减少 redo log 的写入次数：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_log_buffer_size </span><span class="ot">=</span><span class="st"> 64M   # 默认 16M</span></span></code></pre></div>
+            <h3 id="调优效果验证">8.4 调优效果验证</h3>
+            <p>使用 sysbench 验证调优效果：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sysbench</span> oltp_write_only <span class="dt">\</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">--db-driver</span><span class="op">=</span>mysql <span class="dt">\</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-host</span><span class="op">=</span>127.0.0.1 <span class="dt">\</span></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-port</span><span class="op">=</span>3306 <span class="dt">\</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-user</span><span class="op">=</span>sbtest <span class="dt">\</span></span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-password</span><span class="op">=</span>sbtest <span class="dt">\</span></span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--mysql-db</span><span class="op">=</span>sbtest <span class="dt">\</span></span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--tables</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--table-size</span><span class="op">=</span>1000000 <span class="dt">\</span></span>
+<span id="cb34-10"><a href="#cb34-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--threads</span><span class="op">=</span>64 <span class="dt">\</span></span>
+<span id="cb34-11"><a href="#cb34-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time</span><span class="op">=</span>300 <span class="dt">\</span></span>
+<span id="cb34-12"><a href="#cb34-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--report-interval</span><span class="op">=</span>10 <span class="dt">\</span></span>
+<span id="cb34-13"><a href="#cb34-13" aria-hidden="true" tabindex="-1"></a>    run</span></code></pre></div>
+            <p>关注输出中的 <code>transactions</code> 和
+            <code>latency</code> 指标，对比调优前后的 TPS 和 P99
+            延迟。</p>
+            <h3 id="双写与写入性能">8.5 双写与写入性能</h3>
+            <p>InnoDB 的双写缓冲区（Doublewrite
+            Buffer）是防止部分页写入（Partial Page
+            Write）问题的保护机制。在 16KB
+            页面写入磁盘的过程中如果断电，可能只写了一半，导致页面损坏。双写机制先将页面写到双写区域，确认完成后再写到目标位置。</p>
+            <p>双写的代价是每次刷脏页实际写入两次。在 NVMe SSD
+            上，双写带来的额外写入开销约 5% 到 15%。MySQL 8.0.20
+            之后，双写缓冲区的实现从系统表空间迁移到独立文件，并且支持配置到不同磁盘：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_doublewrite_dir </span><span class="ot">=</span><span class="st"> /nvme_fast/doublewrite   # 将双写文件放在更快的磁盘上</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_doublewrite_pages </span><span class="ot">=</span><span class="st"> 64                      # 每批次双写页数</span></span></code></pre></div>
+            <p>如果底层文件系统或硬件已经保证原子写入（例如
+            ZFS、某些支持原子写的 NVMe
+            设备），可以关闭双写以提升写入性能：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="dt">innodb_doublewrite </span><span class="ot">=</span><span class="st"> OFF   # 仅在确认底层支持原子写时关闭</span></span></code></pre></div>
+            <hr />
+            <h2 id="九postgresql-写入调优实战">九、PostgreSQL
+            写入调优实战</h2>
+            <h3 id="postgresql-写入路径">9.1 PostgreSQL 写入路径</h3>
+            <p>PostgreSQL 的写入路径与 MySQL 有显著区别。PostgreSQL
+            使用堆表（Heap Table）+ MVCC（Multi-Version Concurrency
+            Control）模型：</p>
+            <ol type="1">
+            <li>事务修改先写入 WAL（PostgreSQL 的预写日志）</li>
+            <li>修改在共享缓冲区（Shared
+            Buffers）中的数据页上原地更新</li>
+            <li>MVCC 通过在行级别保留旧版本实现，而不是 undo log</li>
+            <li>后台写入进程（Background
+            Writer）和检查点进程（Checkpointer）负责异步刷脏页</li>
+            </ol>
+            <p>PostgreSQL 的 WAL
+            不仅记录逻辑变更，还记录物理页面变更（Full Page
+            Write），这意味着 WAL 的写入量比实际数据变更量大得多。</p>
+            <h3 id="关键写入参数-1">9.2 关键写入参数</h3>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># WAL 相关</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_level </span><span class="ot">=</span><span class="st"> replica                    # WAL 详细程度</span></span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a><span class="dt">synchronous_commit </span><span class="ot">=</span><span class="st"> on                # 事务提交时等待 WAL fsync</span></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_buffers </span><span class="ot">=</span><span class="st"> 64MB                     # WAL 缓冲区大小（默认 -1，自动设置）</span></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_writer_delay </span><span class="ot">=</span><span class="st"> 200ms               # WAL 写入进程的休眠间隔</span></span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_writer_flush_after </span><span class="ot">=</span><span class="st"> 1MB           # WAL 写入进程每累积此量后 fsync</span></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a><span class="dt">commit_delay </span><span class="ot">=</span><span class="st"> 0                       # 分组提交等待时间</span></span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a><span class="dt">commit_siblings </span><span class="ot">=</span><span class="st"> 5                    # 分组提交触发的最小并发事务数</span></span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查点与刷盘</span></span>
+<span id="cb37-11"><a href="#cb37-11" aria-hidden="true" tabindex="-1"></a><span class="dt">checkpoint_timeout </span><span class="ot">=</span><span class="st"> 5min              # 检查点最大间隔</span></span>
+<span id="cb37-12"><a href="#cb37-12" aria-hidden="true" tabindex="-1"></a><span class="dt">checkpoint_completion_target </span><span class="ot">=</span><span class="st"> 0.9     # 检查点完成的时间目标（占间隔比例）</span></span>
+<span id="cb37-13"><a href="#cb37-13" aria-hidden="true" tabindex="-1"></a><span class="dt">max_wal_size </span><span class="ot">=</span><span class="st"> 1GB                     # 触发检查点的 WAL 大小阈值</span></span>
+<span id="cb37-14"><a href="#cb37-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-15"><a href="#cb37-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Full Page Write</span></span>
+<span id="cb37-16"><a href="#cb37-16" aria-hidden="true" tabindex="-1"></a><span class="dt">full_page_writes </span><span class="ot">=</span><span class="st"> on                  # 检查点后首次修改页面时写入完整页</span></span></code></pre></div>
+            <h3 id="full-page-write-与写放大">9.3 Full Page Write
+            与写放大</h3>
+            <p>PostgreSQL 的全页写入（Full Page
+            Write，FPW）是一个容易被忽略的写入放大来源。在每次检查点之后，对某个数据页的第一次修改会导致
+            WAL 中记录整个 8KB
+            页面的内容（而不仅仅是修改的部分）。这是为了防止部分页写入导致的页面损坏——与
+            InnoDB 的双写机制目的相同，但实现方式不同。</p>
+            <p>FPW 的写放大在检查点频繁时尤为严重。假设
+            <code>checkpoint_timeout = 5min</code>，一个频繁更新的表每 5
+            分钟就要把所有被修改的页面在 WAL 中写一遍完整内容。如果表有
+            10 万个活跃页面，每次检查点后 WAL 中会多出近 800MB 的 FPW
+            数据。</p>
+            <p>缓解 FPW 写放大的方法：</p>
+            <ol type="1">
+            <li><strong>增大
+            <code>checkpoint_timeout</code></strong>：从默认的 5
+            分钟增大到 15 到 30 分钟，减少检查点频率，从而减少 FPW
+            次数。代价是崩溃恢复时间增加。</li>
+            <li><strong>增大 <code>max_wal_size</code></strong>：让 WAL
+            有更多空间积累变更，避免因 WAL 大小触发提前检查点。</li>
+            <li><strong>使用
+            <code>wal_compression</code></strong>（PostgreSQL 15+）：对
+            FPW 页面进行压缩，减少 WAL 的物理写入量。</li>
+            </ol>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="dt">checkpoint_timeout </span><span class="ot">=</span><span class="st"> 15min</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a><span class="dt">max_wal_size </span><span class="ot">=</span><span class="st"> 4GB</span></span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_compression </span><span class="ot">=</span><span class="st"> zstd     # PostgreSQL 15+ 支持 pglz、lz4、zstd</span></span></code></pre></div>
+            <h3 id="实战调优示例-1">9.4 实战调优示例</h3>
+            <p>场景：一台 PostgreSQL 17 实例运行高写入 OLTP 负载，128GB
+            内存，NVMe SSD，当前写入吞吐约 12000 TPS，P99
+            延迟偶尔出现尖刺。</p>
+            <p><strong>第一步：分析 WAL 写入量。</strong> 通过
+            <code>pg_stat_wal</code>（PostgreSQL 14+）查看 WAL
+            统计：</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> wal_records, wal_fpi, wal_bytes,</span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a>       wal_fpi:<span class="ch">:float</span> <span class="op">/</span> wal_records <span class="kw">AS</span> fpi_ratio,</span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a>       wal_write, wal_sync,</span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a>       wal_write_time, wal_sync_time</span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_wal;</span></code></pre></div>
+            <p><code>wal_fpi</code>（Full Page Images）与
+            <code>wal_records</code> 的比率反映了 FPW
+            的影响程度。如果比率超过 30%，说明检查点过于频繁。</p>
+            <p><strong>第二步：优化检查点配置。</strong></p>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="dt">checkpoint_timeout </span><span class="ot">=</span><span class="st"> 15min</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="dt">max_wal_size </span><span class="ot">=</span><span class="st"> 8GB</span></span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a><span class="dt">checkpoint_completion_target </span><span class="ot">=</span><span class="st"> </span><span class="fl">0.9</span></span></code></pre></div>
+            <p><code>checkpoint_completion_target = 0.9</code>
+            意味着检查点应在下一次检查点之前 90%
+            的时间内完成刷脏页操作，避免检查点结束时的 I/O 突发。</p>
+            <p><strong>第三步：启用 WAL 压缩。</strong></p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="dt">wal_compression </span><span class="ot">=</span><span class="st"> lz4</span></span></code></pre></div>
+            <p>LZ4 压缩对 CPU 的开销很低（压缩速度约 4GB/s），但可以将
+            FPW 页面压缩 50% 到 70%，显著减少 WAL 的磁盘写入量。</p>
+            <p><strong>第四步：调整分组提交参数。</strong></p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="dt">commit_delay </span><span class="ot">=</span><span class="st"> 100         # 等待 100 微秒</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a><span class="dt">commit_siblings </span><span class="ot">=</span><span class="st"> 10       # 至少 10 个并发事务时才等待</span></span></code></pre></div>
+            <p>对于高并发场景，100 微秒的等待时间可以让多个事务共享一次
+            fsync，提升整体吞吐。</p>
+            <p><strong>第五步：调整 Shared Buffers 和 Background
+            Writer。</strong></p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode ini"><code class="sourceCode ini"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="dt">shared_buffers </span><span class="ot">=</span><span class="st"> 32GB                  # 总内存的 25%</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="dt">bgwriter_lru_maxpages </span><span class="ot">=</span><span class="st"> 1000          # 每轮最多写出的脏页数</span></span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a><span class="dt">bgwriter_lru_multiplier </span><span class="ot">=</span><span class="st"> 4.0         # 脏页写出倍率</span></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="dt">bgwriter_flush_after </span><span class="ot">=</span><span class="st"> 512kB          # 累积写出量达到此值后 fsync</span></span></code></pre></div>
+            <p>Background Writer
+            的作用是在检查点之间持续地将脏页写出，避免检查点时的 I/O
+            突发。增大 <code>bgwriter_lru_maxpages</code> 和
+            <code>bgwriter_lru_multiplier</code> 可以让 Background
+            Writer 更积极地工作。</p>
+            <h3 id="pgbench-验证">9.5 pgbench 验证</h3>
+            <p>使用 pgbench 验证调优效果：</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 初始化测试数据</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbench</span> <span class="at">-i</span> <span class="at">-s</span> 100 testdb</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 运行写入密集型测试</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbench</span> <span class="at">-c</span> 64 <span class="at">-j</span> 8 <span class="at">-T</span> 300 <span class="at">-P</span> 10 <span class="at">--no-vacuum</span> testdb</span></code></pre></div>
+            <p>关注输出中的 TPS 和延迟分布。对比调优前后的 P99
+            延迟尖刺是否减少。</p>
+            <hr />
+            <h2 id="十rocksdb-写入性能分析">十、RocksDB
+            写入性能分析</h2>
+            <h3 id="写入路径全景">10.1 写入路径全景</h3>
+            <p>RocksDB 的写入路径是一个典型的 LSM-Tree
+            实现。一次写入的完整流程如下：</p>
+            <pre class="text"><code>Put(key, value)
+  → 获取写入锁
+  → 写入 WAL（Group Commit）
+  → 插入 Active MemTable
+  → 释放写入锁
+  → 返回成功
+
+后台:
+  → MemTable 达到阈值 → 转为 Immutable MemTable
+  → Flush 线程将 Immutable MemTable 刷盘为 L0 SST 文件
+  → Compaction 线程将 L0 文件合并到更深层级</code></pre>
+            <h3 id="写入选项">10.2 写入选项</h3>
+            <p>RocksDB 的 <code>WriteOptions</code>
+            提供了细粒度的写入控制：</p>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>WriteOptions write_options<span class="op">;</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 持久性控制</span></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a>write_options<span class="op">.</span>sync <span class="op">=</span> <span class="kw">false</span><span class="op">;</span>             <span class="co">// true: 每次写入都 fsync WAL</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a>write_options<span class="op">.</span>disableWAL <span class="op">=</span> <span class="kw">false</span><span class="op">;</span>       <span class="co">// true: 跳过 WAL 写入（断电丢数据）</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a>write_options<span class="op">.</span>no_slowdown <span class="op">=</span> <span class="kw">false</span><span class="op">;</span>      <span class="co">// true: 如果需要降速则直接返回错误</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="co">// 内存写入控制</span></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a>write_options<span class="op">.</span>memtable_insert_hint_per_batch <span class="op">=</span> <span class="kw">false</span><span class="op">;</span>  <span class="co">// 批量写入时使用 hint 优化</span></span>
+<span id="cb46-10"><a href="#cb46-10" aria-hidden="true" tabindex="-1"></a>write_options<span class="op">.</span>protection_bytes_per_key <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>             <span class="co">// 内存数据保护校验字节数</span></span></code></pre></div>
+            <p><code>sync = true</code> 等价于每次写入后调用
+            <code>fsync</code>，性能最差但持久性最强。大多数场景使用
+            <code>sync = false</code>（默认值），此时 WAL 记录只写入
+            Page Cache，由操作系统或后续的 fsync 调用持久化。</p>
+            <p><code>disableWAL = true</code> 完全跳过 WAL
+            写入，写入延迟降低约 50%（省去 WAL
+            序列化和写入开销），但断电时会丢失所有未刷盘的 MemTable
+            数据。只适合可以从其他来源重建数据的场景，例如缓存层或物化视图。</p>
+            <p><code>no_slowdown = true</code>
+            是一个有趣的选项——如果当前系统需要 Write Stall
+            降速，不等待而是直接返回 <code>Status::Incomplete()</code>
+            错误。这允许应用层自己实现限速策略或将请求转发到其他节点。</p>
+            <h3 id="compaction-策略对写入性能的影响">10.3 Compaction
+            策略对写入性能的影响</h3>
+            <p>RocksDB 支持多种 Compaction
+            策略，不同策略对写入性能的影响差异很大：</p>
+            <table>
+            <colgroup>
+            <col style="width: 32%" />
+            <col style="width: 16%" />
+            <col style="width: 18%" />
+            <col style="width: 16%" />
+            <col style="width: 18%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>Compaction 策略</th>
+            <th>写放大</th>
+            <th>空间放大</th>
+            <th>读放大</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Level（默认）</td>
+            <td>高（10-30x）</td>
+            <td>低（~1.1x）</td>
+            <td>低</td>
+            <td>读多写少、空间敏感</td>
+            </tr>
+            <tr>
+            <td>Universal</td>
+            <td>低（2-10x）</td>
+            <td>高（可达 2x）</td>
+            <td>中</td>
+            <td>写多读少、SSD 寿命敏感</td>
+            </tr>
+            <tr>
+            <td>FIFO</td>
+            <td>最低（~1x）</td>
+            <td>最低</td>
+            <td>高</td>
+            <td>时序数据、TTL 场景</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>Level Compaction</strong>（Leveled
+            Compaction）是默认策略。每一层的大小是上一层的
+            <code>max_bytes_for_level_multiplier</code> 倍（默认
+            10）。Compaction 将 L(n) 的一个文件与 L(n+1)
+            中键范围重叠的所有文件合并，写放大较高但保证每层内没有重叠，读性能好。</p>
+            <p><strong>Universal Compaction</strong>
+            采用”全量合并”或”部分合并”策略，通过 <code>size_ratio</code>
+            参数控制哪些文件需要合并。写放大显著低于 Level
+            Compaction，但合并时的临时空间占用更高。对于写入密集型负载（例如日志存储），Universal
+            Compaction 可以将写放大从 20x 降低到 5x 左右。</p>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_style <span class="op">=</span> rocksdb<span class="op">::</span>kCompactionStyleUniversal<span class="op">;</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_options_universal<span class="op">.</span>size_ratio <span class="op">=</span> <span class="dv">1</span><span class="op">;</span>        <span class="co">// 触发合并的大小比例</span></span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_options_universal<span class="op">.</span>min_merge_width <span class="op">=</span> <span class="dv">2</span><span class="op">;</span>   <span class="co">// 最少合并文件数</span></span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_options_universal<span class="op">.</span>max_merge_width <span class="op">=</span> <span class="dv">8</span><span class="op">;</span>   <span class="co">// 最多合并文件数</span></span></code></pre></div>
+            <p><strong>FIFO Compaction</strong>
+            是最简单的策略——达到空间上限时直接删除最老的 SST
+            文件。适用于时序数据或有 TTL 的场景，写放大接近
+            1x（没有合并开销），但不支持范围查询和更新操作。</p>
+            <h3 id="direct-io-与写入性能">10.4 Direct I/O
+            与写入性能</h3>
+            <p>RocksDB 支持对不同类型的 I/O 使用直接 I/O（Direct
+            I/O），绕过操作系统的 Page Cache：</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>use_direct_reads <span class="op">=</span> <span class="kw">true</span><span class="op">;</span>                  <span class="co">// SST 文件读取使用 Direct I/O</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>use_direct_io_for_flush_and_compaction <span class="op">=</span> <span class="kw">true</span><span class="op">;</span>  <span class="co">// Flush 和 Compaction 使用 Direct I/O</span></span></code></pre></div>
+            <p>对于写入性能，<code>use_direct_io_for_flush_and_compaction = true</code>
+            有两个效果：</p>
+            <p>第一，减少 Page Cache 污染。Flush 和 Compaction
+            产生的大量顺序写入不会占用 Page
+            Cache，将缓存空间留给频繁访问的热数据。</p>
+            <p>第二，可能略微增加写入延迟。Direct I/O 绕过了 Page Cache
+            的缓冲作用，每次写入直接到磁盘。但由于 Flush 和 Compaction
+            本身是后台操作，这个延迟增加不会直接影响前台写入。</p>
+            <p>WAL 文件通常不建议使用 Direct I/O——WAL
+            的写入量较小但频繁，Page Cache 的缓冲效果对 WAL
+            性能有正面作用。</p>
+            <h3 id="db_bench-实战">10.5 db_bench 实战</h3>
+            <p>RocksDB 自带的 <code>db_bench</code>
+            是测量写入性能的标准工具：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 基线测试：随机写入 1000 万条记录</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="ex">db_bench</span> <span class="dt">\</span></span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">--benchmarks</span><span class="op">=</span>fillrandom <span class="dt">\</span></span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--num</span><span class="op">=</span>10000000 <span class="dt">\</span></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--value_size</span><span class="op">=</span>1024 <span class="dt">\</span></span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--key_size</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--compression_type</span><span class="op">=</span>none <span class="dt">\</span></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--write_buffer_size</span><span class="op">=</span>67108864 <span class="dt">\</span></span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--max_write_buffer_number</span><span class="op">=</span>3 <span class="dt">\</span></span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">--target_file_size_base</span><span class="op">=</span>67108864 <span class="dt">\</span></span>
+<span id="cb49-11"><a href="#cb49-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">--max_bytes_for_level_base</span><span class="op">=</span>268435456 <span class="dt">\</span></span>
+<span id="cb49-12"><a href="#cb49-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">--threads</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb49-13"><a href="#cb49-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">--statistics</span><span class="op">=</span>1</span>
+<span id="cb49-14"><a href="#cb49-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-15"><a href="#cb49-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 测试 Universal Compaction 的写入性能</span></span>
+<span id="cb49-16"><a href="#cb49-16" aria-hidden="true" tabindex="-1"></a><span class="ex">db_bench</span> <span class="dt">\</span></span>
+<span id="cb49-17"><a href="#cb49-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">--benchmarks</span><span class="op">=</span>fillrandom <span class="dt">\</span></span>
+<span id="cb49-18"><a href="#cb49-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--num</span><span class="op">=</span>10000000 <span class="dt">\</span></span>
+<span id="cb49-19"><a href="#cb49-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--value_size</span><span class="op">=</span>1024 <span class="dt">\</span></span>
+<span id="cb49-20"><a href="#cb49-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--key_size</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb49-21"><a href="#cb49-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--compaction_style</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb49-22"><a href="#cb49-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">--write_buffer_size</span><span class="op">=</span>134217728 <span class="dt">\</span></span>
+<span id="cb49-23"><a href="#cb49-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">--max_write_buffer_number</span><span class="op">=</span>4 <span class="dt">\</span></span>
+<span id="cb49-24"><a href="#cb49-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">--threads</span><span class="op">=</span>8 <span class="dt">\</span></span>
+<span id="cb49-25"><a href="#cb49-25" aria-hidden="true" tabindex="-1"></a>    <span class="at">--statistics</span><span class="op">=</span>1</span></code></pre></div>
+            <p><code>db_bench</code> 的输出包含
+            ops/s、延迟分位数和写放大统计。对比两次运行的结果，可以量化
+            Compaction 策略对写入性能的影响。</p>
+            <h3 id="写入性能调优检查清单">10.6 写入性能调优检查清单</h3>
+            <p>在 RocksDB 写入性能调优时，按以下顺序排查：</p>
+            <ol type="1">
+            <li><strong>确认磁盘性能</strong>：用 fio 测量裸盘的 fsync
+            延迟和顺序写带宽，确定硬件上限。</li>
+            <li><strong>检查 Write Stall</strong>：查看 LOG 文件和
+            <code>rocksdb.stall.micros</code>
+            指标，确认是否有写停顿。</li>
+            <li><strong>调整 MemTable
+            大小</strong>：<code>write_buffer_size</code> 和
+            <code>max_write_buffer_number</code>
+            是影响最大的两个参数。</li>
+            <li><strong>调整 Compaction 并发度</strong>：增加
+            <code>max_background_compactions</code> 和
+            <code>max_background_flushes</code>。</li>
+            <li><strong>选择合适的 Compaction
+            策略</strong>：写入密集型负载考虑 Universal
+            Compaction。</li>
+            <li><strong>考虑 Rate Limiter</strong>：避免 Compaction
+            占满磁盘带宽影响前台写入。</li>
+            <li><strong>评估 WAL 配置</strong>：是否需要
+            <code>sync = true</code>，是否可以
+            <code>disableWAL</code>。</li>
+            <li><strong>评估 Direct I/O</strong>：大数据量场景考虑开启
+            Flush/Compaction 的 Direct I/O。</li>
+            </ol>
+            <hr />
+            <h2 id="十一参考文献">十一、参考文献</h2>
+            <ol type="1">
+            <li><p>Facebook Engineering. “RocksDB Tuning Guide.” GitHub
+            Wiki, <a
+            href="https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide"
+            class="uri">https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide</a></p></li>
+            <li><p>Mark Callaghan. “Read, Write &amp; Space
+            Amplification - Pick 2.” RocksDB Blog, 2015. <a
+            href="http://rocksdb.org/blog/2015/07/23/dynamic-level.html"
+            class="uri">http://rocksdb.org/blog/2015/07/23/dynamic-level.html</a></p></li>
+            <li><p>MySQL Reference Manual. “Optimizing InnoDB Disk I/O.”
+            Oracle Documentation, <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/optimizing-innodb-diskio.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/optimizing-innodb-diskio.html</a></p></li>
+            <li><p>PostgreSQL Documentation. “WAL Configuration.”
+            PostgreSQL 17 Documentation, <a
+            href="https://www.postgresql.org/docs/17/wal-configuration.html"
+            class="uri">https://www.postgresql.org/docs/17/wal-configuration.html</a></p></li>
+            <li><p>PostgreSQL Documentation. “Reliability and the
+            Write-Ahead Log.” PostgreSQL 17 Documentation, <a
+            href="https://www.postgresql.org/docs/17/wal-reliability.html"
+            class="uri">https://www.postgresql.org/docs/17/wal-reliability.html</a></p></li>
+            <li><p>Siying Dong, Mark Callaghan, Leonidas Galanis, Dhruba
+            Borthakur, Tony Savor, Michael Strum. “Optimizing Space
+            Amplification in RocksDB.” CIDR 2017.</p></li>
+            <li><p>MySQL Reference Manual. “Binary Log Group Commit.”
+            Oracle Documentation, <a
+            href="https://dev.mysql.com/doc/refman/8.0/en/replication-options-binary-log.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/replication-options-binary-log.html</a></p></li>
+            <li><p>RocksDB Wiki. “Write Stalls.” GitHub, <a
+            href="https://github.com/facebook/rocksdb/wiki/Write-Stalls"
+            class="uri">https://github.com/facebook/rocksdb/wiki/Write-Stalls</a></p></li>
+            <li><p>RocksDB Wiki. “Rate Limiter.” GitHub, <a
+            href="https://github.com/facebook/rocksdb/wiki/Rate-Limiter"
+            class="uri">https://github.com/facebook/rocksdb/wiki/Rate-Limiter</a></p></li>
+            <li><p>PostgreSQL Wiki. “Tuning Your PostgreSQL Server.” <a
+            href="https://wiki.postgresql.org/wiki/Tuning_Your_PostgreSQL_Server"
+            class="uri">https://wiki.postgresql.org/wiki/Tuning_Your_PostgreSQL_Server</a></p></li>
+            <li><p>Lanyue Lu, Thanumalayan Sankaranarayana Pillai,
+            Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau. “WiscKey:
+            Separating Keys from Values in SSD-conscious Storage.” FAST
+            2016.</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../66-cache-engineering/cache-engineering.html">缓存工程：从
+            Page Cache 到应用层缓存</a></p>
+            <p><strong>下一篇</strong>: <a
+            href="../68-read-optimization/read-optimization.html">读取性能优化</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-28 · linux / storage</p>
+                    <h3><a href="/post/linux/fsync-error-truth/fsync-error-truth.html">fsync 失败的真相：当它返回错误，你的数据可能已经没了</a></h3>
+                    <p>fsync() 返回 EIO 后再调一次为什么会成功？为什么这反而是灾难？从 2018 fsyncgate 到 Linux errseq_t，再到本机内核 6.6 上用 dm-error 单块故障注入的实测，讲清 writeback 失败时脏页被标记 clean、数据静默丢失的真相，以及 PostgreSQL 为什么选择 PANIC。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-21 · storage</p>
+                    <h3><a href="/post/storage/12-data-integrity/data-integrity.html">【存储工程】数据完整性：从 fsync 到端到端校验</a></h3>
+                    <p>数据丢失最令人恐惧的形式不是磁盘报错——而是数据悄无声息地变了，没有任何告警，没有任何日志，直到几个月后你从备份里恢复出一堆损坏的文件，才发现&quot;完整性&quot;这个词从来就不是理所当然的。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-19 · storage</p>
+                    <h3><a href="/post/storage/10-direct-io/direct-io.html">【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</a></h3>
+                    <p>在 Linux 的传统 I/O 路径中，应用程序通过 read() 和 write() 系统调用与文件交互时，数据并不会直接在用户空间缓冲区（User Buffer）和磁盘之间传输。内核会在两者之间插入一层页缓存（Page Cache），作为磁盘数据在内存中的缓存副本。一次典型的写入流程如下：</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-05 · storage</p>
+                    <h3><a href="/post/storage/27-wal-aries/wal-aries.html">【存储工程】WAL 与崩溃恢复：ARIES 协议</a></h3>
+                    <p>WAL 是数据库持久性的基石，ARIES 是工业界公认最完备的崩溃恢复协议。本文从 WAL 三条规则出发，逐步拆解 ARIES 的 Analysis-Redo-Undo 三阶段，结合 InnoDB 实现分析恢复全流程。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,1795 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】Bitcask 与日志结构哈希表 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="bitcask, log-structured, hash-index, compaction, riak, append-only, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/30-bitcask/bitcask.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】Bitcask 与日志结构哈希表" />
+    <meta property="og:description" content="在存储引擎（Storage Engine）的设计谱系中，Bitcask 占据着一个独特而优雅的位置： 它用最简单的数据结构——哈希表（Hash Table）与追加日志（Append-Only Log）—— 组合出了一个在特定工作负载下性能极其出色的键值存储引擎。 本文将从核心思想出发，逐层拆解 Bitcask 的架构、…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/30-bitcask/bitcask.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="bitcask" />
+    <meta property="article:tag" content="log-structured" />
+    <meta property="article:tag" content="hash-index" />
+    <meta property="article:tag" content="compaction" />
+    <meta property="article:tag" content="riak" />
+    <meta property="article:tag" content="append-only" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】Bitcask 与日志结构哈希表" />
+    <meta name="twitter:description" content="在存储引擎（Storage Engine）的设计谱系中，Bitcask 占据着一个独特而优雅的位置： 它用最简单的数据结构——哈希表（Hash Table）与追加日志（Append-Only Log）—— 组合出了一个在特定工作负载下性能极其出色的键值存储引擎。 本文将从核心思想出发，逐层拆解 Bitcask 的架构、…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】Bitcask 与日志结构哈希表", "description": "在存储引擎（Storage Engine）的设计谱系中，Bitcask 占据着一个独特而优雅的位置： 它用最简单的数据结构——哈希表（Hash Table）与追加日志（Append-Only Log）—— 组合出了一个在特定工作负载下性能极其出色的键值存储引擎。 本文将从核心思想出发，逐层拆解 Bitcask 的架构、…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/30-bitcask/bitcask.html"}, "datePublished": "2025-09-08T00:00:00+00:00", "dateModified": "2026-04-15T11:33:47+00:00", "keywords": ["bitcask", "log-structured", "hash-index", "compaction", "riak", "append-only"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】Bitcask 与日志结构哈希表</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-08</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#bitcask</span> <span>#log-structured</span> <span>#hash-index</span> <span>#compaction</span> <span>#riak</span> <span>#append-only</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/29-index-structures/index-structures.html">上一篇：【存储工程】索引结构：从 B+Tree 到倒排索引</a><a class="post-series-nav__link" href="/post/storage/31-lsm-tree-tuning/lsm-tree-tuning.html">下一篇：【存储工程】LSM-Tree 工程调优：三种放大的权衡</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/bitcask.html">#bitcask</a><a class="chip-link" href="/tags/log-structured.html">#log-structured</a><a class="chip-link" href="/tags/hash-index.html">#hash-index</a><a class="chip-link" href="/tags/compaction.html">#compaction</a><a class="chip-link" href="/tags/riak.html">#riak</a><a class="chip-link" href="/tags/append-only.html">#append-only</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#bitcask-与日志结构哈希表"
+                id="toc-bitcask-与日志结构哈希表">Bitcask
+                与日志结构哈希表</a>
+                <ul>
+                <li><a href="#一日志结构存储的核心思想"
+                id="toc-一日志结构存储的核心思想">一、日志结构存储的核心思想</a>
+                <ul>
+                <li><a href="#什么是追加写入"
+                id="toc-什么是追加写入">1.1 什么是追加写入</a></li>
+                <li><a href="#不可变日志的概念"
+                id="toc-不可变日志的概念">1.2 不可变日志的概念</a></li>
+                <li><a href="#为什么顺序-io-如此重要"
+                id="toc-为什么顺序-io-如此重要">1.3 为什么顺序 I/O
+                如此重要</a></li>
+                <li><a href="#日志结构的历史脉络"
+                id="toc-日志结构的历史脉络">1.4
+                日志结构的历史脉络</a></li>
+                </ul></li>
+                <li><a href="#二bitcask-架构"
+                id="toc-二bitcask-架构">二、Bitcask 架构</a>
+                <ul>
+                <li><a href="#论文背景" id="toc-论文背景">2.1
+                论文背景</a></li>
+                <li><a href="#整体架构概览" id="toc-整体架构概览">2.2
+                整体架构概览</a></li>
+                <li><a href="#keydir内存中的索引"
+                id="toc-keydir内存中的索引">2.3
+                KeyDir：内存中的索引</a></li>
+                <li><a href="#数据文件格式" id="toc-数据文件格式">2.4
+                数据文件格式</a></li>
+                <li><a href="#单次磁盘读取的保证"
+                id="toc-单次磁盘读取的保证">2.5
+                单次磁盘读取的保证</a></li>
+                </ul></li>
+                <li><a href="#三写入路径"
+                id="toc-三写入路径">三、写入路径</a>
+                <ul>
+                <li><a href="#写入流程详解" id="toc-写入流程详解">3.1
+                写入流程详解</a></li>
+                <li><a href="#写入性能分析" id="toc-写入性能分析">3.2
+                写入性能分析</a></li>
+                <li><a href="#删除操作" id="toc-删除操作">3.3
+                删除操作</a></li>
+                <li><a href="#持久性保证" id="toc-持久性保证">3.4
+                持久性保证</a></li>
+                <li><a href="#并发写入" id="toc-并发写入">3.5
+                并发写入</a></li>
+                </ul></li>
+                <li><a href="#四读取路径"
+                id="toc-四读取路径">四、读取路径</a>
+                <ul>
+                <li><a href="#读取流程详解" id="toc-读取流程详解">4.1
+                读取流程详解</a></li>
+                <li><a href="#文件描述符管理"
+                id="toc-文件描述符管理">4.2 文件描述符管理</a></li>
+                <li><a href="#读取性能分析" id="toc-读取性能分析">4.3
+                读取性能分析</a></li>
+                <li><a href="#读取放大" id="toc-读取放大">4.4
+                读取放大</a></li>
+                <li><a href="#scan-与遍历" id="toc-scan-与遍历">4.5 Scan
+                与遍历</a></li>
+                </ul></li>
+                <li><a href="#五合并compaction与-hint-file"
+                id="toc-五合并compaction与-hint-file">五、合并（Compaction）与
+                Hint File</a>
+                <ul>
+                <li><a href="#为什么需要合并"
+                id="toc-为什么需要合并">5.1 为什么需要合并</a></li>
+                <li><a href="#合并流程" id="toc-合并流程">5.2
+                合并流程</a></li>
+                <li><a href="#判断记录是否最新"
+                id="toc-判断记录是否最新">5.3 判断记录是否最新</a></li>
+                <li><a href="#hint-file-的结构与作用"
+                id="toc-hint-file-的结构与作用">5.4 Hint File
+                的结构与作用</a></li>
+                <li><a href="#合并策略" id="toc-合并策略">5.5
+                合并策略</a></li>
+                <li><a href="#合并过程中的读写影响"
+                id="toc-合并过程中的读写影响">5.6
+                合并过程中的读写影响</a></li>
+                </ul></li>
+                <li><a href="#六崩溃恢复"
+                id="toc-六崩溃恢复">六、崩溃恢复</a>
+                <ul>
+                <li><a href="#恢复的基本原理"
+                id="toc-恢复的基本原理">6.1 恢复的基本原理</a></li>
+                <li><a href="#恢复流程" id="toc-恢复流程">6.2
+                恢复流程</a></li>
+                <li><a href="#crc-校验的作用"
+                id="toc-crc-校验的作用">6.3 CRC 校验的作用</a></li>
+                <li><a href="#启动时间优化" id="toc-启动时间优化">6.4
+                启动时间优化</a></li>
+                <li><a href="#部分写入与原子性"
+                id="toc-部分写入与原子性">6.5 部分写入与原子性</a></li>
+                </ul></li>
+                <li><a href="#七bitcask-的局限"
+                id="toc-七bitcask-的局限">七、Bitcask 的局限</a>
+                <ul>
+                <li><a href="#所有键必须装入内存"
+                id="toc-所有键必须装入内存">7.1
+                所有键必须装入内存</a></li>
+                <li><a href="#不支持范围查询"
+                id="toc-不支持范围查询">7.2 不支持范围查询</a></li>
+                <li><a href="#值大小的考量" id="toc-值大小的考量">7.3
+                值大小的考量</a></li>
+                <li><a href="#启动时间" id="toc-启动时间">7.4
+                启动时间</a></li>
+                <li><a href="#写放大" id="toc-写放大">7.5
+                写放大</a></li>
+                <li><a href="#单写者限制" id="toc-单写者限制">7.6
+                单写者限制</a></li>
+                </ul></li>
+                <li><a href="#八riak-中的-bitcask"
+                id="toc-八riak-中的-bitcask">八、Riak 中的 Bitcask</a>
+                <ul>
+                <li><a href="#riak-简介" id="toc-riak-简介">8.1 Riak
+                简介</a></li>
+                <li><a href="#bitcask-作为-riak-的后端"
+                id="toc-bitcask-作为-riak-的后端">8.2 Bitcask 作为 Riak
+                的后端</a></li>
+                <li><a href="#运维经验" id="toc-运维经验">8.3
+                运维经验</a></li>
+                <li><a href="#bitcask-与-leveldb-的选择"
+                id="toc-bitcask-与-leveldb-的选择">8.4 Bitcask 与
+                LevelDB 的选择</a></li>
+                <li><a href="#riak-退出后的-bitcask-遗产"
+                id="toc-riak-退出后的-bitcask-遗产">8.5 Riak 退出后的
+                Bitcask 遗产</a></li>
+                </ul></li>
+                <li><a href="#九用-go-实现简化版-bitcask"
+                id="toc-九用-go-实现简化版-bitcask">九、用 Go 实现简化版
+                Bitcask</a>
+                <ul>
+                <li><a href="#设计概述" id="toc-设计概述">9.1
+                设计概述</a></li>
+                <li><a href="#数据结构定义" id="toc-数据结构定义">9.2
+                数据结构定义</a></li>
+                <li><a href="#引擎初始化与恢复"
+                id="toc-引擎初始化与恢复">9.3 引擎初始化与恢复</a></li>
+                <li><a href="#写入与删除" id="toc-写入与删除">9.4
+                写入与删除</a></li>
+                <li><a href="#读取" id="toc-读取">9.5 读取</a></li>
+                <li><a href="#合并" id="toc-合并">9.6 合并</a></li>
+                <li><a href="#关闭" id="toc-关闭">9.7 关闭</a></li>
+                <li><a href="#使用示例" id="toc-使用示例">9.8
+                使用示例</a></li>
+                <li><a href="#实现要点总结" id="toc-实现要点总结">9.9
+                实现要点总结</a></li>
+                </ul></li>
+                <li><a href="#十bitcask-vs-lsm-tree-vs-btree"
+                id="toc-十bitcask-vs-lsm-tree-vs-btree">十、Bitcask vs
+                LSM-Tree vs B+Tree</a>
+                <ul>
+                <li><a href="#三种引擎概述" id="toc-三种引擎概述">10.1
+                三种引擎概述</a></li>
+                <li><a href="#详细对比" id="toc-详细对比">10.2
+                详细对比</a></li>
+                <li><a href="#写入性能对比" id="toc-写入性能对比">10.3
+                写入性能对比</a></li>
+                <li><a href="#读取性能对比" id="toc-读取性能对比">10.4
+                读取性能对比</a></li>
+                <li><a href="#何时选择-bitcask"
+                id="toc-何时选择-bitcask">10.5 何时选择 Bitcask</a></li>
+                <li><a href="#混合使用策略" id="toc-混合使用策略">10.6
+                混合使用策略</a></li>
+                <li><a href="#进一步的思考" id="toc-进一步的思考">10.7
+                进一步的思考</a></li>
+                </ul></li>
+                <li><a href="#参考文献"
+                id="toc-参考文献">参考文献</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="bitcask-与日志结构哈希表">Bitcask
+            与日志结构哈希表</h1>
+            <p>在存储引擎（Storage Engine）的设计谱系中，Bitcask
+            占据着一个独特而优雅的位置：
+            它用最简单的数据结构——哈希表（Hash
+            Table）与追加日志（Append-Only Log）——
+            组合出了一个在特定工作负载下性能极其出色的键值存储引擎。
+            本文将从核心思想出发，逐层拆解 Bitcask 的架构、读写路径、
+            合并回收、崩溃恢复，再到工程实践与横向对比，
+            力求让读者对这一经典设计形成完整认知。</p>
+            <hr />
+            <h2
+            id="一日志结构存储的核心思想">一、日志结构存储的核心思想</h2>
+            <h3 id="什么是追加写入">1.1 什么是追加写入</h3>
+            <p>传统的存储系统——无论是关系型数据库（Relational
+            Database）还是早期的键值存储—— 通常采用”就地更新（In-Place
+            Update）“策略：
+            当一条记录被修改时，引擎会在磁盘上找到该记录原来的位置，直接覆盖旧数据。
+            这种方式看起来直观，但在机械硬盘（HDD）时代却隐含着巨大的性能代价：
+            随机写入（Random
+            Write）需要磁头寻道（Seek），耗时通常在毫秒级别。</p>
+            <p>日志结构存储（Log-Structured Storage）提出了另一种思路：
+            <strong>所有写入都以追加（Append）的方式写到文件末尾，绝不回头修改已写入的数据。</strong>
+            这一简单的约束带来了三个关键优势：</p>
+            <ol type="1">
+            <li><strong>顺序写入（Sequential
+            Write）</strong>：磁盘的顺序写入带宽远高于随机写入， 在 HDD
+            上可以轻松达到 100 MB/s 以上，而随机写入往往只有几
+            MB/s。</li>
+            <li><strong>写入原子性天然友好</strong>：追加写入要么成功、要么不成功，
+            不存在”写了一半覆盖了旧数据”的中间状态，这大幅简化了崩溃恢复逻辑。</li>
+            <li><strong>并发控制简化</strong>：由于旧数据不会被修改，读操作可以安全地访问历史版本，
+            而不需要复杂的锁机制。</li>
+            </ol>
+            <h3 id="不可变日志的概念">1.2 不可变日志的概念</h3>
+            <p>不可变日志（Immutable Log）是日志结构存储的基石。
+            每一次写操作——无论是插入（Insert）、更新（Update）还是删除（Delete）——
+            都会在日志文件的尾部追加一条新记录。
+            对于更新操作，新记录包含同一个键（Key）的最新值（Value）；
+            对于删除操作，新记录是一个特殊的墓碑标记（Tombstone）。</p>
+            <p>这意味着同一个键可能在日志中出现多次，只有最后一条记录是有效的。
+            这看起来会浪费磁盘空间，但正如我们后面会看到的，
+            通过合并（Compaction）过程可以定期回收这些空间。</p>
+            <p>下面用一个简单的例子来说明：</p>
+            <pre class="text"><code>时间线 →
+
+写入 key=a, value=100    [a:100]
+写入 key=b, value=200    [a:100][b:200]
+更新 key=a, value=150    [a:100][b:200][a:150]
+删除 key=b               [a:100][b:200][a:150][b:tombstone]</code></pre>
+            <p>在上面的日志中，<code>a</code> 的最新值是
+            150，<code>b</code> 已被删除。
+            前两条记录（<code>a:100</code> 和
+            <code>b:200</code>）都是过时的，可以在合并时被清除。</p>
+            <h3 id="为什么顺序-io-如此重要">1.3 为什么顺序 I/O
+            如此重要</h3>
+            <p>为了更直观地理解顺序 I/O（Sequential I/O）与随机
+            I/O（Random I/O）的性能差距，
+            下面给出一组典型的磁盘性能数据：</p>
+            <pre class="text"><code>┌─────────────────────┬──────────────┬──────────────┐
+│ 指标                │ HDD (7200r)  │ SSD (NVMe)   │
+├─────────────────────┼──────────────┼──────────────┤
+│ 顺序读带宽          │ ~150 MB/s    │ ~3500 MB/s   │
+│ 顺序写带宽          │ ~130 MB/s    │ ~3000 MB/s   │
+│ 随机读 IOPS         │ ~150         │ ~500,000     │
+│ 随机写 IOPS         │ ~150         │ ~400,000     │
+│ 随机读延迟          │ ~8 ms        │ ~0.1 ms      │
+│ 顺序读延迟          │ ~2 ms        │ ~0.02 ms     │
+└─────────────────────┴──────────────┴──────────────┘</code></pre>
+            <p>即使在 SSD 上，顺序 I/O 仍然比随机 I/O 快数倍。
+            原因包括：操作系统（Operating
+            System）的预读（Read-Ahead）优化、 SSD
+            内部的并行通道利用率、以及减少的 FTL 映射压力。</p>
+            <p>因此，日志结构存储在几乎所有存储介质上都能获得更好的写入吞吐量。
+            这也正是 Bitcask 选择追加写入作为其核心设计的根本原因。</p>
+            <h3 id="日志结构的历史脉络">1.4 日志结构的历史脉络</h3>
+            <p>日志结构的思想最早可以追溯到 1990 年代的日志结构文件系统
+            （Log-Structured File System, LFS）， 由 Rosenblum 和
+            Ousterhout 在论文中提出。
+            此后，这一思想被广泛应用于各种存储系统中：</p>
+            <ul>
+            <li><strong>日志结构合并树（Log-Structured Merge-Tree,
+            LSM-Tree）</strong>：
+            将日志与排序结构结合，支持范围查询（Range Query）。</li>
+            <li><strong>Bitcask</strong>：将日志与内存哈希表结合，追求极致的单点读写性能。</li>
+            <li><strong>预写日志（Write-Ahead Log, WAL）</strong>：
+            几乎所有数据库都使用 WAL
+            来保证事务持久性（Durability）。</li>
+            </ul>
+            <p>这些系统虽然在具体实现上各有不同，
+            但都共享同一个核心洞察：<strong>追加写入是磁盘最高效的写入模式。</strong></p>
+            <hr />
+            <h2 id="二bitcask-架构">二、Bitcask 架构</h2>
+            <h3 id="论文背景">2.1 论文背景</h3>
+            <p>Bitcask 最初由 Basho Technologies 设计并实现，
+            作为分布式数据库 Riak 的默认存储后端（Storage Backend）。
+            其设计思想记录在 2010 年发布的经典论文 “Bitcask: A
+            Log-Structured Hash Table for Fast Key/Value Data” 中。</p>
+            <p>论文开篇就提出了一个简洁的设计目标：</p>
+            <blockquote>
+            <p>A storage system that provides low latency per item read
+            or written, high throughput especially when writing an
+            incoming stream of random items, ability to handle datasets
+            much larger than RAM, and crash friendliness.</p>
+            </blockquote>
+            <p>翻译过来就是：低延迟、高吞吐、支持大数据集、崩溃友好。
+            Bitcask 用最简洁的数据结构实现了这些目标。</p>
+            <h3 id="整体架构概览">2.2 整体架构概览</h3>
+            <p>Bitcask 的架构可以用两个核心组件来概括：</p>
+            <ol type="1">
+            <li><strong>内存哈希表（KeyDir）</strong>：
+            存储每个键到其最新值在磁盘上位置的映射。</li>
+            <li><strong>磁盘数据文件（Data Files）</strong>：
+            以追加方式写入的不可变日志文件。</li>
+            </ol>
+            <p>整体架构如下图所示：</p>
+            <pre class="text"><code>                    ┌─────────────────────────────────┐
+                    │         内存（Memory）           │
+                    │                                  │
+                    │  ┌───────────────────────────┐   │
+                    │  │        KeyDir              │   │
+                    │  │                            │   │
+                    │  │  key → (file_id,           │   │
+                    │  │         offset,             │   │
+                    │  │         size,               │   │
+                    │  │         timestamp)          │   │
+                    │  └───────────────────────────┘   │
+                    └──────────────┬──────────────────┘
+                                   │
+                                   │ 查找
+                                   ▼
+                    ┌─────────────────────────────────┐
+                    │         磁盘（Disk）             │
+                    │                                  │
+                    │  ┌─────────┐  ┌─────────┐       │
+                    │  │ data    │  │ data    │ ...   │
+                    │  │ file 1  │  │ file 2  │       │
+                    │  │ (旧)    │  │ (旧)    │       │
+                    │  └─────────┘  └─────────┘       │
+                    │                                  │
+                    │  ┌─────────┐                    │
+                    │  │ active  │ ← 当前写入文件     │
+                    │  │ file    │                    │
+                    │  └─────────┘                    │
+                    └─────────────────────────────────┘</code></pre>
+            <h3 id="keydir内存中的索引">2.3 KeyDir：内存中的索引</h3>
+            <p>KeyDir
+            是一个常驻内存的哈希表，其中每个条目包含以下信息：</p>
+            <pre class="text"><code>┌──────────┬──────────────────────────────────────┐
+│ 字段     │ 说明                                 │
+├──────────┼──────────────────────────────────────┤
+│ key      │ 键（作为哈希表的查找键）             │
+│ file_id  │ 值所在的数据文件编号                 │
+│ offset   │ 值在该数据文件中的字节偏移量         │
+│ size     │ 值记录的总字节大小                   │
+│ tstamp   │ 写入时间戳                           │
+└──────────┴──────────────────────────────────────┘</code></pre>
+            <p>KeyDir 的内存开销可以这样估算： 假设平均键长度为 32
+            字节，每个条目的元数据占 24 字节（file_id 4 字节 + offset 8
+            字节 + size 4 字节 + tstamp 8 字节），
+            加上哈希表自身的开销（指针、负载因子等），每个键约需 80-100
+            字节。 因此，1 亿个键大约需要 8-10 GB 内存。</p>
+            <h3 id="数据文件格式">2.4 数据文件格式</h3>
+            <p>磁盘上的每条记录（Entry）采用以下格式：</p>
+            <pre class="text"><code>┌────────┬────────┬─────────┬──────────┬───────┬───────┐
+│ crc32  │ tstamp │ key_sz  │ value_sz │ key   │ value │
+│ 4 字节 │ 8 字节 │ 4 字节  │ 4 字节   │ 变长  │ 变长  │
+└────────┴────────┴─────────┴──────────┴───────┴───────┘</code></pre>
+            <p>其中：</p>
+            <ul>
+            <li><strong>crc32</strong>：循环冗余校验码（Cyclic
+            Redundancy Check）， 用于检测数据损坏。</li>
+            <li><strong>tstamp</strong>：写入时的 Unix
+            时间戳（Timestamp），精确到秒或毫秒。</li>
+            <li><strong>key_sz /
+            value_sz</strong>：键和值的字节长度。</li>
+            <li><strong>key / value</strong>：实际的键和值数据。</li>
+            </ul>
+            <p>每个数据文件有一个大小上限（通常为 1-2 GB）。
+            当活跃文件（Active File）达到大小上限时，
+            它会被关闭并变成只读的旧文件（Immutable File），
+            同时创建一个新的活跃文件继续接收写入。</p>
+            <h3 id="单次磁盘读取的保证">2.5 单次磁盘读取的保证</h3>
+            <p>Bitcask 最核心的性能承诺是：
+            <strong>对于任意一个键的读取，最多只需要一次磁盘
+            I/O。</strong></p>
+            <p>这是因为 KeyDir 已经告诉我们值的精确位置（file_id +
+            offset + size），
+            引擎只需打开对应的文件、定位到指定偏移量、读取指定大小的数据即可。
+            不需要遍历索引层级（如 B+Tree 的多层节点），
+            也不需要在多个文件中搜索（如 LSM-Tree 的多层 SSTable）。</p>
+            <p>当操作系统的页缓存（Page
+            Cache）命中时，甚至不需要真正的磁盘 I/O，
+            读取延迟可以降到微秒级别。</p>
+            <hr />
+            <h2 id="三写入路径">三、写入路径</h2>
+            <h3 id="写入流程详解">3.1 写入流程详解</h3>
+            <p>Bitcask 的写入流程极其简洁，可以分为以下几个步骤：</p>
+            <pre class="text"><code>Put(key, value)
+    │
+    ▼
+┌──────────────────────────────────┐
+│ 1. 序列化记录                    │
+│    构造 [crc|tstamp|ksz|vsz|k|v] │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 2. 追加写入活跃文件              │
+│    write(active_file, record)    │
+│    记录当前偏移量 offset         │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 3. 更新 KeyDir                   │
+│    keydir[key] = {               │
+│      file_id,                    │
+│      offset,                     │
+│      size,                       │
+│      tstamp                      │
+│    }                             │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 4. 检查文件大小                  │
+│    if active_file.size &gt; limit:  │
+│      关闭当前文件，创建新文件    │
+└──────────────────────────────────┘</code></pre>
+            <h3 id="写入性能分析">3.2 写入性能分析</h3>
+            <p>整个写入路径的时间复杂度为 O(1)：</p>
+            <ul>
+            <li>序列化记录：O(key_size +
+            value_size)，通常可以忽略。</li>
+            <li>追加写入：一次顺序写入系统调用（System
+            Call），性能极高。</li>
+            <li>更新 KeyDir：哈希表的 O(1) 查找和更新。</li>
+            </ul>
+            <p>由于写入总是追加到文件末尾，Bitcask
+            的写入吞吐量主要受磁盘顺序写带宽限制。 在典型的服务器级 SSD
+            上，Bitcask 可以轻松达到每秒数十万次写入。</p>
+            <h3 id="删除操作">3.3 删除操作</h3>
+            <p>删除操作在 Bitcask 中并不是真正地从磁盘上移除数据，
+            而是写入一条特殊的墓碑记录（Tombstone Record）。
+            墓碑记录的值部分通常是一个特殊的标记（如空值或特定的魔数），
+            表示该键已被删除。</p>
+            <pre class="text"><code>Delete(key)
+    │
+    ▼
+  追加墓碑记录到活跃文件
+  [crc|tstamp|ksz|vsz=TOMBSTONE|key|&lt;tombstone&gt;]
+    │
+    ▼
+  从 KeyDir 中移除该键的条目</code></pre>
+            <p>在 KeyDir 中移除该键后，后续的读取操作将无法找到该键，
+            等效于数据已被删除。磁盘上的旧数据和墓碑记录会在合并过程中被清理。</p>
+            <h3 id="持久性保证">3.4 持久性保证</h3>
+            <p>Bitcask
+            的持久性（Durability）策略可以根据需求进行配置：</p>
+            <ul>
+            <li><strong>每次写入后调用
+            fsync</strong>：保证每次写入都持久化到磁盘，
+            但会显著降低写入性能（因为 fsync
+            需要等待磁盘控制器确认）。</li>
+            <li><strong>定期 fsync</strong>：每 N 次写入或每 T
+            毫秒调用一次 fsync， 在性能与持久性之间取得平衡。</li>
+            <li><strong>依赖操作系统刷盘</strong>：不主动调用 fsync，
+            依赖操作系统在适当时机将页缓存刷入磁盘。
+            性能最高，但在断电时可能丢失最近的写入数据。</li>
+            </ul>
+            <p>在实际生产环境中，大多数 Bitcask 部署选择定期 fsync
+            策略， 以平衡写入性能和数据安全性。</p>
+            <h3 id="并发写入">3.5 并发写入</h3>
+            <p>Bitcask
+            的原始设计中，同一时刻只有一个进程（Process）可以打开活跃文件进行写入。
+            这意味着写入操作是单线程（Single-Threaded）的，
+            天然避免了写-写冲突（Write-Write Conflict）。</p>
+            <p>读取操作则可以并发执行，因为旧的数据文件是不可变的，
+            多个读取线程可以同时访问不同的数据文件而不需要加锁。</p>
+            <p>这种设计在大多数场景下是足够的，因为追加写入的速度很快，
+            单线程写入很少成为瓶颈。如果确实需要更高的写入并发度，
+            可以通过分片（Sharding）——即运行多个独立的 Bitcask
+            实例来实现。</p>
+            <hr />
+            <h2 id="四读取路径">四、读取路径</h2>
+            <h3 id="读取流程详解">4.1 读取流程详解</h3>
+            <p>Bitcask 的读取流程同样简洁：</p>
+            <pre class="text"><code>Get(key)
+    │
+    ▼
+┌──────────────────────────────────┐
+│ 1. 查找 KeyDir                   │
+│    entry = keydir[key]           │
+│    if entry == nil:              │
+│      return NOT_FOUND            │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 2. 读取磁盘                     │
+│    fd = open(entry.file_id)      │
+│    seek(fd, entry.offset)        │
+│    record = read(fd, entry.size) │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 3. 校验数据                     │
+│    verify crc32(record)          │
+│    if failed: return ERROR       │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ 4. 返回值                       │
+│    return record.value           │
+└──────────────────────────────────┘</code></pre>
+            <h3 id="文件描述符管理">4.2 文件描述符管理</h3>
+            <p>由于 Bitcask
+            可能积累大量的数据文件，为每次读取都打开和关闭文件显然是低效的。
+            实际实现中通常会维护一个文件描述符池（File Descriptor
+            Pool）， 预先打开所有数据文件并缓存其文件描述符（File
+            Descriptor）。</p>
+            <pre class="text"><code>┌─────────────────────────────────────┐
+│        文件描述符池                  │
+│                                      │
+│  file_id=1  →  fd=3                 │
+│  file_id=2  →  fd=5                 │
+│  file_id=3  →  fd=7                 │
+│  ...                                │
+│  file_id=N  →  fd=2N+1             │
+└─────────────────────────────────────┘</code></pre>
+            <p>需要注意的是，操作系统对单个进程能打开的文件描述符数量有限制
+            （通常默认为 1024，可以通过 <code>ulimit -n</code> 调整）。
+            当数据文件数量很多时，需要确保这个限制足够大。</p>
+            <h3 id="读取性能分析">4.3 读取性能分析</h3>
+            <p>Bitcask 的读取性能可以分为两种情况：</p>
+            <p><strong>缓存命中（Cache Hit）</strong>：
+            当请求的数据页已经在操作系统的页缓存中时，
+            读取操作无需真正的磁盘 I/O，延迟通常在微秒级别。
+            这种情况在热点数据（Hot Data）场景下非常常见。</p>
+            <p><strong>缓存未命中（Cache Miss）</strong>：
+            当数据页不在页缓存中时，需要一次真正的磁盘 I/O。 在 HDD
+            上，这意味着一次随机读取，延迟约 8-10 毫秒； 在 SSD
+            上，延迟约 0.1 毫秒。</p>
+            <p>无论哪种情况，Bitcask
+            都保证<strong>最多一次磁盘读取</strong>， 这是其相比
+            LSM-Tree（可能需要多次读取）的核心优势之一。</p>
+            <h3 id="读取放大">4.4 读取放大</h3>
+            <p>读取放大（Read Amplification）是指为了读取一条有效数据，
+            实际需要从磁盘读取的数据量与有效数据量的比值。</p>
+            <p>在 Bitcask 中，读取放大严格为 1：
+            每次读取只需要读取一条记录的完整数据（包括头部元数据和键值对），
+            不需要读取任何额外的索引块或元数据页。</p>
+            <p>这与 B+Tree 形成了鲜明对比——B+Tree 的一次读取可能需要遍历
+            3-4 层索引节点，读取放大为 3-4 倍。 LSM-Tree
+            在最坏情况下可能需要检查每一层的 SSTable， 读取放大可能达到
+            10 倍以上。</p>
+            <h3 id="scan-与遍历">4.5 Scan 与遍历</h3>
+            <p>Bitcask 虽然不直接支持高效的范围查询（Range Query），
+            但可以支持全量遍历（Full Scan）操作： 引擎只需遍历 KeyDir
+            中的所有键，依次读取对应的值即可。</p>
+            <p>不过，由于 KeyDir
+            是无序的哈希表，遍历的结果没有特定的顺序，
+            也无法高效地按键的字典序（Lexicographic Order）返回结果。
+            如果需要有序遍历，只能先将所有键排序后再逐个查找，
+            效率较低。</p>
+            <hr />
+            <h2
+            id="五合并compaction与-hint-file">五、合并（Compaction）与
+            Hint File</h2>
+            <h3 id="为什么需要合并">5.1 为什么需要合并</h3>
+            <p>随着写入操作的持续进行，磁盘上会积累大量的过时数据：
+            被更新的键的旧值、被删除的键的数据以及墓碑记录。
+            这些过时数据占用磁盘空间但不再有用，需要通过合并过程来清理。</p>
+            <p>空间放大（Space Amplification）是指磁盘上实际占用的空间
+            与有效数据（最新版本的所有键值对）所需空间的比值。
+            没有合并的情况下，空间放大可能达到数十倍甚至更高。</p>
+            <h3 id="合并流程">5.2 合并流程</h3>
+            <p>合并过程的核心逻辑如下：</p>
+            <pre class="text"><code>Merge()
+    │
+    ▼
+┌──────────────────────────────────────────┐
+│ 1. 选择待合并的旧数据文件                │
+│    files = select_old_files()            │
+│    （不包括当前活跃文件）                 │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 2. 遍历所有待合并文件中的记录            │
+│    for each record in files:             │
+│      if keydir[record.key].file_id       │
+│         == current_file                  │
+│         &amp;&amp; keydir[record.key].offset     │
+│         == current_offset:               │
+│        → 该记录是最新的，写入新文件       │
+│      else:                               │
+│        → 该记录已过时，跳过              │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 3. 更新 KeyDir                           │
+│    将已迁移记录的位置信息指向新文件       │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 4. 删除旧文件                            │
+│    remove(old_files)                     │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 5. 生成 Hint File                        │
+│    为新的合并文件生成对应的 hint 文件     │
+└──────────────────────────────────────────┘</code></pre>
+            <h3 id="判断记录是否最新">5.3 判断记录是否最新</h3>
+            <p>在合并过程中，一个关键问题是如何判断某条记录是否仍然有效。
+            Bitcask 采用一种简洁而高效的方法：</p>
+            <p>对于遍历到的每条记录，检查 KeyDir 中该键的条目。 如果
+            KeyDir 中记录的 <code>file_id</code> 和 <code>offset</code>
+            与当前遍历到的记录一致，
+            则说明这条记录是最新的，应该被保留；否则，该记录已过时，可以跳过。</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 伪代码：判断记录是否最新</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> isLatest<span class="op">(</span>key <span class="op">[]</span><span class="dt">byte</span><span class="op">,</span> fileID <span class="dt">int</span><span class="op">,</span> offset <span class="dt">int64</span><span class="op">)</span> <span class="dt">bool</span> <span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    entry<span class="op">,</span> exists <span class="op">:=</span> keydir<span class="op">[</span><span class="dt">string</span><span class="op">(</span>key<span class="op">)]</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>exists <span class="op">{</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">false</span> <span class="co">// 键已被删除</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> entry<span class="op">.</span>FileID <span class="op">==</span> fileID <span class="op">&amp;&amp;</span> entry<span class="op">.</span>Offset <span class="op">==</span> offset</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="hint-file-的结构与作用">5.4 Hint File
+            的结构与作用</h3>
+            <p>Hint File 是 Bitcask 中一个非常巧妙的设计，
+            它的存在是为了加速系统重启时的索引重建过程。</p>
+            <p>在没有 Hint File 的情况下，Bitcask
+            重启时需要遍历所有数据文件的每条记录， 解析键和值，才能重建
+            KeyDir。这个过程的时间复杂度与数据总量成正比，
+            可能需要数分钟甚至更长时间。</p>
+            <p>Hint File 本质上是数据文件的”索引摘要”，
+            它包含数据文件中每条记录的键和位置信息，但<strong>不包含值</strong>：</p>
+            <pre class="text"><code>Hint File 记录格式：
+┌────────┬─────────┬──────────┬──────────┬───────┐
+│ tstamp │ key_sz  │ value_sz │ offset   │ key   │
+│ 8 字节 │ 4 字节  │ 4 字节   │ 8 字节   │ 变长  │
+└────────┴─────────┴──────────┴──────────┴───────┘</code></pre>
+            <p>由于 Hint File
+            不包含值数据，它的大小通常只有对应数据文件的几分之一。
+            重启时，引擎可以优先读取 Hint File 来快速重建 KeyDir，
+            大幅缩短启动时间。</p>
+            <h3 id="合并策略">5.5 合并策略</h3>
+            <p>实际部署中，合并操作的触发策略需要仔细考量：</p>
+            <ul>
+            <li><strong>触发条件</strong>：可以基于时间周期（如每小时一次）、
+            数据文件数量（如超过 10 个旧文件时触发）、
+            或空间放大比例（如超过 2 倍时触发）。</li>
+            <li><strong>合并窗口</strong>：通常在系统负载较低的时段进行合并，
+            以避免与正常的读写操作竞争 I/O 带宽。</li>
+            <li><strong>合并粒度</strong>：可以选择合并所有旧文件，
+            也可以只合并最老的几个文件（增量合并）。</li>
+            </ul>
+            <p>Riak 中的 Bitcask 实现提供了以下配置选项：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode erlang"><code class="sourceCode erlang"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">%% Riak Bitcask 合并配置示例</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="ch">bitcask</span><span class="fu">,</span> <span class="fu">[</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="ch">merge_window</span><span class="fu">,</span> <span class="fu">{</span><span class="ch">start</span><span class="fu">,</span> <span class="dv">0</span><span class="fu">},</span> <span class="fu">{</span><span class="kw">end</span><span class="fu">,</span> <span class="dv">6</span><span class="fu">}},</span>    <span class="co">%% 合并窗口：午夜到凌晨6点</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="ch">merge_check_interval</span><span class="fu">,</span> <span class="dv">300</span><span class="fu">},</span>              <span class="co">%% 每5分钟检查一次是否需要合并</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="ch">max_merge_size</span><span class="fu">,</span> <span class="dv">1073741824</span><span class="fu">},</span>             <span class="co">%% 单个合并文件最大1GB</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="ch">frag_merge_trigger</span><span class="fu">,</span> <span class="dv">60</span><span class="fu">},</span>                 <span class="co">%% 碎片率超过60%时触发合并</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="ch">dead_bytes_merge_trigger</span><span class="fu">,</span> <span class="dv">536870912</span><span class="fu">}</span>     <span class="co">%% 死数据超过512MB时触发合并</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="fu">]}</span></span></code></pre></div>
+            <h3 id="合并过程中的读写影响">5.6 合并过程中的读写影响</h3>
+            <p>合并操作在后台进行时，正常的读写操作不会被阻塞：</p>
+            <ul>
+            <li><strong>写入不受影响</strong>：新的写入继续追加到活跃文件，与合并操作互不干扰。</li>
+            <li><strong>读取可能受到轻微影响</strong>：合并过程需要读取旧文件的数据，
+            这可能与正常的读取操作竞争磁盘 I/O 带宽。
+            不过，由于合并是顺序读取，对 SSD 的影响较小。</li>
+            </ul>
+            <p>合并完成后，旧文件的文件描述符会被关闭，相应的磁盘空间被释放。
+            KeyDir 中的条目会被原子地更新为新文件的位置信息。</p>
+            <hr />
+            <h2 id="六崩溃恢复">六、崩溃恢复</h2>
+            <h3 id="恢复的基本原理">6.1 恢复的基本原理</h3>
+            <p>Bitcask 的崩溃恢复（Crash
+            Recovery）利用了追加写入的天然优势：
+            由于数据文件是不可变的（活跃文件除外），崩溃不会损坏已关闭的旧文件。
+            唯一可能受到影响的是正在写入的活跃文件的最后几条记录。</p>
+            <p>恢复过程的核心任务是重建
+            KeyDir——也就是在内存中重建每个键到其最新值位置的映射。</p>
+            <h3 id="恢复流程">6.2 恢复流程</h3>
+            <pre class="text"><code>Startup / Recovery
+    │
+    ▼
+┌──────────────────────────────────────────┐
+│ 1. 扫描数据目录                          │
+│    找到所有数据文件和 hint 文件           │
+│    按文件编号排序                         │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 2. 处理有 hint 文件的旧数据文件          │
+│    读取 hint 文件（不含值，速度快）       │
+│    将键和位置信息加载到 KeyDir            │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 3. 处理没有 hint 文件的旧数据文件        │
+│    逐条扫描数据文件                       │
+│    验证 CRC 校验和                        │
+│    将有效记录的键和位置加载到 KeyDir      │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 4. 处理活跃文件（最后一个数据文件）      │
+│    逐条扫描，验证 CRC                    │
+│    丢弃最后一条不完整的记录（如果有）     │
+│    将有效记录加载到 KeyDir                │
+└──────────────┬───────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────┐
+│ 5. 打开新的活跃文件                      │
+│    准备接收新的写入                       │
+└──────────────────────────────────────────┘</code></pre>
+            <h3 id="crc-校验的作用">6.3 CRC 校验的作用</h3>
+            <p>每条记录的 CRC32 校验码在恢复过程中扮演着关键角色。
+            当引擎逐条扫描数据文件时，它会重新计算每条记录的 CRC 值
+            并与存储的 CRC 进行比较：</p>
+            <ul>
+            <li>如果 CRC 匹配，记录完整且未损坏。</li>
+            <li>如果 CRC
+            不匹配，记录可能已损坏（例如在写入过程中断电），
+            该记录以及其后的所有记录都会被丢弃。</li>
+            </ul>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CRC 校验伪代码</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> verifyRecord<span class="op">(</span>data <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="dt">bool</span> <span class="op">{</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    storedCRC <span class="op">:=</span> binary<span class="op">.</span>BigEndian<span class="op">.</span>Uint32<span class="op">(</span>data<span class="op">[:</span><span class="dv">4</span><span class="op">])</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    computedCRC <span class="op">:=</span> crc32<span class="op">.</span>ChecksumIEEE<span class="op">(</span>data<span class="op">[</span><span class="dv">4</span><span class="op">:])</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> storedCRC <span class="op">==</span> computedCRC</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="启动时间优化">6.4 启动时间优化</h3>
+            <p>在数据量较大时，Bitcask 的启动时间可能成为一个关注点。
+            以下是一些优化策略：</p>
+            <ol type="1">
+            <li><p><strong>优先使用 Hint File</strong>：如前所述，Hint
+            File 不包含值数据，
+            读取速度远快于完整的数据文件。确保合并操作总是生成 Hint
+            File。</p></li>
+            <li><p><strong>并行加载</strong>：多个旧数据文件的 Hint File
+            可以并行读取， 利用多核 CPU 和磁盘的并行读取能力。</p></li>
+            <li><p><strong>增量检查点（Checkpoint）</strong>：
+            定期将当前的 KeyDir 快照持久化到磁盘。
+            重启时只需加载最近的检查点，然后重放检查点之后的写入操作。</p></li>
+            <li><p><strong>启动时间估算</strong>：假设磁盘顺序读速度为
+            200 MB/s， 所有键的 Hint File 总大小为 2 GB，则加载时间约为
+            10 秒。 如果没有 Hint File，需要读取完整数据文件（假设 100
+            GB）， 加载时间则可能需要 500 秒（约 8 分钟）。</p></li>
+            </ol>
+            <h3 id="部分写入与原子性">6.5 部分写入与原子性</h3>
+            <p>崩溃时最棘手的场景是部分写入（Partial Write）：
+            一条记录只写了一半就发生了断电。Bitcask
+            的处理方式非常简单：</p>
+            <p>由于追加写入的特性，部分写入只可能出现在活跃文件的末尾。
+            恢复时，CRC 校验会检测到这条不完整的记录，引擎直接将其丢弃。
+            已经完整写入的记录不会受到影响。</p>
+            <p>这种处理方式的代价是可能丢失最后一次或几次写入的数据，
+            但保证了系统状态的一致性——绝不会出现”写了一半”的损坏数据。</p>
+            <hr />
+            <h2 id="七bitcask-的局限">七、Bitcask 的局限</h2>
+            <h3 id="所有键必须装入内存">7.1 所有键必须装入内存</h3>
+            <p>这是 Bitcask 最大的限制。由于 KeyDir
+            必须将所有键及其元数据保存在内存中， Bitcask
+            所能管理的键的数量直接受限于可用内存大小。</p>
+            <p>根据前面的估算，每个键约需 80-100 字节的内存空间。
+            下表展示了不同内存规格下 Bitcask 能管理的最大键数量：</p>
+            <pre class="text"><code>┌──────────────┬──────────────────────────┐
+│ 可用内存     │ 最大键数量（估算）       │
+├──────────────┼──────────────────────────┤
+│ 1 GB         │ ~1000 万                 │
+│ 4 GB         │ ~4000 万                 │
+│ 16 GB        │ ~1.6 亿                  │
+│ 64 GB        │ ~6.4 亿                  │
+│ 256 GB       │ ~25 亿                   │
+└──────────────┴──────────────────────────┘</code></pre>
+            <p>对于键数量超过可用内存的场景，Bitcask 不是合适的选择。
+            此时应考虑 LSM-Tree 或 B+Tree 等支持磁盘索引的引擎。</p>
+            <h3 id="不支持范围查询">7.2 不支持范围查询</h3>
+            <p>由于 KeyDir 是无序的哈希表，Bitcask
+            无法高效地执行范围查询。 例如，以下查询在 Bitcask
+            中无法高效完成：</p>
+            <pre class="text"><code>SELECT * WHERE key BETWEEN &#39;user:1000&#39; AND &#39;user:2000&#39;
+SELECT * WHERE key LIKE &#39;session:2025-01-%&#39;</code></pre>
+            <p>要实现这些查询，只能遍历整个 KeyDir 并过滤， 时间复杂度为
+            O(N)，其中 N 是总键数。 对于需要范围查询的场景，LSM-Tree（如
+            RocksDB、LevelDB） 或 B+Tree（如
+            BoltDB、LMDB）是更好的选择。</p>
+            <h3 id="值大小的考量">7.3 值大小的考量</h3>
+            <p>虽然 Bitcask 在理论上不限制单个值的大小，
+            但在实际使用中需要注意以下问题：</p>
+            <ul>
+            <li><strong>大值写入</strong>：单个很大的值（如几十
+            MB）会占用活跃文件的大量空间，
+            导致文件很快达到大小上限。</li>
+            <li><strong>合并效率</strong>：大值会拖慢合并过程，因为需要复制大量数据。</li>
+            <li><strong>读取延迟</strong>：读取大值需要更多的磁盘 I/O
+            时间。</li>
+            </ul>
+            <p>通常建议将 Bitcask 用于值大小在几 KB 到几十 KB
+            范围内的场景。 对于大型二进制对象（Binary Large Object,
+            BLOB）， 建议使用专门的对象存储系统。</p>
+            <h3 id="启动时间">7.4 启动时间</h3>
+            <p>如前所述，Bitcask 在启动时需要重建 KeyDir，
+            这需要扫描所有数据文件或 Hint File。
+            当数据量很大时，启动时间可能达到数分钟级别。</p>
+            <p>这在需要快速故障转移（Failover）的场景中可能是一个问题。
+            例如，在一个有 10 亿个键的 Bitcask 实例中， 即使使用 Hint
+            File，启动时间也可能需要 30-60 秒。</p>
+            <h3 id="写放大">7.5 写放大</h3>
+            <p>Bitcask 的写放大（Write Amplification）主要来自合并过程。
+            每次合并都需要将有效数据从旧文件复制到新文件，
+            这意味着每条有效数据在其生命周期内可能被写入磁盘多次。</p>
+            <p>写放大的程度取决于合并策略和数据更新频率：</p>
+            <ul>
+            <li>如果数据很少更新（冷数据居多），空间放大低，合并频率低，写放大也低。</li>
+            <li>如果数据频繁更新（热数据居多），旧版本堆积快，
+            需要频繁合并，写放大较高。</li>
+            </ul>
+            <h3 id="单写者限制">7.6 单写者限制</h3>
+            <p>Bitcask 的原始设计仅支持单个进程写入活跃文件。
+            这意味着在需要多节点写入的分布式场景中，
+            每个节点通常运行自己的 Bitcask 实例， 由上层系统（如
+            Riak）负责数据分片和路由。</p>
+            <hr />
+            <h2 id="八riak-中的-bitcask">八、Riak 中的 Bitcask</h2>
+            <h3 id="riak-简介">8.1 Riak 简介</h3>
+            <p>Riak 是由 Basho Technologies
+            开发的分布式键值数据库（Distributed Key-Value Database），
+            其设计深受 Amazon Dynamo 论文的影响。 Riak
+            的核心特性包括：</p>
+            <ul>
+            <li><strong>无主架构（Masterless Architecture）</strong>：
+            所有节点地位平等，没有单点故障。</li>
+            <li><strong>一致性哈希（Consistent Hashing）</strong>：
+            数据通过一致性哈希环分布到各个节点。</li>
+            <li><strong>可调一致性（Tunable Consistency）</strong>：
+            通过 R/W/N 参数控制读写操作的一致性级别。</li>
+            <li><strong>可插拔存储后端（Pluggable Storage
+            Backend）</strong>： 支持 Bitcask、LevelDB
+            等多种存储引擎。</li>
+            </ul>
+            <h3 id="bitcask-作为-riak-的后端">8.2 Bitcask 作为 Riak
+            的后端</h3>
+            <p>在 Riak 中，Bitcask 是默认的存储后端。每个 Riak
+            vnode（虚拟节点） 运行一个独立的 Bitcask 实例，管理该 vnode
+            负责的数据分区。</p>
+            <p>典型的部署配置如下：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode erlang"><code class="sourceCode erlang"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co">%% riak.conf 中的 Bitcask 配置</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ch">storage_backend</span> <span class="op">=</span> <span class="ch">bitcask</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co">%% bitcask 相关配置</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">data_root</span> <span class="op">=</span> <span class="op">/</span><span class="ch">var</span><span class="op">/</span><span class="ch">lib</span><span class="op">/</span><span class="ch">riak</span><span class="op">/</span><span class="ch">bitcask</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">max_file_size</span> <span class="op">=</span> <span class="dv">2147483648</span>          <span class="co">%% 2 GB</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">merge_window</span> <span class="op">=</span> <span class="ch">always</span>               <span class="co">%% 随时可合并</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">merge_check_interval</span> <span class="op">=</span> <span class="dv">3</span>m           <span class="co">%% 每3分钟检查</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">frag_merge_trigger</span> <span class="op">=</span> <span class="dv">60</span>             <span class="co">%% 碎片率 60%</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">dead_bytes_merge_trigger</span> <span class="op">=</span> <span class="dv">512</span>MB</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">frag_threshold</span> <span class="op">=</span> <span class="dv">40</span>                 <span class="co">%% 碎片率阈值</span></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">dead_bytes_threshold</span> <span class="op">=</span> <span class="dv">128</span>MB</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">small_file_threshold</span> <span class="op">=</span> <span class="dv">10</span>MB         <span class="co">%% 小文件合并阈值</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">max_fold_age</span> <span class="op">=</span> <span class="op">-</span><span class="dv">1</span>                   <span class="co">%% fold 操作无超时</span></span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">max_fold_puts</span> <span class="op">=</span> <span class="dv">0</span>                   <span class="co">%% fold 期间不限制 put</span></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">expiry_secs</span> <span class="op">=</span> <span class="op">-</span><span class="dv">1</span>                    <span class="co">%% 无过期</span></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">require_hint_crc</span> <span class="op">=</span> <span class="ch">true</span>             <span class="co">%% 启用 hint CRC 校验</span></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a><span class="ch">bitcask</span><span class="fu">.</span><span class="ch">sync_strategy</span> <span class="op">=</span> <span class="ch">none</span>                <span class="co">%% 不主动 fsync</span></span></code></pre></div>
+            <h3 id="运维经验">8.3 运维经验</h3>
+            <p>在生产环境中运维 Riak + Bitcask
+            组合，以下是一些经验总结：</p>
+            <p><strong>监控指标</strong>：</p>
+            <ul>
+            <li>KeyDir 大小：监控每个 vnode 的 KeyDir
+            条目数和内存占用。</li>
+            <li>数据文件数量：过多的数据文件意味着合并可能没有及时进行。</li>
+            <li>合并进度：监控合并操作的频率和耗时。</li>
+            <li>启动时间：在计划维护时关注 vnode 的启动恢复时间。</li>
+            </ul>
+            <p><strong>常见问题</strong>：</p>
+            <ol type="1">
+            <li><strong>内存不足</strong>：当键数量超过预期时，KeyDir
+            可能耗尽内存。
+            解决方案包括：增加内存、减少键的数量、或切换到 LevelDB
+            后端。</li>
+            <li><strong>合并风暴（Merge Storm）</strong>：
+            大量数据文件同时触发合并，导致磁盘 I/O 饱和。
+            解决方案：配置合并窗口，限制并发合并数量。</li>
+            <li><strong>启动时间过长</strong>：大量数据导致 KeyDir
+            重建耗时过长。 解决方案：确保生成 Hint File，或考虑减小单个
+            vnode 的数据量。</li>
+            </ol>
+            <h3 id="bitcask-与-leveldb-的选择">8.4 Bitcask 与 LevelDB
+            的选择</h3>
+            <p>在 Riak 中，Bitcask 和 LevelDB 是两个最常用的存储后端。
+            选择哪个取决于具体的使用场景：</p>
+            <pre class="text"><code>┌──────────────────┬──────────────┬──────────────┐
+│ 特性             │ Bitcask      │ LevelDB      │
+├──────────────────┼──────────────┼──────────────┤
+│ 读取延迟         │ 极低（1次IO）│ 较低（多次IO）│
+│ 写入吞吐         │ 极高         │ 高           │
+│ 范围查询         │ 不支持       │ 支持         │
+│ 内存要求         │ 高（全键）   │ 低           │
+│ 启动时间         │ 较长         │ 较短         │
+│ 空间效率         │ 中等         │ 较好         │
+│ 适用场景         │ 会话存储、   │ 时序数据、   │
+│                  │ 缓存、计数器 │ 二级索引     │
+└──────────────────┴──────────────┴──────────────┘</code></pre>
+            <h3 id="riak-退出后的-bitcask-遗产">8.5 Riak 退出后的
+            Bitcask 遗产</h3>
+            <p>虽然 Basho Technologies 已经不再活跃运营， 但 Bitcask
+            的设计理念在许多现代存储引擎中得到了延续。 例如，Go
+            生态中的一些嵌入式键值存储 （如
+            <code>go.etcd.io/bbolt</code>
+            的日志部分、<code>github.com/rosedblabs/rosedb</code>）
+            都借鉴了 Bitcask 的追加写入加内存索引的思路。</p>
+            <hr />
+            <h2 id="九用-go-实现简化版-bitcask">九、用 Go 实现简化版
+            Bitcask</h2>
+            <h3 id="设计概述">9.1 设计概述</h3>
+            <p>下面我们用 Go 语言实现一个简化版的 Bitcask 存储引擎。
+            这个实现包含以下核心功能：</p>
+            <ul>
+            <li><code>Put(key, value)</code>：写入键值对。</li>
+            <li><code>Get(key)</code>：读取键对应的值。</li>
+            <li><code>Delete(key)</code>：删除指定的键。</li>
+            <li><code>Merge()</code>：合并旧数据文件，回收空间。</li>
+            <li><code>Close()</code>：关闭引擎，释放资源。</li>
+            </ul>
+            <p>为了简化实现，我们做以下约定：</p>
+            <ul>
+            <li>键和值均为 <code>[]byte</code> 类型。</li>
+            <li>单进程访问，不考虑并发安全（生产实现中应加锁）。</li>
+            <li>数据文件大小上限为 256 MB。</li>
+            <li>使用 CRC32 校验数据完整性。</li>
+            </ul>
+            <h3 id="数据结构定义">9.2 数据结构定义</h3>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> bitcask</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="op">(</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;encoding/binary&quot;</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;hash/crc32&quot;</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;io&quot;</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;os&quot;</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;path/filepath&quot;</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;sort&quot;</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;strconv&quot;</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;strings&quot;</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;sync&quot;</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;time&quot;</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> <span class="op">(</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>    headerSize     <span class="op">=</span> <span class="dv">20</span> <span class="co">// crc(4) + tstamp(8) + ksz(4) + vsz(4)</span></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>    maxFileSize    <span class="op">=</span> <span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span></span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a>    tombstoneValue <span class="op">=</span> <span class="st">&quot;__BITCASK_TOMBSTONE__&quot;</span></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a><span class="co">// KeyDirEntry 表示 KeyDir 中的一个条目。</span></span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> KeyDirEntry <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb20-24"><a href="#cb20-24" aria-hidden="true" tabindex="-1"></a>    FileID    <span class="dt">int</span></span>
+<span id="cb20-25"><a href="#cb20-25" aria-hidden="true" tabindex="-1"></a>    Offset    <span class="dt">int64</span></span>
+<span id="cb20-26"><a href="#cb20-26" aria-hidden="true" tabindex="-1"></a>    Size      <span class="dt">int</span></span>
+<span id="cb20-27"><a href="#cb20-27" aria-hidden="true" tabindex="-1"></a>    Timestamp <span class="dt">int64</span></span>
+<span id="cb20-28"><a href="#cb20-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb20-29"><a href="#cb20-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-30"><a href="#cb20-30" aria-hidden="true" tabindex="-1"></a><span class="co">// Bitcask 是存储引擎的主结构体。</span></span>
+<span id="cb20-31"><a href="#cb20-31" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> Bitcask <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb20-32"><a href="#cb20-32" aria-hidden="true" tabindex="-1"></a>    dir        <span class="dt">string</span></span>
+<span id="cb20-33"><a href="#cb20-33" aria-hidden="true" tabindex="-1"></a>    mu         sync<span class="op">.</span>RWMutex</span>
+<span id="cb20-34"><a href="#cb20-34" aria-hidden="true" tabindex="-1"></a>    keydir     <span class="kw">map</span><span class="op">[</span><span class="dt">string</span><span class="op">]</span>KeyDirEntry</span>
+<span id="cb20-35"><a href="#cb20-35" aria-hidden="true" tabindex="-1"></a>    activeFile <span class="op">*</span>os<span class="op">.</span>File</span>
+<span id="cb20-36"><a href="#cb20-36" aria-hidden="true" tabindex="-1"></a>    activeID   <span class="dt">int</span></span>
+<span id="cb20-37"><a href="#cb20-37" aria-hidden="true" tabindex="-1"></a>    activeOff  <span class="dt">int64</span></span>
+<span id="cb20-38"><a href="#cb20-38" aria-hidden="true" tabindex="-1"></a>    dataFiles  <span class="kw">map</span><span class="op">[</span><span class="dt">int</span><span class="op">]*</span>os<span class="op">.</span>File</span>
+<span id="cb20-39"><a href="#cb20-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="引擎初始化与恢复">9.3 引擎初始化与恢复</h3>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Open 打开或创建一个 Bitcask 实例。</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> Open<span class="op">(</span>dir <span class="dt">string</span><span class="op">)</span> <span class="op">(*</span>Bitcask<span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">:=</span> os<span class="op">.</span>MkdirAll<span class="op">(</span>dir<span class="op">,</span> <span class="bn">0755</span><span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> err</span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>    bc <span class="op">:=</span> <span class="op">&amp;</span>Bitcask<span class="op">{</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>        dir<span class="op">:</span>       dir<span class="op">,</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>        keydir<span class="op">:</span>    <span class="bu">make</span><span class="op">(</span><span class="kw">map</span><span class="op">[</span><span class="dt">string</span><span class="op">]</span>KeyDirEntry<span class="op">),</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>        dataFiles<span class="op">:</span> <span class="bu">make</span><span class="op">(</span><span class="kw">map</span><span class="op">[</span><span class="dt">int</span><span class="op">]*</span>os<span class="op">.</span>File<span class="op">),</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">:=</span> bc<span class="op">.</span><span class="bu">recover</span><span class="op">();</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> err</span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">:=</span> bc<span class="op">.</span>openActiveFile<span class="op">();</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> err</span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> bc<span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-20"><a href="#cb21-20" aria-hidden="true" tabindex="-1"></a><span class="co">// recover 扫描数据目录，重建 KeyDir。</span></span>
+<span id="cb21-21"><a href="#cb21-21" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> <span class="bu">recover</span><span class="op">()</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb21-22"><a href="#cb21-22" aria-hidden="true" tabindex="-1"></a>    entries<span class="op">,</span> err <span class="op">:=</span> os<span class="op">.</span>ReadDir<span class="op">(</span>bc<span class="op">.</span>dir<span class="op">)</span></span>
+<span id="cb21-23"><a href="#cb21-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-24"><a href="#cb21-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> err</span>
+<span id="cb21-25"><a href="#cb21-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-26"><a href="#cb21-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> fileIDs <span class="op">[]</span><span class="dt">int</span></span>
+<span id="cb21-27"><a href="#cb21-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> e <span class="op">:=</span> <span class="kw">range</span> entries <span class="op">{</span></span>
+<span id="cb21-28"><a href="#cb21-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> strings<span class="op">.</span>HasSuffix<span class="op">(</span>e<span class="op">.</span>Name<span class="op">(),</span> <span class="st">&quot;.data&quot;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb21-29"><a href="#cb21-29" aria-hidden="true" tabindex="-1"></a>            idStr <span class="op">:=</span> strings<span class="op">.</span>TrimSuffix<span class="op">(</span>e<span class="op">.</span>Name<span class="op">(),</span> <span class="st">&quot;.data&quot;</span><span class="op">)</span></span>
+<span id="cb21-30"><a href="#cb21-30" aria-hidden="true" tabindex="-1"></a>            id<span class="op">,</span> err <span class="op">:=</span> strconv<span class="op">.</span>Atoi<span class="op">(</span>idStr<span class="op">)</span></span>
+<span id="cb21-31"><a href="#cb21-31" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-32"><a href="#cb21-32" aria-hidden="true" tabindex="-1"></a>                <span class="cf">continue</span></span>
+<span id="cb21-33"><a href="#cb21-33" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb21-34"><a href="#cb21-34" aria-hidden="true" tabindex="-1"></a>            fileIDs <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>fileIDs<span class="op">,</span> id<span class="op">)</span></span>
+<span id="cb21-35"><a href="#cb21-35" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-36"><a href="#cb21-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-37"><a href="#cb21-37" aria-hidden="true" tabindex="-1"></a>    sort<span class="op">.</span>Ints<span class="op">(</span>fileIDs<span class="op">)</span></span>
+<span id="cb21-38"><a href="#cb21-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-39"><a href="#cb21-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> id <span class="op">:=</span> <span class="kw">range</span> fileIDs <span class="op">{</span></span>
+<span id="cb21-40"><a href="#cb21-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> err <span class="op">:=</span> bc<span class="op">.</span>loadDataFile<span class="op">(</span>id<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-41"><a href="#cb21-41" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> err</span>
+<span id="cb21-42"><a href="#cb21-42" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-43"><a href="#cb21-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-44"><a href="#cb21-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>fileIDs<span class="op">)</span> <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb21-45"><a href="#cb21-45" aria-hidden="true" tabindex="-1"></a>        bc<span class="op">.</span>activeID <span class="op">=</span> fileIDs<span class="op">[</span><span class="bu">len</span><span class="op">(</span>fileIDs<span class="op">)-</span><span class="dv">1</span><span class="op">]</span></span>
+<span id="cb21-46"><a href="#cb21-46" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-47"><a href="#cb21-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">nil</span></span>
+<span id="cb21-48"><a href="#cb21-48" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb21-49"><a href="#cb21-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-50"><a href="#cb21-50" aria-hidden="true" tabindex="-1"></a><span class="co">// loadDataFile 加载一个数据文件并重建 KeyDir 条目。</span></span>
+<span id="cb21-51"><a href="#cb21-51" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> loadDataFile<span class="op">(</span>id <span class="dt">int</span><span class="op">)</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb21-52"><a href="#cb21-52" aria-hidden="true" tabindex="-1"></a>    path <span class="op">:=</span> filepath<span class="op">.</span>Join<span class="op">(</span>bc<span class="op">.</span>dir<span class="op">,</span> strconv<span class="op">.</span>Itoa<span class="op">(</span>id<span class="op">)+</span><span class="st">&quot;.data&quot;</span><span class="op">)</span></span>
+<span id="cb21-53"><a href="#cb21-53" aria-hidden="true" tabindex="-1"></a>    f<span class="op">,</span> err <span class="op">:=</span> os<span class="op">.</span>Open<span class="op">(</span>path<span class="op">)</span></span>
+<span id="cb21-54"><a href="#cb21-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-55"><a href="#cb21-55" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> err</span>
+<span id="cb21-56"><a href="#cb21-56" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-57"><a href="#cb21-57" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>dataFiles<span class="op">[</span>id<span class="op">]</span> <span class="op">=</span> f</span>
+<span id="cb21-58"><a href="#cb21-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-59"><a href="#cb21-59" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> offset <span class="dt">int64</span></span>
+<span id="cb21-60"><a href="#cb21-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">{</span></span>
+<span id="cb21-61"><a href="#cb21-61" aria-hidden="true" tabindex="-1"></a>        header <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> headerSize<span class="op">)</span></span>
+<span id="cb21-62"><a href="#cb21-62" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> io<span class="op">.</span>ReadFull<span class="op">(</span>f<span class="op">,</span> header<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-63"><a href="#cb21-63" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="cb21-64"><a href="#cb21-64" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-65"><a href="#cb21-65" aria-hidden="true" tabindex="-1"></a>        ksz <span class="op">:=</span> <span class="dt">int</span><span class="op">(</span>binary<span class="op">.</span>BigEndian<span class="op">.</span>Uint32<span class="op">(</span>header<span class="op">[</span><span class="dv">12</span><span class="op">:</span><span class="dv">16</span><span class="op">]))</span></span>
+<span id="cb21-66"><a href="#cb21-66" aria-hidden="true" tabindex="-1"></a>        vsz <span class="op">:=</span> <span class="dt">int</span><span class="op">(</span>binary<span class="op">.</span>BigEndian<span class="op">.</span>Uint32<span class="op">(</span>header<span class="op">[</span><span class="dv">16</span><span class="op">:</span><span class="dv">20</span><span class="op">]))</span></span>
+<span id="cb21-67"><a href="#cb21-67" aria-hidden="true" tabindex="-1"></a>        payload <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> ksz<span class="op">+</span>vsz<span class="op">)</span></span>
+<span id="cb21-68"><a href="#cb21-68" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> io<span class="op">.</span>ReadFull<span class="op">(</span>f<span class="op">,</span> payload<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb21-69"><a href="#cb21-69" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="cb21-70"><a href="#cb21-70" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-71"><a href="#cb21-71" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 校验 CRC</span></span>
+<span id="cb21-72"><a href="#cb21-72" aria-hidden="true" tabindex="-1"></a>        storedCRC <span class="op">:=</span> binary<span class="op">.</span>BigEndian<span class="op">.</span>Uint32<span class="op">(</span>header<span class="op">[:</span><span class="dv">4</span><span class="op">])</span></span>
+<span id="cb21-73"><a href="#cb21-73" aria-hidden="true" tabindex="-1"></a>        computedCRC <span class="op">:=</span> crc32<span class="op">.</span>ChecksumIEEE<span class="op">(</span><span class="bu">append</span><span class="op">(</span>header<span class="op">[</span><span class="dv">4</span><span class="op">:],</span> payload<span class="op">...))</span></span>
+<span id="cb21-74"><a href="#cb21-74" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> storedCRC <span class="op">!=</span> computedCRC <span class="op">{</span></span>
+<span id="cb21-75"><a href="#cb21-75" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="cb21-76"><a href="#cb21-76" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-77"><a href="#cb21-77" aria-hidden="true" tabindex="-1"></a>        key <span class="op">:=</span> <span class="dt">string</span><span class="op">(</span>payload<span class="op">[:</span>ksz<span class="op">])</span></span>
+<span id="cb21-78"><a href="#cb21-78" aria-hidden="true" tabindex="-1"></a>        value <span class="op">:=</span> <span class="dt">string</span><span class="op">(</span>payload<span class="op">[</span>ksz<span class="op">:])</span></span>
+<span id="cb21-79"><a href="#cb21-79" aria-hidden="true" tabindex="-1"></a>        tstamp <span class="op">:=</span> <span class="dt">int64</span><span class="op">(</span>binary<span class="op">.</span>BigEndian<span class="op">.</span>Uint64<span class="op">(</span>header<span class="op">[</span><span class="dv">4</span><span class="op">:</span><span class="dv">12</span><span class="op">]))</span></span>
+<span id="cb21-80"><a href="#cb21-80" aria-hidden="true" tabindex="-1"></a>        totalSize <span class="op">:=</span> headerSize <span class="op">+</span> ksz <span class="op">+</span> vsz</span>
+<span id="cb21-81"><a href="#cb21-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-82"><a href="#cb21-82" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> value <span class="op">==</span> tombstoneValue <span class="op">{</span></span>
+<span id="cb21-83"><a href="#cb21-83" aria-hidden="true" tabindex="-1"></a>            <span class="bu">delete</span><span class="op">(</span>bc<span class="op">.</span>keydir<span class="op">,</span> key<span class="op">)</span></span>
+<span id="cb21-84"><a href="#cb21-84" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb21-85"><a href="#cb21-85" aria-hidden="true" tabindex="-1"></a>            bc<span class="op">.</span>keydir<span class="op">[</span>key<span class="op">]</span> <span class="op">=</span> KeyDirEntry<span class="op">{</span></span>
+<span id="cb21-86"><a href="#cb21-86" aria-hidden="true" tabindex="-1"></a>                FileID<span class="op">:</span>    id<span class="op">,</span></span>
+<span id="cb21-87"><a href="#cb21-87" aria-hidden="true" tabindex="-1"></a>                Offset<span class="op">:</span>    offset<span class="op">,</span></span>
+<span id="cb21-88"><a href="#cb21-88" aria-hidden="true" tabindex="-1"></a>                Size<span class="op">:</span>      totalSize<span class="op">,</span></span>
+<span id="cb21-89"><a href="#cb21-89" aria-hidden="true" tabindex="-1"></a>                Timestamp<span class="op">:</span> tstamp<span class="op">,</span></span>
+<span id="cb21-90"><a href="#cb21-90" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb21-91"><a href="#cb21-91" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-92"><a href="#cb21-92" aria-hidden="true" tabindex="-1"></a>        offset <span class="op">+=</span> <span class="dt">int64</span><span class="op">(</span>totalSize<span class="op">)</span></span>
+<span id="cb21-93"><a href="#cb21-93" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-94"><a href="#cb21-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">nil</span></span>
+<span id="cb21-95"><a href="#cb21-95" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="写入与删除">9.4 写入与删除</h3>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co">// openActiveFile 创建新的活跃文件。</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> openActiveFile<span class="op">()</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>activeID<span class="op">++</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a>    path <span class="op">:=</span> filepath<span class="op">.</span>Join<span class="op">(</span>bc<span class="op">.</span>dir<span class="op">,</span> strconv<span class="op">.</span>Itoa<span class="op">(</span>bc<span class="op">.</span>activeID<span class="op">)+</span><span class="st">&quot;.data&quot;</span><span class="op">)</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a>    f<span class="op">,</span> err <span class="op">:=</span> os<span class="op">.</span>OpenFile<span class="op">(</span>path<span class="op">,</span> os<span class="op">.</span>O_CREATE<span class="op">|</span>os<span class="op">.</span>O_RDWR<span class="op">|</span>os<span class="op">.</span>O_APPEND<span class="op">,</span> <span class="bn">0644</span><span class="op">)</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> err</span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>activeFile <span class="op">=</span> f</span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>activeOff <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>dataFiles<span class="op">[</span>bc<span class="op">.</span>activeID<span class="op">]</span> <span class="op">=</span> f</span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">nil</span></span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-14"><a href="#cb22-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-15"><a href="#cb22-15" aria-hidden="true" tabindex="-1"></a><span class="co">// encodeRecord 将键值对编码为磁盘记录。</span></span>
+<span id="cb22-16"><a href="#cb22-16" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> encodeRecord<span class="op">(</span>key<span class="op">,</span> value <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="op">[]</span><span class="dt">byte</span> <span class="op">{</span></span>
+<span id="cb22-17"><a href="#cb22-17" aria-hidden="true" tabindex="-1"></a>    ksz <span class="op">:=</span> <span class="bu">len</span><span class="op">(</span>key<span class="op">)</span></span>
+<span id="cb22-18"><a href="#cb22-18" aria-hidden="true" tabindex="-1"></a>    vsz <span class="op">:=</span> <span class="bu">len</span><span class="op">(</span>value<span class="op">)</span></span>
+<span id="cb22-19"><a href="#cb22-19" aria-hidden="true" tabindex="-1"></a>    buf <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> headerSize<span class="op">+</span>ksz<span class="op">+</span>vsz<span class="op">)</span></span>
+<span id="cb22-20"><a href="#cb22-20" aria-hidden="true" tabindex="-1"></a>    tstamp <span class="op">:=</span> time<span class="op">.</span>Now<span class="op">().</span>UnixMilli<span class="op">()</span></span>
+<span id="cb22-21"><a href="#cb22-21" aria-hidden="true" tabindex="-1"></a>    binary<span class="op">.</span>BigEndian<span class="op">.</span>PutUint64<span class="op">(</span>buf<span class="op">[</span><span class="dv">4</span><span class="op">:</span><span class="dv">12</span><span class="op">],</span> <span class="dt">uint64</span><span class="op">(</span>tstamp<span class="op">))</span></span>
+<span id="cb22-22"><a href="#cb22-22" aria-hidden="true" tabindex="-1"></a>    binary<span class="op">.</span>BigEndian<span class="op">.</span>PutUint32<span class="op">(</span>buf<span class="op">[</span><span class="dv">12</span><span class="op">:</span><span class="dv">16</span><span class="op">],</span> <span class="dt">uint32</span><span class="op">(</span>ksz<span class="op">))</span></span>
+<span id="cb22-23"><a href="#cb22-23" aria-hidden="true" tabindex="-1"></a>    binary<span class="op">.</span>BigEndian<span class="op">.</span>PutUint32<span class="op">(</span>buf<span class="op">[</span><span class="dv">16</span><span class="op">:</span><span class="dv">20</span><span class="op">],</span> <span class="dt">uint32</span><span class="op">(</span>vsz<span class="op">))</span></span>
+<span id="cb22-24"><a href="#cb22-24" aria-hidden="true" tabindex="-1"></a>    <span class="bu">copy</span><span class="op">(</span>buf<span class="op">[</span>headerSize<span class="op">:],</span> key<span class="op">)</span></span>
+<span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">copy</span><span class="op">(</span>buf<span class="op">[</span>headerSize<span class="op">+</span>ksz<span class="op">:],</span> value<span class="op">)</span></span>
+<span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a>    crc <span class="op">:=</span> crc32<span class="op">.</span>ChecksumIEEE<span class="op">(</span>buf<span class="op">[</span><span class="dv">4</span><span class="op">:])</span></span>
+<span id="cb22-27"><a href="#cb22-27" aria-hidden="true" tabindex="-1"></a>    binary<span class="op">.</span>BigEndian<span class="op">.</span>PutUint32<span class="op">(</span>buf<span class="op">[:</span><span class="dv">4</span><span class="op">],</span> crc<span class="op">)</span></span>
+<span id="cb22-28"><a href="#cb22-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> buf</span>
+<span id="cb22-29"><a href="#cb22-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-30"><a href="#cb22-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-31"><a href="#cb22-31" aria-hidden="true" tabindex="-1"></a><span class="co">// Put 写入一个键值对。</span></span>
+<span id="cb22-32"><a href="#cb22-32" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> Put<span class="op">(</span>key<span class="op">,</span> value <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb22-33"><a href="#cb22-33" aria-hidden="true" tabindex="-1"></a>    record <span class="op">:=</span> encodeRecord<span class="op">(</span>key<span class="op">,</span> value<span class="op">)</span></span>
+<span id="cb22-34"><a href="#cb22-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> bc<span class="op">.</span>activeOff<span class="op">+</span><span class="dt">int64</span><span class="op">(</span><span class="bu">len</span><span class="op">(</span>record<span class="op">))</span> <span class="op">&gt;</span> maxFileSize <span class="op">{</span></span>
+<span id="cb22-35"><a href="#cb22-35" aria-hidden="true" tabindex="-1"></a>        bc<span class="op">.</span>activeFile<span class="op">.</span>Sync<span class="op">()</span></span>
+<span id="cb22-36"><a href="#cb22-36" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> err <span class="op">:=</span> bc<span class="op">.</span>openActiveFile<span class="op">();</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb22-37"><a href="#cb22-37" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> err</span>
+<span id="cb22-38"><a href="#cb22-38" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb22-39"><a href="#cb22-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-40"><a href="#cb22-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> bc<span class="op">.</span>activeFile<span class="op">.</span>Write<span class="op">(</span>record<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb22-41"><a href="#cb22-41" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> err</span>
+<span id="cb22-42"><a href="#cb22-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-43"><a href="#cb22-43" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>keydir<span class="op">[</span><span class="dt">string</span><span class="op">(</span>key<span class="op">)]</span> <span class="op">=</span> KeyDirEntry<span class="op">{</span></span>
+<span id="cb22-44"><a href="#cb22-44" aria-hidden="true" tabindex="-1"></a>        FileID<span class="op">:</span>    bc<span class="op">.</span>activeID<span class="op">,</span></span>
+<span id="cb22-45"><a href="#cb22-45" aria-hidden="true" tabindex="-1"></a>        Offset<span class="op">:</span>    bc<span class="op">.</span>activeOff<span class="op">,</span></span>
+<span id="cb22-46"><a href="#cb22-46" aria-hidden="true" tabindex="-1"></a>        Size<span class="op">:</span>      <span class="bu">len</span><span class="op">(</span>record<span class="op">),</span></span>
+<span id="cb22-47"><a href="#cb22-47" aria-hidden="true" tabindex="-1"></a>        Timestamp<span class="op">:</span> time<span class="op">.</span>Now<span class="op">().</span>UnixMilli<span class="op">(),</span></span>
+<span id="cb22-48"><a href="#cb22-48" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-49"><a href="#cb22-49" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>activeOff <span class="op">+=</span> <span class="dt">int64</span><span class="op">(</span><span class="bu">len</span><span class="op">(</span>record<span class="op">))</span></span>
+<span id="cb22-50"><a href="#cb22-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">nil</span></span>
+<span id="cb22-51"><a href="#cb22-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb22-52"><a href="#cb22-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-53"><a href="#cb22-53" aria-hidden="true" tabindex="-1"></a><span class="co">// Delete 删除一个键。</span></span>
+<span id="cb22-54"><a href="#cb22-54" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> Delete<span class="op">(</span>key <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb22-55"><a href="#cb22-55" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">:=</span> bc<span class="op">.</span>Put<span class="op">(</span>key<span class="op">,</span> <span class="op">[]</span><span class="dt">byte</span><span class="op">(</span>tombstoneValue<span class="op">));</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb22-56"><a href="#cb22-56" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> err</span>
+<span id="cb22-57"><a href="#cb22-57" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-58"><a href="#cb22-58" aria-hidden="true" tabindex="-1"></a>    <span class="bu">delete</span><span class="op">(</span>bc<span class="op">.</span>keydir<span class="op">,</span> <span class="dt">string</span><span class="op">(</span>key<span class="op">))</span></span>
+<span id="cb22-59"><a href="#cb22-59" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">nil</span></span>
+<span id="cb22-60"><a href="#cb22-60" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="读取">9.5 读取</h3>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Get 读取指定键的值。</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> Get<span class="op">(</span>key <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a>    entry<span class="op">,</span> ok <span class="op">:=</span> bc<span class="op">.</span>keydir<span class="op">[</span><span class="dt">string</span><span class="op">(</span>key<span class="op">)]</span></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>ok <span class="op">{</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> os<span class="op">.</span>ErrNotExist</span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a>    f<span class="op">,</span> ok <span class="op">:=</span> bc<span class="op">.</span>dataFiles<span class="op">[</span>entry<span class="op">.</span>FileID<span class="op">]</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>ok <span class="op">{</span></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> os<span class="op">.</span>ErrNotExist</span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-11"><a href="#cb23-11" aria-hidden="true" tabindex="-1"></a>    buf <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> entry<span class="op">.</span>Size<span class="op">)</span></span>
+<span id="cb23-12"><a href="#cb23-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> f<span class="op">.</span>ReadAt<span class="op">(</span>buf<span class="op">,</span> entry<span class="op">.</span>Offset<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb23-13"><a href="#cb23-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> err</span>
+<span id="cb23-14"><a href="#cb23-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-15"><a href="#cb23-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// CRC 校验</span></span>
+<span id="cb23-16"><a href="#cb23-16" aria-hidden="true" tabindex="-1"></a>    storedCRC <span class="op">:=</span> binary<span class="op">.</span>BigEndian<span class="op">.</span>Uint32<span class="op">(</span>buf<span class="op">[:</span><span class="dv">4</span><span class="op">])</span></span>
+<span id="cb23-17"><a href="#cb23-17" aria-hidden="true" tabindex="-1"></a>    computedCRC <span class="op">:=</span> crc32<span class="op">.</span>ChecksumIEEE<span class="op">(</span>buf<span class="op">[</span><span class="dv">4</span><span class="op">:])</span></span>
+<span id="cb23-18"><a href="#cb23-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> storedCRC <span class="op">!=</span> computedCRC <span class="op">{</span></span>
+<span id="cb23-19"><a href="#cb23-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> crc32ErrCorrupted</span>
+<span id="cb23-20"><a href="#cb23-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb23-21"><a href="#cb23-21" aria-hidden="true" tabindex="-1"></a>    ksz <span class="op">:=</span> <span class="dt">int</span><span class="op">(</span>binary<span class="op">.</span>BigEndian<span class="op">.</span>Uint32<span class="op">(</span>buf<span class="op">[</span><span class="dv">12</span><span class="op">:</span><span class="dv">16</span><span class="op">]))</span></span>
+<span id="cb23-22"><a href="#cb23-22" aria-hidden="true" tabindex="-1"></a>    value <span class="op">:=</span> buf<span class="op">[</span>headerSize<span class="op">+</span>ksz<span class="op">:]</span></span>
+<span id="cb23-23"><a href="#cb23-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> value<span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb23-24"><a href="#cb23-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb23-25"><a href="#cb23-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-26"><a href="#cb23-26" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> crc32ErrCorrupted <span class="op">=</span> <span class="op">&amp;</span>corruptedError<span class="op">{}</span></span>
+<span id="cb23-27"><a href="#cb23-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-28"><a href="#cb23-28" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> corruptedError <span class="kw">struct</span><span class="op">{}</span></span>
+<span id="cb23-29"><a href="#cb23-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-30"><a href="#cb23-30" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>e <span class="op">*</span>corruptedError<span class="op">)</span> Error<span class="op">()</span> <span class="dt">string</span> <span class="op">{</span></span>
+<span id="cb23-31"><a href="#cb23-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="st">&quot;bitcask: data corrupted, CRC mismatch&quot;</span></span>
+<span id="cb23-32"><a href="#cb23-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="合并">9.6 合并</h3>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Merge 合并旧数据文件，回收磁盘空间。</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> Merge<span class="op">()</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> oldIDs <span class="op">[]</span><span class="dt">int</span></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> id <span class="op">:=</span> <span class="kw">range</span> bc<span class="op">.</span>dataFiles <span class="op">{</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> id <span class="op">!=</span> bc<span class="op">.</span>activeID <span class="op">{</span></span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a>            oldIDs <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>oldIDs<span class="op">,</span> id<span class="op">)</span></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb24-9"><a href="#cb24-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>oldIDs<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb24-10"><a href="#cb24-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span></span>
+<span id="cb24-11"><a href="#cb24-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb24-12"><a href="#cb24-12" aria-hidden="true" tabindex="-1"></a>    sort<span class="op">.</span>Ints<span class="op">(</span>oldIDs<span class="op">)</span></span>
+<span id="cb24-13"><a href="#cb24-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-14"><a href="#cb24-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 创建一个新的合并文件</span></span>
+<span id="cb24-15"><a href="#cb24-15" aria-hidden="true" tabindex="-1"></a>    mergeID <span class="op">:=</span> bc<span class="op">.</span>activeID <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb24-16"><a href="#cb24-16" aria-hidden="true" tabindex="-1"></a>    mergePath <span class="op">:=</span> filepath<span class="op">.</span>Join<span class="op">(</span>bc<span class="op">.</span>dir<span class="op">,</span> strconv<span class="op">.</span>Itoa<span class="op">(</span>mergeID<span class="op">)+</span><span class="st">&quot;.data&quot;</span><span class="op">)</span></span>
+<span id="cb24-17"><a href="#cb24-17" aria-hidden="true" tabindex="-1"></a>    mergeFile<span class="op">,</span> err <span class="op">:=</span> os<span class="op">.</span>OpenFile<span class="op">(</span></span>
+<span id="cb24-18"><a href="#cb24-18" aria-hidden="true" tabindex="-1"></a>        mergePath<span class="op">,</span> os<span class="op">.</span>O_CREATE<span class="op">|</span>os<span class="op">.</span>O_RDWR<span class="op">|</span>os<span class="op">.</span>O_APPEND<span class="op">,</span> <span class="bn">0644</span><span class="op">,</span></span>
+<span id="cb24-19"><a href="#cb24-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">)</span></span>
+<span id="cb24-20"><a href="#cb24-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb24-21"><a href="#cb24-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> err</span>
+<span id="cb24-22"><a href="#cb24-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb24-23"><a href="#cb24-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> mergeOff <span class="dt">int64</span></span>
+<span id="cb24-24"><a href="#cb24-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-25"><a href="#cb24-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 遍历 KeyDir，将仍在旧文件中的记录写入合并文件</span></span>
+<span id="cb24-26"><a href="#cb24-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> key<span class="op">,</span> entry <span class="op">:=</span> <span class="kw">range</span> bc<span class="op">.</span>keydir <span class="op">{</span></span>
+<span id="cb24-27"><a href="#cb24-27" aria-hidden="true" tabindex="-1"></a>        isOld <span class="op">:=</span> <span class="ot">false</span></span>
+<span id="cb24-28"><a href="#cb24-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> _<span class="op">,</span> oid <span class="op">:=</span> <span class="kw">range</span> oldIDs <span class="op">{</span></span>
+<span id="cb24-29"><a href="#cb24-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> entry<span class="op">.</span>FileID <span class="op">==</span> oid <span class="op">{</span></span>
+<span id="cb24-30"><a href="#cb24-30" aria-hidden="true" tabindex="-1"></a>                isOld <span class="op">=</span> <span class="ot">true</span></span>
+<span id="cb24-31"><a href="#cb24-31" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span></span>
+<span id="cb24-32"><a href="#cb24-32" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb24-33"><a href="#cb24-33" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-34"><a href="#cb24-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">!</span>isOld <span class="op">{</span></span>
+<span id="cb24-35"><a href="#cb24-35" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb24-36"><a href="#cb24-36" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-37"><a href="#cb24-37" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 从旧文件读取数据</span></span>
+<span id="cb24-38"><a href="#cb24-38" aria-hidden="true" tabindex="-1"></a>        f <span class="op">:=</span> bc<span class="op">.</span>dataFiles<span class="op">[</span>entry<span class="op">.</span>FileID<span class="op">]</span></span>
+<span id="cb24-39"><a href="#cb24-39" aria-hidden="true" tabindex="-1"></a>        buf <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> entry<span class="op">.</span>Size<span class="op">)</span></span>
+<span id="cb24-40"><a href="#cb24-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> f<span class="op">.</span>ReadAt<span class="op">(</span>buf<span class="op">,</span> entry<span class="op">.</span>Offset<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb24-41"><a href="#cb24-41" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb24-42"><a href="#cb24-42" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-43"><a href="#cb24-43" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 写入合并文件</span></span>
+<span id="cb24-44"><a href="#cb24-44" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> mergeFile<span class="op">.</span>Write<span class="op">(</span>buf<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb24-45"><a href="#cb24-45" aria-hidden="true" tabindex="-1"></a>            mergeFile<span class="op">.</span>Close<span class="op">()</span></span>
+<span id="cb24-46"><a href="#cb24-46" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> err</span>
+<span id="cb24-47"><a href="#cb24-47" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-48"><a href="#cb24-48" aria-hidden="true" tabindex="-1"></a>        bc<span class="op">.</span>keydir<span class="op">[</span>key<span class="op">]</span> <span class="op">=</span> KeyDirEntry<span class="op">{</span></span>
+<span id="cb24-49"><a href="#cb24-49" aria-hidden="true" tabindex="-1"></a>            FileID<span class="op">:</span>    mergeID<span class="op">,</span></span>
+<span id="cb24-50"><a href="#cb24-50" aria-hidden="true" tabindex="-1"></a>            Offset<span class="op">:</span>    mergeOff<span class="op">,</span></span>
+<span id="cb24-51"><a href="#cb24-51" aria-hidden="true" tabindex="-1"></a>            Size<span class="op">:</span>      entry<span class="op">.</span>Size<span class="op">,</span></span>
+<span id="cb24-52"><a href="#cb24-52" aria-hidden="true" tabindex="-1"></a>            Timestamp<span class="op">:</span> entry<span class="op">.</span>Timestamp<span class="op">,</span></span>
+<span id="cb24-53"><a href="#cb24-53" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-54"><a href="#cb24-54" aria-hidden="true" tabindex="-1"></a>        mergeOff <span class="op">+=</span> <span class="dt">int64</span><span class="op">(</span>entry<span class="op">.</span>Size<span class="op">)</span></span>
+<span id="cb24-55"><a href="#cb24-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb24-56"><a href="#cb24-56" aria-hidden="true" tabindex="-1"></a>    mergeFile<span class="op">.</span>Sync<span class="op">()</span></span>
+<span id="cb24-57"><a href="#cb24-57" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>dataFiles<span class="op">[</span>mergeID<span class="op">]</span> <span class="op">=</span> mergeFile</span>
+<span id="cb24-58"><a href="#cb24-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-59"><a href="#cb24-59" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 关闭并删除旧文件</span></span>
+<span id="cb24-60"><a href="#cb24-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> oid <span class="op">:=</span> <span class="kw">range</span> oldIDs <span class="op">{</span></span>
+<span id="cb24-61"><a href="#cb24-61" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> f<span class="op">,</span> ok <span class="op">:=</span> bc<span class="op">.</span>dataFiles<span class="op">[</span>oid<span class="op">];</span> ok <span class="op">{</span></span>
+<span id="cb24-62"><a href="#cb24-62" aria-hidden="true" tabindex="-1"></a>            f<span class="op">.</span>Close<span class="op">()</span></span>
+<span id="cb24-63"><a href="#cb24-63" aria-hidden="true" tabindex="-1"></a>            <span class="bu">delete</span><span class="op">(</span>bc<span class="op">.</span>dataFiles<span class="op">,</span> oid<span class="op">)</span></span>
+<span id="cb24-64"><a href="#cb24-64" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb24-65"><a href="#cb24-65" aria-hidden="true" tabindex="-1"></a>        oldPath <span class="op">:=</span> filepath<span class="op">.</span>Join<span class="op">(</span>bc<span class="op">.</span>dir<span class="op">,</span> strconv<span class="op">.</span>Itoa<span class="op">(</span>oid<span class="op">)+</span><span class="st">&quot;.data&quot;</span><span class="op">)</span></span>
+<span id="cb24-66"><a href="#cb24-66" aria-hidden="true" tabindex="-1"></a>        os<span class="op">.</span>Remove<span class="op">(</span>oldPath<span class="op">)</span></span>
+<span id="cb24-67"><a href="#cb24-67" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb24-68"><a href="#cb24-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-69"><a href="#cb24-69" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 切换活跃文件</span></span>
+<span id="cb24-70"><a href="#cb24-70" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>activeFile<span class="op">.</span>Sync<span class="op">()</span></span>
+<span id="cb24-71"><a href="#cb24-71" aria-hidden="true" tabindex="-1"></a>    bc<span class="op">.</span>activeID <span class="op">=</span> mergeID <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb24-72"><a href="#cb24-72" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> bc<span class="op">.</span>openActiveFile<span class="op">()</span></span>
+<span id="cb24-73"><a href="#cb24-73" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="关闭">9.7 关闭</h3>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Close 关闭 Bitcask 实例，释放所有资源。</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> Close<span class="op">()</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> bc<span class="op">.</span>activeFile <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a>        bc<span class="op">.</span>activeFile<span class="op">.</span>Sync<span class="op">()</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a>        bc<span class="op">.</span>activeFile<span class="op">.</span>Close<span class="op">()</span></span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> id<span class="op">,</span> f <span class="op">:=</span> <span class="kw">range</span> bc<span class="op">.</span>dataFiles <span class="op">{</span></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> id <span class="op">!=</span> bc<span class="op">.</span>activeID <span class="op">{</span></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a>            f<span class="op">.</span>Close<span class="op">()</span></span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb25-12"><a href="#cb25-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">nil</span></span>
+<span id="cb25-13"><a href="#cb25-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb25-14"><a href="#cb25-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-15"><a href="#cb25-15" aria-hidden="true" tabindex="-1"></a><span class="co">// ListKeys 返回所有有效键的列表。</span></span>
+<span id="cb25-16"><a href="#cb25-16" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>bc <span class="op">*</span>Bitcask<span class="op">)</span> ListKeys<span class="op">()</span> <span class="op">[]</span><span class="dt">string</span> <span class="op">{</span></span>
+<span id="cb25-17"><a href="#cb25-17" aria-hidden="true" tabindex="-1"></a>    keys <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">string</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="bu">len</span><span class="op">(</span>bc<span class="op">.</span>keydir<span class="op">))</span></span>
+<span id="cb25-18"><a href="#cb25-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> k <span class="op">:=</span> <span class="kw">range</span> bc<span class="op">.</span>keydir <span class="op">{</span></span>
+<span id="cb25-19"><a href="#cb25-19" aria-hidden="true" tabindex="-1"></a>        keys <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>keys<span class="op">,</span> k<span class="op">)</span></span>
+<span id="cb25-20"><a href="#cb25-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb25-21"><a href="#cb25-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> keys</span>
+<span id="cb25-22"><a href="#cb25-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="使用示例">9.8 使用示例</h3>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> main</span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="op">(</span></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;fmt&quot;</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;log&quot;</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;example.com/bitcask&quot;</span></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 打开或创建一个 Bitcask 实例</span></span>
+<span id="cb26-12"><a href="#cb26-12" aria-hidden="true" tabindex="-1"></a>    db<span class="op">,</span> err <span class="op">:=</span> bitcask<span class="op">.</span>Open<span class="op">(</span><span class="st">&quot;./my-bitcask-data&quot;</span><span class="op">)</span></span>
+<span id="cb26-13"><a href="#cb26-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb26-14"><a href="#cb26-14" aria-hidden="true" tabindex="-1"></a>        log<span class="op">.</span>Fatal<span class="op">(</span>err<span class="op">)</span></span>
+<span id="cb26-15"><a href="#cb26-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb26-16"><a href="#cb26-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">defer</span> db<span class="op">.</span>Close<span class="op">()</span></span>
+<span id="cb26-17"><a href="#cb26-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-18"><a href="#cb26-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 写入数据</span></span>
+<span id="cb26-19"><a href="#cb26-19" aria-hidden="true" tabindex="-1"></a>    db<span class="op">.</span>Put<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;name&quot;</span><span class="op">),</span> <span class="op">[]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;bitcask&quot;</span><span class="op">))</span></span>
+<span id="cb26-20"><a href="#cb26-20" aria-hidden="true" tabindex="-1"></a>    db<span class="op">.</span>Put<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;version&quot;</span><span class="op">),</span> <span class="op">[]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;1.0.0&quot;</span><span class="op">))</span></span>
+<span id="cb26-21"><a href="#cb26-21" aria-hidden="true" tabindex="-1"></a>    db<span class="op">.</span>Put<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;author&quot;</span><span class="op">),</span> <span class="op">[]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;basho&quot;</span><span class="op">))</span></span>
+<span id="cb26-22"><a href="#cb26-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-23"><a href="#cb26-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 读取数据</span></span>
+<span id="cb26-24"><a href="#cb26-24" aria-hidden="true" tabindex="-1"></a>    val<span class="op">,</span> err <span class="op">:=</span> db<span class="op">.</span>Get<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;name&quot;</span><span class="op">))</span></span>
+<span id="cb26-25"><a href="#cb26-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb26-26"><a href="#cb26-26" aria-hidden="true" tabindex="-1"></a>        log<span class="op">.</span>Fatal<span class="op">(</span>err<span class="op">)</span></span>
+<span id="cb26-27"><a href="#cb26-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb26-28"><a href="#cb26-28" aria-hidden="true" tabindex="-1"></a>    fmt<span class="op">.</span>Printf<span class="op">(</span><span class="st">&quot;name = %s</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span> val<span class="op">)</span> <span class="co">// 输出: name = bitcask</span></span>
+<span id="cb26-29"><a href="#cb26-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-30"><a href="#cb26-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 更新数据</span></span>
+<span id="cb26-31"><a href="#cb26-31" aria-hidden="true" tabindex="-1"></a>    db<span class="op">.</span>Put<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;version&quot;</span><span class="op">),</span> <span class="op">[]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;2.0.0&quot;</span><span class="op">))</span></span>
+<span id="cb26-32"><a href="#cb26-32" aria-hidden="true" tabindex="-1"></a>    val<span class="op">,</span> _ <span class="op">=</span> db<span class="op">.</span>Get<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;version&quot;</span><span class="op">))</span></span>
+<span id="cb26-33"><a href="#cb26-33" aria-hidden="true" tabindex="-1"></a>    fmt<span class="op">.</span>Printf<span class="op">(</span><span class="st">&quot;version = %s</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span> val<span class="op">)</span> <span class="co">// 输出: version = 2.0.0</span></span>
+<span id="cb26-34"><a href="#cb26-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-35"><a href="#cb26-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 删除数据</span></span>
+<span id="cb26-36"><a href="#cb26-36" aria-hidden="true" tabindex="-1"></a>    db<span class="op">.</span>Delete<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;author&quot;</span><span class="op">))</span></span>
+<span id="cb26-37"><a href="#cb26-37" aria-hidden="true" tabindex="-1"></a>    _<span class="op">,</span> err <span class="op">=</span> db<span class="op">.</span>Get<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span><span class="st">&quot;author&quot;</span><span class="op">))</span></span>
+<span id="cb26-38"><a href="#cb26-38" aria-hidden="true" tabindex="-1"></a>    fmt<span class="op">.</span>Printf<span class="op">(</span><span class="st">&quot;author deleted: %v</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span> err <span class="op">!=</span> <span class="ot">nil</span><span class="op">)</span> <span class="co">// 输出: author deleted: true</span></span>
+<span id="cb26-39"><a href="#cb26-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-40"><a href="#cb26-40" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 列出所有键</span></span>
+<span id="cb26-41"><a href="#cb26-41" aria-hidden="true" tabindex="-1"></a>    keys <span class="op">:=</span> db<span class="op">.</span>ListKeys<span class="op">()</span></span>
+<span id="cb26-42"><a href="#cb26-42" aria-hidden="true" tabindex="-1"></a>    fmt<span class="op">.</span>Printf<span class="op">(</span><span class="st">&quot;remaining keys: %v</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span> keys<span class="op">)</span></span>
+<span id="cb26-43"><a href="#cb26-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-44"><a href="#cb26-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 执行合并，回收空间</span></span>
+<span id="cb26-45"><a href="#cb26-45" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">:=</span> db<span class="op">.</span>Merge<span class="op">();</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb26-46"><a href="#cb26-46" aria-hidden="true" tabindex="-1"></a>        log<span class="op">.</span>Fatal<span class="op">(</span>err<span class="op">)</span></span>
+<span id="cb26-47"><a href="#cb26-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb26-48"><a href="#cb26-48" aria-hidden="true" tabindex="-1"></a>    fmt<span class="op">.</span>Println<span class="op">(</span><span class="st">&quot;merge completed&quot;</span><span class="op">)</span></span>
+<span id="cb26-49"><a href="#cb26-49" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="实现要点总结">9.9 实现要点总结</h3>
+            <p>上面的实现虽然简化了许多细节，但已经覆盖了 Bitcask
+            的核心机制：</p>
+            <pre class="text"><code>┌────────────────────┬──────────────────────────────┐
+│ 特性               │ 实现状态                     │
+├────────────────────┼──────────────────────────────┤
+│ 追加写入           │ ✓ 活跃文件尾部追加           │
+│ 内存哈希索引       │ ✓ keydir map                 │
+│ CRC 校验           │ ✓ crc32 编码与校验           │
+│ 文件轮转           │ ✓ 超过 maxFileSize 自动轮转  │
+│ 墓碑删除           │ ✓ 特殊标记值                 │
+│ 崩溃恢复           │ ✓ 启动时扫描重建 KeyDir      │
+│ 合并回收           │ ✓ Merge 函数                 │
+│ Hint File          │ ✗ 未实现（生产版本应实现）   │
+│ 并发安全           │ ✗ 简化版未加锁               │
+│ 文件描述符池       │ ✗ 简化版未优化               │
+└────────────────────┴──────────────────────────────┘</code></pre>
+            <p>在生产级实现中，还需要加入以下增强：</p>
+            <ul>
+            <li><strong>互斥锁（Mutex）</strong>：保护 KeyDir
+            和活跃文件的并发访问。</li>
+            <li><strong>Hint File
+            生成与读取</strong>：加速启动恢复。</li>
+            <li><strong>文件描述符池管理</strong>：避免频繁的文件打开和关闭。</li>
+            <li><strong>配置化参数</strong>：支持自定义文件大小上限、fsync
+            策略等。</li>
+            <li><strong>错误处理优化</strong>：更细粒度的错误类型和恢复逻辑。</li>
+            </ul>
+            <hr />
+            <h2 id="十bitcask-vs-lsm-tree-vs-btree">十、Bitcask vs
+            LSM-Tree vs B+Tree</h2>
+            <h3 id="三种引擎概述">10.1 三种引擎概述</h3>
+            <p>在键值存储引擎的设计空间中， Bitcask、LSM-Tree 和 B+Tree
+            代表了三种截然不同的设计哲学：</p>
+            <ul>
+            <li><strong>Bitcask</strong>：追加日志 +
+            内存哈希表。追求极致的单点读写性能。</li>
+            <li><strong>LSM-Tree</strong>：追加日志 +
+            排序的磁盘文件（SSTable）。
+            在写入性能和范围查询之间取得平衡。</li>
+            <li><strong>B+Tree</strong>：就地更新的平衡树。读取性能优秀，支持高效的范围查询。</li>
+            </ul>
+            <h3 id="详细对比">10.2 详细对比</h3>
+            <pre class="text"><code>┌──────────────────────┬───────────────┬───────────────┬───────────────┐
+│ 维度                 │ Bitcask       │ LSM-Tree      │ B+Tree        │
+├──────────────────────┼───────────────┼───────────────┼───────────────┤
+│ 写入模式             │ 追加          │ 追加          │ 就地更新      │
+│ 索引结构             │ 内存哈希表    │ 多层 SSTable  │ 平衡树        │
+│ 写入复杂度           │ O(1)          │ O(log N)      │ O(log N)      │
+│ 点读复杂度           │ O(1)          │ O(log N)      │ O(log N)      │
+│ 范围查询             │ 不支持        │ 支持          │ 支持          │
+│ 写放大               │ 低-中         │ 中-高         │ 低            │
+│ 读放大               │ 1             │ 1-10+         │ 3-4           │
+│ 空间放大             │ 中            │ 中            │ 低            │
+│ 内存要求             │ 高（全键）    │ 中（布隆过滤器│ 低（缓存）    │
+│                      │               │  + 索引块）   │               │
+│ 写入吞吐             │ 极高          │ 高            │ 中            │
+│ 读取延迟             │ 极低（1次IO） │ 低-中         │ 低            │
+│ 启动时间             │ 较长          │ 短            │ 短            │
+│ 适用键数量           │ 有限（内存）  │ 无限          │ 无限          │
+│ 代表实现             │ Riak/Bitcask  │ RocksDB,      │ BoltDB,       │
+│                      │               │ LevelDB       │ LMDB, InnoDB  │
+└──────────────────────┴───────────────┴───────────────┴───────────────┘</code></pre>
+            <h3 id="写入性能对比">10.3 写入性能对比</h3>
+            <p>Bitcask 的写入性能在三者中是最优的，因为它只需要：</p>
+            <ol type="1">
+            <li>一次顺序写入（追加到活跃文件）。</li>
+            <li>一次内存操作（更新 KeyDir）。</li>
+            </ol>
+            <p>LSM-Tree 的写入也是顺序追加（先写 WAL，再写 MemTable），
+            但后台的合并操作（Compaction）会带来额外的写放大。</p>
+            <p>B+Tree 的写入需要在树中找到正确的位置并就地更新，
+            可能触发节点分裂（Split），涉及多次随机 I/O。</p>
+            <pre class="text"><code>写入吞吐量排序（典型场景）：
+
+Bitcask ≈ 50-100 万次/秒
+    ▲
+    │
+LSM-Tree ≈ 10-50 万次/秒
+    ▲
+    │
+B+Tree ≈ 5-20 万次/秒</code></pre>
+            <h3 id="读取性能对比">10.4 读取性能对比</h3>
+            <p>Bitcask 的读取在三者中通常也是最快的（缓存命中时）， 因为
+            KeyDir 提供 O(1) 查找，且只需一次磁盘读取。</p>
+            <p>B+Tree 的读取需要遍历 2-4
+            层节点，但由于内部节点通常被缓存在内存中， 实际的磁盘 I/O
+            通常只有 1 次。</p>
+            <p>LSM-Tree 的读取在最坏情况下可能需要检查多层 SSTable，
+            即使使用布隆过滤器（Bloom Filter）来跳过不包含目标键的
+            SSTable， 读取放大仍然可能大于 1。</p>
+            <h3 id="何时选择-bitcask">10.5 何时选择 Bitcask</h3>
+            <p>基于以上分析，以下场景特别适合使用 Bitcask：</p>
+            <p><strong>适合 Bitcask 的场景</strong>：</p>
+            <ol type="1">
+            <li><p><strong>会话存储（Session Store）</strong>： 键是会话
+            ID（Session ID），值是会话数据。
+            键的数量有限（活跃用户数），单点读写性能至关重要。</p></li>
+            <li><p><strong>用户偏好存储（Preferences Store）</strong>：
+            键是用户 ID，值是用户偏好设置的 JSON 数据。
+            键的数量等于用户数，通常可以放入内存。</p></li>
+            <li><p><strong>URL 缩短服务（URL Shortener）</strong>：
+            键是短链接编码，值是原始 URL。
+            写入量大但键总量有限，需要极低的读取延迟。</p></li>
+            <li><p><strong>计数器服务（Counter Service）</strong>：
+            键是计数器名称，值是当前计数。
+            高频更新，对写入性能要求极高。</p></li>
+            <li><p><strong>消息队列的存储层（Message Queue
+            Backend）</strong>： 使用自增 ID 作为键，消息内容作为值。
+            追加写入模式天然匹配消息队列的特点。</p></li>
+            </ol>
+            <p><strong>不适合 Bitcask 的场景</strong>：</p>
+            <ol type="1">
+            <li>键数量极大（数十亿级别），无法全部放入内存。</li>
+            <li>需要范围查询或有序遍历的场景。</li>
+            <li>需要复杂查询（如二级索引、过滤）的场景。</li>
+            <li>单个值很大（数 MB 以上）的场景。</li>
+            </ol>
+            <h3 id="混合使用策略">10.6 混合使用策略</h3>
+            <p>在实际的系统设计中，不同的存储引擎可以混合使用。
+            例如，Riak 允许不同的
+            Bucket（数据桶）使用不同的存储后端：</p>
+            <ul>
+            <li>将频繁读写的小数据放在 Bitcask
+            后端，获得极致的延迟。</li>
+            <li>将需要范围查询的数据放在 LevelDB
+            后端，获得排序遍历能力。</li>
+            <li>将冷数据归档到外部的分布式文件系统。</li>
+            </ul>
+            <p>这种混合策略在很多大型系统中都被采用，
+            体现了”没有万能引擎，只有合适的引擎”这一工程哲学。</p>
+            <h3 id="进一步的思考">10.7 进一步的思考</h3>
+            <p>Bitcask 的设计可以被看作是一个极端的权衡选择：
+            它牺牲了范围查询能力和内存效率，换取了极致的单点读写性能。
+            这种设计在特定工作负载下是最优的，但在通用场景下则有明显的局限。</p>
+            <p>现代存储引擎的设计趋势是在这些权衡之间找到更好的平衡点。
+            例如：</p>
+            <ul>
+            <li><p><strong>WiscKey</strong>（FAST 2016）：
+            将键值分离（Key-Value Separation），键存储在 LSM-Tree 中，
+            值存储在追加日志中。这样既支持范围查询，又减少了写放大。
+            这可以看作 Bitcask 和 LSM-Tree 的混合体。</p></li>
+            <li><p><strong>Bourbon</strong>（OSDI 2020）：
+            使用机器学习（Machine Learning）来优化 LSM-Tree 的合并策略，
+            根据工作负载自适应地调整参数。</p></li>
+            <li><p><strong>SILK</strong>（ATC 2019）： 通过 I/O
+            调度器来协调 LSM-Tree 的前台读写和后台合并，
+            减少合并对读取延迟的影响。</p></li>
+            </ul>
+            <p>这些工作都建立在 Bitcask 和 LSM-Tree 等经典设计的基础上，
+            通过创新性的组合和优化来推动存储引擎的发展。</p>
+            <hr />
+            <h2 id="参考文献">参考文献</h2>
+            <ol type="1">
+            <li><p>Justin Sheehy, David Smith. <em>Bitcask: A
+            Log-Structured Hash Table for Fast Key/Value Data</em>.
+            Basho Technologies, 2010. <a
+            href="https://riak.com/assets/bitcask-intro.pdf"
+            class="uri">https://riak.com/assets/bitcask-intro.pdf</a></p></li>
+            <li><p>Patrick O’Neil, Edward Cheng, Dieter Gawlick,
+            Elizabeth O’Neil. <em>The Log-Structured Merge-Tree
+            (LSM-Tree)</em>. Acta Informatica, 1996.</p></li>
+            <li><p>Mendel Rosenblum, John K. Ousterhout. <em>The Design
+            and Implementation of a Log-Structured File System</em>. ACM
+            Transactions on Computer Systems, 1992.</p></li>
+            <li><p>Giuseppe DeCandia et al. <em>Dynamo: Amazon’s Highly
+            Available Key-Value Store</em>. SOSP, 2007.</p></li>
+            <li><p>Lanyue Lu, Thanumalayan Sankaranarayana Pillai, et
+            al. <em>WiscKey: Separating Keys from Values in
+            SSD-Conscious Storage</em>. FAST, 2016.</p></li>
+            <li><p>Sian Lun Lau, Boshi Chen, et al. <em>Bourbon: Learned
+            Tree Structure-Aware Key-Value Store</em>. OSDI,
+            2020.</p></li>
+            <li><p>Oana Balmau, Rachid Guerraoui, et al. <em>SILK:
+            Preventing Latency Spikes in Log-Structured Merge Key-Value
+            Stores</em>. ATC, 2019.</p></li>
+            <li><p>Riak KV Documentation. <em>Bitcask Backend
+            Configuration</em>. <a
+            href="https://docs.riak.com/riak/kv/latest/setup/planning/backend/bitcask/"
+            class="uri">https://docs.riak.com/riak/kv/latest/setup/planning/backend/bitcask/</a></p></li>
+            <li><p>Martin Kleppmann. <em>Designing Data-Intensive
+            Applications</em>, Chapter 3: Storage and Retrieval.
+            O’Reilly Media, 2017.</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../29-index-structures/index-structures.html">索引结构：从
+            B+Tree 到倒排索引</a></p>
+            <p><strong>下一篇</strong>: <a
+            href="../31-lsm-tree-tuning/lsm-tree-tuning.html">LSM-Tree
+            工程调优：三种放大的权衡</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/17-compaction/17-compaction.html">【数据湖与开放表格式】小文件与 Compaction</a></h3>
+                    <p>拆解 lakehouse 小文件的根因（频繁提交、流式、过细分区），以及 bin-pack、sort/z-order/clustering、rewrite manifests、expire snapshots、remove orphan files 这套治理操作；讲清 Puffin 中 Theta NDV sketch 对查询 planning 的作用，附 PyIceberg 真实实验对比 compaction 前后文件数与 planning 耗时。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-09 · storage</p>
+                    <h3><a href="/post/storage/31-lsm-tree-tuning/lsm-tree-tuning.html">【存储工程】LSM-Tree 工程调优：三种放大的权衡</a></h3>
+                    <p>LSM-Tree 的核心设计是把随机写转换为顺序写，但这个转换不是免费的。写入经过 MemTable 刷盘、再经过多次 Compaction 合并，每一字节的用户数据在磁盘上可能被反复读写数十次。读取一个 key 时，最坏情况下需要逐层搜索，直到命中或遍历全部层级。与此同时，旧版本数据和墓碑标记占用的额外空间，在 Co…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-10 · storage</p>
+                    <h3><a href="/post/storage/32-rocksdb-practice/rocksdb-practice.html">【存储工程】RocksDB 工程实践</a></h3>
+                    <p>从 Column Family、Write Buffer、Block Cache、Compaction、Rate Limiter 到 Direct I/O 和监控，系统拆解 RocksDB 在生产环境中的关键配置与故障模式，并给出 SSD 场景下的配置模板和 db_bench 基准测试方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-07 · storage</p>
+                    <h3><a href="/post/storage/29-index-structures/index-structures.html">【存储工程】索引结构：从 B+Tree 到倒排索引</a></h3>
+                    <p>数据库里存了一亿行数据，要找出 userid 42 的那一行。没有索引的做法是全表扫描（Full Table Scan）——从第一个数据页读到最后一个数据页，逐行比对。假设每个数据页 16 KB，一亿行占 20 GB，即使顺序读能跑到 500 MB/s，也需要 40 秒。加一个 B+Tree 索引，三次磁盘 I/O 就…</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

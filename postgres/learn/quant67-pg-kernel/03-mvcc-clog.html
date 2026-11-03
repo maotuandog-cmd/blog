@@ -1,0 +1,1246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="在已有 MVCC 文章基础上深入 PG
+并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU
+淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG
+14 snapshot scalability 优化的具体机制（ProcArrayLock
+为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID
+回卷（wraparound）的威胁模型。最后与 InnoDB undo log
+方案做系统性对比。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, mvcc, clog, hint-bit, snapshot, slru, transaction-id, wraparound, procarraylock, innodb, undo-log, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性" />
+    <meta property="og:description" content="在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="mvcc" />
+    <meta property="article:tag" content="clog" />
+    <meta property="article:tag" content="hint-bit" />
+    <meta property="article:tag" content="snapshot" />
+    <meta property="article:tag" content="slru" />
+    <meta property="article:tag" content="transaction-id" />
+    <meta property="article:tag" content="wraparound" />
+    <meta property="article:tag" content="procarraylock" />
+    <meta property="article:tag" content="innodb" />
+    <meta property="article:tag" content="undo-log" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性" />
+    <meta name="twitter:description" content="在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性", "description": "在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-07-23T15:46:43+00:00", "keywords": ["postgresql", "pg-kernel", "mvcc", "clog", "hint-bit", "snapshot", "slru", "transaction-id", "wraparound", "procarraylock", "innodb", "undo-log"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#mvcc</span> <span>#clog</span> <span>#hint-bit</span> <span>#snapshot</span> <span>#slru</span> <span>#transaction-id</span> <span>#wraparound</span> <span>#procarraylock</span> <span>#innodb</span> <span>#undo-log</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/mvcc.html">#mvcc</a><a class="chip-link" href="/tags/clog.html">#clog</a><a class="chip-link" href="/tags/hint-bit.html">#hint-bit</a><a class="chip-link" href="/tags/snapshot.html">#snapshot</a><a class="chip-link" href="/tags/slru.html">#slru</a><a class="chip-link" href="/tags/transaction-id.html">#transaction-id</a><a class="chip-link" href="/tags/wraparound.html">#wraparound</a><a class="chip-link" href="/tags/procarraylock.html">#procarraylock</a><a class="chip-link" href="/tags/innodb.html">#innodb</a><a class="chip-link" href="/tags/undo-log.html">#undo-log</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#mvcc-实现cloghint-bit-与快照可扩展性"
+                id="toc-mvcc-实现cloghint-bit-与快照可扩展性">MVCC
+                实现：CLOG、hint bit 与快照可扩展性</a>
+                <ul>
+                <li><a href="#一快照与可见性判定的快速回顾"
+                id="toc-一快照与可见性判定的快速回顾">一、快照与可见性判定的快速回顾</a></li>
+                <li><a href="#二clog提交日志的内部机制"
+                id="toc-二clog提交日志的内部机制">二、CLOG：提交日志的内部机制</a>
+                <ul>
+                <li><a href="#事务状态位"
+                id="toc-事务状态位">事务状态位</a></li>
+                <li><a href="#slru-页面管理" id="toc-slru-页面管理">SLRU
+                页面管理</a></li>
+                <li><a href="#clog-的读取路径与-lru-淘汰"
+                id="toc-clog-的读取路径与-lru-淘汰">CLOG 的读取路径与
+                LRU 淘汰</a></li>
+                <li><a href="#clog-的磁盘段文件"
+                id="toc-clog-的磁盘段文件">CLOG 的磁盘段文件</a></li>
+                </ul></li>
+                <li><a href="#三hint-bit为什么写怎么写写坏了怎么办"
+                id="toc-三hint-bit为什么写怎么写写坏了怎么办">三、hint
+                bit：为什么写、怎么写、写坏了怎么办</a>
+                <ul>
+                <li><a href="#为什么需要-hint-bit"
+                id="toc-为什么需要-hint-bit">为什么需要 hint
+                bit</a></li>
+                <li><a href="#写入时机sethintbits"
+                id="toc-写入时机sethintbits">写入时机：SetHintBits</a></li>
+                <li><a href="#hint-bit-的竞争问题"
+                id="toc-hint-bit-的竞争问题">hint bit
+                的竞争问题</a></li>
+                </ul></li>
+                <li><a
+                href="#四快照可扩展性procarraylock-争用与-pg-14-优化"
+                id="toc-四快照可扩展性procarraylock-争用与-pg-14-优化">四、快照可扩展性：ProcArrayLock
+                争用与 PG 14 优化</a>
+                <ul>
+                <li><a href="#为什么高连接数下取快照会痛"
+                id="toc-为什么高连接数下取快照会痛">为什么高连接数下取快照会痛</a></li>
+                <li><a href="#演进两阶段先-pgxact再拆掉-pgxact"
+                id="toc-演进两阶段先-pgxact再拆掉-pgxact">演进两阶段：先
+                PGXACT，再拆掉 PGXACT</a></li>
+                <li><a href="#性能数字怎么引用"
+                id="toc-性能数字怎么引用">性能数字怎么引用</a></li>
+                <li><a href="#仍然昂贵的操作"
+                id="toc-仍然昂贵的操作">仍然昂贵的操作</a></li>
+                </ul></li>
+                <li><a href="#五事务-id-回卷pg-的-20-亿上限"
+                id="toc-五事务-id-回卷pg-的-20-亿上限">五、事务 ID
+                回卷：PG 的 20 亿上限</a>
+                <ul>
+                <li><a href="#位-xid-与回卷环"
+                id="toc-位-xid-与回卷环">32 位 XID 与回卷环</a></li>
+                <li><a href="#回卷的威胁模型"
+                id="toc-回卷的威胁模型">回卷的威胁模型</a></li>
+                <li><a href="#监控手段"
+                id="toc-监控手段">监控手段</a></li>
+                </ul></li>
+                <li><a href="#六与-innodb-的-undo-log-方案对比"
+                id="toc-六与-innodb-的-undo-log-方案对比">六、与 InnoDB
+                的 undo log 方案对比</a>
+                <ul>
+                <li><a href="#innodb-的方案undo-log-rollback-segment"
+                id="toc-innodb-的方案undo-log-rollback-segment">InnoDB
+                的方案：undo log + rollback segment</a></li>
+                <li><a href="#两套方案的关键差异"
+                id="toc-两套方案的关键差异">两套方案的关键差异</a></li>
+                <li><a href="#pg-不选-undo-log-的原因"
+                id="toc-pg-不选-undo-log-的原因">PG 不选 undo log
+                的原因</a></li>
+                <li><a href="#批量更新场景下的行为差异"
+                id="toc-批量更新场景下的行为差异">批量更新场景下的行为差异</a></li>
+                </ul></li>
+                <li><a href="#七实验观察-clog-与-hint-bit"
+                id="toc-七实验观察-clog-与-hint-bit">七、实验：观察 CLOG
+                与 hint bit</a>
+                <ul>
+                <li><a href="#观察-hint-bit-的写入"
+                id="toc-观察-hint-bit-的写入">观察 hint bit
+                的写入</a></li>
+                <li><a href="#验证只读查询产生脏页"
+                id="toc-验证只读查询产生脏页">验证只读查询产生脏页</a></li>
+                <li><a href="#监控事务-id-回卷"
+                id="toc-监控事务-id-回卷">监控事务 ID 回卷</a></li>
+                <li><a href="#观察-update-后的版本链"
+                id="toc-观察-update-后的版本链">观察 UPDATE
+                后的版本链</a></li>
+                </ul></li>
+                <li><a href="#八关键要点"
+                id="toc-八关键要点">八、关键要点</a></li>
+                <li><a href="#九争论zheap-与要不要-undo"
+                id="toc-九争论zheap-与要不要-undo">九、争论：zheap
+                与「要不要 undo」</a></li>
+                <li><a href="#十开放问题"
+                id="toc-十开放问题">十、开放问题</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#前置文章"
+                id="toc-前置文章">前置文章</a></li>
+                <li><a
+                href="#源码机制描述以-pg-14-当前主线为准阅读时核对所装大版本"
+                id="toc-源码机制描述以-pg-14-当前主线为准阅读时核对所装大版本">源码（机制描述以
+                PG 14+ / 当前主线为准；阅读时核对所装大版本）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文与设计讨论"
+                id="toc-论文与设计讨论">论文与设计讨论</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="mvcc-实现cloghint-bit-与快照可扩展性">MVCC
+            实现：CLOG、hint bit 与快照可扩展性</h1>
+            <p>在 <a href="../../mvcc/mvcc.html">数据库
+            MVCC：快照隔离到底隔离了什么</a> 中，我们拆解了 PG
+            的版本链（xmin/xmax/ctid）、快照结构（<code>SnapshotData</code>）和可见性判断规则。那篇文章到
+            <code>HeapTupleSatisfiesMVCC()</code>
+            为止，留下三个不透明的问题：</p>
+            <ol type="1">
+            <li>xmin/xmax 只给了事务 ID——怎么知道事务 1001
+            是提交了还是回滚了？</li>
+            <li><code>t_infomask</code> 里的
+            <code>HEAP_XMIN_COMMITTED</code>、<code>HEAP_XMAX_COMMITTED</code>
+            这些 hint bit 是谁写的？什么时候写的？</li>
+            <li><code>GetSnapshotData()</code> 扫描所有活跃 Backend 的
+            <code>PGPROC</code> 来构建快照——1000
+            个连接时这个扫描到底有多重？</li>
+            </ol>
+            <p>这三个问题分别指向 CLOG（提交日志）、hint
+            bit（可见性缓存）和 snapshot
+            scalability（快照可扩展性）。本文逐个拆解它们的源码实现，最后与
+            InnoDB 的 undo log 方案做系统性对比。</p>
+            <hr />
+            <h2
+            id="一快照与可见性判定的快速回顾">一、快照与可见性判定的快速回顾</h2>
+            <p>在展开 CLOG 之前，先回顾可见性判定的完整路径，明确 CLOG
+            和 hint bit 在哪里介入。</p>
+            <p>每个 Backend 在执行查询前获取一个快照：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/ipc/procarray.c</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>Snapshot GetSnapshotData<span class="op">(</span>Snapshot snapshot<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 获取 ProcArrayLock 共享锁（PG 14 优化了持锁范围，见第四节）</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    LWLockAcquire<span class="op">(</span>ProcArrayLock<span class="op">,</span> LW_SHARED<span class="op">);</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 确定快照的 xmin / xmax / xip（活跃事务列表）</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    snapshot<span class="op">-&gt;</span>xmin <span class="op">=</span> GetOldestActiveTransactionId<span class="op">();</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    snapshot<span class="op">-&gt;</span>xmax <span class="op">=</span> ReadNextFullTransactionId<span class="op">();</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    snapshot<span class="op">-&gt;</span>xip <span class="op">=</span> 收集所有 xmin <span class="op">&lt;</span> xid <span class="op">&lt;</span> xmax 的活跃事务 ID<span class="op">;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    LWLockRelease<span class="op">(</span>ProcArrayLock<span class="op">);</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> snapshot<span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>拿到快照后，每次读一行时调用可见性判定函数。以
+            <code>HeapTupleSatisfiesMVCC()</code> 为例：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/heap/heapam_visibility.c</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> HeapTupleSatisfiesMVCC<span class="op">(</span>HeapTuple htup<span class="op">,</span> Snapshot snapshot<span class="op">,</span> Buffer buffer<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 如果 xmin 是当前事务 → 可见（本事务的修改自己能看到）</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 如果 xmin 在快照的 xip 列表中 → 不可见（创建者还没提交）</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 如果 xmin &lt; snapshot-&gt;xmin → 需要查 CLOG 确认是否已提交</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    → TransactionIdDidCommit(xmin)   ← CLOG 在这里介入</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 如果 xmin 已提交 → 检查 xmax：是否被删除了？</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    → 同样需要查 CLOG 确认 xmax 事务的状态</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>流程 3 和 4 中的 <code>TransactionIdDidCommit()</code>
+            就是 CLOG 的入口。每次判定都要查的话代价很高——这就是 hint
+            bit 存在的理由：把 CLOG 的结果缓存到 tuple header 的
+            <code>t_infomask</code> 里，后续读取直接看 flag。</p>
+            <hr />
+            <h2
+            id="二clog提交日志的内部机制">二、CLOG：提交日志的内部机制</h2>
+            <h3 id="事务状态位">事务状态位</h3>
+            <p>CLOG（Commit Log）是 PG
+            在共享内存中维护的事务状态日志，记录每个事务的最终状态。它不是”日志”文件意义上的
+            append-only log——它在共享内存中是一个 SLRU（Simple Least
+            Recently Used）缓存，对每个事务 ID 存储 2 个 bit：</p>
+            <table>
+            <colgroup>
+            <col style="width: 33%" />
+            <col style="width: 33%" />
+            <col style="width: 33%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>状态</th>
+            <th>编码</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>CLOG_XID_STATUS_IN_PROGRESS</code></td>
+            <td><code>0x00</code></td>
+            <td>事务正在进行中（初始状态）</td>
+            </tr>
+            <tr>
+            <td><code>CLOG_XID_STATUS_COMMITTED</code></td>
+            <td><code>0x01</code></td>
+            <td>事务已提交</td>
+            </tr>
+            <tr>
+            <td><code>CLOG_XID_STATUS_ABORTED</code></td>
+            <td><code>0x02</code></td>
+            <td>事务已回滚</td>
+            </tr>
+            <tr>
+            <td><code>CLOG_XID_STATUS_SUB_COMMITTED</code></td>
+            <td><code>0x03</code></td>
+            <td>子事务已提交，但父事务尚未提交（仅子事务使用）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>每个事务只占 2 bit。一个 8KB 的 CLOG 页面可以记录 32768
+            个事务的状态。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/clog.h</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_XID_STATUS_IN_PROGRESS     </span><span class="bn">0x00</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_XID_STATUS_COMMITTED       </span><span class="bn">0x01</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_XID_STATUS_ABORTED         </span><span class="bn">0x02</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_XID_STATUS_SUB_COMMITTED   </span><span class="bn">0x03</span></span></code></pre></div>
+            <h3 id="slru-页面管理">SLRU 页面管理</h3>
+            <p>CLOG 基于 SLRU（Simple Least Recently
+            Used）框架实现。SLRU 是 PG
+            内部的通用页面缓存机制——CLOG、<code>pg_subtrans</code>（子事务映射）、<code>pg_multixact</code>（多事务
+            ID 映射）都用它。SLRU
+            维护一个固定大小的共享内存缓冲区，当请求的页面不在缓冲区时，从磁盘的
+            <code>pg_xact/</code> 目录加载。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/clog.c</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_BLCKSZ            BLCKSZ         </span><span class="co">// 8KB per page</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_BITS_PER_XACT     </span><span class="dv">2</span><span class="pp">              </span><span class="co">// 2 bits per transaction</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_XACTS_PER_BYTE    </span><span class="dv">4</span><span class="pp">              </span><span class="co">// 4 transactions per byte</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLOG_XACTS_PER_PAGE    </span><span class="op">(</span><span class="pp">CLOG_BLCKSZ </span><span class="op">*</span><span class="pp"> CLOG_XACTS_PER_BYTE</span><span class="op">)</span><span class="pp">  </span><span class="co">// 32768</span></span></code></pre></div>
+            <p>CLOG 页面在 <code>pg_xact/</code> 目录（PG 10+，之前叫
+            <code>pg_clog/</code>）下以
+            <code>0000</code>、<code>0001</code>、<code>0002</code>
+            等命名，每个文件 256KB（32 个页面）。PG 用
+            <code>TransactionIdToPage(xid)</code> 和
+            <code>TransactionIdToPgOffset(xid)</code> 两个宏定位：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/clog.h</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TransactionIdToPage</span><span class="op">(</span><span class="pp">xid</span><span class="op">)</span><span class="pp">    </span><span class="op">((</span><span class="pp">xid</span><span class="op">)</span><span class="pp"> </span><span class="op">/</span><span class="pp"> </span><span class="op">(</span><span class="pp">TransactionId</span><span class="op">)</span><span class="pp"> CLOG_XACTS_PER_PAGE</span><span class="op">)</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TransactionIdToPgOffset</span><span class="op">(</span><span class="pp">xid</span><span class="op">)</span><span class="pp"> </span><span class="op">((</span><span class="pp">xid</span><span class="op">)</span><span class="pp"> </span><span class="op">%</span><span class="pp"> </span><span class="op">(</span><span class="pp">TransactionId</span><span class="op">)</span><span class="pp"> CLOG_XACTS_PER_PAGE</span><span class="op">)</span></span></code></pre></div>
+            <p>事务提交时，CLOG 的状态在
+            <code>TransactionIdSetTreeStatus()</code> 中更新：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/clog.c</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> TransactionIdSetTreeStatus<span class="op">(</span>TransactionId xid<span class="op">,</span> <span class="dt">int</span> nsubxids<span class="op">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>                                 TransactionId <span class="op">*</span>subxids<span class="op">,</span> XidStatus status<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 更新主事务的 CLOG 状态</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    TransactionIdSetPageStatus<span class="op">(</span>xid<span class="op">,</span> nsubxids<span class="op">,</span> subxids<span class="op">,</span> status<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 如果 status == COMMITTED，把子事务的状态从 SUB_COMMITTED 推进到 COMMITTED</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="clog-的读取路径与-lru-淘汰">CLOG 的读取路径与 LRU
+            淘汰</h3>
+            <p>当 <code>HeapTupleSatisfiesMVCC()</code>
+            需要判定事务可见性时，调用链为：</p>
+            <pre class="text"><code>HeapTupleSatisfiesMVCC()
+  → TransactionIdDidCommit(xid)
+    → TransactionLogFetch(xid)
+      → SimpleLruReadPage(ClogCtl, pageno, ...)
+        → 如果页面在 SLRU buffer 中 → 直接返回
+        → 如果不在 → SlruPhysicalReadPage() 从 pg_xact/ 读磁盘
+        → 如果缓冲区满 → SlruSelectVictimPage() 挑一个最近最少使用的淘汰</code></pre>
+            <p>SLRU 的淘汰是纯粹的 LRU——没有 shared_buffers 那种 clock
+            sweep 策略。CLOG 的 SLRU buffer 大小由
+            <code>clog_buffers</code> 控制（默认给 1 个 buffer，即
+            8KB。但若 <code>shared_buffers</code> 较大，PG
+            会自动扩展）。在绝大多数场景下，活跃事务的 CLOG
+            页面都能命中缓冲区——事务提交后很快就会被查询判定可见性。</p>
+            <p>读 CLOG 的关键函数：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/clog.c</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>XidStatus TransactionLogFetch<span class="op">(</span>TransactionId xid<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 计算 CLOG 页面号</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> pageno <span class="op">=</span> TransactionIdToPage<span class="op">(</span>xid<span class="op">);</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> byteno <span class="op">=</span> TransactionIdToPgOffset<span class="op">(</span>xid<span class="op">)</span> <span class="op">/</span> CLOG_XACTS_PER_BYTE<span class="op">;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> bshift <span class="op">=</span> TransactionIdToPgOffset<span class="op">(</span>xid<span class="op">)</span> <span class="op">%</span> CLOG_XACTS_PER_BYTE <span class="op">*</span> CLOG_BITS_PER_XACT<span class="op">;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 通过 SLRU 读取页面</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> slotno <span class="op">=</span> SimpleLruReadPage<span class="op">(</span>ClogCtl<span class="op">,</span> pageno<span class="op">,</span> <span class="kw">true</span><span class="op">,</span> xid<span class="op">);</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 从页面中提取这 2 bit</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    byte <span class="op">=</span> <span class="op">((</span><span class="dt">char</span> <span class="op">*)</span> ClogCtl<span class="op">-&gt;</span>shared<span class="op">-&gt;</span>page_buffer<span class="op">[</span>slotno<span class="op">])[</span>byteno<span class="op">];</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    status <span class="op">=</span> <span class="op">(</span>byte <span class="op">&gt;&gt;</span> bshift<span class="op">)</span> <span class="op">&amp;</span> CLOG_XACT_BITMASK<span class="op">;</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> status<span class="op">;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="clog-的磁盘段文件">CLOG 的磁盘段文件</h3>
+            <p>CLOG 的磁盘存储位于 <code>$PGDATA/pg_xact/</code>（PG
+            10+，此前为 <code>pg_clog/</code>）。每个段文件 256KB（32 个
+            8KB 页面）：</p>
+            <pre><code>$PGDATA/pg_xact/
+  0000    → 事务 ID 0       ~ 1,048,575    (页面 0-31)
+  0001    → 事务 ID 1,048,576 ~ 2,097,151  (页面 32-63)
+  0002    → ...</code></pre>
+            <p>在 checkpoint 时，PG 将 SLRU 缓冲区中的脏 CLOG
+            页面写出到对应段文件。同时会检查并删除不再需要的旧段文件——判断标准是该段文件覆盖的所有事务
+            ID 都小于 <code>oldestActiveXid</code> 的 wraparound
+            裁剪点。如果 freezing 滞后，<code>pg_xact/</code>
+            可能堆积大量段文件占用磁盘。</p>
+            <hr />
+            <h2 id="三hint-bit为什么写怎么写写坏了怎么办">三、hint
+            bit：为什么写、怎么写、写坏了怎么办</h2>
+            <h3 id="为什么需要-hint-bit">为什么需要 hint bit</h3>
+            <p>每次读一行都要调用 <code>TransactionIdDidCommit()</code>
+            去查 CLOG——即使 xmin 对应的事务一年前就提交了。在 1000 TPS
+            的 OLTP 系统里，这会产生大量重复的 SLRU 查询，争用 CLOG 的
+            <code>SlruCtl-&gt;shared-&gt;buffer_locks</code>。</p>
+            <p>hint bit 的解决方案：<strong>第一次判定 xmin
+            已提交时，把结果写到 tuple header 的 <code>t_infomask</code>
+            里</strong>。后续再读这行时，看到
+            <code>HEAP_XMIN_COMMITTED</code> 标志就知道 xmin
+            已提交——完全跳过 CLOG 查询。</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/htup_details.h</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define HEAP_XMIN_COMMITTED     </span><span class="bn">0x0100</span><span class="pp">  </span><span class="co">// xmin 事务已提交</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define HEAP_XMIN_INVALID       </span><span class="bn">0x0200</span><span class="pp">  </span><span class="co">// xmin 事务已回滚</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define HEAP_XMAX_COMMITTED     </span><span class="bn">0x0400</span><span class="pp">  </span><span class="co">// xmax 事务已提交（即这行已被删除/更新）</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define HEAP_XMAX_INVALID       </span><span class="bn">0x0800</span><span class="pp">  </span><span class="co">// xmax 事务已回滚</span></span></code></pre></div>
+            <p>当 <code>HEAP_XMIN_COMMITTED</code>
+            设置后，判定只是一个位运算：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define HeapTupleHeaderXminCommitted</span><span class="op">(</span><span class="pp">tup</span><span class="op">)</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">((</span><span class="pp">tup</span><span class="op">)-&gt;</span><span class="pp">t_infomask </span><span class="op">&amp;</span><span class="pp"> HEAP_XMIN_COMMITTED</span><span class="op">)</span></span></code></pre></div>
+            <h3 id="写入时机sethintbits">写入时机：SetHintBits</h3>
+            <p>hint bit 的写入发生在
+            <code>HeapTupleSatisfiesMVCC()</code> 的返回值路径上，通过
+            <code>SetHintBits()</code> 完成：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/heap/heapam_visibility.c</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> SetHintBits<span class="op">(</span>HeapTupleHeader tuple<span class="op">,</span> Buffer buffer<span class="op">,</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>                         uint16 infomask<span class="op">,</span> TransactionId xid<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 如果 buffer 可写 → 直接在共享缓冲区中修改 tuple header</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!(</span>buf_state <span class="op">&amp;</span> BM_DIRTY<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>        tuple<span class="op">-&gt;</span>t_infomask <span class="op">|=</span> infomask<span class="op">;</span>              <span class="co">// 设置 hint bit</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>        MarkBufferDirtyHint<span class="op">(</span>buffer<span class="op">,</span> buf_state<span class="op">);</span>     <span class="co">// 标记 buffer 为非关键脏页</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 如果 buffer 不可写（如从 toast 返回的 tuple）→ 跳过</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>几个要点：</p>
+            <ul>
+            <li>hint bit 写入不是
+            WAL-logged——<code>MarkBufferDirtyHint()</code> 创建的脏页在
+            checkpoint 时才会写盘，crash recovery 后 hint bit 丢失。丢失
+            hint bit 不影响正确性，只影响性能（需要重新查 CLOG）。</li>
+            <li>只在 <code>t_infomask</code> 中写四个标志之一，不碰
+            <code>xmin</code>/<code>xmax</code> 本身——这些值是 tuple
+            创建/删除时由 WAL-logged 操作写入的。hint bit
+            是对已有数据的注释性缓存，因此不需要 WAL 保护。</li>
+            <li>在共享缓冲区中进行修改——修改的是
+            <code>shared_buffers</code> 中的页面。下次 checkpoint 或
+            bgwriter 写出时，hint bit 一并写入磁盘。</li>
+            </ul>
+            <h3 id="hint-bit-的竞争问题">hint bit 的竞争问题</h3>
+            <p>hint bit 写入不是免费的。主要风险有三个：</p>
+            <p><strong>1. Buffer 内容锁（content
+            lock）的争用。</strong>写入 hint bit 需要以
+            <code>BUFFER_LOCK_SHARE</code> 持有 buffer 内容锁。当多个
+            Backend 同时读同一行（比如热点行），它们都会尝试写 hint
+            bit——第一个写入后 hint bit 已设置，后续 Backend
+            跳过写入，但获取内容锁本身有开销。不过 hint bit
+            的写入只需要共享内容锁（而非排他），所以不会阻塞同页面的其他读取者。</p>
+            <p><strong>2. 只读查询产生写脏页。</strong>在
+            <code>pg_stat_statements</code> 中看到
+            <code>shared_blks_dirtied &gt; 0</code> 的纯
+            <code>SELECT</code> 查询，几乎都是 hint bit
+            写入导致的。这些只读查询间接增加了 bgwriter 和 checkpoint
+            的写盘量——对写入延迟敏感的场景中需要注意。对于只读副本（hot
+            standby），hint bit 写入在 PG 9.4 之前是完全禁止的（standby
+            上的页面不可写）；PG 9.4 后引入了
+            <code>wal_log_hints = on</code> 选项，允许 standby 写 hint
+            bit，但此时 hint bit 变更为 WAL-logged，增加了流复制的 WAL
+            流量。</p>
+            <p><strong>3. 大量初始 hint bit 写入的 IO
+            压力。</strong>大表批量 <code>SELECT</code>
+            首次接触大量未设置 hint bit 的 tuple（如从 pg_dump
+            导入的数据、从旧版本 pg_upgrade
+            迁移后的库），会在短期内产生密集的 hint bit
+            写入。每个写入调用
+            <code>MarkBufferDirtyHint()</code>，虽然不立即刷盘，但增加了
+            shared_buffers 的脏页比例——当 dirty page 比例超过
+            <code>bgwriter_lru_maxpages</code> 的吸纳能力时，backend
+            需要自己执行
+            <code>FlushBuffer()</code>，查询延迟出现尖峰。</p>
+            <hr />
+            <h2
+            id="四快照可扩展性procarraylock-争用与-pg-14-优化">四、快照可扩展性：ProcArrayLock
+            争用与 PG 14 优化</h2>
+            <h3
+            id="为什么高连接数下取快照会痛">为什么高连接数下取快照会痛</h3>
+            <p><code>GetSnapshotData()</code>（<code>src/backend/storage/ipc/procarray.c</code>）要收集所有已建立连接上<strong>可能影响可见性</strong>的事务
+            ID，填进 <code>SnapshotData</code> 的 <code>xip</code>
+            等字段。连接数上千时，这件事变成连接可扩展性的主瓶颈——Andres
+            Freund 在分析生产 profile 时看到只读负载把大量 CPU 花在
+            <code>GetSnapshotData()</code> 上（见其 2020 年 Citus 博文
+            <em>Improving Postgres Connection Scalability:
+            Snapshots</em>）。</p>
+            <p>痛点不只是「<span
+            class="math inline">\(O(\text{连接数})\)</span>」算法，还有<strong>缓存线乒乓</strong>：</p>
+            <ol type="1">
+            <li>通过 <code>procArray-&gt;pgprocnos[]</code>
+            间接跳到稀疏的 <code>PGPROC</code> / 旧 <code>PGXACT</code>
+            槽，扫描时碰到大量空闲或无关字段；</li>
+            <li>历史上为维护 <code>RecentGlobalXmin</code>
+            还要读各后端的
+            <code>xmin</code>，写路径频繁改这些字段，读路径反复拉脏
+            cache line。</li>
+            </ol>
+            <p>取快照时仍会拿 <code>ProcArrayLock</code>
+            的<strong>共享锁</strong>（与「完全无锁」不是一回事）；PG 14
+            的贡献是把扫描变成对<strong>稠密、按字段拆分的数组</strong>的顺序读，并砍掉不必要的字段访问，从而缩短持锁窗口、降低跨核流量。</p>
+            <h3 id="演进两阶段先-pgxact再拆掉-pgxact">演进两阶段：先
+            PGXACT，再拆掉 PGXACT</h3>
+            <p><strong>第一阶段（PG 9.4 起）：从 <code>PGPROC</code>
+            拆出 <code>PGXACT</code>。</strong><br />
+            把 <code>xid</code> / <code>xmin</code> /
+            子事务计数等「快照关心的字段」从巨大的 <code>PGPROC</code>
+            里挪到更紧凑的并行数组，避免扫描时拖进锁等待、信号量等无关成员。这是必要但不够：数组仍可能稀疏，且
+            <code>GetSnapshotData()</code> 曾为
+            <code>RecentGlobalXmin</code> 去读
+            <code>xmin</code>，继续制造跨核写读冲突。</p>
+            <p><strong>第二阶段（PG 14，Freund 系列提交）：稠密
+            <code>xids</code> 数组，并最终移除
+            <code>PGXACT</code>。</strong><br />
+            关键提交包括（均可在 postgres.git 核对）：</p>
+            <table>
+            <colgroup>
+            <col style="width: 57%" />
+            <col style="width: 42%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>Commit</th>
+            <th>作用</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>941697c3</code></td>
+            <td>引入
+            <code>ProcGlobal-&gt;xids</code>：<strong>稠密</strong>的
+            in-progress xid 数组，按 <code>pgxactoff</code> 索引，避免经
+            <code>pgprocnos</code> 间接扫稀疏槽</td>
+            </tr>
+            <tr>
+            <td><code>5788e258</code></td>
+            <td>把 <code>vacuumFlags</code> 挪到
+            <code>ProcGlobal</code></td>
+            </tr>
+            <tr>
+            <td><code>73487a60</code></td>
+            <td>子事务信息进 <code>ProcGlobal</code>，<strong>删除
+            <code>PGXACT</code></strong></td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>GetSnapshotData()</code> 在持有
+            <code>ProcArrayLock</code> 共享锁时，核心循环变成对
+            <code>ProcGlobal-&gt;xids[pgxactoff]</code>
+            的顺序读取（示意，以源码为准）：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* PG 14+ procarray.c — 逻辑示意，非完整函数 */</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>LWLockAcquire<span class="op">(</span>ProcArrayLock<span class="op">,</span> LW_SHARED<span class="op">);</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>other_xids <span class="op">=</span> ProcGlobal<span class="op">-&gt;</span>xids<span class="op">;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span>pgxactoff <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> pgxactoff <span class="op">&lt;</span> numProcs<span class="op">;</span> pgxactoff<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    TransactionId xid <span class="op">=</span> UINT32_ACCESS_ONCE<span class="op">(</span>other_xids<span class="op">[</span>pgxactoff<span class="op">]);</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* 仅当 xid 有效时再碰其它稠密数组 / 收集进 snapshot-&gt;xip */</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>LWLockRelease<span class="op">(</span>ProcArrayLock<span class="op">);</span></span></code></pre></div>
+            <p>另外，快照计算不再依赖在 <code>GetSnapshotData()</code>
+            里维护
+            <code>RecentGlobalXmin</code>（该职责调整后，读路径可少碰经常被写的
+            <code>xmin</code> 字段）——这是 Freund
+            博文里强调的「去掉不必要工作」一步。</p>
+            <h3 id="性能数字怎么引用">性能数字怎么引用</h3>
+            <p>Freund 在 Azure F72s_v2 上用只读 pgbench
+            对比改动前后，并给出多组「活跃连接 +
+            大量空闲连接」曲线（博文 Figure 1–3
+            与文末表格）。结论应写成：<strong>高连接、尤其大量空闲连接时，快照路径的可扩展性显著改善</strong>；不要笼统写成「1000
+            连接 TPS 提升 25–40%」这类无硬件/workload
+            出处的概括。本站写作环境未复跑该实验，故<strong>只引用、不冒充自测</strong>。</p>
+            <h3 id="仍然昂贵的操作">仍然昂贵的操作</h3>
+            <table>
+            <colgroup>
+            <col style="width: 20%" />
+            <col style="width: 60%" />
+            <col style="width: 20%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>操作</th>
+            <th>与 ProcArrayLock</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>GetSnapshotData</code></td>
+            <td>共享锁，持锁时间缩短但仍存在</td>
+            <td>连接数极大时仍 <span
+            class="math inline">\(O(n)\)</span></td>
+            </tr>
+            <tr>
+            <td>Backend 进出 <code>ProcArrayAdd/Remove</code></td>
+            <td>排他锁</td>
+            <td>改稠密数组布局时更敏感一点</td>
+            </tr>
+            <tr>
+            <td>分配/清理 xid</td>
+            <td>写 <code>ProcGlobal-&gt;xids</code> 等</td>
+            <td>与读路径缓存局部性相关</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>开放改进（Freund
+            博文亦提到）：缓存快照是否仍有效时的锁、以及更根本的
+            <strong>CSN（commit sequence
+            number）快照</strong>——社区讨论多年，工程体量大，PG 14
+            选择了可合入的稠密数组路线而非一次换成 CSN。</p>
+            <hr />
+            <h2 id="五事务-id-回卷pg-的-20-亿上限">五、事务 ID 回卷：PG
+            的 20 亿上限</h2>
+            <h3 id="位-xid-与回卷环">32 位 XID 与回卷环</h3>
+            <p>PG 的 <code>TransactionId</code> 是
+            <code>uint32</code>，最多 <span class="math inline">\(2^{32}
+            \approx 43\)</span> 亿。由于 PG 对事务 ID
+            做模比较（区分”过去”和”未来”），有效比较范围是 <span
+            class="math inline">\(2^{31} \approx 21\)</span> 亿。当一个
+            PG 集群的事务 ID 接近这个极限时，必须做
+            <strong>freezing</strong>——将足够老的 tuple 的
+            <code>xmin</code> 设为 <code>FrozenTransactionId</code>（=
+            2），这样比较逻辑会认为它是”比所有事务都老”的。</p>
+            <p>事务 ID 空间是一个环。PG 将 32-bit
+            空间分成两半：小于当前事务 ID 约 10
+            亿的是”过去”区间，大于当前事务 ID 约 10
+            亿的是”未来”区间。如果存在
+            <code>xmin &lt; 当前 xid - 10亿</code> 的未被冻结 tuple，PG
+            无法区分这个 tuple 是”很久以前的”还是”未来的”。</p>
+            <h3 id="回卷的威胁模型">回卷的威胁模型</h3>
+            <p>四个递进阈值的计算在 <code>SetTransactionIdLimit()</code>
+            中：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/varsup.c</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> SetTransactionIdLimit<span class="op">(</span>TransactionId oldest_datfrozenxid<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    xidVacLimit  <span class="op">=</span> oldest_datfrozenxid <span class="op">+</span> autovacuum_freeze_max_age<span class="op">;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    xidWarnLimit <span class="op">=</span> xidVacLimit <span class="op">+</span> <span class="dv">5000000</span><span class="op">;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    xidStopLimit <span class="op">=</span> xidWarnLimit <span class="op">+</span> <span class="dv">5000000</span><span class="op">;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    xidWrapLimit <span class="op">=</span> oldest_datfrozenxid <span class="op">+</span> <span class="bn">0x7FFFFFFF</span><span class="op">;</span>  <span class="co">// 21 亿</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>四个阈值的触发顺序：</p>
+            <ol type="1">
+            <li><strong><code>xidVacLimit</code></strong>：触发
+            autovacuum 的 anti-wraparound VACUUM，冻结老 tuple。</li>
+            <li><strong><code>xidWarnLimit</code></strong>：在日志中输出警告信息，提示数据库即将进入保护模式。</li>
+            <li><strong><code>xidStopLimit</code></strong>：拒绝新事务，只允许
+            autovacuum 运行。<code>pg_stat_activity</code>
+            中看到连接试图开始事务时收到 “database is not accepting
+            commands to avoid wraparound” 错误。</li>
+            <li><strong><code>xidWrapLimit</code></strong>：数据库被迫
+            shutdown——如果 autovacuum 在 <code>xidStopLimit</code>
+            之前没能完成 freezing，到达这个阈值时 PG
+            强制关闭避免数据丢失。</li>
+            </ol>
+            <h3 id="监控手段">监控手段</h3>
+            <p>在生产中，应该持续监控事务年龄，而不是等告警：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 每个数据库的事务年龄（核心指标）</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> datname,</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>       age(datfrozenxid) <span class="kw">AS</span> xid_age,</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>       datfrozenxid,</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>       <span class="dv">2</span>^<span class="dv">31</span> <span class="op">-</span> age(datfrozenxid) <span class="kw">AS</span> xid_remaining</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_database</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> age(datfrozenxid) <span class="kw">DESC</span>;</span></code></pre></div>
+            <p>当 <code>age(datfrozenxid)</code> 超过
+            <code>autovacuum_freeze_max_age</code>（默认 2
+            亿）时，anti-wraparound VACUUM 被触发。注意这个 2
+            亿不是安全线——它只是触发阈值。如果 autovacuum
+            跟不上事务产生速率，2 亿的 buffer
+            会在几个星期内耗尽（取决于事务速率）。</p>
+            <p>也可以通过查看 <code>pg_xact/</code>
+            的段文件数间接判断冻结是否滞后：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 段文件数直接反映 CLOG 覆盖的事务范围</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="va">$PGDATA</span>/pg_xact/ <span class="kw">|</span> <span class="fu">wc</span> <span class="at">-l</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 每个段文件覆盖约 100 万个事务 ID</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 过多段文件（如 &gt; 1000）意味着 old xid 冻结严重滞后</span></span></code></pre></div>
+            <p>这个威胁链的完整讨论在第 8 章展开（VACUUM 与
+            Freezing），第 22 章还会给出 wraparound
+            危机从预警信号到数据库只读 shutdown
+            的完整时间线和修复边界。此处先建立威胁模型：CLOG
+            需要为每个事务 ID 分配存储，而事务 ID 空间是有限的——这是 PG
+            MVCC 实现中最根本的工程约束。</p>
+            <hr />
+            <h2 id="六与-innodb-的-undo-log-方案对比">六、与 InnoDB 的
+            undo log 方案对比</h2>
+            <h3 id="innodb-的方案undo-log-rollback-segment">InnoDB
+            的方案：undo log + rollback segment</h3>
+            <p>InnoDB（MySQL 8.0）的 MVCC 使用 undo log 回溯旧版本：</p>
+            <pre><code>聚簇索引中只保留最新版本
+  + 每行有一个 ROLL_PTR（回滚指针），指向 undo log 中的旧版本
+  + undo log 以链表形式链接每个行的历史版本
+  + 读旧版本时：从索引读最新版本 → 沿 ROLL_PTR 回溯 → 应用 undo record 重建旧版本</code></pre>
+            <p>undo log 存放在共享表空间（<code>ibdata1</code>）或独立的
+            undo tablespace 中，由 purge 线程异步回收不再需要的 undo
+            record。</p>
+            <h3 id="两套方案的关键差异">两套方案的关键差异</h3>
+            <table>
+            <colgroup>
+            <col style="width: 12%" />
+            <col style="width: 38%" />
+            <col style="width: 48%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>PG（heap 版本链）</th>
+            <th>InnoDB（undo log 回溯）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>旧版本存储位置</td>
+            <td>heap 表页面上（多版本 inline）</td>
+            <td>undo log 独立存储，聚簇索引只保留最新版本</td>
+            </tr>
+            <tr>
+            <td>版本访问</td>
+            <td>沿 ctid 链向前遍历（版本都在数据页上）</td>
+            <td>从索引读最新版本 → ROLL_PTR 回溯 undo log</td>
+            </tr>
+            <tr>
+            <td>旧版本膨胀</td>
+            <td>表膨胀（dead tuple 占据页面空间）→ 必须 VACUUM</td>
+            <td>undo log 膨胀（purge 线程跟不上）</td>
+            </tr>
+            <tr>
+            <td>回滚速度</td>
+            <td>O(1)：标记 xmax 即可回滚，不需要重建数据</td>
+            <td>需要沿 ROLL_PTR 应用 undo，大事务回滚可能很慢</td>
+            </tr>
+            <tr>
+            <td>hint bit 等价物</td>
+            <td>hint bit 在 tuple header
+            中（<code>HEAP_XMIN_COMMITTED</code>）</td>
+            <td>undo record header 中的事务状态标志</td>
+            </tr>
+            <tr>
+            <td>长事务影响</td>
+            <td>阻止 VACUUM 回收 dead tuple → 表膨胀</td>
+            <td>阻止 purge 回收 undo record → undo 表空间膨胀</td>
+            </tr>
+            <tr>
+            <td>事务状态查询</td>
+            <td>CLOG（SLRU 缓存，固定大小共享内存）</td>
+            <td>事务系统页（<code>TRX_SYS</code>
+            页面，在共享表空间中）</td>
+            </tr>
+            <tr>
+            <td>崩溃后事务状态恢复</td>
+            <td>CLOG 从磁盘 <code>pg_xact/</code> 读取，不需要恢复</td>
+            <td>undo log 本身就是恢复信息——崩溃时未提交事务通过 undo
+            回滚</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="pg-不选-undo-log-的原因">PG 不选 undo log
+            的原因</h3>
+            <p>PG 的设计决策可以追溯到 Berkeley POSTGRES
+            项目（Stonebraker &amp; Rowe, SIGMOD 1986）。PG 选择 heap
+            版本链而非 undo log，有几个历史和技术原因：</p>
+            <p><strong>1. 回滚简单。</strong>PG 只需在 tuple header
+            上设置 <code>xmax</code> 即为”回滚”——不需要读取和逆操作 undo
+            record。对于大事务的内部回滚（savepoint 级别），PG
+            也只需清理当前子事务插入的 tuple——不需要逐行 undo。</p>
+            <p><strong>2. 时间旅行查询。</strong>POSTGRES
+            项目最初支持”时间旅行”（查询任意历史时间点的数据）。如果把所有版本都
+            inline
+            存在数据页上，时间旅行只需扫描页面上的旧版本。虽然这个特性在商业化
+            PG 中未被广泛使用，但其设计影响延续至今。</p>
+            <p><strong>3. 避免 undo 膨胀和回滚竞争。</strong>InnoDB 的
+            undo log 在高并发更新场景下，purge 线程可能跟不上，导致 undo
+            表空间膨胀。PG 的 VACUUM 也面临类似挑战，但 VACUUM
+            的回收粒度是整页扫描，而 purge 是按 undo record
+            逐条回收——在某些场景下 PG 的回收效率更高。</p>
+            <p><strong>但代价也很明显：</strong></p>
+            <ul>
+            <li><p>表膨胀是 PG MVCC 最直接的代价——每个 UPDATE
+            都在数据页上创建一个新版本，没有独立的 undo
+            空间做”卸压阀”。VACUUM 是必须的，而不是可选的。PG
+            把多版本直接存在数据表里，InnoDB 把历史版本存在独立的 undo
+            tablespace 中，聚簇索引保持紧凑。</p></li>
+            <li><p>跨页面的版本链让 index scan 付出随机 I/O——当一个
+            tuple 被多次 UPDATE 且每次新版本落在不同页面时，沿着
+            <code>ctid</code> 链读取需要跳转多个页面。而 InnoDB
+            的索引始终指向聚簇索引的最新版本，版本链只在 undo log
+            中，不需要在多个数据页之间跳转。</p></li>
+            <li><p>事务 ID 回卷的威胁是 PG 独有的——因为版本都在 heap
+            页面上，必须通过 freezing 来给 32-bit 事务 ID
+            做”垃圾回收”。InnoDB 的 undo record 生命周期由 purge
+            线程管理——一旦所有需要它的快照都关闭了，undo record 被 purge
+            回收，对应的事务 ID 也就不再被引用。PG 的 tuple
+            可以数亿个事务不被冻结地存在数据页上，累积成 wraparound
+            风险。</p></li>
+            <li><p>跨页版本链对 seqscan 的影响：PG 的 seqscan
+            按物理页面顺序扫描，遇到旧版本时需要沿 <code>ctid</code>
+            跳跃到新版本所在页面再做可见性判定。如果一个表上有大量
+            UPDATE，同一个逻辑行的版本散布在多个页面，seqscan
+            的缓存局部性被破坏。</p></li>
+            </ul>
+            <h3
+            id="批量更新场景下的行为差异">批量更新场景下的行为差异</h3>
+            <p>用一个典型场景展示差异。假设对一张 100 万行的表执行
+            <code>UPDATE ... SET col = col + 1</code>（更新所有行）：</p>
+            <p><strong>PG：</strong>heap 表从 100 万行变成 200 万行（100
+            万旧版本 + 100 万新版本），表大小翻倍。如果 autovacuum
+            还没来得及跑，seqscan 需要扫描 200 万个
+            tuple（但通过可见性判定跳过 100
+            万个旧版本）。索引也需要更新——每行的 <code>ctid</code>
+            变了，索引条目指向新的物理位置。这个 <code>UPDATE</code>
+            需要更新所有索引。</p>
+            <p><strong>InnoDB：</strong>聚簇索引中仍是 100
+            万行（新旧版本原地替换），旧版本通过
+            <code>DB_ROLL_PTR</code> 存储在 undo log
+            中。索引如果只覆盖了没被修改的列，不需要更新（change buffer
+            缓冲）。表大小增长主要发生在 undo tablespace。</p>
+            <p>这个差异在实际运维中的后果：PG 的大批量
+            <code>UPDATE</code> 后面如果不紧跟
+            VACUUM，磁盘使用和查询扫描范围都会膨胀。InnoDB 的大批量
+            <code>UPDATE</code> 后面如果不紧跟 purge，undo tablespace
+            膨胀——但聚簇索引保持紧凑。</p>
+            <hr />
+            <h2 id="七实验观察-clog-与-hint-bit">七、实验：观察 CLOG 与
+            hint bit</h2>
+            <h3 id="观察-hint-bit-的写入">观察 hint bit 的写入</h3>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pageinspect;</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建测试表</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> test_hint (<span class="kw">id</span> <span class="dt">INTEGER</span>, val TEXT);</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> test_hint <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">&#39;hello&#39;</span>);</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询前：观察 t_infomask（还没有 hint bit）</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> lp, t_xmin, t_xmax,</span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>       t_infomask:<span class="ch">:bit</span>(<span class="dv">16</span>) <span class="kw">AS</span> infomask_bits,</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>       (t_infomask &amp; x<span class="st">&#39;0100&#39;</span>:<span class="ch">:int</span>) <span class="op">&gt;</span> <span class="dv">0</span> <span class="kw">AS</span> xmin_committed</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> heap_page_items(get_raw_page(<span class="st">&#39;test_hint&#39;</span>, <span class="dv">0</span>));</span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 执行一次 SELECT，触发 hint bit 写入</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> test_hint;</span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询后：现在 HEAP_XMIN_COMMITTED (0x0100) 应该被设置了</span></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> lp, t_xmin, t_xmax,</span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a>       t_infomask:<span class="ch">:bit</span>(<span class="dv">16</span>) <span class="kw">AS</span> infomask_bits,</span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a>       (t_infomask &amp; x<span class="st">&#39;0100&#39;</span>:<span class="ch">:int</span>) <span class="op">&gt;</span> <span class="dv">0</span> <span class="kw">AS</span> xmin_committed</span>
+<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> heap_page_items(get_raw_page(<span class="st">&#39;test_hint&#39;</span>, <span class="dv">0</span>));</span></code></pre></div>
+            <h3 id="验证只读查询产生脏页">验证只读查询产生脏页</h3>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 启用 pg_stat_statements</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pg_stat_statements;</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 重置统计</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_stat_statements_reset();</span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对刚导入的大表执行 SELECT（没有 hint bit）</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> large_table;</span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 shared_blks_dirtied — 纯 SELECT 也应该有非零值</span></span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">query</span>, shared_blks_dirtied, shared_blks_hit</span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_statements</span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> <span class="kw">query</span> <span class="kw">LIKE</span> <span class="st">&#39;%large_table%&#39;</span>;</span></code></pre></div>
+            <h3 id="监控事务-id-回卷">监控事务 ID 回卷</h3>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 每个数据库的事务年龄</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> datname,</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>       age(datfrozenxid) <span class="kw">AS</span> xid_age,</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>       datfrozenxid,</span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>       current_setting(<span class="st">&#39;autovacuum_freeze_max_age&#39;</span>):<span class="ch">:int</span> <span class="kw">AS</span> freeze_max_age,</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>       <span class="dv">2</span>^<span class="dv">31</span> <span class="op">-</span> age(datfrozenxid) <span class="kw">AS</span> xid_remaining</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_database</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> datname <span class="kw">NOT</span> <span class="kw">LIKE</span> <span class="st">&#39;template%&#39;</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> age(datfrozenxid) <span class="kw">DESC</span>;</span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- CLOG 段文件数（需要在 OS 层执行）</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 段文件过多意味着老事务 ID 对应的 CLOG 还没被回收</span></span></code></pre></div>
+            <h3 id="观察-update-后的版本链">观察 UPDATE 后的版本链</h3>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 插一行，更新两次</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> test_chain <span class="kw">VALUES</span> (<span class="dv">1</span>, <span class="st">&#39;v1&#39;</span>);</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> test_chain <span class="kw">SET</span> val <span class="op">=</span> <span class="st">&#39;v2&#39;</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> test_chain <span class="kw">SET</span> val <span class="op">=</span> <span class="st">&#39;v3&#39;</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察版本链：lp_flags, t_ctid, xmin, xmax</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> lp, lp_flags, t_xmin, t_xmax, t_ctid,</span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>       t_infomask:<span class="ch">:bit</span>(<span class="dv">16</span>) <span class="kw">AS</span> mask,</span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>       <span class="cf">CASE</span> lp_flags</span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>         <span class="cf">WHEN</span> <span class="dv">1</span> <span class="cf">THEN</span> <span class="st">&#39;LP_NORMAL&#39;</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a>         <span class="cf">WHEN</span> <span class="dv">2</span> <span class="cf">THEN</span> <span class="st">&#39;LP_REDIRECT&#39;</span></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a>         <span class="cf">WHEN</span> <span class="dv">3</span> <span class="cf">THEN</span> <span class="st">&#39;LP_DEAD&#39;</span></span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>         <span class="cf">ELSE</span> <span class="st">&#39;LP_UNUSED&#39;</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a>       <span class="cf">END</span> <span class="kw">AS</span> flag_desc</span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> heap_page_items(get_raw_page(<span class="st">&#39;test_chain&#39;</span>, <span class="dv">0</span>));</span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出中能看到旧版本 t_ctid 指向新版本的 (block, offset)，</span></span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 以及 xmax 记录了更新旧版本的事务 ID</span></span></code></pre></div>
+            <hr />
+            <h2 id="八关键要点">八、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>CLOG 是 PG
+            的事务状态仲裁者</strong>——每个事务 ID 对应 2 bit
+            的状态（IN_PROGRESS / COMMITTED / ABORTED /
+            SUB_COMMITTED），通过 SLRU 框架缓存和管理。CLOG 页面在
+            <code>pg_xact/</code> 目录中作为段文件持久化，每次
+            checkpoint 写出脏页并回收废弃段文件。</p></li>
+            <li><p><strong>hint bit 是 CLOG
+            的缓存层</strong>——第一次判定事务状态后，把结果写入 tuple
+            header 的 <code>t_infomask</code>，后续读取跳过 CLOG
+            查询。hint bit 写入不生成 WAL 记录，crash recovery
+            后丢失时需重新查 CLOG，不影响正确性。只读查询通过 hint bit
+            间接产生脏页。</p></li>
+            <li><p><strong>PG 14 的快照可扩展性优化减轻了高连接下的
+            cache 争用</strong>——稠密 <code>ProcGlobal-&gt;xids</code>
+            等数组取代稀疏 <code>PGXACT</code>
+            间接扫描；<code>GetSnapshotData()</code> 仍取
+            <code>ProcArrayLock</code>
+            共享锁，但持锁路径更短、跨核流量更低。数字以 Freund 2020
+            博文的 pgbench 图表为准，本文不冒充自测。</p></li>
+            <li><p><strong>事务 ID 回卷是 PG MVCC
+            的硬约束</strong>——32-bit 事务 ID 的有效比较范围是 21
+            亿，接近极限时必须通过 freezing 重置老 tuple 的
+            <code>xmin</code>。<code>xidVacLimit</code> 到
+            <code>xidWrapLimit</code> 是四个递进的危机阈值。监控
+            <code>age(datfrozenxid)</code> 是预防 wraparound
+            的第一道防线。</p></li>
+            <li><p><strong>PG 的 heap 版本链 vs InnoDB 的 undo
+            log：膨胀落点不同</strong>——PG
+            用表膨胀换回滚简单与堆内版本局部性；InnoDB 用 undo
+            表空间换聚簇紧凑。详见第六节与 <a
+            href="../../mysql-innodb/07-mvcc-read-view/07-mvcc-read-view.html">InnoDB
+            Read View</a>。</p></li>
+            </ol>
+            <hr />
+            <h2 id="九争论zheap-与要不要-undo">九、争论：zheap
+            与「要不要 undo」</h2>
+            <p>第六节论证了「为什么历史选择 heap
+            版本链」。社区并非没有反向试验：</p>
+            <ul>
+            <li><strong>zheap</strong>（EnterpriseDB 等推动的 undo-based
+            heap 原型）：目标是把旧版本挪出主堆页，减轻表膨胀与
+            HOT/VACUUM 压力，语义上更接近 InnoDB 的「最新行 +
+            undo」。</li>
+            <li><strong>停滞原因（工程判断，需对照当时 pgsql-hackers /
+            项目状态）</strong>：与现有索引、HOT、逻辑解码、复制、扩展的耦合面极大；收益依赖特定更新密集负载，而默认
+            heap 的运维工具链已经极其成熟。</li>
+            </ul>
+            <p>因此「PG 不选
+            undo」不是永恒教条，而是<strong>默认路径的路径依赖</strong>；读
+            InnoDB 对照时，应把 zheap 当成「同一争论在 PG
+            树内的分叉尝试」，而不是已合并的替代实现。跨引擎变体总览见
+            <a
+            href="../../algorithms/64-mvcc-variants/mvcc-variants.html">MVCC
+            实现变体</a>。</p>
+            <hr />
+            <h2 id="十开放问题">十、开放问题</h2>
+            <ol type="1">
+            <li><strong>CSN 快照</strong>：用提交序号代替扫描活跃 xid
+            集合，从算法上打破 <span
+            class="math inline">\(O(\text{连接数})\)</span>——Freund
+            博文与邮件列表均指出工程体量大、开放问题多，至今未取代稠密数组路线。</li>
+            <li><strong>64-bit XID / 冻结策略</strong>：降低 wraparound
+            运维负担的补丁与设计反复出现；任何方案都要回答「谁为历史版本买单」以及与
+            logical decoding 的兼容。</li>
+            <li><strong>只读备库与 hint
+            bit</strong>：<code>wal_log_hints</code> 打开后，hint
+            写入变成复制流量——云上只读副本的最优默认值仍依赖
+            workload，缺少单一公开基准。</li>
+            </ol>
+            <p>上一章：<a
+            href="../02-page-tuple/02-page-tuple.html">页面布局与元组格式</a>
+            下一章：<a
+            href="../04-wal-internals/04-wal-internals.html">WAL
+            内部机制</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="前置文章">前置文章</h3>
+            <ul>
+            <li><a href="../../mvcc/mvcc.html">数据库
+            MVCC：快照隔离到底隔离了什么</a> — 本文的前置阅读，覆盖
+            xmin/xmax/ctid
+            版本链、快照结构、可见性判断规则和隔离级别</li>
+            <li><a
+            href="../../mysql-innodb/07-mvcc-read-view/07-mvcc-read-view.html">MySQL
+            InnoDB · MVCC 与 Read View</a> — undo 链对照</li>
+            </ul>
+            <h3
+            id="源码机制描述以-pg-14-当前主线为准阅读时核对所装大版本">源码（机制描述以
+            PG 14+ / 当前主线为准；阅读时核对所装大版本）</h3>
+            <ul>
+            <li><code>src/backend/access/transam/clog.c</code>：CLOG 的
+            SLRU
+            管理，<code>TransactionLogFetch()</code>、<code>TransactionIdSetTreeStatus()</code></li>
+            <li><code>src/include/access/clog.h</code>：<code>TransactionIdToPage()</code>、<code>TransactionIdToPgOffset()</code>
+            宏，CLOG 状态常量</li>
+            <li><code>src/backend/storage/ipc/procarray.c</code>：<code>GetSnapshotData()</code>（PG
+            14+ 稠密 <code>ProcGlobal-&gt;xids</code> 路径）</li>
+            <li><code>src/backend/access/heap/heapam_visibility.c</code>：<code>HeapTupleSatisfiesMVCC()</code>、<code>SetHintBits()</code></li>
+            <li><code>src/include/access/htup_details.h</code>：<code>t_infomask</code>
+            的 hint bit 标志位定义</li>
+            <li><code>src/include/storage/proc.h</code>：<code>PGPROC</code>
+            /
+            <code>PROC_HDR</code>（<code>ProcGlobal</code>）相关定义；PG
+            14 后勿再假设存在独立 <code>PGXACT</code></li>
+            <li><code>src/backend/access/transam/varsup.c</code>：<code>SetTransactionIdLimit()</code>
+            — 事务 ID 回卷阈值的计算</li>
+            <li><code>contrib/pageinspect/</code>：<code>heap_page_items()</code>
+            函数，观察 hint bit</li>
+            <li>Commits：<code>941697c3</code>、<code>5788e258</code>、<code>73487a60</code>（snapshot
+            scalability 系列）</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 50: Overview of
+            PostgreSQL Internals — “Transaction Processing”</li>
+            <li>PostgreSQL Documentation, Chapter 68: Database Physical
+            Storage</li>
+            <li>PostgreSQL Documentation, Section 25.1.5: Preventing
+            Transaction ID Wraparound Failures</li>
+            </ul>
+            <h3 id="论文与设计讨论">论文与设计讨论</h3>
+            <ul>
+            <li>Stonebraker, M. &amp; Rowe, L. A. <em>The Design of
+            POSTGRES</em>. SIGMOD 1986. — PG 不带 undo log
+            的历史根源</li>
+            <li>Berenson, H. et al. <em>A Critique of ANSI SQL Isolation
+            Levels</em>. SIGMOD 1995. — 快照隔离的形式化基础</li>
+            <li>Andres Freund. <em>Improving Postgres Connection
+            Scalability: Snapshots</em>. Citus Data Blog, 2020-10-25. —
+            PG 14 快照可扩展性动机、设计与 pgbench 图表（引用数据）</li>
+            <li>Andres Freund. pgsql-hackers: <em>Improving connection
+            scalability: GetSnapshotData()</em>, 2020. — 设计讨论</li>
+            <li>MySQL Reference Manual, InnoDB Multi-Versioning — InnoDB
+            MVCC 的官方描述</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/08-vacuum-freezing/08-vacuum-freezing.html">【PG 内核】VACUUM 与 Freezing：膨胀的根因和 Wraparound 危机</a></h3>
+                    <p>拆解 PostgreSQL VACUUM 的完整内部流程：heap scan、dead tuple 回收、索引清理、FSM/VM 更新。深入可见性映射和空闲空间映射的结构设计，以及 Index-Only Scan 如何依赖 VM 判断页面全可见。解析 Freezing 机制与事务 ID 回卷防御，Autovacuum 的触发阈值和 cost-based delay。最后用一条从 n_tup_del 增长到数据库强制只读的完整危机时间线，讲清楚 Anti-wraparound VACUUM 的预警信号链、典型陷阱和排查方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / kernel</p>
+                    <h3><a href="/post/db/mysql-innodb/index.html">【MySQL InnoDB 内核】InnoDB 存储引擎机制深度拆解</a></h3>
+                    <p>从线程模型到页格式、从 undo log MVCC 到 binlog 两阶段提交——对 MySQL InnoDB 做源码级拆解，并与 PostgreSQL 内核系列逐章对照。20 篇覆盖内核机制与生产运维实战，面向 MySQL DBA、从 PG 转 MySQL 的后端与数据库内核开发者。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/07-transaction-subxact/07-transaction-subxact.html">【PG 内核】事务与子事务：Savepoint 的 TransactionState 栈和 2PC 的状态文件</a></h3>
+                    <p>拆解 PostgreSQL 事务系统的三层结构：事务状态机 TransState 的状态转换路径、子事务（savepoint）的 TransactionState 栈与 ResourceOwner 嵌套管理、两阶段提交（2PC）的 WAL 记录与 pg_twophase 状态文件格式、事务 ID 分配的 xidStopLimit/xidWrapLimit 防线。附带 2PC 泄露的排查 SQL 和子事务栈过深的故障案例。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,2140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】存储引擎概览：堆文件到 LSM-Tree 的演化路径 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="storage-engine, heap-file, btree, lsm-tree, rum-conjecture, write-amplification, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/24-storage-engine-overview/storage-engine-overview.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】存储引擎概览：堆文件到 LSM-Tree 的演化路径" />
+    <meta property="og:description" content="数据库系统的架构可以划分为两大层：上层的查询处理层负责解析 SQL、生成执行计划、优化查询；下层的存储引擎（Storage Engine）负责把数据持久化到磁盘，并在需要时高效地把数据取回来。查询处理层决定&quot;做什么&quot;，存储引擎决定&quot;怎么存、怎么取&quot;。同一个查询处理层可以对接不同的存储引擎——MySQL 的 InnoDB…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/24-storage-engine-overview/storage-engine-overview.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="storage-engine" />
+    <meta property="article:tag" content="heap-file" />
+    <meta property="article:tag" content="btree" />
+    <meta property="article:tag" content="lsm-tree" />
+    <meta property="article:tag" content="rum-conjecture" />
+    <meta property="article:tag" content="write-amplification" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】存储引擎概览：堆文件到 LSM-Tree 的演化路径" />
+    <meta name="twitter:description" content="数据库系统的架构可以划分为两大层：上层的查询处理层负责解析 SQL、生成执行计划、优化查询；下层的存储引擎（Storage Engine）负责把数据持久化到磁盘，并在需要时高效地把数据取回来。查询处理层决定&quot;做什么&quot;，存储引擎决定&quot;怎么存、怎么取&quot;。同一个查询处理层可以对接不同的存储引擎——MySQL 的 InnoDB…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】存储引擎概览：堆文件到 LSM-Tree 的演化路径", "description": "数据库系统的架构可以划分为两大层：上层的查询处理层负责解析 SQL、生成执行计划、优化查询；下层的存储引擎（Storage Engine）负责把数据持久化到磁盘，并在需要时高效地把数据取回来。查询处理层决定\"做什么\"，存储引擎决定\"怎么存、怎么取\"。同一个查询处理层可以对接不同的存储引擎——MySQL 的 InnoDB…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/24-storage-engine-overview/storage-engine-overview.html"}, "datePublished": "2025-09-02T00:00:00+00:00", "dateModified": "2026-04-15T11:20:56+00:00", "keywords": ["storage-engine", "heap-file", "btree", "lsm-tree", "rum-conjecture", "write-amplification"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】存储引擎概览：堆文件到 LSM-Tree 的演化路径</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-02</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#storage-engine</span> <span>#heap-file</span> <span>#btree</span> <span>#lsm-tree</span> <span>#rum-conjecture</span> <span>#write-amplification</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/23-snapshot-thin-provisioning/snapshot-thin-provisioning.html">上一篇：【存储工程】存储快照与精简配置</a><a class="post-series-nav__link" href="/post/storage/25-btree-engineering/btree-engineering.html">下一篇：【存储工程】B-Tree 与 B+Tree：页式存储引擎的工程实现</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/storage-engine.html">#storage-engine</a><a class="chip-link" href="/tags/heap-file.html">#heap-file</a><a class="chip-link" href="/tags/btree.html">#btree</a><a class="chip-link" href="/tags/lsm-tree.html">#lsm-tree</a><a class="chip-link" href="/tags/rum-conjecture.html">#rum-conjecture</a><a class="chip-link" href="/tags/write-amplification.html">#write-amplification</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一存储引擎的角色"
+                id="toc-一存储引擎的角色">一、存储引擎的角色</a>
+                <ul>
+                <li><a href="#存储引擎在数据库架构中的位置"
+                id="toc-存储引擎在数据库架构中的位置">1.1
+                存储引擎在数据库架构中的位置</a></li>
+                <li><a href="#存储引擎的核心-api"
+                id="toc-存储引擎的核心-api">1.2 存储引擎的核心
+                API</a></li>
+                <li><a href="#读路径与写路径"
+                id="toc-读路径与写路径">1.3 读路径与写路径</a></li>
+                <li><a href="#存储引擎与文件系统的关系"
+                id="toc-存储引擎与文件系统的关系">1.4
+                存储引擎与文件系统的关系</a></li>
+                </ul></li>
+                <li><a href="#二堆文件heap-file"
+                id="toc-二堆文件heap-file">二、堆文件（Heap File）</a>
+                <ul>
+                <li><a href="#最简单的存储结构"
+                id="toc-最简单的存储结构">2.1 最简单的存储结构</a></li>
+                <li><a href="#堆文件的操作" id="toc-堆文件的操作">2.2
+                堆文件的操作</a></li>
+                <li><a href="#堆文件的性能特征"
+                id="toc-堆文件的性能特征">2.3 堆文件的性能特征</a></li>
+                <li><a href="#堆文件的实际应用"
+                id="toc-堆文件的实际应用">2.4 堆文件的实际应用</a></li>
+                </ul></li>
+                <li><a href="#三哈希索引"
+                id="toc-三哈希索引">三、哈希索引</a>
+                <ul>
+                <li><a href="#从堆文件到哈希索引"
+                id="toc-从堆文件到哈希索引">3.1
+                从堆文件到哈希索引</a></li>
+                <li><a href="#bitcask-模型" id="toc-bitcask-模型">3.2
+                Bitcask 模型</a></li>
+                <li><a href="#合并与压缩" id="toc-合并与压缩">3.3
+                合并与压缩</a></li>
+                <li><a href="#bitcask-的优势与局限"
+                id="toc-bitcask-的优势与局限">3.4 Bitcask
+                的优势与局限</a></li>
+                <li><a href="#哈希索引的变体"
+                id="toc-哈希索引的变体">3.5 哈希索引的变体</a></li>
+                </ul></li>
+                <li><a href="#四b-tree-与-btree"
+                id="toc-四b-tree-与-btree">四、B-Tree 与 B+Tree</a>
+                <ul>
+                <li><a href="#从哈希到有序索引"
+                id="toc-从哈希到有序索引">4.1 从哈希到有序索引</a></li>
+                <li><a href="#b-tree-的基本结构"
+                id="toc-b-tree-的基本结构">4.2 B-Tree
+                的基本结构</a></li>
+                <li><a href="#btreeb-tree-的优化变体"
+                id="toc-btreeb-tree-的优化变体">4.3 B+Tree：B-Tree
+                的优化变体</a></li>
+                <li><a href="#btree-的核心操作"
+                id="toc-btree-的核心操作">4.4 B+Tree 的核心操作</a></li>
+                <li><a href="#页面page与磁盘-io"
+                id="toc-页面page与磁盘-io">4.5 页面（Page）与磁盘
+                I/O</a></li>
+                <li><a href="#并发控制与崩溃恢复"
+                id="toc-并发控制与崩溃恢复">4.6
+                并发控制与崩溃恢复</a></li>
+                <li><a href="#btree-的性能特征"
+                id="toc-btree-的性能特征">4.7 B+Tree 的性能特征</a></li>
+                </ul></li>
+                <li><a href="#五lsm-tree"
+                id="toc-五lsm-tree">五、LSM-Tree</a>
+                <ul>
+                <li><a href="#从-btree-的写入瓶颈说起"
+                id="toc-从-btree-的写入瓶颈说起">5.1 从 B+Tree
+                的写入瓶颈说起</a></li>
+                <li><a href="#lsm-tree-的核心思想"
+                id="toc-lsm-tree-的核心思想">5.2 LSM-Tree
+                的核心思想</a></li>
+                <li><a href="#memtable" id="toc-memtable">5.3
+                MemTable</a></li>
+                <li><a href="#sstablesorted-string-table"
+                id="toc-sstablesorted-string-table">5.4 SSTable（Sorted
+                String Table）</a></li>
+                <li><a href="#读取路径" id="toc-读取路径">5.5
+                读取路径</a></li>
+                <li><a href="#压缩compaction"
+                id="toc-压缩compaction">5.6 压缩（Compaction）</a></li>
+                <li><a href="#lsm-tree-的性能特征"
+                id="toc-lsm-tree-的性能特征">5.7 LSM-Tree
+                的性能特征</a></li>
+                </ul></li>
+                <li><a href="#六读放大写放大与空间放大"
+                id="toc-六读放大写放大与空间放大">六、读放大、写放大与空间放大</a>
+                <ul>
+                <li><a href="#三种放大因子" id="toc-三种放大因子">6.1
+                三种放大因子</a></li>
+                <li><a href="#各引擎的放大因子对比"
+                id="toc-各引擎的放大因子对比">6.2
+                各引擎的放大因子对比</a></li>
+                <li><a href="#计算写放大的实际案例"
+                id="toc-计算写放大的实际案例">6.3
+                计算写放大的实际案例</a></li>
+                <li><a href="#写放大对-ssd-寿命的影响"
+                id="toc-写放大对-ssd-寿命的影响">6.4 写放大对 SSD
+                寿命的影响</a></li>
+                </ul></li>
+                <li><a href="#七rum-猜想" id="toc-七rum-猜想">七、RUM
+                猜想</a>
+                <ul>
+                <li><a href="#猜想的提出" id="toc-猜想的提出">7.1
+                猜想的提出</a></li>
+                <li><a href="#三个维度的定义"
+                id="toc-三个维度的定义">7.2 三个维度的定义</a></li>
+                <li><a href="#rum-空间中的存储引擎"
+                id="toc-rum-空间中的存储引擎">7.3 RUM
+                空间中的存储引擎</a></li>
+                <li><a href="#rum-猜想的实践意义"
+                id="toc-rum-猜想的实践意义">7.4 RUM
+                猜想的实践意义</a></li>
+                <li><a href="#超越-rum-的考量"
+                id="toc-超越-rum-的考量">7.5 超越 RUM 的考量</a></li>
+                </ul></li>
+                <li><a href="#八存储引擎分类学"
+                id="toc-八存储引擎分类学">八、存储引擎分类学</a>
+                <ul>
+                <li><a href="#分类维度一更新策略"
+                id="toc-分类维度一更新策略">8.1
+                分类维度一：更新策略</a></li>
+                <li><a href="#分类维度二数据布局"
+                id="toc-分类维度二数据布局">8.2
+                分类维度二：数据布局</a></li>
+                <li><a href="#分类维度三索引与数据的关系"
+                id="toc-分类维度三索引与数据的关系">8.3
+                分类维度三：索引与数据的关系</a></li>
+                <li><a href="#分类维度四并发控制模型"
+                id="toc-分类维度四并发控制模型">8.4
+                分类维度四：并发控制模型</a></li>
+                <li><a href="#分类总结表" id="toc-分类总结表">8.5
+                分类总结表</a></li>
+                </ul></li>
+                <li><a href="#九各引擎适用场景"
+                id="toc-九各引擎适用场景">九、各引擎适用场景</a>
+                <ul>
+                <li><a href="#oltp-场景btree-引擎"
+                id="toc-oltp-场景btree-引擎">9.1 OLTP 场景：B+Tree
+                引擎</a></li>
+                <li><a href="#写密集型场景lsm-tree-引擎"
+                id="toc-写密集型场景lsm-tree-引擎">9.2
+                写密集型场景：LSM-Tree 引擎</a></li>
+                <li><a href="#分析型场景列存储引擎"
+                id="toc-分析型场景列存储引擎">9.3
+                分析型场景：列存储引擎</a></li>
+                <li><a href="#缓存与热点数据哈希引擎"
+                id="toc-缓存与热点数据哈希引擎">9.4
+                缓存与热点数据：哈希引擎</a></li>
+                <li><a href="#场景选型决策树"
+                id="toc-场景选型决策树">9.5 场景选型决策树</a></li>
+                <li><a href="#混合负载htap场景"
+                id="toc-混合负载htap场景">9.6
+                混合负载（HTAP）场景</a></li>
+                </ul></li>
+                <li><a href="#十主流存储引擎一览"
+                id="toc-十主流存储引擎一览">十、主流存储引擎一览</a>
+                <ul>
+                <li><a href="#引擎对比总表" id="toc-引擎对比总表">10.1
+                引擎对比总表</a></li>
+                <li><a href="#innodb" id="toc-innodb">10.2
+                InnoDB</a></li>
+                <li><a href="#rocksdb" id="toc-rocksdb">10.3
+                RocksDB</a></li>
+                <li><a href="#wiredtiger" id="toc-wiredtiger">10.4
+                WiredTiger</a></li>
+                <li><a href="#pebble" id="toc-pebble">10.5
+                Pebble</a></li>
+                <li><a href="#boltdb" id="toc-boltdb">10.6
+                BoltDB</a></li>
+                <li><a href="#badgerdb" id="toc-badgerdb">10.7
+                BadgerDB</a></li>
+                <li><a href="#引擎选型速查表"
+                id="toc-引擎选型速查表">10.8 引擎选型速查表</a></li>
+                <li><a href="#性能基准参考" id="toc-性能基准参考">10.9
+                性能基准参考</a></li>
+                </ul></li>
+                <li><a href="#附参考资料"
+                id="toc-附参考资料">附：参考资料</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>数据库系统的架构可以划分为两大层：上层的查询处理层负责解析
+            SQL、生成执行计划、优化查询；下层的存储引擎（Storage
+            Engine）负责把数据持久化到磁盘，并在需要时高效地把数据取回来。查询处理层决定”做什么”，存储引擎决定”怎么存、怎么取”。同一个查询处理层可以对接不同的存储引擎——MySQL
+            的 InnoDB 和 MyISAM、MongoDB 的 WiredTiger 和早期的
+            MMAPv1，就是这种分层设计的典型体现。</p>
+            <p>存储引擎的选型直接决定了数据库的读写性能、空间利用率、并发能力和故障恢复特性。选错存储引擎意味着在错误的维度上做优化：写密集型负载用
+            B+Tree 引擎会遇到严重的写放大（Write
+            Amplification），读密集型负载用 LSM-Tree
+            引擎会遇到不可忽视的读放大（Read
+            Amplification），分析型负载用行存储（Row
+            Store）引擎会浪费大量 I/O 在不需要的列上。</p>
+            <p>本文从存储引擎的 API
+            边界讲起，按照从简单到复杂的演化路径，依次拆解堆文件（Heap
+            File）、哈希索引（Hash Index）、B-Tree / B+Tree、LSM-Tree
+            四种核心数据结构，然后讨论读放大、写放大、空间放大三个度量指标和
+            RUM 猜想（RUM
+            Conjecture），最后给出存储引擎的分类体系和选型指南。LSM-Tree
+            的详细实现（MemTable、SSTable、Compaction 策略）在 <a
+            href="../../db/lsm-tree/lsm-overview.html">LSM-Tree 系列</a>
+            中有更深入的讨论，本文侧重全局视角和横向对比。</p>
+            <hr />
+            <h2 id="一存储引擎的角色">一、存储引擎的角色</h2>
+            <h3 id="存储引擎在数据库架构中的位置">1.1
+            存储引擎在数据库架构中的位置</h3>
+            <p>一个典型的数据库系统可以分为以下几层：</p>
+            <pre class="text"><code>┌──────────────────────────────────────────┐
+│              客户端连接层                  │
+│         （协议解析、连接管理）              │
+├──────────────────────────────────────────┤
+│              查询处理层                    │
+│   （SQL 解析、查询优化、执行计划生成）       │
+├──────────────────────────────────────────┤
+│              事务管理层                    │
+│     （并发控制、锁管理、MVCC）              │
+├──────────────────────────────────────────┤
+│              存储引擎层                    │  ← 本文聚焦
+│   （数据组织、索引管理、缓冲池、WAL）       │
+├──────────────────────────────────────────┤
+│              操作系统 / 文件系统            │
+├──────────────────────────────────────────┤
+│              存储介质（HDD / SSD）          │
+└──────────────────────────────────────────┘</code></pre>
+            <p>存储引擎是数据库与物理存储之间的翻译层。它向上提供结构化的读写接口（按键查找、范围扫描、插入、更新、删除），向下把这些操作转化为对磁盘块的读写。存储引擎的设计决定了数据在磁盘上的物理布局（Physical
+            Layout）——数据是按行存放还是按列存放、索引用什么数据结构、写入时先写日志还是直接写数据页、缓冲池如何管理内存中的页面。</p>
+            <h3 id="存储引擎的核心-api">1.2 存储引擎的核心 API</h3>
+            <p>不同存储引擎的内部实现差异巨大，但它们对外暴露的接口可以归结为一组简洁的键值操作（Key-Value
+            Operations）：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode go"><code class="sourceCode go"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> StorageEngine <span class="kw">interface</span> <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 点查：根据键查找对应的值</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    Get<span class="op">(</span>key <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="op">(</span>value <span class="op">[]</span><span class="dt">byte</span><span class="op">,</span> err <span class="dt">error</span><span class="op">)</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 写入：将键值对写入存储</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    Put<span class="op">(</span>key <span class="op">[]</span><span class="dt">byte</span><span class="op">,</span> value <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="dt">error</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 删除：移除指定键</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    Delete<span class="op">(</span>key <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="dt">error</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 范围扫描：返回 [startKey, endKey) 范围内的所有键值对</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    Scan<span class="op">(</span>startKey<span class="op">,</span> endKey <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="op">(</span>Iterator<span class="op">,</span> <span class="dt">error</span><span class="op">)</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 批量写入：原子地执行一组写操作</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    WriteBatch<span class="op">(</span>batch <span class="op">[]</span>WriteOp<span class="op">)</span> <span class="dt">error</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>这组接口看似简单，背后的实现复杂度取决于四个核心需求：</p>
+            <ol type="1">
+            <li><strong>持久性（Durability）</strong>：写入的数据在进程崩溃或断电后不丢失；</li>
+            <li><strong>高效读取</strong>：点查和范围扫描都要足够快；</li>
+            <li><strong>高效写入</strong>：单条写入和批量写入都要有好的吞吐；</li>
+            <li><strong>空间效率</strong>：磁盘空间的利用率要高，不能有过多的碎片和冗余。</li>
+            </ol>
+            <p>没有一种数据结构能在所有四个维度上同时做到最优。这就是存储引擎设计的核心矛盾，也是后面
+            RUM 猜想要形式化表达的观点。</p>
+            <h3 id="读路径与写路径">1.3 读路径与写路径</h3>
+            <p>存储引擎的所有操作可以归结为两条路径：</p>
+            <p><strong>写路径（Write Path）</strong>：</p>
+            <pre class="text"><code>客户端 Put(k, v)
+    │
+    ▼
+写入 WAL（追加写，顺序 I/O）       ← 保证持久性
+    │
+    ▼
+更新内存数据结构（MemTable / Buffer Pool）
+    │
+    ▼
+后台刷盘（异步，批量写入磁盘）       ← 提高吞吐</code></pre>
+            <p><strong>读路径（Read Path）</strong>：</p>
+            <pre class="text"><code>客户端 Get(k)
+    │
+    ▼
+查找内存数据结构（MemTable / Buffer Pool）
+    │  命中？返回
+    ▼  未命中
+查找磁盘索引结构（B+Tree 页面 / SSTable）
+    │
+    ▼
+从磁盘读取数据页，加载到内存
+    │
+    ▼
+返回结果</code></pre>
+            <p>不同存储引擎在这两条路径上的设计取舍决定了它们的性能特征。B+Tree
+            引擎的读路径高效（索引结构天然支持快速定位），但写路径需要在原位更新（In-Place
+            Update）索引页面，可能触发页分裂和随机写。LSM-Tree
+            引擎的写路径高效（所有写入都是顺序追加），但读路径需要查找多个层级的
+            SSTable，可能触发多次磁盘读取。</p>
+            <h3 id="存储引擎与文件系统的关系">1.4
+            存储引擎与文件系统的关系</h3>
+            <p>存储引擎可以选择两种方式与底层存储交互：</p>
+            <ol type="1">
+            <li><strong>基于文件系统</strong>：通过操作系统的文件系统
+            API（open、read、write、fsync）来管理数据文件。大多数存储引擎采用这种方式，例如
+            RocksDB 的 SSTable 文件、InnoDB 的 .ibd 文件；</li>
+            <li><strong>直接管理裸设备</strong>：绕过文件系统，直接在块设备上管理数据布局。Oracle
+            ASM（Automatic Storage Management）是典型代表，MySQL 的
+            InnoDB 也支持使用裸设备作为表空间。</li>
+            </ol>
+            <p>基于文件系统的方式更常见，因为文件系统提供了命名、目录结构、元数据管理等便利功能。但文件系统本身会引入额外的写放大（日志、元数据更新）和不可控的缓存行为（Page
+            Cache），所以高性能场景下存储引擎通常会使用 O_DIRECT 绕过
+            Page Cache，自己管理缓冲池。</p>
+            <hr />
+            <h2 id="二堆文件heap-file">二、堆文件（Heap File）</h2>
+            <h3 id="最简单的存储结构">2.1 最简单的存储结构</h3>
+            <p>堆文件（Heap
+            File）是最原始、最简单的数据存储方式：把所有记录（Record）按照插入顺序依次追加到文件末尾，不维护任何索引结构。这就像往一个笔记本里一页页地写笔记——新内容永远写在最后一页，找东西只能从头翻到尾。</p>
+            <pre class="text"><code>┌─────────────────────────────────────────────┐
+│ 页面 0（Page 0）                              │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐     │
+│ │ Record 1 │ │ Record 2 │ │ Record 3 │     │
+│ └──────────┘ └──────────┘ └──────────┘     │
+├─────────────────────────────────────────────┤
+│ 页面 1（Page 1）                              │
+│ ┌──────────┐ ┌──────────┐                   │
+│ │ Record 4 │ │ Record 5 │                   │
+│ └──────────┘ └──────────┘                   │
+├─────────────────────────────────────────────┤
+│ 页面 2（Page 2）                              │
+│ ┌──────────┐                                 │
+│ │ Record 6 │     （剩余空间）                  │
+│ └──────────┘                                 │
+└─────────────────────────────────────────────┘</code></pre>
+            <h3 id="堆文件的操作">2.2 堆文件的操作</h3>
+            <p><strong>插入（Insert）</strong>：</p>
+            <p>找到有空闲空间的页面，将记录追加到该页面。如果没有空闲页面，分配一个新页面。有些实现维护一个空闲空间映射表（Free
+            Space
+            Map，FSM），记录每个页面的可用空间大小，避免插入时扫描所有页面。PostgreSQL
+            就使用 FSM 来加速堆文件的插入。</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 堆文件插入的伪代码</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>function heap_insert<span class="op">(</span>record<span class="op">):</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    page <span class="op">=</span> find_page_with_free_space<span class="op">(</span>record<span class="op">.</span>size<span class="op">)</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> page <span class="op">==</span> NULL<span class="op">:</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>        page <span class="op">=</span> allocate_new_page<span class="op">()</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    offset <span class="op">=</span> append_record_to_page<span class="op">(</span>page<span class="op">,</span> record<span class="op">)</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">(</span>page<span class="op">.</span>id<span class="op">,</span> offset<span class="op">)</span>  <span class="co">// 返回记录的物理地址（RID）</span></span></code></pre></div>
+            <p><strong>查找（Lookup）</strong>：</p>
+            <p>按键查找一条记录需要扫描（Sequential
+            Scan）整个堆文件，逐页读取，逐条比对。时间复杂度为 O(N)，N
+            是记录总数。这在数据量大时完全不可接受。</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 堆文件查找的伪代码</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>function heap_lookup<span class="op">(</span>target_key<span class="op">):</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> each page in heap_file<span class="op">:</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> each record in page<span class="op">:</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> record<span class="op">.</span>key <span class="op">==</span> target_key<span class="op">:</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> record</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NOT_FOUND</span></code></pre></div>
+            <p><strong>删除（Delete）</strong>：</p>
+            <p>标记记录为已删除（设置删除标志位），但不立即回收空间。被删除记录占据的空间会在后续的
+            VACUUM 或压缩（Compaction）操作中回收。PostgreSQL 的 MVCC
+            实现就基于这种方式——被删除的元组（Tuple）通过 xmax
+            字段标记为无效，VACUUM 进程定期清理无效元组。</p>
+            <p><strong>更新（Update）</strong>：</p>
+            <p>两种策略：原地更新（如果新记录不大于旧记录）或删除旧记录再插入新记录。PostgreSQL
+            选择后者——每次 UPDATE 都会生成一个新版本的元组，旧版本通过
+            MVCC 保留到不再被任何事务引用时才清理。</p>
+            <h3 id="堆文件的性能特征">2.3 堆文件的性能特征</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>操作</th>
+            <th>时间复杂度</th>
+            <th>I/O 模式</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>插入</td>
+            <td>O(1)（有 FSM 时）</td>
+            <td>顺序写</td>
+            </tr>
+            <tr>
+            <td>按键查找</td>
+            <td>O(N)</td>
+            <td>全表扫描</td>
+            </tr>
+            <tr>
+            <td>范围扫描</td>
+            <td>O(N)</td>
+            <td>全表扫描</td>
+            </tr>
+            <tr>
+            <td>删除</td>
+            <td>O(N)（查找）+ O(1)（标记）</td>
+            <td>随机读 + 随机写</td>
+            </tr>
+            <tr>
+            <td>全表扫描</td>
+            <td>O(N)</td>
+            <td>顺序读</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>堆文件的唯一优势是写入性能：插入操作只需追加到文件末尾，没有索引维护开销。它的致命缺陷是读取性能：任何非全表扫描的查询都需要遍历整个文件。</p>
+            <h3 id="堆文件的实际应用">2.4 堆文件的实际应用</h3>
+            <p>堆文件很少单独使用，但它是几乎所有关系数据库的基础存储层。在
+            PostgreSQL 和 MySQL（InnoDB
+            之外的情况）中，表数据就存储在堆文件中，索引是建立在堆文件之上的独立结构。InnoDB
+            的聚簇索引（Clustered Index）是一个特例——数据直接嵌入 B+Tree
+            的叶子节点中，不使用独立的堆文件。</p>
+            <p>堆文件的存在提出了一个本质问题：如何在不改变底层存储结构的前提下加速读取？答案是索引（Index）。接下来的三节分别讨论三种索引策略：哈希索引、B-Tree
+            / B+Tree 和 LSM-Tree。</p>
+            <hr />
+            <h2 id="三哈希索引">三、哈希索引</h2>
+            <h3 id="从堆文件到哈希索引">3.1 从堆文件到哈希索引</h3>
+            <p>堆文件的查找是 O(N)，能不能做到
+            O(1)？如果把每条记录的键（Key）映射到它在磁盘上的物理位置（偏移量），就可以在
+            O(1) 时间内定位任意记录。这就是哈希索引（Hash
+            Index）的核心思想。</p>
+            <p>哈希索引的基本结构是一个内存中的哈希表（Hash
+            Table），键是记录的 Key，值是记录在磁盘上的文件偏移量（File
+            Offset）或页面地址：</p>
+            <pre class="text"><code>内存中的哈希表                      磁盘上的数据文件
+┌───────────────────┐              ┌──────────────────┐
+│ &quot;user:1001&quot; → 0   │──────────────│ 偏移 0: {1001,   │
+│ &quot;user:1002&quot; → 64  │──────────────│ 偏移 64: {1002,  │
+│ &quot;user:1003&quot; → 128 │──────────────│ 偏移 128: {1003, │
+│ &quot;user:1004&quot; → 192 │──────────────│ 偏移 192: {1004, │
+│       ...         │              │       ...         │
+└───────────────────┘              └──────────────────┘</code></pre>
+            <h3 id="bitcask-模型">3.2 Bitcask 模型</h3>
+            <p>Bitcask 是 Riak
+            数据库早期默认的存储引擎，是哈希索引最经典的实现。它的设计极其简洁：</p>
+            <ol type="1">
+            <li><strong>写入</strong>：所有写操作追加到当前活跃的数据文件（Active
+            Data
+            File）末尾，同时更新内存中的哈希表。数据文件达到大小阈值后关闭，新建一个活跃文件；</li>
+            <li><strong>读取</strong>：从内存哈希表查找键对应的（文件编号，偏移量），然后从对应文件的对应偏移量读取值；</li>
+            <li><strong>删除</strong>：追加一条墓碑记录（Tombstone），同时从哈希表中删除对应的条目。</li>
+            </ol>
+            <pre class="text"><code>写入流程：
+   Put(&quot;name&quot;, &quot;Alice&quot;)
+       │
+       ▼
+   追加到活跃数据文件
+   ┌──────────────────────────────────┐
+   │ ts=1001 | ksz=4 | vsz=5 |       │
+   │ key=&quot;name&quot; | value=&quot;Alice&quot;      │
+   └──────────────────────────────────┘
+       │
+       ▼
+   更新内存哈希表
+   hash[&quot;name&quot;] = {file_id=3, offset=4096, size=32}</code></pre>
+            <p>Bitcask 的数据文件格式如下：</p>
+            <pre class="text"><code>┌────────┬────────┬──────────┬─────────────┬───────────────┬──────┐
+│ CRC32  │ tstamp │ key_size │ value_size  │     key       │ value│
+│ 4 字节 │ 4 字节 │  2 字节  │   4 字节    │   变长        │ 变长 │
+└────────┴────────┴──────────┴─────────────┴───────────────┴──────┘</code></pre>
+            <h3 id="合并与压缩">3.3 合并与压缩</h3>
+            <p>由于数据文件只追加不修改，同一个键的多次更新会在文件中留下多个版本。旧版本占据的空间需要通过合并与压缩（Merge
+            and Compaction）来回收：</p>
+            <pre class="text"><code>合并前：
+  文件 1: [A=1] [B=2] [A=3] [C=4]
+  文件 2: [B=5] [D=6] [A=7]
+
+合并后：
+  新文件: [A=7] [B=5] [C=4] [D=6]
+  （每个键只保留最新版本）</code></pre>
+            <p>合并过程读取所有关闭的数据文件，对每个键只保留最新版本，写入新的合并文件，然后删除旧文件并更新哈希表中的偏移量。</p>
+            <p>合并完成后会生成一个提示文件（Hint
+            File），记录每个键在合并文件中的偏移量。启动时用 Hint File
+            重建哈希表比重新扫描数据文件快得多。</p>
+            <h3 id="bitcask-的优势与局限">3.4 Bitcask 的优势与局限</h3>
+            <p><strong>优势</strong>：</p>
+            <ul>
+            <li>读写延迟都非常低：写入是一次顺序追加 +
+            一次哈希表更新；读取是一次哈希查找 + 一次磁盘 seek；</li>
+            <li>写入吞吐高：所有写操作都是顺序 I/O；</li>
+            <li>实现简单，代码量小，容易验证正确性。</li>
+            </ul>
+            <p><strong>局限</strong>：</p>
+            <ul>
+            <li><strong>所有键必须放入内存</strong>：哈希表存在内存中，如果键的数量超过内存容量，就无法工作。假设每个键
+            64 字节，每个哈希表条目的内存开销约 100
+            字节（包括指针和元数据），那么 1 亿个键需要约 10 GB
+            内存；</li>
+            <li><strong>不支持范围查询（Range
+            Query）</strong>：哈希表没有顺序概念，无法高效执行
+            <code>WHERE key BETWEEN 'A' AND 'Z'</code> 这样的查询；</li>
+            <li><strong>合并过程的 I/O
+            开销</strong>：合并需要读取和重写所有数据文件，在大数据量时会消耗可观的磁盘带宽。</li>
+            </ul>
+            <h3 id="哈希索引的变体">3.5 哈希索引的变体</h3>
+            <p>除了 Bitcask，哈希索引在其他场景中也有应用：</p>
+            <ul>
+            <li><strong>PostgreSQL Hash Index</strong>：PostgreSQL
+            支持基于磁盘的哈希索引，但在 PostgreSQL 10 之前它不写
+            WAL，崩溃后无法恢复，因此很少使用。PostgreSQL 10
+            修复了这个问题，但实际使用中 B-Tree
+            索引在大多数场景下仍然更优；</li>
+            <li><strong>内存数据库的哈希表</strong>：Redis、Memcached
+            这类内存数据库本质上就是大型哈希表，键值对完全驻留在内存中；</li>
+            <li><strong>数据库缓冲池的页表（Page
+            Table）</strong>：InnoDB
+            的缓冲池使用哈希表来快速定位内存中缓存的页面，键是（表空间
+            ID，页号），值是缓冲池中的帧号。</li>
+            </ul>
+            <p>范围查询的需求把我们推向了下一个数据结构——B-Tree 和
+            B+Tree。</p>
+            <hr />
+            <h2 id="四b-tree-与-btree">四、B-Tree 与 B+Tree</h2>
+            <h3 id="从哈希到有序索引">4.1 从哈希到有序索引</h3>
+            <p>哈希索引解决了点查的效率问题（O(1)），但无法处理范围查询。关系数据库中的大量查询模式都涉及范围操作：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 范围查询：查找某个日期范围内的订单</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> order_date <span class="kw">BETWEEN</span> <span class="st">&#39;2025-01-01&#39;</span> <span class="kw">AND</span> <span class="st">&#39;2025-06-30&#39;</span>;</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 排序：按分数降序排列</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> students <span class="kw">ORDER</span> <span class="kw">BY</span> score <span class="kw">DESC</span>;</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 前缀匹配：LIKE &#39;Zhang%&#39; 可以利用有序索引</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> users <span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">&#39;Zhang%&#39;</span>;</span></code></pre></div>
+            <p>要支持这些操作，需要一种维护键的有序性（Ordering）的索引结构。二叉搜索树（Binary
+            Search
+            Tree，BST）是最直观的有序索引，但它的缺陷在于深度过大——100
+            万个键的平衡 BST 有约 20 层，每层对应一次磁盘 I/O。B-Tree
+            通过增大每个节点的分支因子（Branching
+            Factor）来降低树的高度，将磁盘 I/O 次数压到 3-4 次。</p>
+            <h3 id="b-tree-的基本结构">4.2 B-Tree 的基本结构</h3>
+            <p>B-Tree（Balanced Tree）由 Rudolf Bayer 和 Edward
+            McCreight 于 1970 年提出（论文：“Organization and
+            maintenance of large ordered indexes”）。一棵 m 阶 B-Tree
+            满足以下性质：</p>
+            <ol type="1">
+            <li>每个节点最多有 m 个子节点；</li>
+            <li>每个非根内部节点至少有 ⌈m/2⌉ 个子节点；</li>
+            <li>根节点至少有 2 个子节点（除非它同时是叶子）；</li>
+            <li>所有叶子节点在同一层；</li>
+            <li>有 k 个子节点的内部节点包含 k-1 个键。</li>
+            </ol>
+            <pre class="text"><code>              ┌──────────────────┐
+              │     [30, 70]     │         根节点
+              └──┬──────┬──────┬─┘
+                 │      │      │
+        ┌────────┘      │      └────────┐
+        ▼               ▼               ▼
+  ┌──────────┐   ┌──────────┐   ┌──────────┐
+  │ [10, 20] │   │ [40, 50] │   │ [80, 90] │   内部节点
+  └─┬──┬──┬──┘   └─┬──┬──┬──┘   └─┬──┬──┬──┘
+    │  │  │        │  │  │        │  │  │
+    ▼  ▼  ▼        ▼  ▼  ▼        ▼  ▼  ▼
+   叶子节点（包含键和对应的数据/指针）</code></pre>
+            <p>B-Tree 的关键特性是它的高度极低。一个分支因子为 500 的
+            B-Tree（这是一个 4 KB 页面能容纳的典型值），三层就能索引
+            500^3 = 1.25 亿个键。也就是说，在 1.25
+            亿条记录中按键查找，只需要 3 次磁盘
+            I/O（如果根节点常驻内存，则只需 2 次）。</p>
+            <h3 id="btreeb-tree-的优化变体">4.3 B+Tree：B-Tree
+            的优化变体</h3>
+            <p>B+Tree 是 B-Tree
+            最重要的变体，也是现代关系数据库中使用最广泛的索引结构。B+Tree
+            与 B-Tree 的关键区别在于：</p>
+            <ol type="1">
+            <li><strong>数据只存储在叶子节点</strong>：B-Tree
+            的内部节点同时存储键和数据，B+Tree
+            的内部节点只存储键和子节点指针，数据全部放在叶子节点；</li>
+            <li><strong>叶子节点形成有序链表</strong>：B+Tree
+            的叶子节点之间通过指针串联成双向链表，支持高效的范围扫描。</li>
+            </ol>
+            <pre class="text"><code>B+Tree 结构：
+
+内部节点（只有键和指针）
+              ┌────────────────────┐
+              │   [30]  [70]       │
+              │  ↙    ↓    ↘      │
+              └────────────────────┘
+              │        │        │
+     ┌────────┘        │        └────────┐
+     ▼                 ▼                 ▼
+┌─────────┐     ┌──────────┐     ┌──────────┐
+│ [10,20] │     │ [30,40,  │     │ [70,80,  │
+│ data    │ ──→ │  50,60]  │ ──→ │  90]     │  叶子节点
+│         │     │ data     │     │ data     │  （双向链表）
+└─────────┘     └──────────┘     └──────────┘</code></pre>
+            <p>这个设计带来两个好处：</p>
+            <ul>
+            <li><strong>内部节点更紧凑</strong>：不存储数据意味着每个页面能容纳更多的键和指针，分支因子更大，树的高度更低；</li>
+            <li><strong>范围扫描高效</strong>：找到范围的起始键后，沿叶子节点链表顺序遍历即可，不需要回溯到父节点。</li>
+            </ul>
+            <h3 id="btree-的核心操作">4.4 B+Tree 的核心操作</h3>
+            <p><strong>查找（Search）</strong>：</p>
+            <p>从根节点开始，在每个内部节点中用二分查找定位应该进入的子节点，直到到达叶子节点。时间复杂度
+            O(log_B N)，其中 B 是分支因子，N 是键的总数。</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> btree_search(root, key):</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>    node <span class="op">=</span> root</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="kw">not</span> node.is_leaf:</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 在内部节点中二分查找</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>        i <span class="op">=</span> binary_search(node.keys, key)</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>        node <span class="op">=</span> node.children[i]</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 在叶子节点中查找</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    i <span class="op">=</span> binary_search(node.keys, key)</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> i <span class="op">&lt;</span> <span class="bu">len</span>(node.keys) <span class="kw">and</span> node.keys[i] <span class="op">==</span> key:</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> node.values[i]</span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NOT_FOUND</span></code></pre></div>
+            <p><strong>插入（Insert）</strong>：</p>
+            <p>找到应该插入的叶子节点，如果叶子节点有空间则直接插入。如果叶子节点已满，执行节点分裂（Split）：将叶子节点分成两半，中间键上升到父节点。如果父节点也满了，递归分裂，最坏情况下分裂会传播到根节点，导致树的高度增加
+            1。</p>
+            <pre class="text"><code>插入键 25 导致叶子节点分裂：
+
+分裂前：
+  父节点: [30]
+  叶子:   [10, 20, 25, 30]  ← 已满
+
+分裂后：
+  父节点: [20, 30]
+  叶子 L: [10, 20]
+  叶子 R: [25, 30]</code></pre>
+            <p><strong>删除（Delete）</strong>：</p>
+            <p>找到包含目标键的叶子节点并删除。如果删除后叶子节点的键数量低于最小值（⌈m/2⌉
+            -
+            1），需要从兄弟节点借一个键，或与兄弟节点合并（Merge）。合并可能导致父节点的键数量也低于最小值，递归向上合并。</p>
+            <h3 id="页面page与磁盘-io">4.5 页面（Page）与磁盘 I/O</h3>
+            <p>B+Tree 的设计与磁盘 I/O 特性紧密耦合。数据库中的 B+Tree
+            以固定大小的页面（Page）为单位组织数据，每个节点对应一个页面。常见的页面大小：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>数据库</th>
+            <th>默认页面大小</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>MySQL InnoDB</td>
+            <td>16 KB</td>
+            </tr>
+            <tr>
+            <td>PostgreSQL</td>
+            <td>8 KB</td>
+            </tr>
+            <tr>
+            <td>SQLite</td>
+            <td>4 KB</td>
+            </tr>
+            <tr>
+            <td>Oracle</td>
+            <td>8 KB</td>
+            </tr>
+            <tr>
+            <td>SQL Server</td>
+            <td>8 KB</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>页面大小的选择是一个权衡：</p>
+            <ul>
+            <li><strong>大页面</strong>：分支因子更大，树更矮，点查需要的
+            I/O 次数更少；但每次 I/O
+            传输的数据量更大，如果只需要页面中的一条记录，其余数据是浪费的；</li>
+            <li><strong>小页面</strong>：每次 I/O
+            传输的数据量少，浪费更小；但分支因子更小，树更高，点查的 I/O
+            次数更多。</li>
+            </ul>
+            <p>InnoDB 的 16 KB 页面中，一个内部节点大约能容纳 1000
+            个指针（假设键是 8 字节的整数，指针是 6
+            字节），因此一个三层的 B+Tree 可以索引 1000 × 1000 × 100 = 1
+            亿条记录（叶子节点每页约 100 条记录）。</p>
+            <h3 id="并发控制与崩溃恢复">4.6 并发控制与崩溃恢复</h3>
+            <p>B+Tree
+            在多线程环境下需要精细的并发控制。最简单的方式是给整棵树加一把大锁，但这会导致严重的争用。实际实现采用的策略包括：</p>
+            <ul>
+            <li><strong>锁耦合（Lock Coupling /
+            Crabbing）</strong>：从根向叶子方向逐层加锁，获取子节点锁后释放父节点锁。安全节点（不会分裂或合并的节点）的锁可以提前释放；</li>
+            <li><strong>乐观锁（Optimistic
+            Locking）</strong>：先不加锁遍历到叶子，在叶子上加锁并验证路径上的节点没有发生结构变化。大多数操作不会触发分裂/合并，所以这种策略的实际冲突率很低；</li>
+            <li><strong>Latch-Free B+Tree</strong>：使用
+            CAS（Compare-and-Swap）等原子操作实现无锁并发，例如
+            Bw-Tree（微软的 LLAMA 项目）。</li>
+            </ul>
+            <p>崩溃恢复依赖预写日志（Write-Ahead Log，WAL）。B+Tree
+            的页面修改分为两种：</p>
+            <ol type="1">
+            <li><strong>逻辑修改</strong>：在叶子节点插入/删除一条记录；</li>
+            <li><strong>结构修改（Structure Modification
+            Operation，SMO）</strong>：页面分裂、合并、根节点替换等涉及多个页面的原子操作。</li>
+            </ol>
+            <p>WAL 记录所有修改操作，崩溃后通过重放 WAL
+            恢复到一致状态。SMO 需要特殊处理来保证原子性——例如 InnoDB
+            使用 redo log 和 doublewrite buffer
+            来保证即使在页面分裂过程中崩溃也能恢复。</p>
+            <h3 id="btree-的性能特征">4.7 B+Tree 的性能特征</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>操作</th>
+            <th>时间复杂度</th>
+            <th>典型磁盘 I/O 次数</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>点查</td>
+            <td>O(log_B N)</td>
+            <td>2-4 次</td>
+            </tr>
+            <tr>
+            <td>范围扫描</td>
+            <td>O(log_B N + K)</td>
+            <td>2-4 + K/F 次</td>
+            </tr>
+            <tr>
+            <td>插入</td>
+            <td>O(log_B N)</td>
+            <td>2-4 次（不分裂）</td>
+            </tr>
+            <tr>
+            <td>删除</td>
+            <td>O(log_B N)</td>
+            <td>2-4 次（不合并）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>其中 B 是分支因子，N 是记录总数，K
+            是范围扫描返回的记录数，F 是每页的记录数。</p>
+            <p>B+Tree
+            的核心优势是读取性能稳定：无论数据量多大，点查的磁盘 I/O
+            次数都在 2-4 次之间。它的核心劣势是写入时的随机
+            I/O：每次插入/更新都需要在原位修改页面，如果页面不在缓冲池中就需要先读取再修改再写回，导致随机读和随机写。在写密集型负载下，B+Tree
+            的性能会显著下降。</p>
+            <hr />
+            <h2 id="五lsm-tree">五、LSM-Tree</h2>
+            <h3 id="从-btree-的写入瓶颈说起">5.1 从 B+Tree
+            的写入瓶颈说起</h3>
+            <p>B+Tree 的写入瓶颈根源在于原地更新（In-Place
+            Update）：每次写操作都需要找到数据所在的页面，读取到内存，修改内容，再写回磁盘。这意味着：</p>
+            <ol type="1">
+            <li><strong>随机 I/O</strong>：数据分散在 B+Tree
+            的不同页面中，写入位置是随机的；</li>
+            <li><strong>写放大</strong>：修改叶子节点中的一条记录需要写回整个页面（4-16
+            KB），加上 WAL 的写入，实际写入的数据量远大于用户数据；</li>
+            <li><strong>页面分裂的开销</strong>：分裂涉及分配新页面、拷贝数据、更新父节点指针，是昂贵的操作。</li>
+            </ol>
+            <p>在 HDD 时代，随机 I/O 是致命的性能瓶颈——HDD 的随机写 IOPS
+            只有约 200，而顺序写吞吐可达 100-200 MB/s。即使在 SSD
+            时代，顺序写仍然比随机写快 2-10 倍（取决于 SSD
+            的架构和写入粒度），而且随机写会加速 SSD 的磨损。</p>
+            <p>LSM-Tree（Log-Structured
+            Merge-Tree）的核心思想就是把所有随机写转化为顺序写。</p>
+            <h3 id="lsm-tree-的核心思想">5.2 LSM-Tree 的核心思想</h3>
+            <p>LSM-Tree 由 Patrick O’Neil 等人在 1996 年的论文”The
+            Log-Structured Merge-Tree
+            (LSM-Tree)“中提出。其核心设计原则是：</p>
+            <ol type="1">
+            <li><strong>所有写入先进内存</strong>：写操作首先写入内存中的数据结构（MemTable），完全不触发磁盘
+            I/O（WAL 除外）；</li>
+            <li><strong>内存满后刷盘为有序文件</strong>：MemTable
+            达到大小阈值后，将其中的数据排序后写入磁盘，生成一个不可变的有序文件（Sorted
+            String Table，SSTable）；</li>
+            <li><strong>后台合并排序文件</strong>：通过后台的压缩（Compaction）过程，将多个
+            SSTable 合并为更大的 SSTable，消除重复键和已删除的键。</li>
+            </ol>
+            <pre class="text"><code>LSM-Tree 整体结构：
+
+     写入 ──→ WAL ──→ MemTable（内存，有序）
+                          │
+                          │ 刷盘（Flush）
+                          ▼
+             Level 0:  [SST-1] [SST-2] [SST-3]
+                          │
+                          │ 压缩（Compaction）
+                          ▼
+             Level 1:  [SST-A] [SST-B]
+                          │
+                          │ 压缩（Compaction）
+                          ▼
+             Level 2:  [SST-X]</code></pre>
+            <h3 id="memtable">5.3 MemTable</h3>
+            <p>MemTable 是 LSM-Tree
+            在内存中的写缓冲区，通常使用跳表（Skip
+            List）或红黑树（Red-Black
+            Tree）实现。选择跳表的原因是它支持高效的并发写入（CAS
+            操作即可实现无锁插入），且实现比红黑树简单。</p>
+            <pre class="text"><code>跳表（Skip List）结构：
+
+Level 3:  HEAD ──────────────────────────→ 50 ─────────────────→ NIL
+Level 2:  HEAD ──────────→ 20 ──────────→ 50 ──────→ 70 ──────→ NIL
+Level 1:  HEAD ────→ 10 → 20 ──→ 30 ──→ 50 → 60 → 70 → 80 ──→ NIL
+Level 0:  HEAD → 5 → 10 → 20 → 25 → 30 → 50 → 60 → 70 → 75 → 80 → NIL</code></pre>
+            <p>写入流程：</p>
+            <ol type="1">
+            <li>先将操作追加到 WAL（顺序写），保证持久性；</li>
+            <li>将键值对插入 MemTable；</li>
+            <li>如果 MemTable 的大小达到阈值（通常 32-64 MB），将当前
+            MemTable 标记为不可变（Immutable MemTable），创建一个新的空
+            MemTable 接收新写入；</li>
+            <li>后台线程将 Immutable MemTable
+            的内容排序后写入磁盘，生成一个新的 SSTable 文件。</li>
+            </ol>
+            <h3 id="sstablesorted-string-table">5.4 SSTable（Sorted
+            String Table）</h3>
+            <p>SSTable 是 LSM-Tree 在磁盘上的基本存储单元。每个 SSTable
+            文件内部的键值对按键的字典序排列，文件创建后不可修改（Immutable）。一个
+            SSTable 文件的典型结构：</p>
+            <pre class="text"><code>┌─────────────────────────────────────────────────────┐
+│                   数据块（Data Blocks）               │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐            │
+│  │ Block 0  │ │ Block 1  │ │ Block 2  │ ...        │
+│  │ (4-32KB) │ │ (4-32KB) │ │ (4-32KB) │            │
+│  │ 有序 KV  │ │ 有序 KV  │ │ 有序 KV  │            │
+│  └──────────┘ └──────────┘ └──────────┘            │
+├─────────────────────────────────────────────────────┤
+│                   元数据块（Meta Blocks）             │
+│  ┌──────────────┐ ┌──────────────┐                  │
+│  │ Bloom Filter │ │ 统计信息     │                  │
+│  └──────────────┘ └──────────────┘                  │
+├─────────────────────────────────────────────────────┤
+│                   索引块（Index Block）              │
+│  记录每个数据块的起始键和偏移量                        │
+├─────────────────────────────────────────────────────┤
+│                   页脚（Footer）                     │
+│  索引块偏移量、元数据块偏移量、魔数                    │
+└─────────────────────────────────────────────────────┘</code></pre>
+            <p>SSTable 中的布隆过滤器（Bloom
+            Filter）用于快速判断一个键是否可能存在于该文件中。布隆过滤器是一个概率型数据结构，它会产生假阳性（False
+            Positive）——说”可能存在”的键实际可能不存在，但不会产生假阴性（False
+            Negative）——说”不存在”的键一定不存在。通过布隆过滤器，读操作可以跳过大量不包含目标键的
+            SSTable 文件，显著减少不必要的磁盘读取。</p>
+            <h3 id="读取路径">5.5 读取路径</h3>
+            <p>LSM-Tree 的读取需要按从新到旧的顺序查找多个位置：</p>
+            <pre class="text"><code>读取 Get(key)：
+
+1. 查找 MemTable               ← 最新数据
+   │ 未命中
+   ▼
+2. 查找 Immutable MemTable     ← 即将刷盘的数据
+   │ 未命中
+   ▼
+3. 查找 Level 0 SSTable        ← 最近刷盘的文件
+   │ 未命中（布隆过滤器过滤）
+   ▼
+4. 查找 Level 1 SSTable        ← 布隆过滤器 + 二分查找
+   │ 未命中
+   ▼
+5. 查找 Level 2 SSTable
+   │ ...
+   ▼
+N. 返回 NOT_FOUND</code></pre>
+            <p>最坏情况下，一次点查需要查找 MemTable + 所有层级的
+            SSTable，这就是 LSM-Tree
+            读放大的来源。布隆过滤器可以显著缓解这个问题——假设布隆过滤器的假阳性率为
+            1%，那么查找一个不存在的键在每层触发实际磁盘读的概率只有
+            1%。</p>
+            <h3 id="压缩compaction">5.6 压缩（Compaction）</h3>
+            <p>压缩是 LSM-Tree
+            最关键也最复杂的后台操作。它的目的是：</p>
+            <ol type="1">
+            <li>减少 SSTable 文件的数量，降低读放大；</li>
+            <li>消除同一个键的旧版本，回收空间；</li>
+            <li>移除已删除键的墓碑记录。</li>
+            </ol>
+            <p>两种主流压缩策略：</p>
+            <p><strong>大小分层压缩（Size-Tiered
+            Compaction，STCS）</strong>：</p>
+            <pre class="text"><code>Level 0: [S1] [S2] [S3] [S4]    ← 大小相近的 SSTable 累积到阈值
+                    │
+                    │ 合并
+                    ▼
+Level 1:        [M1] [M2]        ← 合并后的更大 SSTable
+                    │
+                    │ 合并
+                    ▼
+Level 2:           [L1]          ← 更大的 SSTable</code></pre>
+            <p>同一层的 SSTable 大小相近，数量达到阈值（通常 4
+            个）时合并成一个更大的 SSTable 放入下一层。STCS
+            的优点是写放大低（每层只合并一次），缺点是空间放大高（同一层的
+            SSTable 之间键范围可能重叠，同一个键可能存在于多个 SSTable
+            中）。</p>
+            <p><strong>分层压缩（Leveled
+            Compaction，LCS）</strong>：</p>
+            <pre class="text"><code>Level 0: [S1] [S2]              ← 允许键范围重叠
+                │
+                │ 合并到 Level 1
+                ▼
+Level 1: [A-E] [F-K] [L-P] [Q-Z]  ← 键范围不重叠
+                │
+                │ 选择一个 SSTable 与 Level 2 合并
+                ▼
+Level 2: [A-C] [D-F] [G-I] ... [X-Z]  ← 键范围不重叠，容量是上一层的 10 倍</code></pre>
+            <p>除 Level 0 外，每一层的 SSTable 之间键范围不重叠。Level
+            N+1 的总容量是 Level N 的固定倍数（通常 10
+            倍）。当某一层的容量超过阈值时，选择一个 SSTable
+            与下一层有键范围重叠的 SSTable 合并。LCS
+            的优点是空间放大低（每个键在每层最多出现一次），缺点是写放大高（一个
+            SSTable 可能需要与下一层的多个 SSTable 合并）。</p>
+            <p>关于压缩策略的详细分析和工程实现，参见 <a
+            href="../../db/lsm-tree/lsm-overview.html">LSM-Tree
+            系列：压缩策略</a>。</p>
+            <h3 id="lsm-tree-的性能特征">5.7 LSM-Tree 的性能特征</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>操作</th>
+            <th>时间复杂度</th>
+            <th>I/O 模式</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>写入</td>
+            <td>O(1)（摊还）</td>
+            <td>顺序写（WAL + MemTable 刷盘）</td>
+            </tr>
+            <tr>
+            <td>点查</td>
+            <td>O(L × log N)</td>
+            <td>可能多次随机读（L 层）</td>
+            </tr>
+            <tr>
+            <td>范围扫描</td>
+            <td>O(L × log N + K)</td>
+            <td>多路归并（Merge）</td>
+            </tr>
+            <tr>
+            <td>空间回收</td>
+            <td>后台压缩</td>
+            <td>顺序读写</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>其中 L 是 SSTable 的层数，N 是每层的 SSTable 数量，K
+            是范围扫描返回的记录数。</p>
+            <p>LSM-Tree 的核心优势是写入性能：所有用户写入都转化为顺序
+            I/O。它的核心劣势是读取性能：一次点查可能需要查找多个层级的多个
+            SSTable。在读密集型负载下，LSM-Tree 的延迟可能显著高于
+            B+Tree。</p>
+            <hr />
+            <h2
+            id="六读放大写放大与空间放大">六、读放大、写放大与空间放大</h2>
+            <h3 id="三种放大因子">6.1 三种放大因子</h3>
+            <p>存储引擎的效率不能只看操作的时间复杂度，还需要关注实际的
+            I/O 放大。I/O 放大有三个维度：</p>
+            <p><strong>读放大（Read
+            Amplification）</strong>：完成一次逻辑读操作实际触发的物理
+            I/O 次数。</p>
+            <pre class="text"><code>读放大 = 实际磁盘读取次数 / 逻辑读取次数
+
+例：
+- B+Tree 点查：读 2-4 个页面，读放大 = 2-4
+- LSM-Tree 点查（最坏）：查 MemTable + L 层 SSTable，
+  每层可能读索引块 + 数据块，读放大 = 2L（无布隆过滤器）</code></pre>
+            <p><strong>写放大（Write
+            Amplification）</strong>：完成一次逻辑写操作实际写入磁盘的数据量与用户数据量的比值。</p>
+            <pre class="text"><code>写放大 = 实际写入磁盘的数据量 / 用户写入的数据量
+
+例：
+- B+Tree 插入：写 WAL（~用户数据）+ 写回整页（16 KB），
+  如果用户数据 100 字节，写放大 ≈ 16KB / 100B ≈ 160
+- LSM-Tree（Leveled Compaction）：每层压缩写放大约 10，
+  L 层的总写放大 ≈ 10L（通常 L=5-7，写放大 50-70）</code></pre>
+            <p><strong>空间放大（Space
+            Amplification）</strong>：存储引擎占用的磁盘空间与用户数据实际大小的比值。</p>
+            <pre class="text"><code>空间放大 = 磁盘上占用的总空间 / 用户数据的逻辑大小
+
+例：
+- B+Tree：页面的平均填充率约 70%，空间放大 ≈ 1.4
+- LSM-Tree（Size-Tiered）：压缩过程中旧文件和新文件并存，
+  空间放大最坏情况可达 2.0
+- LSM-Tree（Leveled）：每个键在每层最多一份，空间放大 ≈ 1.1</code></pre>
+            <h3 id="各引擎的放大因子对比">6.2 各引擎的放大因子对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 27%" />
+            <col style="width: 22%" />
+            <col style="width: 22%" />
+            <col style="width: 27%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>存储引擎</th>
+            <th>读放大</th>
+            <th>写放大</th>
+            <th>空间放大</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>堆文件（无索引）</td>
+            <td>极高（全表扫描）</td>
+            <td>极低（1.0）</td>
+            <td>低（~1.0）</td>
+            </tr>
+            <tr>
+            <td>哈希索引（Bitcask）</td>
+            <td>低（1 次 seek）</td>
+            <td>低（顺序追加）</td>
+            <td>中（旧版本积累）</td>
+            </tr>
+            <tr>
+            <td>B+Tree（InnoDB）</td>
+            <td>低（2-4）</td>
+            <td>中-高（10-40）</td>
+            <td>低-中（~1.4）</td>
+            </tr>
+            <tr>
+            <td>LSM-Tree（STCS）</td>
+            <td>中（5-20）</td>
+            <td>低（4-10）</td>
+            <td>高（最坏 2.0）</td>
+            </tr>
+            <tr>
+            <td>LSM-Tree（LCS）</td>
+            <td>低-中（2-10）</td>
+            <td>高（10-30）</td>
+            <td>低（~1.1）</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="计算写放大的实际案例">6.3 计算写放大的实际案例</h3>
+            <p>以 RocksDB 的 Leveled Compaction 为例，计算一条 1 KB
+            记录的写放大：</p>
+            <pre class="text"><code>写入路径：
+1. 写 WAL：           1 KB      ← 第 1 次写入
+2. MemTable 刷盘：     1 KB      ← 第 2 次写入（刷入 Level 0）
+3. L0 → L1 压缩：      1 KB      ← 第 3 次写入
+4. L1 → L2 压缩：      1 KB × 10 ← Level 2 是 Level 1 的 10 倍
+                        （最坏情况下与 10 个 SSTable 合并）
+5. L2 → L3 压缩：      1 KB × 10
+6. L3 → L4 压缩：      1 KB × 10
+
+总写入量 = 1 + 1 + 1 + 10 + 10 + 10 = 33 KB
+写放大 = 33 KB / 1 KB = 33</code></pre>
+            <p>实际的写放大取决于工作负载的特征（键的分布、更新频率）、压缩策略的参数（层数比例、压缩触发阈值）和后台压缩线程的调度。RocksDB
+            的 <code>compaction_stats</code>
+            输出可以直接观察到每层的写放大：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 RocksDB 的 LOG 文件中查看压缩统计</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="st">&quot;compaction_stats&quot;</span> /path/to/rocksdb/LOG</span></code></pre></div>
+            <h3 id="写放大对-ssd-寿命的影响">6.4 写放大对 SSD
+            寿命的影响</h3>
+            <p>SSD 的 NAND Flash 有写入次数限制（Program/Erase
+            Cycles）。TLC NAND 的典型 P/E 次数为 1000-3000 次，QLC
+            更低（约 500-1000 次）。存储引擎的写放大会直接加速 SSD
+            的磨损。</p>
+            <p>假设一块 1 TB TLC SSD 的额定写入量（TBW，Total Bytes
+            Written）为 600 TB。如果存储引擎的写放大为
+            30，那么用户实际可以写入的逻辑数据量只有 600 TB / 30 = 20
+            TB。如果每天写入 100 GB 的用户数据，SSD 的理论寿命约为 20 TB
+            / 100 GB = 200 天。</p>
+            <p>因此，在 SSD
+            上运行写密集型负载时，存储引擎的写放大是一个必须认真评估的指标。降低写放大的手段包括：</p>
+            <ul>
+            <li>选择写放大更低的压缩策略（例如 STCS 优于 LCS）；</li>
+            <li>增大 MemTable 的大小，减少刷盘频率；</li>
+            <li>使用 key-value 分离（例如 BadgerDB 的 WiscKey
+            设计），将大 value 与 key
+            分开存储，减少压缩时的数据搬迁量。</li>
+            </ul>
+            <hr />
+            <h2 id="七rum-猜想">七、RUM 猜想</h2>
+            <h3 id="猜想的提出">7.1 猜想的提出</h3>
+            <p>RUM 猜想（RUM Conjecture）由 Manos Athanassoulis 等人在
+            2016 年的论文”Designing Access Methods: The RUM
+            Conjecture”（发表于 EDBT 2016）中提出。RUM
+            是三个单词的缩写：</p>
+            <ul>
+            <li><strong>R</strong>：Read Overhead（读开销）；</li>
+            <li><strong>U</strong>：Update
+            Overhead（更新/写开销）；</li>
+            <li><strong>M</strong>：Memory Overhead（空间开销）。</li>
+            </ul>
+            <p>猜想的核心陈述是：</p>
+            <blockquote>
+            <p>一种访问方法（Access Method）可以在 R、U、M
+            三个维度中优化其中两个，但必须以牺牲第三个为代价。不存在同时在三个维度都达到最优的访问方法。</p>
+            </blockquote>
+            <p>这类似于分布式系统中的 CAP 定理——你可以选择 CP 或
+            AP，但无法同时拥有 C、A 和 P。RUM
+            猜想告诉我们，在存储引擎的设计空间中也存在类似的不可能三角。</p>
+            <h3 id="三个维度的定义">7.2 三个维度的定义</h3>
+            <p>在 RUM 框架下，三个维度的精确定义如下：</p>
+            <p><strong>读开销（R）</strong>：执行一次读操作需要访问的额外数据量。理想情况下，点查只读取目标数据本身，读开销为
+            0。实际中，读取一条记录可能需要额外读取索引页面、遍历多层结构、检查布隆过滤器等。</p>
+            <p><strong>更新开销（U）</strong>：执行一次写操作需要写入的额外数据量。理想情况下，写入只影响目标数据本身，更新开销为
+            0。实际中，写入可能触发 WAL
+            写入、索引更新、页面分裂、后台压缩等。</p>
+            <p><strong>空间开销（M）</strong>：存储数据所需的额外空间。理想情况下，存储一条记录只占用记录本身的大小，空间开销为
+            0。实际中，索引结构、元数据、填充率不足、旧版本保留等都会增加空间开销。</p>
+            <h3 id="rum-空间中的存储引擎">7.3 RUM 空间中的存储引擎</h3>
+            <p>可以将各种存储引擎放置在 RUM 三角形中：</p>
+            <pre class="text"><code>          R（读优化）
+         ╱╲
+        ╱  ╲
+       ╱    ╲
+      ╱ B+Tree╲
+     ╱  读优化  ╲
+    ╱──────────╲
+   ╱    最优点   ╲
+  ╱  （不可达）   ╲
+ ╱                ╲
+U ──── LSM-Tree ──── M
+（写优化）    （空间优化）
+
+RUM 三角形：
+- B+Tree 优化了 R 和 M，牺牲了 U（写放大高）
+- LSM-Tree（LCS）优化了 U 和 M，牺牲了 R（读放大高）
+- LSM-Tree（STCS）优化了 U 和 R，牺牲了 M（空间放大高）</code></pre>
+            <p>各引擎在 RUM 空间中的位置：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>引擎 / 配置</th>
+            <th>R（读开销）</th>
+            <th>U（更新开销）</th>
+            <th>M（空间开销）</th>
+            <th>优化目标</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>B+Tree</td>
+            <td>低</td>
+            <td>高</td>
+            <td>低</td>
+            <td>R + M</td>
+            </tr>
+            <tr>
+            <td>LSM-Tree（LCS）</td>
+            <td>中</td>
+            <td>高</td>
+            <td>低</td>
+            <td>R + M（有限度）</td>
+            </tr>
+            <tr>
+            <td>LSM-Tree（STCS）</td>
+            <td>中-高</td>
+            <td>低</td>
+            <td>高</td>
+            <td>U</td>
+            </tr>
+            <tr>
+            <td>哈希索引</td>
+            <td>极低（点查）</td>
+            <td>低</td>
+            <td>高</td>
+            <td>R + U（仅点查）</td>
+            </tr>
+            <tr>
+            <td>堆文件</td>
+            <td>极高</td>
+            <td>极低</td>
+            <td>极低</td>
+            <td>U + M</td>
+            </tr>
+            <tr>
+            <td>Fractal Tree</td>
+            <td>低</td>
+            <td>中</td>
+            <td>中</td>
+            <td>平衡</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="rum-猜想的实践意义">7.4 RUM 猜想的实践意义</h3>
+            <p>RUM
+            猜想不是一个严格的数学定理（没有形式化的证明），而是一个经验性的设计指导原则。它的实践意义在于：</p>
+            <ol type="1">
+            <li><strong>消除幻想</strong>：不存在”银弹”存储引擎。当有人宣称某个新引擎”在所有维度上都优于现有方案”时，应该追问它在
+            RUM 的哪个维度做了妥协；</li>
+            <li><strong>指导选型</strong>：根据工作负载的特征，确定哪个维度可以容忍劣化，然后选择在另外两个维度优化的引擎；</li>
+            <li><strong>指导调优</strong>：同一个存储引擎的不同配置参数（如
+            RocksDB 的压缩策略、布隆过滤器精度、MemTable 大小）可以在
+            RUM 空间中移动引擎的位置。调优的本质是在 RUM
+            空间中找到最适合当前负载的点。</li>
+            </ol>
+            <h3 id="超越-rum-的考量">7.5 超越 RUM 的考量</h3>
+            <p>RUM
+            猜想聚焦于单机存储引擎的三个核心维度，但实际选型还需要考虑其他因素：</p>
+            <ul>
+            <li><strong>并发性能</strong>：引擎是否支持高并发读写？锁粒度如何？</li>
+            <li><strong>恢复时间</strong>：崩溃后重启需要多长时间？WAL
+            重放的效率如何？</li>
+            <li><strong>压缩稳定性</strong>：后台压缩对前台读写的性能影响有多大？是否会出现”压缩风暴”（Compaction
+            Storm）？</li>
+            <li><strong>内存管理</strong>：引擎对内存的使用是否可控？是否会出现
+            OOM？</li>
+            <li><strong>生态成熟度</strong>：社区活跃度、工具链完善程度、文档质量。</li>
+            </ul>
+            <hr />
+            <h2 id="八存储引擎分类学">八、存储引擎分类学</h2>
+            <h3 id="分类维度一更新策略">8.1 分类维度一：更新策略</h3>
+            <p>存储引擎按数据更新策略可以分为两大类：</p>
+            <p><strong>原地更新（In-Place Update）</strong>：</p>
+            <p>修改数据时直接覆盖原来的位置。B+Tree
+            是典型的原地更新结构——修改叶子节点中的一条记录时，直接在对应的页面上修改，然后写回磁盘。</p>
+            <p>优点：读取路径简单，数据只有一个版本，不需要合并；
+            缺点：随机写、写放大、需要处理页面分裂和碎片。</p>
+            <p><strong>追加写入（Append-Only / Out-of-Place
+            Update）</strong>：</p>
+            <p>修改数据时不覆盖原数据，而是将新版本追加到新位置。LSM-Tree
+            和日志结构文件系统（Log-Structured File
+            System）都属于追加写入。</p>
+            <p>优点：顺序写、写入吞吐高、天然支持快照和版本控制；
+            缺点：读取需要查找多个位置、需要后台压缩回收空间、空间放大。</p>
+            <pre class="text"><code>原地更新 vs 追加写入：
+
+原地更新（B+Tree）：
+  写入前：[页面 A: k1=v1, k2=v2, k3=v3]
+  更新 k2：[页面 A: k1=v1, k2=v2_new, k3=v3]  ← 直接覆盖
+
+追加写入（LSM-Tree）：
+  写入前：
+    SSTable-1: [k1=v1, k2=v2, k3=v3]
+  更新 k2：
+    SSTable-1: [k1=v1, k2=v2, k3=v3]   ← 旧版本保留
+    MemTable:  [k2=v2_new]              ← 新版本追加
+  压缩后：
+    SSTable-2: [k1=v1, k2=v2_new, k3=v3] ← 合并消除旧版本</code></pre>
+            <h3 id="分类维度二数据布局">8.2 分类维度二：数据布局</h3>
+            <p>按数据在磁盘上的物理布局，存储引擎可以分为行存储（Row
+            Store）和列存储（Column Store）。</p>
+            <p><strong>行存储（Row Store）</strong>：</p>
+            <p>每一行的所有列连续存储在一起。适合 OLTP
+            场景——一次查询通常需要读取一行的全部或大部分列。</p>
+            <pre class="text"><code>行存储的磁盘布局：
+
+页面 0: [id=1, name=&quot;Alice&quot;, age=30, city=&quot;Beijing&quot;]
+        [id=2, name=&quot;Bob&quot;,   age=25, city=&quot;Shanghai&quot;]
+页面 1: [id=3, name=&quot;Carol&quot;, age=28, city=&quot;Shenzhen&quot;]
+        [id=4, name=&quot;Dave&quot;,  age=35, city=&quot;Guangzhou&quot;]</code></pre>
+            <p>执行 <code>SELECT * FROM users WHERE id = 2</code>
+            时，只需读取页面 0 即可获取完整的行数据。</p>
+            <p><strong>列存储（Column Store）</strong>：</p>
+            <p>每一列的所有值连续存储在一起。适合 OLAP
+            场景——分析查询通常只涉及少数几列，但需要扫描大量行。</p>
+            <pre class="text"><code>列存储的磁盘布局：
+
+id 列文件:   [1, 2, 3, 4, 5, ...]
+name 列文件: [&quot;Alice&quot;, &quot;Bob&quot;, &quot;Carol&quot;, &quot;Dave&quot;, ...]
+age 列文件:  [30, 25, 28, 35, ...]
+city 列文件: [&quot;Beijing&quot;, &quot;Shanghai&quot;, &quot;Shenzhen&quot;, &quot;Guangzhou&quot;, ...]</code></pre>
+            <p>执行 <code>SELECT AVG(age) FROM users</code> 时，只需读取
+            age 列文件，其他列的数据完全不触碰。如果表有 100
+            列，列存储相比行存储减少了 99% 的 I/O。</p>
+            <p>列存储还有一个重要优势——压缩率（Compression
+            Ratio）更高。同一列的数据类型相同、取值范围相似，压缩算法（如字典编码（Dictionary
+            Encoding）、游程编码（Run-Length
+            Encoding）、位图编码（Bitmap Encoding））可以达到 5-20
+            倍的压缩比。行存储中一行内的不同列类型不同，压缩效果差得多。</p>
+            <h3 id="分类维度三索引与数据的关系">8.3
+            分类维度三：索引与数据的关系</h3>
+            <p><strong>聚簇索引（Clustered Index）</strong>：</p>
+            <p>索引的叶子节点直接包含完整的行数据，行数据按索引键的顺序物理排列。InnoDB
+            的主键索引就是聚簇索引——表数据和主键 B+Tree
+            是同一个结构。每张表只能有一个聚簇索引。</p>
+            <p><strong>非聚簇索引（Non-Clustered Index / Secondary
+            Index）</strong>：</p>
+            <p>索引的叶子节点包含索引键和指向行数据的指针（行 ID
+            或主键值），行数据存储在独立的堆文件或聚簇索引中。InnoDB
+            的二级索引（Secondary
+            Index）叶子节点存储的是主键值，查找行数据时需要”回表”（Index
+            Lookup + Primary Key Lookup）。</p>
+            <pre class="text"><code>聚簇索引（InnoDB 主键索引）：
+  B+Tree 叶子节点: [PK=1, 完整行数据] [PK=2, 完整行数据] ...
+
+非聚簇索引（InnoDB 二级索引）：
+  B+Tree 叶子节点: [idx_key=A, PK=3] [idx_key=B, PK=1] ...
+                                │
+                                │ 回表
+                                ▼
+  聚簇索引: [PK=3, 完整行数据]</code></pre>
+            <h3 id="分类维度四并发控制模型">8.4
+            分类维度四：并发控制模型</h3>
+            <ul>
+            <li><strong>基于锁的并发控制（Lock-Based Concurrency
+            Control）</strong>：通过行锁、页锁或表锁来隔离并发事务。MyISAM
+            使用表级锁，InnoDB 使用行级锁；</li>
+            <li><strong>多版本并发控制（Multi-Version Concurrency
+            Control，MVCC）</strong>：为每行数据维护多个版本，读操作访问事务开始时的快照版本，不阻塞写操作。InnoDB、PostgreSQL、WiredTiger
+            都使用 MVCC；</li>
+            <li><strong>乐观并发控制（Optimistic Concurrency
+            Control，OCC）</strong>：事务执行过程中不加锁，提交时检测冲突。适合冲突率低的负载。</li>
+            </ul>
+            <h3 id="分类总结表">8.5 分类总结表</h3>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 20%" />
+            <col style="width: 16%" />
+            <col style="width: 16%" />
+            <col style="width: 22%" />
+            <col style="width: 22%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>分类维度</th>
+            <th>选项 A</th>
+            <th>选项 B</th>
+            <th>典型引擎 A</th>
+            <th>典型引擎 B</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>更新策略</td>
+            <td>原地更新</td>
+            <td>追加写入</td>
+            <td>InnoDB（B+Tree）</td>
+            <td>RocksDB（LSM-Tree）</td>
+            </tr>
+            <tr>
+            <td>数据布局</td>
+            <td>行存储</td>
+            <td>列存储</td>
+            <td>InnoDB、WiredTiger</td>
+            <td>Parquet、ClickHouse</td>
+            </tr>
+            <tr>
+            <td>索引关系</td>
+            <td>聚簇索引</td>
+            <td>非聚簇索引</td>
+            <td>InnoDB 主键</td>
+            <td>PostgreSQL B-Tree</td>
+            </tr>
+            <tr>
+            <td>并发模型</td>
+            <td>基于锁</td>
+            <td>MVCC</td>
+            <td>MyISAM（表锁）</td>
+            <td>InnoDB（行级 MVCC）</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="九各引擎适用场景">九、各引擎适用场景</h2>
+            <h3 id="oltp-场景btree-引擎">9.1 OLTP 场景：B+Tree 引擎</h3>
+            <p>在线事务处理（Online Transaction
+            Processing，OLTP）的典型特征：</p>
+            <ul>
+            <li>查询模式以点查和小范围扫描为主；</li>
+            <li>读写混合，读多写少（典型读写比 8:2 到 9:1）；</li>
+            <li>对延迟敏感，要求单次操作在毫秒级完成；</li>
+            <li>数据热点集中，缓冲池命中率高。</li>
+            </ul>
+            <p>B+Tree 引擎（如 InnoDB）是 OLTP 场景的标准选择。原因是
+            B+Tree 的读路径短（2-4 次
+            I/O），在缓冲池命中率高的情况下绝大多数操作可以在内存中完成。写入虽然有随机
+            I/O 的问题，但 WAL
+            和缓冲池的配合可以将随机写转化为顺序写（WAL）+
+            异步刷盘。</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 典型 OLTP 查询</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">12345</span>;</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span> <span class="kw">WHERE</span> account_id <span class="op">=</span> <span class="dv">12345</span>;</span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> transactions (from_id, to_id, amount) <span class="kw">VALUES</span> (<span class="dv">12345</span>, <span class="dv">67890</span>, <span class="dv">100</span>);</span></code></pre></div>
+            <h3 id="写密集型场景lsm-tree-引擎">9.2
+            写密集型场景：LSM-Tree 引擎</h3>
+            <p>写密集型负载的典型特征：</p>
+            <ul>
+            <li>写入量远大于读取量（如日志采集、时序数据、消息队列）；</li>
+            <li>写入模式以追加为主，很少更新已有数据；</li>
+            <li>可以容忍较高的读取延迟（非实时查询）；</li>
+            <li>数据量大，需要良好的压缩率。</li>
+            </ul>
+            <p>LSM-Tree 引擎（如
+            RocksDB、LevelDB）是写密集型场景的最佳选择。原因是 LSM-Tree
+            的写路径完全是顺序
+            I/O，写入吞吐可以接近磁盘的顺序写带宽。</p>
+            <pre class="text"><code>写密集型场景示例：
+
+1. 时序数据库（Time Series Database）：
+   - 传感器每秒上报数据，写入量巨大
+   - 查询模式：按时间范围聚合
+   - 代表：InfluxDB（基于 TSM，类似 LSM）
+
+2. 消息队列的持久化层：
+   - 消息按顺序追加，消费后标记为已读
+   - 代表：Apache Kafka（日志结构存储）
+
+3. 监控指标存储：
+   - 高频写入，低频查询
+   - 代表：Prometheus（基于自定义的时序存储引擎）</code></pre>
+            <h3 id="分析型场景列存储引擎">9.3
+            分析型场景：列存储引擎</h3>
+            <p>在线分析处理（Online Analytical
+            Processing，OLAP）的典型特征：</p>
+            <ul>
+            <li>查询涉及大量行但只读取少数列；</li>
+            <li>以聚合计算为主（SUM、AVG、COUNT、GROUP BY）；</li>
+            <li>查询延迟要求不高（秒级到分钟级）；</li>
+            <li>数据以批量方式导入，很少单条更新。</li>
+            </ul>
+            <p>列存储引擎是 OLAP 场景的标准选择。代表性引擎包括：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>引擎 / 系统</th>
+            <th>存储格式</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Apache Parquet</td>
+            <td>列式文件格式</td>
+            <td>数据湖分析</td>
+            </tr>
+            <tr>
+            <td>ClickHouse</td>
+            <td>MergeTree（列式 LSM 变体）</td>
+            <td>实时分析</td>
+            </tr>
+            <tr>
+            <td>Apache Druid</td>
+            <td>列式 + 倒排索引</td>
+            <td>实时 OLAP</td>
+            </tr>
+            <tr>
+            <td>DuckDB</td>
+            <td>列式内存引擎</td>
+            <td>嵌入式分析</td>
+            </tr>
+            <tr>
+            <td>Vertica</td>
+            <td>列式 + 投影</td>
+            <td>企业级数仓</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>列存储的优势在高列数表上尤为明显。假设一张表有 200
+            列，分析查询通常只涉及 5-10 列，列存储的 I/O 效率是行存储的
+            20-40 倍。</p>
+            <h3 id="缓存与热点数据哈希引擎">9.4
+            缓存与热点数据：哈希引擎</h3>
+            <p>当工作负载以点查为主、不需要范围查询、数据集可以放入内存时，哈希引擎（或内存哈希表）是最高效的选择：</p>
+            <ul>
+            <li><strong>Redis</strong>：内存哈希表 +
+            多种数据结构，用于缓存、会话管理、排行榜；</li>
+            <li><strong>Memcached</strong>：纯内存哈希表，用于简单的键值缓存；</li>
+            <li><strong>Bitcask</strong>（Riak）：内存哈希表 +
+            磁盘日志，用于需要持久化的键值存储。</li>
+            </ul>
+            <h3 id="场景选型决策树">9.5 场景选型决策树</h3>
+            <pre class="text"><code>你的主要负载是什么？
+│
+├── 读密集 + 点查/范围查询 + ACID 事务
+│   └── B+Tree 引擎（InnoDB、WiredTiger、BoltDB）
+│
+├── 写密集 + 顺序写入 + 可容忍读延迟
+│   └── LSM-Tree 引擎（RocksDB、LevelDB、Pebble、BadgerDB）
+│
+├── 分析型 + 聚合查询 + 批量导入
+│   └── 列存储引擎（Parquet、ClickHouse、DuckDB）
+│
+├── 纯点查 + 数据集可放入内存
+│   └── 哈希引擎（Redis、Memcached、Bitcask）
+│
+└── 混合负载（HTAP）
+    └── 混合引擎（TiDB 的 TiKV + TiFlash、CockroachDB）</code></pre>
+            <h3 id="混合负载htap场景">9.6 混合负载（HTAP）场景</h3>
+            <p>实际业务中，很多系统需要同时处理 OLTP 和 OLAP
+            负载——在线服务需要快速的点查和事务处理，同时业务分析团队需要在同一份数据上执行复杂的聚合查询。这种场景称为
+            HTAP（Hybrid Transactional/Analytical Processing）。</p>
+            <p>传统做法是 OLTP 数据库 + ETL 管道 + OLAP 数据仓库，但 ETL
+            引入了延迟和复杂性。新一代 HTAP
+            系统试图用一套存储引擎同时服务两种负载：</p>
+            <ul>
+            <li><strong>TiDB</strong>：使用行存储引擎 TiKV（基于
+            RocksDB）处理 OLTP，同时通过 TiFlash（列存储副本）处理
+            OLAP。Raft 协议保证行列副本之间的一致性；</li>
+            <li><strong>CockroachDB</strong>：基于 Pebble（Go 实现的
+            LSM-Tree）的分布式 SQL
+            数据库，通过计算下推和并行扫描来加速分析查询；</li>
+            <li><strong>SingleStore</strong>（原 MemSQL）：内存行存储 +
+            磁盘列存储的双引擎架构。</li>
+            </ul>
+            <hr />
+            <h2 id="十主流存储引擎一览">十、主流存储引擎一览</h2>
+            <h3 id="引擎对比总表">10.1 引擎对比总表</h3>
+            <table>
+            <colgroup>
+            <col style="width: 10%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            <col style="width: 10%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            <col style="width: 15%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>引擎</th>
+            <th>所属项目</th>
+            <th>数据结构</th>
+            <th>语言</th>
+            <th>更新策略</th>
+            <th>事务支持</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>InnoDB</td>
+            <td>MySQL</td>
+            <td>B+Tree</td>
+            <td>C/C++</td>
+            <td>原地更新</td>
+            <td>ACID（行级锁 + MVCC）</td>
+            <td>OLTP</td>
+            </tr>
+            <tr>
+            <td>RocksDB</td>
+            <td>Meta（原 Facebook）</td>
+            <td>LSM-Tree</td>
+            <td>C++</td>
+            <td>追加写入</td>
+            <td>原子 WriteBatch</td>
+            <td>写密集、嵌入式 KV</td>
+            </tr>
+            <tr>
+            <td>WiredTiger</td>
+            <td>MongoDB</td>
+            <td>B-Tree + LSM</td>
+            <td>C</td>
+            <td>两者皆支持</td>
+            <td>MVCC</td>
+            <td>文档数据库</td>
+            </tr>
+            <tr>
+            <td>Pebble</td>
+            <td>CockroachDB</td>
+            <td>LSM-Tree</td>
+            <td>Go</td>
+            <td>追加写入</td>
+            <td>原子 WriteBatch</td>
+            <td>分布式 SQL</td>
+            </tr>
+            <tr>
+            <td>BoltDB</td>
+            <td>etcd（早期）</td>
+            <td>B+Tree</td>
+            <td>Go</td>
+            <td>原地更新</td>
+            <td>ACID（MVCC）</td>
+            <td>嵌入式只读密集</td>
+            </tr>
+            <tr>
+            <td>BadgerDB</td>
+            <td>Dgraph</td>
+            <td>LSM-Tree + VLog</td>
+            <td>Go</td>
+            <td>追加写入</td>
+            <td>ACID（SSI）</td>
+            <td>嵌入式写密集</td>
+            </tr>
+            <tr>
+            <td>LevelDB</td>
+            <td>Google</td>
+            <td>LSM-Tree</td>
+            <td>C++</td>
+            <td>追加写入</td>
+            <td>无</td>
+            <td>嵌入式 KV</td>
+            </tr>
+            <tr>
+            <td>SQLite</td>
+            <td>公共领域</td>
+            <td>B-Tree</td>
+            <td>C</td>
+            <td>原地更新</td>
+            <td>ACID（WAL 模式）</td>
+            <td>嵌入式 SQL</td>
+            </tr>
+            <tr>
+            <td>MyRocks</td>
+            <td>Meta</td>
+            <td>LSM-Tree（RocksDB）</td>
+            <td>C++</td>
+            <td>追加写入</td>
+            <td>ACID</td>
+            <td>MySQL 写密集替代</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="innodb">10.2 InnoDB</h3>
+            <p>InnoDB 是 MySQL 的默认存储引擎，也是最成熟的 B+Tree
+            引擎之一。核心特性：</p>
+            <ul>
+            <li><strong>聚簇索引</strong>：表数据按主键顺序存储在 B+Tree
+            的叶子节点中。如果没有显式定义主键，InnoDB 会自动生成一个 6
+            字节的隐藏主键（ROW_ID）；</li>
+            <li><strong>缓冲池（Buffer
+            Pool）</strong>：内存中缓存数据页和索引页，使用 LRU（Least
+            Recently Used）变体算法管理。典型配置将 70-80%
+            的可用内存分配给缓冲池；</li>
+            <li><strong>MVCC</strong>：通过 undo log
+            维护行数据的历史版本，读操作访问快照版本，不阻塞写操作；</li>
+            <li><strong>ARIES 风格的崩溃恢复</strong>：redo
+            log（重做日志）保证已提交事务的持久性，undo
+            log（回滚日志）保证未提交事务的原子性。</li>
+            </ul>
+            <p>InnoDB 的适用场景是传统的 OLTP
+            负载——电商订单、银行交易、用户管理等。它的主要局限是写放大较高，在写密集型负载下性能不如
+            LSM-Tree 引擎。</p>
+            <h3 id="rocksdb">10.3 RocksDB</h3>
+            <p>RocksDB 由 Meta（原 Facebook）开发，基于 Google 的
+            LevelDB，是目前最广泛使用的 LSM-Tree
+            引擎。它不是一个独立的数据库，而是一个嵌入式键值存储库（Embedded
+            Key-Value Store），被大量系统用作底层存储引擎：</p>
+            <ul>
+            <li><strong>MySQL MyRocks</strong>：MySQL 的 RocksDB
+            存储引擎插件，为写密集型负载提供更低的写放大和更好的压缩率；</li>
+            <li><strong>TiKV</strong>：TiDB 的分布式键值存储层；</li>
+            <li><strong>CockroachDB</strong>（早期版本）：使用 RocksDB
+            作为单节点存储引擎（后改为 Pebble）；</li>
+            <li><strong>Apache Flink</strong>：使用 RocksDB
+            存储有状态流处理的检查点数据。</li>
+            </ul>
+            <p>RocksDB 的核心优势：</p>
+            <ol type="1">
+            <li><strong>高度可调参数</strong>：压缩策略、MemTable
+            类型、布隆过滤器精度、压缩算法、线程数等都可以精细调节；</li>
+            <li><strong>列族（Column
+            Family）</strong>：逻辑上隔离不同类型的数据，每个列族有独立的
+            MemTable 和 SSTable；</li>
+            <li><strong>前缀布隆过滤器（Prefix Bloom
+            Filter）</strong>：加速前缀扫描；</li>
+            <li><strong>限速器（Rate
+            Limiter）</strong>：控制压缩和刷盘的 I/O
+            速率，避免后台操作影响前台读写。</li>
+            </ol>
+            <h3 id="wiredtiger">10.4 WiredTiger</h3>
+            <p>WiredTiger 是 MongoDB 从 3.2
+            版本开始的默认存储引擎。独特之处在于它同时支持 B-Tree 和
+            LSM-Tree
+            两种数据结构，用户可以在创建集合（Collection）时选择。</p>
+            <p>核心特性：</p>
+            <ul>
+            <li><strong>文档级并发控制</strong>：使用 MVCC
+            实现文档级别（而非集合级别）的并发控制；</li>
+            <li><strong>块压缩（Block Compression）</strong>：支持
+            Snappy、zlib、zstd 等压缩算法，在数据页级别进行压缩；</li>
+            <li><strong>检查点（Checkpoint）</strong>：定期创建一致性检查点，崩溃恢复从最近的检查点开始重放
+            WAL；</li>
+            <li><strong>前缀压缩（Prefix Compression）</strong>：对
+            B-Tree 内部节点的键进行前缀压缩，降低索引的空间占用。</li>
+            </ul>
+            <p>WiredTiger 在 MongoDB
+            的文档模型下表现优异，但它是一个通用的嵌入式存储引擎，也可以独立使用。</p>
+            <h3 id="pebble">10.5 Pebble</h3>
+            <p>Pebble 是 CockroachDB 团队用 Go 语言开发的 LSM-Tree
+            引擎，用于替代之前使用的 RocksDB。替代的主要原因：</p>
+            <ol type="1">
+            <li><strong>CGo 调用开销</strong>：Go 调用 C/C++
+            库（RocksDB）需要通过 CGo 接口，每次调用有约 100 ns
+            的固定开销；</li>
+            <li><strong>内存管理冲突</strong>：Go 的垃圾回收器与 RocksDB
+            的手动内存管理之间存在交互问题；</li>
+            <li><strong>构建复杂性</strong>：依赖 C++ 编译器和 RocksDB
+            的构建系统增加了 CockroachDB 的构建复杂度。</li>
+            </ol>
+            <p>Pebble 的 API 设计与 RocksDB 相似，但针对 Go
+            生态做了优化。它的 SSTable 格式兼容 RocksDB（LevelDB
+            格式），这使得 CockroachDB 可以平滑迁移。</p>
+            <h3 id="boltdb">10.6 BoltDB</h3>
+            <p>BoltDB 是一个纯 Go 实现的嵌入式 B+Tree 数据库，API
+            极其简洁。etcd（Kubernetes 的元数据存储）的早期版本使用
+            BoltDB 作为后端（后来切换到 bbolt，BoltDB
+            的社区维护分支）。</p>
+            <p>BoltDB 的特点：</p>
+            <ul>
+            <li><strong>单文件存储</strong>：整个数据库存储在一个文件中，通过
+            mmap 映射到内存；</li>
+            <li><strong>完整的 ACID
+            事务</strong>：支持读写事务和只读事务，使用 MVCC
+            实现读写不阻塞；</li>
+            <li><strong>COW
+            B+Tree</strong>：写事务修改页面时使用写时复制，不原地修改旧页面；</li>
+            <li><strong>单写者模型</strong>：同一时刻只允许一个写事务执行，通过互斥锁保证。</li>
+            </ul>
+            <p>BoltDB
+            的适用场景是读多写少的嵌入式存储——配置管理、元数据存储、小规模键值缓存。它不适合写密集型负载（单写者模型限制了写入吞吐）。</p>
+            <h3 id="badgerdb">10.7 BadgerDB</h3>
+            <p>BadgerDB 是 Dgraph 团队用 Go 语言开发的 LSM-Tree
+            引擎，最大的创新是 Key-Value 分离（Key-Value
+            Separation），灵感来自 WiscKey 论文（“WiscKey: Separating
+            Keys from Values in SSD-Conscious Storage”，FAST
+            2016）。</p>
+            <p>传统 LSM-Tree
+            在压缩时需要重写所有的键值对，包括可能很大的 Value。WiscKey
+            的思想是：</p>
+            <pre class="text"><code>传统 LSM-Tree：
+  SSTable: [key1:large_value1] [key2:large_value2] ...
+  压缩时需要搬迁所有 key + value
+
+WiscKey / BadgerDB：
+  SSTable: [key1:vlog_offset1] [key2:vlog_offset2] ...  ← 只存 key 和指针
+  VLog:    [large_value1] [large_value2] ...              ← value 单独存储
+  压缩时只需要搬迁 key + 指针，value 不动</code></pre>
+            <p>Key-Value
+            分离显著降低了写放大——压缩只涉及键和元数据，不涉及实际的
+            Value 数据。但它增加了点查的读放大（需要额外一次 VLog
+            读取）和垃圾回收的复杂性（VLog 中的过期 Value
+            需要单独回收）。</p>
+            <h3 id="引擎选型速查表">10.8 引擎选型速查表</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>你的需求</th>
+            <th>推荐引擎</th>
+            <th>理由</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>MySQL OLTP</td>
+            <td>InnoDB</td>
+            <td>成熟稳定、ACID、行级锁</td>
+            </tr>
+            <tr>
+            <td>MySQL 写密集</td>
+            <td>MyRocks</td>
+            <td>基于 RocksDB、低写放大、高压缩率</td>
+            </tr>
+            <tr>
+            <td>MongoDB 文档存储</td>
+            <td>WiredTiger</td>
+            <td>文档级 MVCC、压缩支持</td>
+            </tr>
+            <tr>
+            <td>Go 嵌入式读密集 KV</td>
+            <td>BoltDB / bbolt</td>
+            <td>简洁 API、ACID 事务、单文件</td>
+            </tr>
+            <tr>
+            <td>Go 嵌入式写密集 KV</td>
+            <td>BadgerDB / Pebble</td>
+            <td>LSM-Tree、高写入吞吐</td>
+            </tr>
+            <tr>
+            <td>分布式 SQL 底层存储</td>
+            <td>RocksDB / Pebble</td>
+            <td>久经考验的 LSM-Tree 实现</td>
+            </tr>
+            <tr>
+            <td>流处理状态后端</td>
+            <td>RocksDB</td>
+            <td>Apache Flink 官方支持</td>
+            </tr>
+            <tr>
+            <td>实时分析</td>
+            <td>ClickHouse MergeTree</td>
+            <td>列存储 + 向量化执行</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="性能基准参考">10.9 性能基准参考</h3>
+            <p>不同存储引擎在标准基准测试下的表现差异显著。以下是典型的相对性能对比（基于公开的
+            benchmark 数据，具体数值取决于硬件和配置）：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>测试项</th>
+            <th>B+Tree（InnoDB）</th>
+            <th>LSM-Tree（RocksDB）</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>随机写入吞吐</td>
+            <td>1x</td>
+            <td>3-10x</td>
+            <td>LSM-Tree 的顺序写优势</td>
+            </tr>
+            <tr>
+            <td>随机读取延迟</td>
+            <td>1x</td>
+            <td>1.5-3x</td>
+            <td>B+Tree 的读路径更短</td>
+            </tr>
+            <tr>
+            <td>范围扫描</td>
+            <td>1x</td>
+            <td>0.5-2x</td>
+            <td>取决于压缩状态</td>
+            </tr>
+            <tr>
+            <td>空间占用</td>
+            <td>1x</td>
+            <td>0.5-0.7x</td>
+            <td>LSM-Tree 压缩率更高</td>
+            </tr>
+            <tr>
+            <td>写放大</td>
+            <td>10-40x</td>
+            <td>10-30x（LCS）</td>
+            <td>取决于负载和配置</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这些数字只是量级参考，实际性能取决于工作负载特征（键大小、值大小、读写比例、热点分布）、硬件配置（内存大小、SSD
+            型号、CPU
+            核数）和引擎参数调优。任何存储引擎的选型都应基于用实际负载做的
+            benchmark，而非通用数据。</p>
+            <hr />
+            <h2 id="附参考资料">附：参考资料</h2>
+            <ol type="1">
+            <li>Bayer, R., &amp; McCreight, E. (1970). “Organization and
+            maintenance of large ordered indexes.” <em>Acta
+            Informatica</em>, 1(3), 173-189.</li>
+            <li>O’Neil, P., Cheng, E., Gawlick, D., &amp; O’Neil, E.
+            (1996). “The Log-Structured Merge-Tree (LSM-Tree).” <em>Acta
+            Informatica</em>, 33(4), 351-385.</li>
+            <li>Athanassoulis, M., Kester, M. S., Maas, L. M., Stoica,
+            R., Idreos, S., Ailamaki, A., &amp; Callaghan, M. (2016).
+            “Designing Access Methods: The RUM Conjecture.”
+            <em>Proceedings of the 19th International Conference on
+            Extending Database Technology (EDBT)</em>, 461-466.</li>
+            <li>Lu, L., Pillai, T. S., Gopalakrishnan, H.,
+            Arpaci-Dusseau, A. C., &amp; Arpaci-Dusseau, R. H. (2016).
+            “WiscKey: Separating Keys from Values in SSD-Conscious
+            Storage.” <em>14th USENIX Conference on File and Storage
+            Technologies (FAST 16)</em>, 133-148.</li>
+            <li>Dong, S., Callaghan, M., Galanis, L., Borthakur, D.,
+            Savor, T., &amp; Strum, M. (2017). “Optimizing Space
+            Amplification in RocksDB.” <em>8th Biennial Conference on
+            Innovative Data Systems Research (CIDR)</em>.</li>
+            <li>RocksDB Wiki：<a
+            href="https://github.com/facebook/rocksdb/wiki">https://github.com/facebook/rocksdb/wiki</a></li>
+            <li>LevelDB 实现文档：<a
+            href="https://github.com/google/leveldb/blob/main/doc/impl.md">https://github.com/google/leveldb/blob/main/doc/impl.md</a></li>
+            <li>InnoDB 官方文档：<a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-storage-engine.html">https://dev.mysql.com/doc/refman/8.0/en/innodb-storage-engine.html</a></li>
+            <li>WiredTiger 文档：<a
+            href="https://source.wiredtiger.com/">https://source.wiredtiger.com/</a></li>
+            <li>Pebble 设计文档：<a
+            href="https://github.com/cockroachdb/pebble">https://github.com/cockroachdb/pebble</a></li>
+            <li>BadgerDB 文档：<a
+            href="https://dgraph.io/docs/badger/">https://dgraph.io/docs/badger/</a></li>
+            <li>BoltDB / bbolt：<a
+            href="https://github.com/etcd-io/bbolt">https://github.com/etcd-io/bbolt</a></li>
+            <li>Hellerstein, J. M., Stonebraker, M., &amp; Hamilton, J.
+            (2007). “Architecture of a Database System.” <em>Foundations
+            and Trends in Databases</em>, 1(2), 141-259.</li>
+            <li>Kleppmann, M. (2017). <em>Designing Data-Intensive
+            Applications</em>. O’Reilly Media. Chapter 3: Storage and
+            Retrieval.</li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../23-snapshot-thin-provisioning/snapshot-thin-provisioning.html">存储快照与精简配置</a>
+            <strong>下一篇</strong>: <a
+            href="../25-btree-engineering/btree-engineering.html">B-Tree
+            与 B+Tree：页式存储引擎的工程实现</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-09 · storage</p>
+                    <h3><a href="/post/storage/31-lsm-tree-tuning/lsm-tree-tuning.html">【存储工程】LSM-Tree 工程调优：三种放大的权衡</a></h3>
+                    <p>LSM-Tree 的核心设计是把随机写转换为顺序写，但这个转换不是免费的。写入经过 MemTable 刷盘、再经过多次 Compaction 合并，每一字节的用户数据在磁盘上可能被反复读写数十次。读取一个 key 时，最坏情况下需要逐层搜索，直到命中或遍历全部层级。与此同时，旧版本数据和墓碑标记占用的额外空间，在 Co…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / storage</p>
+                    <h3><a href="/post/db/columnar-engine/01-columnar-basics/01-columnar-basics.html">【列存引擎内核】列存基础与 ClickHouse 架构</a></h3>
+                    <p>行存 vs 列存的带宽、压缩与向量化三角；ClickHouse Server 进程模型、线程池与 MergeTree 引擎家族地图；src/Storages 与 src/Processors 源码入口。对照 PG 行存与 LSM 写优化路径，版本锚定 ClickHouse 24.x LTS。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

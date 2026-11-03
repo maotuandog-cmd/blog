@@ -1,0 +1,2283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】Parquet 文件格式深度解析 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="parquet, row-group, column-chunk, encoding, predicate-pushdown, pyarrow, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/36-parquet/parquet.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】Parquet 文件格式深度解析" />
+    <meta property="og:description" content="上一篇我们讨论了列式存储（Columnar Storage）的核心思想：把同一列的数据连续存放，让分析查询只读取需要的列，而不是扫描整行。这个思想落地到具体文件格式时，需要回答一系列工程问题：文件内部怎么组织数据才能同时支持并行读取和列裁剪？同一列的数据用什么编码方式才能最大化压缩率？如何在不读取全部数据的前提下跳过不…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/36-parquet/parquet.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="parquet" />
+    <meta property="article:tag" content="row-group" />
+    <meta property="article:tag" content="column-chunk" />
+    <meta property="article:tag" content="encoding" />
+    <meta property="article:tag" content="predicate-pushdown" />
+    <meta property="article:tag" content="pyarrow" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】Parquet 文件格式深度解析" />
+    <meta name="twitter:description" content="上一篇我们讨论了列式存储（Columnar Storage）的核心思想：把同一列的数据连续存放，让分析查询只读取需要的列，而不是扫描整行。这个思想落地到具体文件格式时，需要回答一系列工程问题：文件内部怎么组织数据才能同时支持并行读取和列裁剪？同一列的数据用什么编码方式才能最大化压缩率？如何在不读取全部数据的前提下跳过不…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】Parquet 文件格式深度解析", "description": "上一篇我们讨论了列式存储（Columnar Storage）的核心思想：把同一列的数据连续存放，让分析查询只读取需要的列，而不是扫描整行。这个思想落地到具体文件格式时，需要回答一系列工程问题：文件内部怎么组织数据才能同时支持并行读取和列裁剪？同一列的数据用什么编码方式才能最大化压缩率？如何在不读取全部数据的前提下跳过不…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/36-parquet/parquet.html"}, "datePublished": "2025-09-14T00:00:00+00:00", "dateModified": "2026-04-15T11:45:56+00:00", "keywords": ["parquet", "row-group", "column-chunk", "encoding", "predicate-pushdown", "pyarrow"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】Parquet 文件格式深度解析</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-14</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#parquet</span> <span>#row-group</span> <span>#column-chunk</span> <span>#encoding</span> <span>#predicate-pushdown</span> <span>#pyarrow</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/35-columnar-storage/columnar-storage.html">上一篇：【存储工程】列式存储原理：为什么分析查询快 10 倍</a><a class="post-series-nav__link" href="/post/storage/37-arrow/arrow.html">下一篇：【存储工程】Apache Arrow：零拷贝内存列式格式</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/parquet.html">#parquet</a><a class="chip-link" href="/tags/row-group.html">#row-group</a><a class="chip-link" href="/tags/column-chunk.html">#column-chunk</a><a class="chip-link" href="/tags/encoding.html">#encoding</a><a class="chip-link" href="/tags/predicate-pushdown.html">#predicate-pushdown</a><a class="chip-link" href="/tags/pyarrow.html">#pyarrow</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一parquet-设计目标"
+                id="toc-一parquet-设计目标">一、Parquet 设计目标</a>
+                <ul>
+                <li><a href="#设计约束" id="toc-设计约束">1.1
+                设计约束</a></li>
+                <li><a href="#dremel-的遗产" id="toc-dremel-的遗产">1.2
+                Dremel 的遗产</a></li>
+                <li><a href="#与-orc-的定位差异"
+                id="toc-与-orc-的定位差异">1.3 与 ORC
+                的定位差异</a></li>
+                </ul></li>
+                <li><a href="#二row-groupcolumn-chunkpage-三级结构"
+                id="toc-二row-groupcolumn-chunkpage-三级结构">二、Row
+                Group/Column Chunk/Page 三级结构</a>
+                <ul>
+                <li><a href="#文件整体布局" id="toc-文件整体布局">2.1
+                文件整体布局</a></li>
+                <li><a href="#行组row-group" id="toc-行组row-group">2.2
+                行组（Row Group）</a></li>
+                <li><a href="#列块column-chunk"
+                id="toc-列块column-chunk">2.3 列块（Column
+                Chunk）</a></li>
+                <li><a href="#页page" id="toc-页page">2.4
+                页（Page）</a></li>
+                <li><a href="#三级结构的协作"
+                id="toc-三级结构的协作">2.5 三级结构的协作</a></li>
+                </ul></li>
+                <li><a href="#三编码方式"
+                id="toc-三编码方式">三、编码方式</a>
+                <ul>
+                <li><a href="#plain-编码" id="toc-plain-编码">3.1 Plain
+                编码</a></li>
+                <li><a href="#字典编码dictionary-encoding"
+                id="toc-字典编码dictionary-encoding">3.2
+                字典编码（Dictionary Encoding）</a></li>
+                <li><a href="#rlebit-packing-混合编码"
+                id="toc-rlebit-packing-混合编码">3.3 RLE/Bit-Packing
+                混合编码</a></li>
+                <li><a href="#delta-编码delta-encoding"
+                id="toc-delta-编码delta-encoding">3.4 Delta 编码（Delta
+                Encoding）</a></li>
+                <li><a href="#delta-length-byte-array-编码"
+                id="toc-delta-length-byte-array-编码">3.5 Delta Length
+                Byte Array 编码</a></li>
+                <li><a href="#delta-strings-编码"
+                id="toc-delta-strings-编码">3.6 Delta Strings
+                编码</a></li>
+                <li><a href="#byte-stream-split-编码"
+                id="toc-byte-stream-split-编码">3.7 Byte Stream Split
+                编码</a></li>
+                <li><a href="#编码选择建议" id="toc-编码选择建议">3.8
+                编码选择建议</a></li>
+                </ul></li>
+                <li><a href="#四统计信息与谓词下推"
+                id="toc-四统计信息与谓词下推">四、统计信息与谓词下推</a>
+                <ul>
+                <li><a href="#列统计信息column-statistics"
+                id="toc-列统计信息column-statistics">4.1
+                列统计信息（Column Statistics）</a></li>
+                <li><a href="#谓词下推原理" id="toc-谓词下推原理">4.2
+                谓词下推原理</a></li>
+                <li><a href="#page-index" id="toc-page-index">4.3 Page
+                Index</a></li>
+                <li><a href="#bloom-filter" id="toc-bloom-filter">4.4
+                Bloom Filter</a></li>
+                <li><a href="#支持的谓词类型"
+                id="toc-支持的谓词类型">4.5 支持的谓词类型</a></li>
+                </ul></li>
+                <li><a href="#五投影下推"
+                id="toc-五投影下推">五、投影下推</a>
+                <ul>
+                <li><a href="#投影下推原理" id="toc-投影下推原理">5.1
+                投影下推原理</a></li>
+                <li><a href="#投影下推的-io-节省"
+                id="toc-投影下推的-io-节省">5.2 投影下推的 I/O
+                节省</a></li>
+                <li><a href="#嵌套列的投影" id="toc-嵌套列的投影">5.3
+                嵌套列的投影</a></li>
+                </ul></li>
+                <li><a href="#六parquet-版本演进"
+                id="toc-六parquet-版本演进">六、Parquet 版本演进</a>
+                <ul>
+                <li><a href="#版本号体系" id="toc-版本号体系">6.1
+                版本号体系</a></li>
+                <li><a href="#各版本关键变化"
+                id="toc-各版本关键变化">6.2 各版本关键变化</a></li>
+                <li><a href="#逻辑类型logical-type"
+                id="toc-逻辑类型logical-type">6.3 逻辑类型（Logical
+                Type）</a></li>
+                <li><a href="#兼容性实践" id="toc-兼容性实践">6.4
+                兼容性实践</a></li>
+                </ul></li>
+                <li><a href="#七parquet-tools-实战"
+                id="toc-七parquet-tools-实战">七、parquet-tools 实战</a>
+                <ul>
+                <li><a href="#安装" id="toc-安装">7.1 安装</a></li>
+                <li><a href="#查看-schema" id="toc-查看-schema">7.2 查看
+                Schema</a></li>
+                <li><a href="#查看元数据" id="toc-查看元数据">7.3
+                查看元数据</a></li>
+                <li><a href="#查看数据内容" id="toc-查看数据内容">7.4
+                查看数据内容</a></li>
+                <li><a href="#查看-row-group-详细信息"
+                id="toc-查看-row-group-详细信息">7.5 查看 Row Group
+                详细信息</a></li>
+                <li><a href="#检查-page-index"
+                id="toc-检查-page-index">7.6 检查 Page Index</a></li>
+                <li><a href="#文件大小分析" id="toc-文件大小分析">7.7
+                文件大小分析</a></li>
+                </ul></li>
+                <li><a href="#八pyarrow-读写-parquet"
+                id="toc-八pyarrow-读写-parquet">八、PyArrow 读写
+                Parquet</a>
+                <ul>
+                <li><a href="#基本写入" id="toc-基本写入">8.1
+                基本写入</a></li>
+                <li><a href="#基本读取" id="toc-基本读取">8.2
+                基本读取</a></li>
+                <li><a href="#分区写入" id="toc-分区写入">8.3
+                分区写入</a></li>
+                <li><a href="#流式写入逐行组写入"
+                id="toc-流式写入逐行组写入">8.4
+                流式写入（逐行组写入）</a></li>
+                <li><a href="#读取元数据" id="toc-读取元数据">8.5
+                读取元数据</a></li>
+                <li><a href="#控制编码方式" id="toc-控制编码方式">8.6
+                控制编码方式</a></li>
+                <li><a href="#pandas-互操作" id="toc-pandas-互操作">8.7
+                Pandas 互操作</a></li>
+                </ul></li>
+                <li><a href="#九row-group-大小调优"
+                id="toc-九row-group-大小调优">九、Row Group 大小调优</a>
+                <ul>
+                <li><a href="#row-group-大小的影响因素"
+                id="toc-row-group-大小的影响因素">9.1 Row Group
+                大小的影响因素</a></li>
+                <li><a href="#行组大小-vs-hdfs-block-大小"
+                id="toc-行组大小-vs-hdfs-block-大小">9.2 行组大小 vs
+                HDFS Block 大小</a></li>
+                <li><a href="#不同场景下的推荐大小"
+                id="toc-不同场景下的推荐大小">9.3
+                不同场景下的推荐大小</a></li>
+                <li><a href="#spark-中的配置"
+                id="toc-spark-中的配置">9.4 Spark 中的配置</a></li>
+                <li><a href="#行组行数-vs-行组大小"
+                id="toc-行组行数-vs-行组大小">9.5 行组行数 vs
+                行组大小</a></li>
+                <li><a href="#实测调优方法" id="toc-实测调优方法">9.6
+                实测调优方法</a></li>
+                </ul></li>
+                <li><a href="#十parquet-最佳实践"
+                id="toc-十parquet-最佳实践">十、Parquet 最佳实践</a>
+                <ul>
+                <li><a href="#压缩算法选择" id="toc-压缩算法选择">10.1
+                压缩算法选择</a></li>
+                <li><a href="#排序对压缩率的影响"
+                id="toc-排序对压缩率的影响">10.2
+                排序对压缩率的影响</a></li>
+                <li><a href="#分区策略" id="toc-分区策略">10.3
+                分区策略</a></li>
+                <li><a href="#schema-设计" id="toc-schema-设计">10.4
+                Schema 设计</a></li>
+                <li><a href="#小文件合并" id="toc-小文件合并">10.5
+                小文件合并</a></li>
+                <li><a href="#写入性能优化" id="toc-写入性能优化">10.6
+                写入性能优化</a></li>
+                <li><a href="#读取性能优化" id="toc-读取性能优化">10.7
+                读取性能优化</a></li>
+                <li><a href="#schema-演化" id="toc-schema-演化">10.8
+                Schema 演化</a></li>
+                <li><a href="#与其他格式的互操作"
+                id="toc-与其他格式的互操作">10.9
+                与其他格式的互操作</a></li>
+                <li><a href="#监控与诊断" id="toc-监控与诊断">10.10
+                监控与诊断</a></li>
+                </ul></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#规范与源码"
+                id="toc-规范与源码">规范与源码</a></li>
+                <li><a href="#文档" id="toc-文档">文档</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>上一篇我们讨论了列式存储（Columnar
+            Storage）的核心思想：把同一列的数据连续存放，让分析查询只读取需要的列，而不是扫描整行。这个思想落地到具体文件格式时，需要回答一系列工程问题：文件内部怎么组织数据才能同时支持并行读取和列裁剪？同一列的数据用什么编码方式才能最大化压缩率？如何在不读取全部数据的前提下跳过不符合条件的行？</p>
+            <p>Apache Parquet
+            是目前大数据生态中使用最广泛的列式文件格式。从
+            Spark、Hive、Impala 到 DuckDB、Polars，几乎所有分析引擎都把
+            Parquet 作为首选存储格式。它的设计源自 Google Dremel
+            论文中的列式编码思想，由 Twitter 和 Cloudera 联合开发，2013
+            年进入 Apache 孵化器，目前最新规范版本为 2.10（对应 Parquet
+            Format 的 GitHub 仓库）。</p>
+            <p>本文基于 Parquet Format 规范（parquet-format GitHub
+            仓库，版本 2.10）和 parquet-java 实现（版本
+            1.14.x），从文件结构、编码方式、统计信息、谓词下推、投影下推、版本演进六个维度拆解
+            Parquet 的内部机制，再通过 parquet-tools 和 PyArrow
+            的实战操作落到工程实践。</p>
+            <hr />
+            <h2 id="一parquet-设计目标">一、Parquet 设计目标</h2>
+            <h3 id="设计约束">1.1 设计约束</h3>
+            <p>Parquet
+            要解决的核心问题是：在分布式文件系统（HDFS、S3、GCS）上存储结构化数据，让分析查询尽可能少读数据、尽可能快解码数据。这个目标拆解成几个具体约束：</p>
+            <ol type="1">
+            <li><strong>列裁剪（Column Pruning）</strong>：查询只涉及 3
+            列时，不应该读取其余 97 列的数据。</li>
+            <li><strong>行组过滤（Row Group
+            Filtering）</strong>：查询条件是 <code>age &gt; 30</code>
+            时，如果某个数据块的 <code>age</code> 最大值只有
+            25，整个块都应该跳过。</li>
+            <li><strong>高压缩率</strong>：同一列的数据类型一致、值域相近，列式存储天然适合压缩。编码方式应该利用这个特性。</li>
+            <li><strong>可分片（Splittable）</strong>：MapReduce、Spark
+            等框架需要把一个文件拆成多个分片（Split）并行处理。文件格式必须支持在合理边界上切分。</li>
+            <li><strong>自描述（Self-Describing）</strong>：文件内部包含完整的模式信息（Schema），不依赖外部元数据服务。</li>
+            <li><strong>嵌套结构支持</strong>：现实数据不只有扁平表，还有嵌套的
+            struct、array、map 结构。格式必须高效支持嵌套数据。</li>
+            </ol>
+            <h3 id="dremel-的遗产">1.2 Dremel 的遗产</h3>
+            <p>Parquet 的嵌套编码方案直接来自 Google 在 2010 年发表的
+            Dremel 论文。Dremel 提出了两个关键概念：</p>
+            <ul>
+            <li><strong>定义级别（Definition
+            Level）</strong>：记录一个值在嵌套结构中”存在到第几层”。如果一个可选字段（Optional
+            Field）的值为 null，Definition Level
+            就小于该字段的最大嵌套深度。</li>
+            <li><strong>重复级别（Repetition
+            Level）</strong>：记录一个值在重复结构（Repeated
+            Field）中”从第几层开始重复”。</li>
+            </ul>
+            <p>这两个整数配合列值本身，可以无损地重建任意深度的嵌套结构，而不需要在列式存储中保留行的边界信息。</p>
+            <p>举一个例子。假设 Schema 定义如下：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode protobuf"><code class="sourceCode protobuf"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">message</span> Document {</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="kw">required</span> <span class="dt">int64</span> doc_id;</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="kw">repeated</span> group Links {</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">optional</span> <span class="dt">int64</span> forward;</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">optional</span> <span class="dt">int64</span> backward;</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  }</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div>
+            <p>对于 <code>Links.forward</code> 这一列，Parquet
+            存储的不只是值的序列，还有每个值对应的 Definition Level 和
+            Repetition Level。如果某条记录没有 <code>Links</code>
+            字段，<code>forward</code> 的 Definition Level 为 0（Links
+            这一层就不存在了）；如果有 <code>Links</code> 但
+            <code>forward</code> 为 null，Definition Level 为 1（Links
+            存在，forward 不存在）；如果 <code>forward</code>
+            有值，Definition Level 为 2。</p>
+            <p>对于扁平表（Flat Schema），所有字段的 Definition Level
+            最多为 0 或 1（取决于是否可选），Repetition Level 始终为
+            0。这种情况下嵌套编码几乎没有额外开销。</p>
+            <h3 id="与-orc-的定位差异">1.3 与 ORC 的定位差异</h3>
+            <p>Parquet 和 ORC（Optimized Row
+            Columnar）是大数据生态中两个主要的列式文件格式。它们的设计目标相似，但在几个维度上有所不同：</p>
+            <table>
+            <colgroup>
+            <col style="width: 30%" />
+            <col style="width: 45%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>Parquet</th>
+            <th>ORC</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>嵌套支持</td>
+            <td>Dremel 编码，原生支持任意嵌套</td>
+            <td>扁平化处理，嵌套支持较弱</td>
+            </tr>
+            <tr>
+            <td>生态绑定</td>
+            <td>Spark、Arrow 生态首选</td>
+            <td>Hive 生态首选</td>
+            </tr>
+            <tr>
+            <td>索引能力</td>
+            <td>列统计 + Page Index（2.6 起）</td>
+            <td>Bloom Filter + Row Group Index</td>
+            </tr>
+            <tr>
+            <td>ACID 支持</td>
+            <td>依赖 Delta Lake / Iceberg 等外部表格式</td>
+            <td>Hive ACID 原生支持</td>
+            </tr>
+            <tr>
+            <td>压缩率</td>
+            <td>取决于编码，整体相当</td>
+            <td>取决于编码，整体相当</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>我认为 Parquet 在跨引擎互操作性上有明显优势。ORC
+            的核心用户群体集中在 Hive 生态，而 Parquet
+            几乎被所有现代分析引擎支持：Spark、DuckDB、Polars、ClickHouse、DataFusion、BigQuery。如果你的数据需要被多个引擎读取，Parquet
+            是更安全的选择。</p>
+            <hr />
+            <h2 id="二row-groupcolumn-chunkpage-三级结构">二、Row
+            Group/Column Chunk/Page 三级结构</h2>
+            <h3 id="文件整体布局">2.1 文件整体布局</h3>
+            <p>一个 Parquet 文件的物理结构分为三层：行组（Row
+            Group）、列块（Column Chunk）、页（Page）。文件头部有 4
+            字节魔数（Magic Number）<code>PAR1</code>，尾部同样有 4 字节
+            <code>PAR1</code>，尾部魔数之前是文件元数据（File
+            Metadata）及其长度。</p>
+            <pre class="text"><code>┌──────────────────────────────────┐
+│  Magic Number: PAR1 (4 bytes)    │
+├──────────────────────────────────┤
+│  Row Group 0                     │
+│  ├── Column Chunk 0 (col_a)      │
+│  │   ├── Page 0                  │
+│  │   ├── Page 1                  │
+│  │   └── Page 2                  │
+│  ├── Column Chunk 1 (col_b)      │
+│  │   ├── Page 0                  │
+│  │   └── Page 1                  │
+│  └── Column Chunk 2 (col_c)      │
+│      └── Page 0                  │
+├──────────────────────────────────┤
+│  Row Group 1                     │
+│  ├── Column Chunk 0 (col_a)      │
+│  │   ├── Page 0                  │
+│  │   └── Page 1                  │
+│  ├── Column Chunk 1 (col_b)      │
+│  │   └── Page 0                  │
+│  └── Column Chunk 2 (col_c)      │
+│      ├── Page 0                  │
+│      └── Page 1                  │
+├──────────────────────────────────┤
+│  File Metadata (Thrift)          │
+│  ├── Schema                      │
+│  ├── Row Group Metadata[]        │
+│  │   ├── Column Chunk Metadata[] │
+│  │   │   ├── file_offset         │
+│  │   │   ├── num_values          │
+│  │   │   ├── encodings           │
+│  │   │   ├── statistics          │
+│  │   │   └── ...                 │
+│  │   └── total_byte_size         │
+│  └── num_rows                    │
+├──────────────────────────────────┤
+│  Footer Length (4 bytes)         │
+│  Magic Number: PAR1 (4 bytes)    │
+└──────────────────────────────────┘</code></pre>
+            <p>读取 Parquet 文件的第一步是从文件尾部读取
+            Footer：先定位到文件末尾的 8 字节（4 字节 Footer Length + 4
+            字节魔数），拿到 Footer Length 后再往前读取对应长度的 File
+            Metadata。File Metadata 使用 Thrift 编码（Compact
+            Protocol），包含完整的 Schema 定义和所有 Row Group
+            的元数据。</p>
+            <p>这个”先读尾部”的设计有一个重要意义：写入 Parquet
+            文件时可以流式追加数据，一个 Row Group
+            写完再写下一个，最后才写
+            Footer。如果写入过程中崩溃，丢失的只是最后一个未完成的 Row
+            Group 和 Footer。</p>
+            <h3 id="行组row-group">2.2 行组（Row Group）</h3>
+            <p>行组是 Parquet
+            中最粗粒度的数据分区单元。一个行组包含一批行（通常几十万到几百万行），这些行的所有列数据都在同一个行组内。行组有两个核心作用：</p>
+            <ol type="1">
+            <li><strong>并行处理单元</strong>：MapReduce 和 Spark 的一个
+            Task
+            通常处理一个或多个行组。行组之间没有数据依赖，可以完全并行。</li>
+            <li><strong>I/O
+            调度单元</strong>：读取一个行组的某些列时，只需要发起对应列块的
+            I/O 请求，不需要读取其他行组的数据。</li>
+            </ol>
+            <p>行组的大小对性能影响很大。行组太小，元数据占比高，列的压缩效果差，且
+            I/O 请求过于碎片化。行组太大，一个 Task
+            的内存占用高，且无法细粒度并行。Parquet
+            官方文档建议行组大小在 128MB 到 1GB 之间，Spark 默认使用
+            128MB。</p>
+            <p>行组的行数不是固定的，它由写入时的行组大小限制决定。写入方会累积数据，当累积大小接近目标行组大小时，把当前数据刷写为一个行组。因此，不同行组的行数可能不同。</p>
+            <h3 id="列块column-chunk">2.3 列块（Column Chunk）</h3>
+            <p>一个行组中，每一列的数据构成一个列块。列块是列维度上的数据分区单元。一个列块只包含一列的数据，且这些数据在文件中连续存放。</p>
+            <p>列块的元数据（Column Chunk Metadata）记录在 File Metadata
+            中，包括：</p>
+            <ul>
+            <li><code>file_offset</code>：列块在文件中的起始偏移量。</li>
+            <li><code>total_compressed_size</code>：压缩后的总字节数。</li>
+            <li><code>total_uncompressed_size</code>：未压缩的总字节数。</li>
+            <li><code>num_values</code>：值的数量（包括 null）。</li>
+            <li><code>encodings</code>：该列块使用的编码方式列表。</li>
+            <li><code>codec</code>：压缩编解码器（Snappy、Zstd、LZ4
+            等）。</li>
+            <li><code>statistics</code>：列级统计信息（最小值、最大值、null
+            计数等）。</li>
+            </ul>
+            <p>列块是投影下推（Projection
+            Pushdown）的基本单位。如果查询不涉及某一列，读取器直接跳过该列的所有列块，不发起任何
+            I/O。</p>
+            <h3 id="页page">2.4 页（Page）</h3>
+            <p>页是 Parquet
+            中最细粒度的数据单元，也是编码（Encoding）和压缩（Compression）的基本单位。一个列块由一个或多个页组成。Parquet
+            定义了三种页类型：</p>
+            <ul>
+            <li><strong>数据页（Data Page）</strong>：存储列值本身，以及
+            Definition Level 和 Repetition Level。</li>
+            <li><strong>字典页（Dictionary
+            Page）</strong>：如果列使用了字典编码（Dictionary
+            Encoding），字典页存储字典条目。一个列块最多有一个字典页，且必须出现在所有数据页之前。</li>
+            <li><strong>索引页（Index Page）</strong>：Parquet 2.6
+            引入的 Page Index 机制中使用的偏移量索引和列索引页。</li>
+            </ul>
+            <p>数据页的默认大小为
+            1MB（未压缩）。页太小会增加页头开销和解码次数；页太大会降低谓词下推的过滤精度（因为统计信息是按页粒度记录的）。</p>
+            <p>数据页有两个版本：Data Page V1 和 Data Page V2。V2 在
+            Parquet 2.0 中引入，主要变化是把 Definition Level 和
+            Repetition Level
+            的编码从页数据中分离出来，放到页头中独立的部分，使得跳过不需要的页时不必解码
+            Level 数据。</p>
+            <p>一个数据页（V1）的二进制布局如下：</p>
+            <pre class="text"><code>┌─────────────────────────────────────┐
+│  Page Header (Thrift)               │
+│  ├── page_type: DATA_PAGE           │
+│  ├── uncompressed_page_size         │
+│  ├── compressed_page_size           │
+│  ├── num_values                     │
+│  ├── encoding                       │
+│  ├── definition_level_encoding      │
+│  └── repetition_level_encoding      │
+├─────────────────────────────────────┤
+│  Repetition Levels (encoded)        │
+├─────────────────────────────────────┤
+│  Definition Levels (encoded)        │
+├─────────────────────────────────────┤
+│  Values (encoded + compressed)      │
+└─────────────────────────────────────┘</code></pre>
+            <p>Data Page V2 的布局有一处关键不同：Repetition Level 和
+            Definition Level 不参与压缩，只有 Values
+            部分被压缩。这使得读取器可以先读取 Level 数据判断哪些值为
+            null，再决定是否需要解压 Values 部分。</p>
+            <pre class="text"><code>┌──────────────────────────────────────┐
+│  Page Header (Thrift)                │
+│  ├── page_type: DATA_PAGE_V2        │
+│  ├── num_values                      │
+│  ├── num_nulls                       │
+│  ├── num_rows                        │
+│  ├── encoding                        │
+│  ├── definition_levels_byte_length   │
+│  ├── repetition_levels_byte_length   │
+│  └── is_compressed                   │
+├──────────────────────────────────────┤
+│  Repetition Levels (NOT compressed)  │
+├──────────────────────────────────────┤
+│  Definition Levels (NOT compressed)  │
+├──────────────────────────────────────┤
+│  Values (compressed)                 │
+└──────────────────────────────────────┘</code></pre>
+            <h3 id="三级结构的协作">2.5 三级结构的协作</h3>
+            <p>这三层结构之间的关系可以用一个类比来理解：</p>
+            <ul>
+            <li><strong>行组</strong>
+            类似书架上的一本书，包含一段完整的行数据。</li>
+            <li><strong>列块</strong>
+            类似书中的一个章节，只包含一个主题（列）的内容。</li>
+            <li><strong>页</strong>
+            类似章节中的一页纸，是实际读取和解码的最小单位。</li>
+            </ul>
+            <p>查询引擎读取 Parquet 文件的典型流程是：</p>
+            <ol type="1">
+            <li>读取 Footer，获取 Schema 和所有行组的元数据。</li>
+            <li>根据查询涉及的列，确定需要读取哪些列块（投影下推）。</li>
+            <li>根据查询的过滤条件和行组/列块的统计信息，跳过不符合条件的行组（谓词下推）。</li>
+            <li>对于需要读取的列块，按页逐个解码，应用页级别的过滤（如果有
+            Page Index）。</li>
+            <li>将解码后的列数据重组为行或批次，交给上层算子处理。</li>
+            </ol>
+            <hr />
+            <h2 id="三编码方式">三、编码方式</h2>
+            <p>Parquet
+            支持多种编码方式（Encoding），目标是利用同一列数据的统计特征来减少存储空间和加速解码。编码发生在压缩之前：数据先编码，再压缩。选择合适的编码方式通常比选择压缩算法更能影响文件大小和读取性能。</p>
+            <h3 id="plain-编码">3.1 Plain 编码</h3>
+            <p>普通编码（Plain
+            Encoding）是最简单的编码方式：值按原始二进制格式连续存放。固定长度类型（INT32、INT64、FLOAT、DOUBLE）直接写入字节序列；变长类型（BYTE_ARRAY）先写
+            4 字节长度前缀，再写内容。</p>
+            <pre class="text"><code># INT32 Plain Encoding
+[value0: 4 bytes][value1: 4 bytes][value2: 4 bytes]...
+
+# BYTE_ARRAY Plain Encoding
+[len0: 4 bytes][data0: len0 bytes][len1: 4 bytes][data1: len1 bytes]...</code></pre>
+            <p>Plain
+            编码没有任何压缩效果，但解码速度最快——直接读取字节，不需要任何计算。当列的基数（Cardinality）很高、值之间没有规律时，Plain
+            编码配合通用压缩算法（如 Zstd）可能是最好的选择。</p>
+            <h3 id="字典编码dictionary-encoding">3.2
+            字典编码（Dictionary Encoding）</h3>
+            <p>字典编码是 Parquet
+            中使用最广泛的编码方式。它的原理是：如果一列的去重值（Distinct
+            Values）数量远小于总行数，就建立一个字典（Dictionary），把每个值映射为一个整数索引，然后只存储索引序列。</p>
+            <pre class="text"><code>字典页（Dictionary Page）:
+  entries = [&quot;Beijing&quot;, &quot;Shanghai&quot;, &quot;Guangzhou&quot;, &quot;Shenzhen&quot;]
+
+数据页（Data Page）:
+  indices = [0, 1, 0, 2, 3, 1, 0, 2, ...]</code></pre>
+            <p>字典编码的索引序列本身通常使用 RLE/Bit-Packing
+            混合编码（见下文）进一步压缩。例如，如果字典只有 4
+            个条目，每个索引只需要 2 位（Bit），1000 个值只需要 250
+            字节（加上 RLE 压缩可能更少），而原始字符串可能需要几十
+            KB。</p>
+            <p>字典编码有一个硬限制：字典页的大小不能超过页大小限制（默认
+            1MB）。当列的基数超过这个限制时，写入器会放弃字典编码，回退到
+            Plain 编码。这个回退称为”字典回退（Dictionary
+            Fallback）“。实际工程中，当列的基数超过几万到几十万时（取决于值的平均长度），字典编码就会失效。</p>
+            <p>Parquet
+            的写入器通常默认启用字典编码，并在写入过程中动态监测字典大小。一旦字典超限，当前页及后续页切换到
+            Plain
+            编码。同一个列块内可能前几个页使用字典编码，后几个页使用
+            Plain 编码，这在元数据的 <code>encodings</code>
+            字段中有体现。</p>
+            <h3 id="rlebit-packing-混合编码">3.3 RLE/Bit-Packing
+            混合编码</h3>
+            <p>游程编码（Run-Length
+            Encoding，RLE）和位打包（Bit-Packing）是 Parquet
+            用来编码小整数序列的核心方法。它们通常组合使用，称为
+            RLE/Bit-Packing 混合编码（Hybrid Encoding）。</p>
+            <p>这个编码方式用于两个场景：</p>
+            <ol type="1">
+            <li>字典编码的索引序列。</li>
+            <li>Definition Level 和 Repetition Level 序列。</li>
+            </ol>
+            <p>混合编码的基本思想是：对于连续重复的值，使用
+            RLE（记录值和重复次数）；对于不重复的值，使用
+            Bit-Packing（把多个小整数打包到一组字节中）。编码器在写入时动态选择
+            RLE 还是 Bit-Packing，以较小者为准。</p>
+            <p>编码格式以变长整数（VarInt）开头作为 header。header
+            的最低位标识编码类型：</p>
+            <ul>
+            <li><code>header &amp; 1 == 0</code>：RLE
+            编码。<code>header &gt;&gt; 1</code>
+            是重复次数。后面跟一个用最少字节数表示的值。</li>
+            <li><code>header &amp; 1 == 1</code>：Bit-Packing
+            编码。<code>header &gt;&gt; 1</code> 是组数（每组 8
+            个值）。后面跟打包后的字节序列。</li>
+            </ul>
+            <pre class="text"><code># 示例：bit_width = 3，编码序列 [5, 5, 5, 5, 5, 5, 5, 5, 1, 2, 3, 4, 5, 6, 7, 8]
+
+# 前 8 个值全是 5，使用 RLE：
+# header = 8 &lt;&lt; 1 | 0 = 16 (varint编码)
+# value = 5 (用 ceil(3/8) = 1 字节表示)
+# 编码结果: [16, 5]
+
+# 后 8 个值不重复，使用 Bit-Packing：
+# header = 1 &lt;&lt; 1 | 1 = 3 (varint编码，1 组 x 8 个值)
+# 8 个 3-bit 值打包到 3 字节：
+# 编码结果: [3, packed_bytes...]</code></pre>
+            <p>Bit-Packing 的位宽（Bit
+            Width）由该列的最大值决定。例如字典大小为
+            100，索引的最大值为 99，需要 7 位，所以 Bit Width =
+            7。位宽越小，压缩效果越好。</p>
+            <h3 id="delta-编码delta-encoding">3.4 Delta 编码（Delta
+            Encoding）</h3>
+            <p>Delta 编码（Delta Binary
+            Packing）适用于整数列，特别是单调递增或递减的序列（如时间戳、自增
+            ID）。它不存储原始值，而是存储相邻值之间的差值（Delta），再用
+            Bit-Packing 编码这些差值。</p>
+            <pre class="text"><code>原始值:     [1000, 1001, 1005, 1009, 1010]
+差值:       [1000, 1, 4, 4, 1]  (第一个值作为基准)</code></pre>
+            <p>差值通常比原始值小得多，需要的位宽更低，压缩效果更好。对于严格递增
+            1 的序列（如连续 ID），所有差值都是 1，RLE
+            可以进一步把它压缩到极小的空间。</p>
+            <p>Parquet 中的 Delta Binary Packing 编码参考了 Daniel
+            Lemire 和 Leonid Boytsov 的 FastPFOR
+            论文。它把值分成固定大小的块（Block），每个块内部独立计算
+            Delta 和 Bit Width，以适应值域的局部变化。</p>
+            <p>具体结构：</p>
+            <pre class="text"><code>Block Header:
+  min_delta: zigzag varint
+  bit_widths: [bw0, bw1, ...] (每个 mini-block 的位宽)
+
+Mini-Block 0: bit-packed deltas using bw0
+Mini-Block 1: bit-packed deltas using bw1
+...</code></pre>
+            <p>Delta
+            编码对于时间戳列效果显著。以毫秒精度的时间戳为例，原始值需要
+            64 位，但相邻事件的时间差通常只有几毫秒到几秒，用 10-20
+            位就能表示。</p>
+            <h3 id="delta-length-byte-array-编码">3.5 Delta Length Byte
+            Array 编码</h3>
+            <p>这是 Delta
+            编码在变长字节数组上的变体。它把长度和内容分开存储：长度序列使用
+            Delta Binary Packing 编码，内容直接拼接。</p>
+            <pre class="text"><code>原始数据: [&quot;abc&quot;, &quot;defg&quot;, &quot;hi&quot;, &quot;jklmn&quot;]
+
+长度序列: [3, 4, 2, 5]  → Delta Binary Packing 编码
+内容拼接: abcdefghijklmn
+
+解码时先还原长度序列，再按长度切分内容。</code></pre>
+            <p>这种编码对长度比较均匀的字符串列有效。如果长度变化不大，长度的
+            Delta 序列会很小。</p>
+            <h3 id="delta-strings-编码">3.6 Delta Strings 编码</h3>
+            <p>Delta Strings（也称 Incremental
+            Encoding）针对已排序的字符串列做前缀压缩。它存储每个字符串与前一个字符串的公共前缀长度和后缀内容。</p>
+            <pre class="text"><code>原始数据（已排序）: [&quot;apple&quot;, &quot;application&quot;, &quot;apply&quot;, &quot;banana&quot;]
+
+编码:
+  前缀长度: [0, 4, 4, 0]    → Delta Binary Packing 编码
+  后缀:     [&quot;apple&quot;, &quot;ication&quot;, &quot;y&quot;, &quot;banana&quot;] → Delta Length Byte Array 编码</code></pre>
+            <p>Delta Strings
+            编码在排序后的字符串列上压缩效果极好，特别是
+            URL、文件路径这类有大量公共前缀的数据。但它要求列数据已排序，否则公共前缀长度趋近于零，编码退化为
+            Delta Length Byte Array。</p>
+            <h3 id="byte-stream-split-编码">3.7 Byte Stream Split
+            编码</h3>
+            <p>字节流拆分编码（Byte Stream Split）是 Parquet 2.8
+            引入的编码方式，专门针对 FLOAT 和 DOUBLE 类型设计。IEEE 754
+            浮点数的字节表示中，高位字节（指数部分）的变化通常比低位字节（尾数部分）小得多。Byte
+            Stream Split 把每个值的第 k 个字节收集到一起，形成 N
+            个字节流，然后对这些字节流进行压缩。</p>
+            <pre class="text"><code>原始数据（FLOAT，4 字节）: [v0, v1, v2, v3]
+
+v0 = [b0_0, b0_1, b0_2, b0_3]
+v1 = [b1_0, b1_1, b1_2, b1_3]
+v2 = [b2_0, b2_1, b2_2, b2_3]
+v3 = [b3_0, b3_1, b3_2, b3_3]
+
+Byte Stream Split 重排后:
+Stream 0: [b0_0, b1_0, b2_0, b3_0]  (所有值的第 0 字节)
+Stream 1: [b0_1, b1_1, b2_1, b3_1]  (所有值的第 1 字节)
+Stream 2: [b0_2, b1_2, b2_2, b3_2]  (所有值的第 2 字节)
+Stream 3: [b0_3, b1_3, b2_3, b3_3]  (所有值的第 3 字节)
+
+最终存储: Stream 0 || Stream 1 || Stream 2 || Stream 3</code></pre>
+            <p>这个重排本身不减少数据量，但它让通用压缩算法（如
+            Zstd）更容易发现模式。同一字节位置的值通常有更高的相关性（例如指数字节变化很慢），压缩率因此提高。实测中，Byte
+            Stream Split + Zstd 在浮点数列上的压缩率比 Plain + Zstd 提高
+            20%-40%。</p>
+            <h3 id="编码选择建议">3.8 编码选择建议</h3>
+            <p>不同编码方式适用于不同的数据特征。以下是选择建议：</p>
+            <table>
+            <colgroup>
+            <col style="width: 38%" />
+            <col style="width: 38%" />
+            <col style="width: 23%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>数据特征</th>
+            <th>推荐编码</th>
+            <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>低基数字符串/整数（基数 &lt; 10000）</td>
+            <td>Dictionary</td>
+            <td>字典索引远小于原始值</td>
+            </tr>
+            <tr>
+            <td>高基数字符串</td>
+            <td>Plain + Zstd</td>
+            <td>字典会溢出，直接压缩更好</td>
+            </tr>
+            <tr>
+            <td>单调递增整数（时间戳、ID）</td>
+            <td>Delta Binary Packing</td>
+            <td>差值极小，位宽低</td>
+            </tr>
+            <tr>
+            <td>已排序字符串</td>
+            <td>Delta Strings</td>
+            <td>前缀压缩效果好</td>
+            </tr>
+            <tr>
+            <td>浮点数</td>
+            <td>Byte Stream Split + Zstd</td>
+            <td>字节流重排提升压缩率</td>
+            </tr>
+            <tr>
+            <td>Boolean</td>
+            <td>RLE</td>
+            <td>只有两个值，RLE 极度有效</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>大多数写入器（包括
+            PyArrow、parquet-java）会根据列类型和统计信息自动选择编码方式。通常不需要手动指定，但了解编码原理有助于诊断压缩率不理想的问题。</p>
+            <hr />
+            <h2 id="四统计信息与谓词下推">四、统计信息与谓词下推</h2>
+            <h3 id="列统计信息column-statistics">4.1 列统计信息（Column
+            Statistics）</h3>
+            <p>Parquet
+            在写入时为每个列块记录统计信息（Statistics），存储在 Column
+            Chunk Metadata 中。标准统计字段包括：</p>
+            <ul>
+            <li><code>min</code>：该列块中的最小值。</li>
+            <li><code>max</code>：该列块中的最大值。</li>
+            <li><code>null_count</code>：null 值的数量。</li>
+            <li><code>distinct_count</code>：去重值的数量（可选，不是所有写入器都填写）。</li>
+            <li><code>num_values</code>：非 null 值的数量。</li>
+            </ul>
+            <p>这些统计信息是谓词下推（Predicate
+            Pushdown）的基础。查询引擎在读取数据之前先检查统计信息，判断当前行组/列块是否可能包含符合条件的数据。</p>
+            <p>有一个容易踩的坑：Parquet 早期版本（1.x
+            规范）中，字符串类型的 <code>min</code>/<code>max</code>
+            统计信息使用有符号字节比较（Signed Byte
+            Comparison），而实际字符串比较应该是无符号的。这导致统计信息不可靠，一些读取器会忽略字符串列的统计信息。Parquet
+            2.0 规范引入了 <code>min_value</code>/<code>max_value</code>
+            字段，使用正确的无符号比较语义，同时废弃了旧的
+            <code>min</code>/<code>max</code> 字段。</p>
+            <h3 id="谓词下推原理">4.2 谓词下推原理</h3>
+            <p>谓词下推（Predicate
+            Pushdown）是指查询引擎把过滤条件”下推”到存储层，让存储层在读取数据时就跳过不符合条件的数据块。在
+            Parquet 中，谓词下推发生在两个层级：</p>
+            <p><strong>行组级别</strong>：读取器检查行组内每个相关列块的统计信息。如果过滤条件与统计信息矛盾，整个行组被跳过。</p>
+            <pre class="text"><code>查询条件: WHERE age &gt; 30
+
+行组 0: age 列统计 min=18, max=25
+  → max(25) &lt; 30，不可能有 age &gt; 30 的行 → 跳过整个行组
+
+行组 1: age 列统计 min=22, max=55
+  → max(55) &gt; 30，可能有符合条件的行 → 需要读取
+
+行组 2: age 列统计 min=35, max=60
+  → min(35) &gt; 30，所有行都符合条件 → 需要读取</code></pre>
+            <p><strong>页级别</strong>（Page Index，Parquet 2.6
+            起）：对于需要读取的行组，读取器进一步检查每个数据页的统计信息，跳过不符合条件的页。</p>
+            <h3 id="page-index">4.3 Page Index</h3>
+            <p>Parquet 2.6 引入了页索引（Page
+            Index）机制，把统计信息的粒度从行组/列块级别细化到页级别。Page
+            Index 由两个结构组成：</p>
+            <ul>
+            <li><strong>列索引（Column
+            Index）</strong>：记录每个数据页的 min/max 值和 null
+            计数。</li>
+            <li><strong>偏移量索引（Offset
+            Index）</strong>：记录每个数据页在文件中的偏移量和大小。</li>
+            </ul>
+            <p>这两个索引结构存储在 File Metadata
+            中（而不是内联在数据页里），这样读取器可以在读取任何数据页之前就获取所有页的统计信息。</p>
+            <pre class="text"><code>Column Index for column &quot;age&quot;:
+  page 0: min=18, max=22, null_count=0
+  page 1: min=19, max=25, null_count=2
+  page 2: min=28, max=55, null_count=0
+
+Offset Index for column &quot;age&quot;:
+  page 0: offset=1024, compressed_size=4096
+  page 1: offset=5120, compressed_size=3840
+  page 2: offset=8960, compressed_size=4096
+
+查询条件: WHERE age &gt; 30
+  → page 0: max=22 &lt; 30 → 跳过
+  → page 1: max=25 &lt; 30 → 跳过
+  → page 2: max=55 &gt; 30 → 需要读取</code></pre>
+            <p>Page Index 在大行组场景下特别有用。如果一个行组有 100
+            万行、分成 100 个页，没有 Page Index
+            时要么读取整个行组，要么完全跳过。有了 Page
+            Index，可以只读取 2-3 个页，I/O 量减少一到两个数量级。</p>
+            <h3 id="bloom-filter">4.4 Bloom Filter</h3>
+            <p>Parquet 2.7 引入了布隆过滤器（Bloom Filter）支持。Bloom
+            Filter
+            是一种概率数据结构，可以快速判断”一个值是否可能在集合中”。它有两种结果：</p>
+            <ul>
+            <li>“一定不在”：可以安全地跳过该数据块。</li>
+            <li>“可能在”：需要读取数据块进一步验证。</li>
+            </ul>
+            <p>Bloom Filter
+            对等值查询（<code>column = value</code>）特别有效，弥补了
+            min/max 统计信息在高基数列上的不足。例如，一个列块的
+            min=1、max=1000000，查询 <code>id = 42</code> 时，min/max
+            无法排除这个列块，但 Bloom Filter 可以判断 42
+            是否可能存在于该列块中。</p>
+            <pre class="text"><code>Column Chunk Metadata:
+  statistics: min=1, max=1000000
+  bloom_filter: [bit_array, num_hashes, hash_algorithm]
+
+查询: WHERE id = 42
+  min/max 检查: 1 &lt;= 42 &lt;= 1000000 → 无法排除
+  Bloom Filter 检查: hash(42) 对应的位全为 1 → 可能存在 → 需要读取
+                    或 hash(42) 对应的位有 0 → 一定不存在 → 跳过</code></pre>
+            <p>Bloom Filter 的空间开销需要权衡。每个列块的 Bloom Filter
+            通常占几 KB 到几十
+            KB，对于有大量列块的大文件，总开销可能可观。写入时需要显式启用
+            Bloom Filter，并指定期望的假阳性率（False Positive
+            Rate，通常 1%-5%）。</p>
+            <h3 id="支持的谓词类型">4.5 支持的谓词类型</h3>
+            <p>不同的统计信息支持不同类型的谓词下推：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>谓词类型</th>
+            <th>min/max</th>
+            <th>Bloom Filter</th>
+            <th>Page Index</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>col = value</code></td>
+            <td>部分有效</td>
+            <td>高度有效</td>
+            <td>部分有效</td>
+            </tr>
+            <tr>
+            <td><code>col &gt; value</code></td>
+            <td>有效</td>
+            <td>不适用</td>
+            <td>有效</td>
+            </tr>
+            <tr>
+            <td><code>col &lt; value</code></td>
+            <td>有效</td>
+            <td>不适用</td>
+            <td>有效</td>
+            </tr>
+            <tr>
+            <td><code>col BETWEEN a AND b</code></td>
+            <td>有效</td>
+            <td>不适用</td>
+            <td>有效</td>
+            </tr>
+            <tr>
+            <td><code>col IN (v1, v2, ...)</code></td>
+            <td>部分有效</td>
+            <td>有效</td>
+            <td>部分有效</td>
+            </tr>
+            <tr>
+            <td><code>col IS NULL</code></td>
+            <td>有效（null_count）</td>
+            <td>不适用</td>
+            <td>有效</td>
+            </tr>
+            <tr>
+            <td><code>col LIKE 'prefix%'</code></td>
+            <td>有效（字符串有序时）</td>
+            <td>不适用</td>
+            <td>有效</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>我认为在实际工程中，min/max
+            统计信息能处理大部分场景，Page Index 是进阶优化，Bloom
+            Filter
+            则是针对等值查询的补充。三者不是互斥的，而是分层配合。</p>
+            <hr />
+            <h2 id="五投影下推">五、投影下推</h2>
+            <h3 id="投影下推原理">5.1 投影下推原理</h3>
+            <p>投影下推（Projection
+            Pushdown）是列式存储最基本的优势：查询只涉及表中的部分列时，只读取这些列的数据，完全跳过其他列。这在行式存储（如
+            CSV、JSON）中无法做到——即使只需要一列，也必须解析整行。</p>
+            <p>Parquet
+            的列块在文件中独立存放，每个列块的偏移量和大小记录在 File
+            Metadata
+            中。读取器根据查询涉及的列列表，只向存储层发起对应列块的读取请求。</p>
+            <pre class="text"><code>Schema: id (INT64), name (STRING), age (INT32), address (STRING), salary (DOUBLE)
+
+查询: SELECT name, salary FROM table WHERE age &gt; 30
+
+投影下推: 只读取 name, age, salary 三列的列块
+         跳过 id 和 address 列块
+         （age 用于过滤，过滤完成后可以丢弃）</code></pre>
+            <h3 id="投影下推的-io-节省">5.2 投影下推的 I/O 节省</h3>
+            <p>投影下推的 I/O
+            节省量取决于查询涉及的列数占总列数的比例。分析场景中，宽表（几十到几百列）是常态，但单次查询通常只涉及
+            5-10 列。这意味着投影下推可以减少 90%-99% 的 I/O。</p>
+            <p>以一个具体例子说明。假设一个表有 100
+            列，每列的数据量大致相同，总文件大小 10GB：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>查询列数</th>
+            <th>行式存储读取量</th>
+            <th>列式存储读取量</th>
+            <th>节省比例</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>1</td>
+            <td>10 GB</td>
+            <td>100 MB</td>
+            <td>99%</td>
+            </tr>
+            <tr>
+            <td>5</td>
+            <td>10 GB</td>
+            <td>500 MB</td>
+            <td>95%</td>
+            </tr>
+            <tr>
+            <td>10</td>
+            <td>10 GB</td>
+            <td>1 GB</td>
+            <td>90%</td>
+            </tr>
+            <tr>
+            <td>50</td>
+            <td>10 GB</td>
+            <td>5 GB</td>
+            <td>50%</td>
+            </tr>
+            <tr>
+            <td>100</td>
+            <td>10 GB</td>
+            <td>10 GB</td>
+            <td>0%</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>在对象存储（S3、GCS）上，投影下推的收益更大，因为每次 I/O
+            请求都有网络延迟，减少请求数量和数据传输量直接降低查询延迟和成本。</p>
+            <h3 id="嵌套列的投影">5.3 嵌套列的投影</h3>
+            <p>Parquet 对嵌套结构的投影支持比较细致。如果 Schema
+            中有一个 Struct 类型的列：</p>
+            <pre class="text"><code>message Record {
+  required group user {
+    required string name;
+    optional int32 age;
+    optional string email;
+  }
+  required int64 timestamp;
+}</code></pre>
+            <p>查询只需要 <code>user.name</code> 和
+            <code>timestamp</code> 时，Parquet 可以只读取
+            <code>user.name</code> 和 <code>timestamp</code>
+            的列块，跳过 <code>user.age</code> 和
+            <code>user.email</code>。嵌套结构在 Parquet
+            内部被展平为独立的叶子列（Leaf
+            Column），每个叶子列有独立的列块。</p>
+            <p>对于 Array（Repeated）类型和 Map
+            类型，情况稍微复杂。Array 元素的数量通过 Repetition Level
+            编码，Map 的 key 和 value
+            是两个独立的叶子列。投影下推仍然在叶子列级别进行。</p>
+            <hr />
+            <h2 id="六parquet-版本演进">六、Parquet 版本演进</h2>
+            <h3 id="版本号体系">6.1 版本号体系</h3>
+            <p>Parquet
+            的版本号容易混淆，因为存在两个独立的版本号体系：</p>
+            <ol type="1">
+            <li><strong>Format
+            Version</strong>：文件格式规范的版本号，定义在
+            parquet-format 仓库中。重要版本包括
+            1.0、2.0、2.4、2.6、2.7、2.8、2.9、2.10。</li>
+            <li><strong>Writer
+            Version</strong>：写入器声明的兼容版本号，存储在 File
+            Metadata 的 <code>created_by</code> 字段中。例如
+            <code>parquet-mr version 1.14.1</code> 表示使用 parquet-java
+            1.14.1 版本写入。</li>
+            </ol>
+            <p>Format Version
+            决定了文件中可以使用哪些特性。为了向后兼容，大多数写入器默认使用
+            Format Version 1.0
+            的特性子集，除非显式配置为使用更高版本的特性。</p>
+            <h3 id="各版本关键变化">6.2 各版本关键变化</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>版本</th>
+            <th>年份</th>
+            <th>关键特性</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>1.0</td>
+            <td>2013</td>
+            <td>初始版本：三级结构、基本编码、Thrift 元数据</td>
+            </tr>
+            <tr>
+            <td>2.0</td>
+            <td>2014</td>
+            <td>Data Page V2、Delta 编码、修正字符串统计信息语义</td>
+            </tr>
+            <tr>
+            <td>2.4</td>
+            <td>2018</td>
+            <td>逻辑类型（Logical Type）重构，替代旧的
+            ConvertedType</td>
+            </tr>
+            <tr>
+            <td>2.6</td>
+            <td>2019</td>
+            <td>Page Index（Column Index + Offset Index）</td>
+            </tr>
+            <tr>
+            <td>2.7</td>
+            <td>2020</td>
+            <td>Bloom Filter 支持</td>
+            </tr>
+            <tr>
+            <td>2.8</td>
+            <td>2021</td>
+            <td>Byte Stream Split 编码</td>
+            </tr>
+            <tr>
+            <td>2.9</td>
+            <td>2022</td>
+            <td>16 位浮点（FLOAT16）类型</td>
+            </tr>
+            <tr>
+            <td>2.10</td>
+            <td>2023</td>
+            <td>Geometry 和 Geography 逻辑类型（GeoParquet）</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="逻辑类型logical-type">6.3 逻辑类型（Logical
+            Type）</h3>
+            <p>Parquet 的物理类型（Physical
+            Type）只有七种：BOOLEAN、INT32、INT64、FLOAT、DOUBLE、BYTE_ARRAY、FIXED_LEN_BYTE_ARRAY。逻辑类型（Logical
+            Type）在物理类型之上定义更丰富的语义：</p>
+            <table>
+            <colgroup>
+            <col style="width: 38%" />
+            <col style="width: 38%" />
+            <col style="width: 23%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>逻辑类型</th>
+            <th>物理类型</th>
+            <th>语义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>STRING</td>
+            <td>BYTE_ARRAY</td>
+            <td>UTF-8 字符串</td>
+            </tr>
+            <tr>
+            <td>DECIMAL</td>
+            <td>INT32/INT64/FIXED_LEN_BYTE_ARRAY/BYTE_ARRAY</td>
+            <td>定点数，带精度和标度</td>
+            </tr>
+            <tr>
+            <td>DATE</td>
+            <td>INT32</td>
+            <td>日期，Unix 纪元以来的天数</td>
+            </tr>
+            <tr>
+            <td>TIME</td>
+            <td>INT32/INT64</td>
+            <td>时间，毫秒或微秒精度</td>
+            </tr>
+            <tr>
+            <td>TIMESTAMP</td>
+            <td>INT64</td>
+            <td>时间戳，毫秒、微秒或纳秒精度</td>
+            </tr>
+            <tr>
+            <td>UUID</td>
+            <td>FIXED_LEN_BYTE_ARRAY(16)</td>
+            <td>128 位 UUID</td>
+            </tr>
+            <tr>
+            <td>LIST</td>
+            <td>group</td>
+            <td>有序列表</td>
+            </tr>
+            <tr>
+            <td>MAP</td>
+            <td>group</td>
+            <td>键值映射</td>
+            </tr>
+            <tr>
+            <td>ENUM</td>
+            <td>BYTE_ARRAY</td>
+            <td>枚举字符串</td>
+            </tr>
+            <tr>
+            <td>JSON</td>
+            <td>BYTE_ARRAY</td>
+            <td>JSON 字符串</td>
+            </tr>
+            <tr>
+            <td>BSON</td>
+            <td>BYTE_ARRAY</td>
+            <td>BSON 二进制</td>
+            </tr>
+            <tr>
+            <td>FLOAT16</td>
+            <td>FIXED_LEN_BYTE_ARRAY(2)</td>
+            <td>IEEE 754 半精度浮点数</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Parquet 2.4 之前使用 <code>ConvertedType</code>
+            枚举来表示逻辑类型，2.4 之后改为 <code>LogicalType</code>
+            结构体，能携带更多参数（如 TIMESTAMP
+            的精度和时区信息）。新的写入器应该使用
+            LogicalType，但同时写入 ConvertedType 以兼容旧的读取器。</p>
+            <h3 id="兼容性实践">6.4 兼容性实践</h3>
+            <p>我认为在实际工程中处理 Parquet
+            版本兼容性时，有三条原则：</p>
+            <ol type="1">
+            <li><p><strong>写入时保守，读取时宽容。</strong>
+            写入器默认使用 Format Version 1.0
+            的特性，除非确认所有消费者都支持更高版本。读取器应该尽量支持所有已知版本。</p></li>
+            <li><p><strong>显式声明 writer version。</strong> 使用
+            PyArrow 写入时通过 <code>version</code>
+            参数控制（<code>"1.0"</code> 或 <code>"2.6"</code>）。使用
+            Spark 时通过
+            <code>spark.sql.parquet.writeLegacyFormat</code>
+            控制。</p></li>
+            <li><p><strong>测试下游兼容性。</strong>
+            写入后用目标引擎实际读取验证。Hive 对 Data Page V2
+            的支持历史上有过问题，Spark 对 Page Index
+            的利用程度在不同版本间有差异。</p></li>
+            </ol>
+            <hr />
+            <h2 id="七parquet-tools-实战">七、parquet-tools 实战</h2>
+            <h3 id="安装">7.1 安装</h3>
+            <p>parquet-tools 有多个实现。推荐使用 Python 版本的
+            <code>parquet-tools</code>（基于 PyArrow）或 Apache 官方的
+            <code>parquet-cli</code>（基于 Java）。</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Python 版本（推荐，轻量）</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install parquet-tools</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者直接使用 PyArrow 自带的命令行功能</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install pyarrow</span></code></pre></div>
+            <p>Apache 官方的 parquet-cli 需要 Java 环境：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 下载 parquet-cli JAR</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="co"># https://repo1.maven.org/maven2/org/apache/parquet/parquet-cli/</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="ex">java</span> <span class="at">-jar</span> parquet-cli-1.14.1.jar meta input.parquet</span></code></pre></div>
+            <h3 id="查看-schema">7.2 查看 Schema</h3>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件的 Schema</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="ex">parquet-tools</span> schema input.parquet</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>message schema {
+  required int64 id;
+  optional binary name (STRING);
+  optional int32 age;
+  optional double salary;
+  optional binary city (STRING);
+  optional int64 created_at (TIMESTAMP(MILLIS,true));
+}</code></pre>
+            <p>这里 <code>binary</code> 是 Parquet 的物理类型名称，对应
+            <code>BYTE_ARRAY</code>。括号中的 <code>STRING</code> 和
+            <code>TIMESTAMP(MILLIS,true)</code> 是逻辑类型注解。</p>
+            <h3 id="查看元数据">7.3 查看元数据</h3>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件级元数据</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="ex">parquet-tools</span> meta input.parquet</span></code></pre></div>
+            <p>输出示例（简化）：</p>
+            <pre class="text"><code>File Metadata:
+  Version: 2.6
+  Created By: parquet-cpp-arrow version 15.0.0
+  Num Row Groups: 3
+  Total Rows: 1500000
+
+Row Group 0:
+  Num Rows: 500000
+  Total Byte Size: 42315678
+  Column: id
+    Type: INT64
+    Encodings: PLAIN, RLE
+    Compression: ZSTD
+    Num Values: 500000
+    Null Count: 0
+    Min: 1
+    Max: 500000
+    Compressed Size: 1234567
+    Uncompressed Size: 4000000
+  Column: name
+    Type: BYTE_ARRAY
+    Encodings: PLAIN, RLE, PLAIN_DICTIONARY
+    Compression: ZSTD
+    Num Values: 500000
+    Null Count: 1234
+    Min: Aaron
+    Max: Zylstra
+    Compressed Size: 5678901
+    Uncompressed Size: 12345678
+  ...</code></pre>
+            <h3 id="查看数据内容">7.4 查看数据内容</h3>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看前 10 行数据</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">parquet-tools</span> head <span class="at">-n</span> 10 input.parquet</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看指定列的前 5 行</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">parquet-tools</span> head <span class="at">-n</span> 5 <span class="at">-c</span> id,name input.parquet</span></code></pre></div>
+            <h3 id="查看-row-group-详细信息">7.5 查看 Row Group
+            详细信息</h3>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 PyArrow 查看详细的 Row Group 元数据</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="st">import pyarrow.parquet as pq</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a><span class="st">f = pq.ParquetFile(&#39;input.parquet&#39;)</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a><span class="st">print(&#39;Num Row Groups:&#39;, f.metadata.num_row_groups)</span></span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a><span class="st">for i in range(f.metadata.num_row_groups):</span></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a><span class="st">    rg = f.metadata.row_group(i)</span></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a><span class="st">    print(f&#39;Row Group {i}: {rg.num_rows} rows, {rg.total_byte_size} bytes&#39;)</span></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a><span class="st">    for j in range(rg.num_columns):</span></span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a><span class="st">        col = rg.column(j)</span></span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a><span class="st">        print(f&#39;  Column {j} ({col.path_in_schema}):&#39;)</span></span>
+<span id="cb25-12"><a href="#cb25-12" aria-hidden="true" tabindex="-1"></a><span class="st">        print(f&#39;    Encoding: {col.encodings}&#39;)</span></span>
+<span id="cb25-13"><a href="#cb25-13" aria-hidden="true" tabindex="-1"></a><span class="st">        print(f&#39;    Compression: {col.compression}&#39;)</span></span>
+<span id="cb25-14"><a href="#cb25-14" aria-hidden="true" tabindex="-1"></a><span class="st">        if col.statistics:</span></span>
+<span id="cb25-15"><a href="#cb25-15" aria-hidden="true" tabindex="-1"></a><span class="st">            stats = col.statistics</span></span>
+<span id="cb25-16"><a href="#cb25-16" aria-hidden="true" tabindex="-1"></a><span class="st">            print(f&#39;    Min: {stats.min}, Max: {stats.max}&#39;)</span></span>
+<span id="cb25-17"><a href="#cb25-17" aria-hidden="true" tabindex="-1"></a><span class="st">            print(f&#39;    Null Count: {stats.null_count}&#39;)</span></span>
+<span id="cb25-18"><a href="#cb25-18" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="检查-page-index">7.6 检查 Page Index</h3>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 Page Index 信息（需要文件写入时启用）</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="st">import pyarrow.parquet as pq</span></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a><span class="st">f = pq.ParquetFile(&#39;input.parquet&#39;)</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a><span class="st">metadata = f.metadata</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a><span class="st">for i in range(metadata.num_row_groups):</span></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a><span class="st">    rg = metadata.row_group(i)</span></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a><span class="st">    for j in range(rg.num_columns):</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a><span class="st">        col = rg.column(j)</span></span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a><span class="st">        print(f&#39;Row Group {i}, Column {j} ({col.path_in_schema}):&#39;)</span></span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a><span class="st">        print(f&#39;  Has Column Index: {col.is_stats_set}&#39;)</span></span>
+<span id="cb26-12"><a href="#cb26-12" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="文件大小分析">7.7 文件大小分析</h3>
+            <p>在诊断 Parquet
+            文件的存储效率时，一个常用方法是分析每列的压缩率：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="st">import pyarrow.parquet as pq</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="st">f = pq.ParquetFile(&#39;input.parquet&#39;)</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="st">metadata = f.metadata</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="st">print(f&#39;Total file rows: {metadata.num_rows}&#39;)</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a><span class="st">print(f&#39;Total row groups: {metadata.num_row_groups}&#39;)</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a><span class="st">print()</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a><span class="st">print(f&#39;{</span><span class="dt">\&quot;</span><span class="st">Column</span><span class="dt">\&quot;</span><span class="st">:&lt;30} {</span><span class="dt">\&quot;</span><span class="st">Compressed</span><span class="dt">\&quot;</span><span class="st">:&gt;12} {</span><span class="dt">\&quot;</span><span class="st">Uncompressed</span><span class="dt">\&quot;</span><span class="st">:&gt;14} {</span><span class="dt">\&quot;</span><span class="st">Ratio</span><span class="dt">\&quot;</span><span class="st">:&gt;8}&#39;)</span></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a><span class="st">print(&#39;-&#39; * 68)</span></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a><span class="st">col_stats = {}</span></span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a><span class="st">for i in range(metadata.num_row_groups):</span></span>
+<span id="cb27-13"><a href="#cb27-13" aria-hidden="true" tabindex="-1"></a><span class="st">    rg = metadata.row_group(i)</span></span>
+<span id="cb27-14"><a href="#cb27-14" aria-hidden="true" tabindex="-1"></a><span class="st">    for j in range(rg.num_columns):</span></span>
+<span id="cb27-15"><a href="#cb27-15" aria-hidden="true" tabindex="-1"></a><span class="st">        col = rg.column(j)</span></span>
+<span id="cb27-16"><a href="#cb27-16" aria-hidden="true" tabindex="-1"></a><span class="st">        name = col.path_in_schema</span></span>
+<span id="cb27-17"><a href="#cb27-17" aria-hidden="true" tabindex="-1"></a><span class="st">        if name not in col_stats:</span></span>
+<span id="cb27-18"><a href="#cb27-18" aria-hidden="true" tabindex="-1"></a><span class="st">            col_stats[name] = [0, 0]</span></span>
+<span id="cb27-19"><a href="#cb27-19" aria-hidden="true" tabindex="-1"></a><span class="st">        col_stats[name][0] += col.total_compressed_size</span></span>
+<span id="cb27-20"><a href="#cb27-20" aria-hidden="true" tabindex="-1"></a><span class="st">        col_stats[name][1] += col.total_uncompressed_size</span></span>
+<span id="cb27-21"><a href="#cb27-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-22"><a href="#cb27-22" aria-hidden="true" tabindex="-1"></a><span class="st">for name, (comp, uncomp) in col_stats.items():</span></span>
+<span id="cb27-23"><a href="#cb27-23" aria-hidden="true" tabindex="-1"></a><span class="st">    ratio = comp / uncomp if uncomp &gt; 0 else 0</span></span>
+<span id="cb27-24"><a href="#cb27-24" aria-hidden="true" tabindex="-1"></a><span class="st">    print(f&#39;{name:&lt;30} {comp:&gt;12,} {uncomp:&gt;14,} {ratio:&gt;7.1%}&#39;)</span></span>
+<span id="cb27-25"><a href="#cb27-25" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span></code></pre></div>
+            <hr />
+            <h2 id="八pyarrow-读写-parquet">八、PyArrow 读写
+            Parquet</h2>
+            <h3 id="基本写入">8.1 基本写入</h3>
+            <p>PyArrow 是目前最常用的 Parquet 读写库之一。它基于 C++
+            实现的 parquet-cpp，性能接近原生代码。</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 构造数据</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pa.table({</span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;id&quot;</span>: pa.array(<span class="bu">range</span>(<span class="dv">1000000</span>), <span class="bu">type</span><span class="op">=</span>pa.int64()),</span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;name&quot;</span>: pa.array([<span class="ss">f&quot;user_</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1000000</span>)], <span class="bu">type</span><span class="op">=</span>pa.string()),</span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;age&quot;</span>: pa.array([<span class="dv">20</span> <span class="op">+</span> (i <span class="op">%</span> <span class="dv">50</span>) <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1000000</span>)], <span class="bu">type</span><span class="op">=</span>pa.int32()),</span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;salary&quot;</span>: pa.array([<span class="fl">3000.0</span> <span class="op">+</span> i <span class="op">*</span> <span class="fl">0.5</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1000000</span>)], <span class="bu">type</span><span class="op">=</span>pa.float64()),</span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;city&quot;</span>: pa.array([<span class="st">&quot;Beijing&quot;</span>, <span class="st">&quot;Shanghai&quot;</span>, <span class="st">&quot;Guangzhou&quot;</span>, <span class="st">&quot;Shenzhen&quot;</span>] <span class="op">*</span> <span class="dv">250000</span>,</span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a>                     <span class="bu">type</span><span class="op">=</span>pa.string()),</span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 写入 Parquet 文件</span></span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a>pq.write_table(</span>
+<span id="cb28-16"><a href="#cb28-16" aria-hidden="true" tabindex="-1"></a>    table,</span>
+<span id="cb28-17"><a href="#cb28-17" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;output.parquet&quot;</span>,</span>
+<span id="cb28-18"><a href="#cb28-18" aria-hidden="true" tabindex="-1"></a>    compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb28-19"><a href="#cb28-19" aria-hidden="true" tabindex="-1"></a>    compression_level<span class="op">=</span><span class="dv">3</span>,</span>
+<span id="cb28-20"><a href="#cb28-20" aria-hidden="true" tabindex="-1"></a>    row_group_size<span class="op">=</span><span class="dv">500000</span>,</span>
+<span id="cb28-21"><a href="#cb28-21" aria-hidden="true" tabindex="-1"></a>    version<span class="op">=</span><span class="st">&quot;2.6&quot;</span>,</span>
+<span id="cb28-22"><a href="#cb28-22" aria-hidden="true" tabindex="-1"></a>    write_statistics<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb28-23"><a href="#cb28-23" aria-hidden="true" tabindex="-1"></a>    use_dictionary<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb28-24"><a href="#cb28-24" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+            <p>关键参数说明：</p>
+            <ul>
+            <li><code>compression</code>：压缩算法。常用选项包括
+            <code>"snappy"</code>（速度快、压缩率一般）、<code>"zstd"</code>（压缩率高、速度稍慢）、<code>"gzip"</code>（兼容性好、速度最慢）、<code>"lz4"</code>（速度最快、压缩率最低）。</li>
+            <li><code>compression_level</code>：压缩级别。Zstd 支持
+            1-22，默认 3。级别越高压缩率越好，但写入速度越慢。</li>
+            <li><code>row_group_size</code>：每个行组的行数上限。</li>
+            <li><code>version</code>：Parquet Format
+            Version。<code>"1.0"</code> 使用 Data Page
+            V1，<code>"2.6"</code> 使用 Data Page V2 并写入 Page
+            Index。</li>
+            <li><code>use_dictionary</code>：是否启用字典编码。可以传
+            <code>True</code>（所有列）、<code>False</code>（所有列不用）或列名列表。</li>
+            </ul>
+            <h3 id="基本读取">8.2 基本读取</h3>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 读取整个文件</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pq.read_table(<span class="st">&quot;output.parquet&quot;</span>)</span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Rows: </span><span class="sc">{</span>table<span class="sc">.</span>num_rows<span class="sc">}</span><span class="ss">, Columns: </span><span class="sc">{</span>table<span class="sc">.</span>num_columns<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(table.schema)</span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 投影下推：只读取指定列</span></span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pq.read_table(<span class="st">&quot;output.parquet&quot;</span>, columns<span class="op">=</span>[<span class="st">&quot;name&quot;</span>, <span class="st">&quot;salary&quot;</span>])</span>
+<span id="cb29-10"><a href="#cb29-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-11"><a href="#cb29-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 谓词下推：使用过滤条件</span></span>
+<span id="cb29-12"><a href="#cb29-12" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pq.read_table(</span>
+<span id="cb29-13"><a href="#cb29-13" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;output.parquet&quot;</span>,</span>
+<span id="cb29-14"><a href="#cb29-14" aria-hidden="true" tabindex="-1"></a>    filters<span class="op">=</span>[</span>
+<span id="cb29-15"><a href="#cb29-15" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;age&quot;</span>, <span class="st">&quot;&gt;&quot;</span>, <span class="dv">30</span>),</span>
+<span id="cb29-16"><a href="#cb29-16" aria-hidden="true" tabindex="-1"></a>        (<span class="st">&quot;city&quot;</span>, <span class="st">&quot;=&quot;</span>, <span class="st">&quot;Beijing&quot;</span>),</span>
+<span id="cb29-17"><a href="#cb29-17" aria-hidden="true" tabindex="-1"></a>    ],</span>
+<span id="cb29-18"><a href="#cb29-18" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+            <p><code>filters</code>
+            参数接受一个条件列表，列表中的条件默认以 AND 连接。PyArrow
+            会将这些条件转换为行组级别和页级别（如果有 Page
+            Index）的过滤。</p>
+            <h3 id="分区写入">8.3 分区写入</h3>
+            <p>分区（Partitioning）是处理大数据集的标准做法。PyArrow
+            支持按列值将数据写入不同的子目录：</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pa.table({</span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;date&quot;</span>: [<span class="st">&quot;2025-01-01&quot;</span>, <span class="st">&quot;2025-01-01&quot;</span>, <span class="st">&quot;2025-01-02&quot;</span>, <span class="st">&quot;2025-01-02&quot;</span>],</span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;city&quot;</span>: [<span class="st">&quot;Beijing&quot;</span>, <span class="st">&quot;Shanghai&quot;</span>, <span class="st">&quot;Beijing&quot;</span>, <span class="st">&quot;Guangzhou&quot;</span>],</span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;value&quot;</span>: [<span class="dv">100</span>, <span class="dv">200</span>, <span class="dv">300</span>, <span class="dv">400</span>],</span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 按 date 和 city 分区写入</span></span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a>pq.write_to_dataset(</span>
+<span id="cb30-12"><a href="#cb30-12" aria-hidden="true" tabindex="-1"></a>    table,</span>
+<span id="cb30-13"><a href="#cb30-13" aria-hidden="true" tabindex="-1"></a>    root_path<span class="op">=</span><span class="st">&quot;output_partitioned&quot;</span>,</span>
+<span id="cb30-14"><a href="#cb30-14" aria-hidden="true" tabindex="-1"></a>    partition_cols<span class="op">=</span>[<span class="st">&quot;date&quot;</span>, <span class="st">&quot;city&quot;</span>],</span>
+<span id="cb30-15"><a href="#cb30-15" aria-hidden="true" tabindex="-1"></a>    compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb30-16"><a href="#cb30-16" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+            <p>写入后的目录结构：</p>
+            <pre class="text"><code>output_partitioned/
+├── date=2025-01-01/
+│   ├── city=Beijing/
+│   │   └── part-0.parquet
+│   └── city=Shanghai/
+│       └── part-0.parquet
+└── date=2025-01-02/
+    ├── city=Beijing/
+    │   └── part-0.parquet
+    └── city=Guangzhou/
+        └── part-0.parquet</code></pre>
+            <p>分区下推（Partition
+            Pruning）比行组级谓词下推更高效：查询条件涉及分区列时，读取器直接跳过不匹配的子目录，连文件都不需要打开。</p>
+            <h3 id="流式写入逐行组写入">8.4 流式写入（逐行组写入）</h3>
+            <p>对于无法一次性放入内存的大数据集，可以使用
+            <code>ParquetWriter</code> 逐行组写入：</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a>schema <span class="op">=</span> pa.schema([</span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;id&quot;</span>, pa.int64()),</span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;value&quot;</span>, pa.float64()),</span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a>])</span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-9"><a href="#cb32-9" aria-hidden="true" tabindex="-1"></a>writer <span class="op">=</span> pq.ParquetWriter(</span>
+<span id="cb32-10"><a href="#cb32-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;large_output.parquet&quot;</span>,</span>
+<span id="cb32-11"><a href="#cb32-11" aria-hidden="true" tabindex="-1"></a>    schema,</span>
+<span id="cb32-12"><a href="#cb32-12" aria-hidden="true" tabindex="-1"></a>    compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb32-13"><a href="#cb32-13" aria-hidden="true" tabindex="-1"></a>    version<span class="op">=</span><span class="st">&quot;2.6&quot;</span>,</span>
+<span id="cb32-14"><a href="#cb32-14" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb32-15"><a href="#cb32-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-16"><a href="#cb32-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 模拟分批生成数据</span></span>
+<span id="cb32-17"><a href="#cb32-17" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> batch_idx <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">10</span>):</span>
+<span id="cb32-18"><a href="#cb32-18" aria-hidden="true" tabindex="-1"></a>    batch <span class="op">=</span> pa.table({</span>
+<span id="cb32-19"><a href="#cb32-19" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;id&quot;</span>: pa.array(<span class="bu">range</span>(batch_idx <span class="op">*</span> <span class="dv">100000</span>, (batch_idx <span class="op">+</span> <span class="dv">1</span>) <span class="op">*</span> <span class="dv">100000</span>)),</span>
+<span id="cb32-20"><a href="#cb32-20" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;value&quot;</span>: pa.array([<span class="bu">float</span>(i) <span class="op">*</span> <span class="fl">0.1</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">100000</span>)]),</span>
+<span id="cb32-21"><a href="#cb32-21" aria-hidden="true" tabindex="-1"></a>    })</span>
+<span id="cb32-22"><a href="#cb32-22" aria-hidden="true" tabindex="-1"></a>    writer.write_table(batch)</span>
+<span id="cb32-23"><a href="#cb32-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-24"><a href="#cb32-24" aria-hidden="true" tabindex="-1"></a>writer.close()  <span class="co"># 必须显式关闭，写入 Footer</span></span></code></pre></div>
+            <p>每次调用 <code>write_table()</code>
+            会写入一个新的行组。如果不显式关闭 Writer，Footer
+            不会写入，文件将不可读。推荐使用上下文管理器（Context
+            Manager）：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> pq.ParquetWriter(<span class="st">&quot;output.parquet&quot;</span>, schema, compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>) <span class="im">as</span> writer:</span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> batch <span class="kw">in</span> data_batches:</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a>        writer.write_table(batch)</span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 离开 with 块时自动关闭</span></span></code></pre></div>
+            <h3 id="读取元数据">8.5 读取元数据</h3>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 只读取元数据，不读取数据</span></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a>metadata <span class="op">=</span> pq.read_metadata(<span class="st">&quot;output.parquet&quot;</span>)</span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Format Version: </span><span class="sc">{</span>metadata<span class="sc">.</span>format_version<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Created By: </span><span class="sc">{</span>metadata<span class="sc">.</span>created_by<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Num Rows: </span><span class="sc">{</span>metadata<span class="sc">.</span>num_rows<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Num Row Groups: </span><span class="sc">{</span>metadata<span class="sc">.</span>num_row_groups<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Num Columns: </span><span class="sc">{</span>metadata<span class="sc">.</span>num_columns<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb34-10"><a href="#cb34-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-11"><a href="#cb34-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查 Schema</span></span>
+<span id="cb34-12"><a href="#cb34-12" aria-hidden="true" tabindex="-1"></a>schema <span class="op">=</span> pq.read_schema(<span class="st">&quot;output.parquet&quot;</span>)</span>
+<span id="cb34-13"><a href="#cb34-13" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(schema)</span>
+<span id="cb34-14"><a href="#cb34-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-15"><a href="#cb34-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查单个 Row Group</span></span>
+<span id="cb34-16"><a href="#cb34-16" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(metadata.num_row_groups):</span>
+<span id="cb34-17"><a href="#cb34-17" aria-hidden="true" tabindex="-1"></a>    rg <span class="op">=</span> metadata.row_group(i)</span>
+<span id="cb34-18"><a href="#cb34-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="ss">Row Group </span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">:&quot;</span>)</span>
+<span id="cb34-19"><a href="#cb34-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  Rows: </span><span class="sc">{</span>rg<span class="sc">.</span>num_rows<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb34-20"><a href="#cb34-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  Size: </span><span class="sc">{</span>rg<span class="sc">.</span>total_byte_size<span class="sc">:,}</span><span class="ss"> bytes&quot;</span>)</span></code></pre></div>
+            <h3 id="控制编码方式">8.6 控制编码方式</h3>
+            <p>PyArrow 允许按列指定编码方式：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pa.table({</span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;ts&quot;</span>: pa.array(<span class="bu">range</span>(<span class="dv">0</span>, <span class="dv">1000000</span>, <span class="dv">1</span>), <span class="bu">type</span><span class="op">=</span>pa.int64()),</span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;temperature&quot;</span>: pa.array([<span class="fl">20.5</span> <span class="op">+</span> i <span class="op">*</span> <span class="fl">0.001</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1000000</span>)],</span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a>                            <span class="bu">type</span><span class="op">=</span>pa.float32()),</span>
+<span id="cb35-8"><a href="#cb35-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;status&quot;</span>: pa.array([<span class="st">&quot;OK&quot;</span>, <span class="st">&quot;WARN&quot;</span>, <span class="st">&quot;ERROR&quot;</span>] <span class="op">*</span> <span class="dv">333333</span> <span class="op">+</span> [<span class="st">&quot;OK&quot;</span>],</span>
+<span id="cb35-9"><a href="#cb35-9" aria-hidden="true" tabindex="-1"></a>                       <span class="bu">type</span><span class="op">=</span>pa.string()),</span>
+<span id="cb35-10"><a href="#cb35-10" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb35-11"><a href="#cb35-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-12"><a href="#cb35-12" aria-hidden="true" tabindex="-1"></a>pq.write_table(</span>
+<span id="cb35-13"><a href="#cb35-13" aria-hidden="true" tabindex="-1"></a>    table,</span>
+<span id="cb35-14"><a href="#cb35-14" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;encoded.parquet&quot;</span>,</span>
+<span id="cb35-15"><a href="#cb35-15" aria-hidden="true" tabindex="-1"></a>    compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb35-16"><a href="#cb35-16" aria-hidden="true" tabindex="-1"></a>    use_dictionary<span class="op">=</span>[<span class="st">&quot;status&quot;</span>],         <span class="co"># 只对 status 列启用字典编码</span></span>
+<span id="cb35-17"><a href="#cb35-17" aria-hidden="true" tabindex="-1"></a>    column_encoding<span class="op">=</span>{</span>
+<span id="cb35-18"><a href="#cb35-18" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;ts&quot;</span>: <span class="st">&quot;DELTA_BINARY_PACKED&quot;</span>,   <span class="co"># 时间戳用 Delta 编码</span></span>
+<span id="cb35-19"><a href="#cb35-19" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;temperature&quot;</span>: <span class="st">&quot;BYTE_STREAM_SPLIT&quot;</span>,  <span class="co"># 浮点用 Byte Stream Split</span></span>
+<span id="cb35-20"><a href="#cb35-20" aria-hidden="true" tabindex="-1"></a>    },</span>
+<span id="cb35-21"><a href="#cb35-21" aria-hidden="true" tabindex="-1"></a>    write_statistics<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb35-22"><a href="#cb35-22" aria-hidden="true" tabindex="-1"></a>    version<span class="op">=</span><span class="st">&quot;2.6&quot;</span>,</span>
+<span id="cb35-23"><a href="#cb35-23" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb35-24"><a href="#cb35-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-25"><a href="#cb35-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 验证编码方式</span></span>
+<span id="cb35-26"><a href="#cb35-26" aria-hidden="true" tabindex="-1"></a>f <span class="op">=</span> pq.ParquetFile(<span class="st">&quot;encoded.parquet&quot;</span>)</span>
+<span id="cb35-27"><a href="#cb35-27" aria-hidden="true" tabindex="-1"></a>rg <span class="op">=</span> f.metadata.row_group(<span class="dv">0</span>)</span>
+<span id="cb35-28"><a href="#cb35-28" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(rg.num_columns):</span>
+<span id="cb35-29"><a href="#cb35-29" aria-hidden="true" tabindex="-1"></a>    col <span class="op">=</span> rg.column(i)</span>
+<span id="cb35-30"><a href="#cb35-30" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>col<span class="sc">.</span>path_in_schema<span class="sc">}</span><span class="ss">: encodings=</span><span class="sc">{</span>col<span class="sc">.</span>encodings<span class="sc">}</span><span class="ss">, &quot;</span></span>
+<span id="cb35-31"><a href="#cb35-31" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;compression=</span><span class="sc">{</span>col<span class="sc">.</span>compression<span class="sc">}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+            <h3 id="pandas-互操作">8.7 Pandas 互操作</h3>
+            <p>PyArrow 与 Pandas 的互操作是最常见的使用场景：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pandas <span class="im">as</span> pd</span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Pandas DataFrame → Parquet</span></span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a>df <span class="op">=</span> pd.DataFrame({</span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;id&quot;</span>: <span class="bu">range</span>(<span class="dv">100000</span>),</span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;name&quot;</span>: [<span class="ss">f&quot;item_</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">100000</span>)],</span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;price&quot;</span>: [<span class="bu">round</span>(i <span class="op">*</span> <span class="fl">0.99</span>, <span class="dv">2</span>) <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">100000</span>)],</span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a>df.to_parquet(<span class="st">&quot;from_pandas.parquet&quot;</span>, engine<span class="op">=</span><span class="st">&quot;pyarrow&quot;</span>, compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>)</span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Parquet → Pandas DataFrame</span></span>
+<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a>df2 <span class="op">=</span> pd.read_parquet(<span class="st">&quot;from_pandas.parquet&quot;</span>, columns<span class="op">=</span>[<span class="st">&quot;name&quot;</span>, <span class="st">&quot;price&quot;</span>])</span>
+<span id="cb36-15"><a href="#cb36-15" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(df2.head())</span></code></pre></div>
+            <p>需要注意的是，Pandas 的 <code>NaN</code> 和 Parquet 的
+            null 语义不完全一致。Pandas 使用 <code>NaN</code>
+            表示缺失值（对于浮点列），使用 <code>None</code> 或
+            <code>pd.NA</code>（对于 Nullable 整数类型）。PyArrow
+            在转换时会自动处理，但边界情况下可能需要显式指定类型映射。</p>
+            <hr />
+            <h2 id="九row-group-大小调优">九、Row Group 大小调优</h2>
+            <h3 id="row-group-大小的影响因素">9.1 Row Group
+            大小的影响因素</h3>
+            <p>行组大小是 Parquet
+            文件性能调优中最重要的参数之一。它影响四个方面：</p>
+            <ol type="1">
+            <li><strong>I/O 效率</strong>：行组越大，每次 I/O
+            请求读取的有效数据越多，元数据开销占比越低。</li>
+            <li><strong>并行度</strong>：行组是并行处理的基本单位。行组太少，Task
+            数量不足，集群利用率低。</li>
+            <li><strong>内存占用</strong>：写入器需要在内存中缓存一个行组的数据才能刷写。行组越大，写入时的内存峰值越高。</li>
+            <li><strong>谓词下推精度</strong>：行组越小，统计信息的覆盖范围越小，过滤效果越好。但行组太小，元数据膨胀，整体性能反而下降。</li>
+            </ol>
+            <h3 id="行组大小-vs-hdfs-block-大小">9.2 行组大小 vs HDFS
+            Block 大小</h3>
+            <p>在 HDFS 上，一个经典的建议是让行组大小等于 HDFS Block
+            大小（默认 128MB）。原因是：</p>
+            <ul>
+            <li>如果行组大小小于 Block 大小，一个 Block
+            可能包含多个行组或行组的一部分。MapReduce 的一个 Task
+            处理一个 Block 时，可能需要读取相邻 Block
+            中的数据来完成一个行组的读取，产生跨节点网络 I/O。</li>
+            <li>如果行组大小等于 Block 大小，一个行组恰好占一个
+            Block，数据本地性（Data Locality）最好。</li>
+            </ul>
+            <p>但在对象存储（S3、GCS）上，没有 Block
+            的概念，数据本地性也不适用。此时行组大小的选择更自由。一般建议在
+            128MB 到 512MB 之间，根据查询模式调整。</p>
+            <h3 id="不同场景下的推荐大小">9.3 不同场景下的推荐大小</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>场景</th>
+            <th>推荐行组大小</th>
+            <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>HDFS + Spark/Hive</td>
+            <td>128MB（与 Block 对齐）</td>
+            <td>数据本地性最优</td>
+            </tr>
+            <tr>
+            <td>S3 + Spark</td>
+            <td>128MB-256MB</td>
+            <td>平衡 I/O 粒度和并行度</td>
+            </tr>
+            <tr>
+            <td>DuckDB 单机分析</td>
+            <td>256MB-1GB</td>
+            <td>行组切换开销大于 I/O 收益</td>
+            </tr>
+            <tr>
+            <td>实时查询（Impala、Presto）</td>
+            <td>64MB-128MB</td>
+            <td>减少单次查询的延迟</td>
+            </tr>
+            <tr>
+            <td>频繁使用谓词下推</td>
+            <td>64MB-128MB</td>
+            <td>更细粒度的统计信息</td>
+            </tr>
+            <tr>
+            <td>宽表（&gt;100 列）</td>
+            <td>256MB-512MB</td>
+            <td>每列的列块足够大，压缩效果好</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="spark-中的配置">9.4 Spark 中的配置</h3>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Spark 行组大小配置</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a>spark.conf.<span class="bu">set</span>(<span class="st">&quot;spark.sql.parquet.rowGroupSize&quot;</span>, <span class="bu">str</span>(<span class="dv">128</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>))  <span class="co"># 128MB</span></span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者在写入时指定</span></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a>df.write <span class="op">\</span></span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a>    .option(<span class="st">&quot;parquet.block.size&quot;</span>, <span class="bu">str</span>(<span class="dv">256</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>)) <span class="op">\</span></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a>    .parquet(<span class="st">&quot;output_path&quot;</span>)</span></code></pre></div>
+            <p>Spark 中 <code>parquet.block.size</code> 和
+            <code>spark.sql.parquet.rowGroupSize</code>
+            是同义参数，都控制行组的目标大小（以字节为单位）。注意这是目标大小，实际行组大小可能略有偏差，因为写入器在接近目标大小时才决定是否刷写。</p>
+            <h3 id="行组行数-vs-行组大小">9.5 行组行数 vs 行组大小</h3>
+            <p>有两种方式控制行组粒度：按行数和按字节大小。PyArrow 的
+            <code>row_group_size</code> 参数控制的是行数上限，而 Spark
+            的 <code>parquet.block.size</code>
+            控制的是字节大小上限。</p>
+            <p>行数控制更简单直观，但不同列的宽度差异可能导致实际字节大小差异很大。字节大小控制更贴近
+            I/O
+            行为，但需要写入器在写入过程中估算已累积数据的字节大小。</p>
+            <p>我认为在大多数场景下，按字节大小控制更合理。如果使用
+            PyArrow
+            且需要精确控制字节大小，可以预估每行的平均大小，再换算为行数：</p>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 假设每行平均 200 字节，目标行组大小 128MB</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a>avg_row_bytes <span class="op">=</span> <span class="dv">200</span></span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a>target_rg_bytes <span class="op">=</span> <span class="dv">128</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span></span>
+<span id="cb38-4"><a href="#cb38-4" aria-hidden="true" tabindex="-1"></a>row_group_size <span class="op">=</span> target_rg_bytes <span class="op">//</span> avg_row_bytes  <span class="co"># 约 671,000 行</span></span></code></pre></div>
+            <h3 id="实测调优方法">9.6 实测调优方法</h3>
+            <p>调优行组大小的建议步骤：</p>
+            <ol type="1">
+            <li>用实际数据写入多个不同行组大小的文件。</li>
+            <li>记录文件大小和写入时间。</li>
+            <li>用实际查询测试读取性能。</li>
+            <li>检查行组统计信息的过滤效果。</li>
+            </ol>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 生成测试数据</span></span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pa.table({</span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;id&quot;</span>: pa.array(<span class="bu">range</span>(<span class="dv">5000000</span>), <span class="bu">type</span><span class="op">=</span>pa.int64()),</span>
+<span id="cb39-8"><a href="#cb39-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;value&quot;</span>: pa.array([<span class="bu">float</span>(i <span class="op">%</span> <span class="dv">1000</span>) <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">5000000</span>)], <span class="bu">type</span><span class="op">=</span>pa.float64()),</span>
+<span id="cb39-9"><a href="#cb39-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;category&quot;</span>: pa.array([<span class="ss">f&quot;cat_</span><span class="sc">{</span>i <span class="op">%</span> <span class="dv">100</span><span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">5000000</span>)], <span class="bu">type</span><span class="op">=</span>pa.string()),</span>
+<span id="cb39-10"><a href="#cb39-10" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb39-11"><a href="#cb39-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-12"><a href="#cb39-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 测试不同行组大小</span></span>
+<span id="cb39-13"><a href="#cb39-13" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> rg_size <span class="kw">in</span> [<span class="dv">50000</span>, <span class="dv">100000</span>, <span class="dv">500000</span>, <span class="dv">1000000</span>, <span class="dv">5000000</span>]:</span>
+<span id="cb39-14"><a href="#cb39-14" aria-hidden="true" tabindex="-1"></a>    start <span class="op">=</span> time.time()</span>
+<span id="cb39-15"><a href="#cb39-15" aria-hidden="true" tabindex="-1"></a>    pq.write_table(</span>
+<span id="cb39-16"><a href="#cb39-16" aria-hidden="true" tabindex="-1"></a>        table,</span>
+<span id="cb39-17"><a href="#cb39-17" aria-hidden="true" tabindex="-1"></a>        <span class="ss">f&quot;test_rg_</span><span class="sc">{</span>rg_size<span class="sc">}</span><span class="ss">.parquet&quot;</span>,</span>
+<span id="cb39-18"><a href="#cb39-18" aria-hidden="true" tabindex="-1"></a>        compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb39-19"><a href="#cb39-19" aria-hidden="true" tabindex="-1"></a>        row_group_size<span class="op">=</span>rg_size,</span>
+<span id="cb39-20"><a href="#cb39-20" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb39-21"><a href="#cb39-21" aria-hidden="true" tabindex="-1"></a>    write_time <span class="op">=</span> time.time() <span class="op">-</span> start</span>
+<span id="cb39-22"><a href="#cb39-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-23"><a href="#cb39-23" aria-hidden="true" tabindex="-1"></a>    f <span class="op">=</span> pq.ParquetFile(<span class="ss">f&quot;test_rg_</span><span class="sc">{</span>rg_size<span class="sc">}</span><span class="ss">.parquet&quot;</span>)</span>
+<span id="cb39-24"><a href="#cb39-24" aria-hidden="true" tabindex="-1"></a>    <span class="im">import</span> os</span>
+<span id="cb39-25"><a href="#cb39-25" aria-hidden="true" tabindex="-1"></a>    file_size <span class="op">=</span> os.path.getsize(<span class="ss">f&quot;test_rg_</span><span class="sc">{</span>rg_size<span class="sc">}</span><span class="ss">.parquet&quot;</span>)</span>
+<span id="cb39-26"><a href="#cb39-26" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;RG Size: </span><span class="sc">{</span>rg_size<span class="sc">:&gt;10,}</span><span class="ss">  &quot;</span></span>
+<span id="cb39-27"><a href="#cb39-27" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;Row Groups: </span><span class="sc">{</span>f<span class="sc">.</span>metadata<span class="sc">.</span>num_row_groups<span class="sc">:&gt;3}</span><span class="ss">  &quot;</span></span>
+<span id="cb39-28"><a href="#cb39-28" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;File Size: </span><span class="sc">{</span>file_size<span class="sc">:&gt;12,}</span><span class="ss">  &quot;</span></span>
+<span id="cb39-29"><a href="#cb39-29" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;Write Time: </span><span class="sc">{</span>write_time<span class="sc">:.2f}</span><span class="ss">s&quot;</span>)</span></code></pre></div>
+            <hr />
+            <h2 id="十parquet-最佳实践">十、Parquet 最佳实践</h2>
+            <h3 id="压缩算法选择">10.1 压缩算法选择</h3>
+            <p>压缩算法的选择需要在压缩率、压缩速度和解压速度之间权衡：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>算法</th>
+            <th>压缩率</th>
+            <th>压缩速度</th>
+            <th>解压速度</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Snappy</td>
+            <td>中等</td>
+            <td>快</td>
+            <td>极快</td>
+            <td>交互查询，解压速度优先</td>
+            </tr>
+            <tr>
+            <td>Zstd</td>
+            <td>高</td>
+            <td>中等</td>
+            <td>快</td>
+            <td>通用推荐，压缩率和速度平衡</td>
+            </tr>
+            <tr>
+            <td>LZ4</td>
+            <td>较低</td>
+            <td>极快</td>
+            <td>极快</td>
+            <td>极端速度要求</td>
+            </tr>
+            <tr>
+            <td>Gzip</td>
+            <td>高</td>
+            <td>慢</td>
+            <td>中等</td>
+            <td>兼容性要求，冷数据归档</td>
+            </tr>
+            <tr>
+            <td>不压缩</td>
+            <td>无</td>
+            <td>无开销</td>
+            <td>无开销</td>
+            <td>数据已经不可压缩</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Zstd 是目前大多数场景下的最佳选择。它的压缩率接近
+            Gzip，但解压速度接近 Snappy。Zstd
+            的压缩级别可调（1-22），级别 3 是一个常用的平衡点。</p>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Zstd 不同级别的对比测试</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> level <span class="kw">in</span> [<span class="dv">1</span>, <span class="dv">3</span>, <span class="dv">6</span>, <span class="dv">9</span>, <span class="dv">15</span>]:</span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a>    pq.write_table(table, <span class="ss">f&quot;zstd_l</span><span class="sc">{</span>level<span class="sc">}</span><span class="ss">.parquet&quot;</span>,</span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a>                   compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>, compression_level<span class="op">=</span>level)</span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a>    size <span class="op">=</span> os.path.getsize(<span class="ss">f&quot;zstd_l</span><span class="sc">{</span>level<span class="sc">}</span><span class="ss">.parquet&quot;</span>)</span>
+<span id="cb40-9"><a href="#cb40-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Zstd level </span><span class="sc">{</span>level<span class="sc">:&gt;2}</span><span class="ss">: </span><span class="sc">{</span>size<span class="sc">:&gt;12,}</span><span class="ss"> bytes&quot;</span>)</span></code></pre></div>
+            <h3 id="排序对压缩率的影响">10.2 排序对压缩率的影响</h3>
+            <p>数据写入前按低基数列排序，可以显著提升压缩率。原因有两个：</p>
+            <ol type="1">
+            <li>排序后同一列的相邻值更可能相同或相近，字典编码和 RLE
+            编码的效率更高。</li>
+            <li>排序后行组内的统计信息（min/max）范围更窄，谓词下推的过滤效果更好。</li>
+            </ol>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 未排序写入</span></span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a>table_unsorted <span class="op">=</span> pa.table({</span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;region&quot;</span>: pa.array([<span class="st">&quot;East&quot;</span>, <span class="st">&quot;West&quot;</span>, <span class="st">&quot;North&quot;</span>, <span class="st">&quot;South&quot;</span>] <span class="op">*</span> <span class="dv">250000</span>),</span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;product&quot;</span>: pa.array([<span class="ss">f&quot;P</span><span class="sc">{</span>i <span class="op">%</span> <span class="dv">50</span><span class="sc">}</span><span class="ss">&quot;</span> <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1000000</span>)]),</span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;amount&quot;</span>: pa.array([<span class="bu">float</span>(i <span class="op">%</span> <span class="dv">10000</span>) <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">1000000</span>)]),</span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a>pq.write_table(table_unsorted, <span class="st">&quot;unsorted.parquet&quot;</span>, compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>)</span>
+<span id="cb41-12"><a href="#cb41-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-13"><a href="#cb41-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 按 region + product 排序后写入</span></span>
+<span id="cb41-14"><a href="#cb41-14" aria-hidden="true" tabindex="-1"></a>indices <span class="op">=</span> pa.compute.sort_indices(table_unsorted, sort_keys<span class="op">=</span>[</span>
+<span id="cb41-15"><a href="#cb41-15" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;region&quot;</span>, <span class="st">&quot;ascending&quot;</span>), (<span class="st">&quot;product&quot;</span>, <span class="st">&quot;ascending&quot;</span>)</span>
+<span id="cb41-16"><a href="#cb41-16" aria-hidden="true" tabindex="-1"></a>])</span>
+<span id="cb41-17"><a href="#cb41-17" aria-hidden="true" tabindex="-1"></a>table_sorted <span class="op">=</span> table_unsorted.take(indices)</span>
+<span id="cb41-18"><a href="#cb41-18" aria-hidden="true" tabindex="-1"></a>pq.write_table(table_sorted, <span class="st">&quot;sorted.parquet&quot;</span>, compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>)</span>
+<span id="cb41-19"><a href="#cb41-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-20"><a href="#cb41-20" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Unsorted: </span><span class="sc">{</span>os<span class="sc">.</span>path<span class="sc">.</span>getsize(<span class="st">&#39;unsorted.parquet&#39;</span>)<span class="sc">:&gt;12,}</span><span class="ss"> bytes&quot;</span>)</span>
+<span id="cb41-21"><a href="#cb41-21" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;Sorted:   </span><span class="sc">{</span>os<span class="sc">.</span>path<span class="sc">.</span>getsize(<span class="st">&#39;sorted.parquet&#39;</span>)<span class="sc">:&gt;12,}</span><span class="ss"> bytes&quot;</span>)</span></code></pre></div>
+            <p>排序的收益取决于数据特征。低基数列放在排序键前面效果最好。对于已经按时间顺序生成的数据（如日志、事件），时间列天然有序，不需要额外排序。</p>
+            <h3 id="分区策略">10.3 分区策略</h3>
+            <p>分区（Partitioning）把数据按一个或多个列的值拆分到不同的文件或目录中。分区的目标是让查询引擎在扫描前就排除大量无关数据。</p>
+            <p>分区策略的选择原则：</p>
+            <ol type="1">
+            <li><strong>分区列应该是查询中最常出现在 WHERE
+            子句中的列。</strong>
+            典型的分区列包括日期、地区、业务类型。</li>
+            <li><strong>分区数量不宜过多。</strong>
+            每个分区对应一个或多个文件，分区过多导致小文件问题（Small
+            File
+            Problem），增加元数据开销和文件系统负担。一般建议总分区数不超过
+            10000。</li>
+            <li><strong>单个分区文件不宜太小。</strong>
+            理想情况下每个分区文件至少
+            64MB-128MB。如果分区后每个文件只有几
+            MB，应该降低分区粒度或合并小文件。</li>
+            <li><strong>分区列不应该是高基数列。</strong> 用
+            <code>user_id</code>
+            作为分区列会产生数百万个分区目录，这是灾难性的。</li>
+            </ol>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 合理的分区策略</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a>pq.write_to_dataset(</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a>    table,</span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a>    root_path<span class="op">=</span><span class="st">&quot;events&quot;</span>,</span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a>    partition_cols<span class="op">=</span>[<span class="st">&quot;date&quot;</span>, <span class="st">&quot;region&quot;</span>],  <span class="co"># 低基数列</span></span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a>    compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb42-7"><a href="#cb42-7" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb42-8"><a href="#cb42-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-9"><a href="#cb42-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 不合理的分区策略（避免）</span></span>
+<span id="cb42-10"><a href="#cb42-10" aria-hidden="true" tabindex="-1"></a><span class="co"># partition_cols=[&quot;user_id&quot;]  # 高基数，会产生大量小文件</span></span></code></pre></div>
+            <h3 id="schema-设计">10.4 Schema 设计</h3>
+            <p>Parquet Schema 设计影响存储效率和查询性能：</p>
+            <ol type="1">
+            <li><p><strong>使用最紧凑的物理类型。</strong> 如果值域在
+            INT32 范围内，不要用 INT64。FLOAT 够用时不要用
+            DOUBLE。每个值省 4 字节，100 万行就省 4MB。</p></li>
+            <li><p><strong>字符串 vs 枚举。</strong>
+            如果一个字符串列的取值只有几十种，考虑在应用层转换为整数编码。虽然
+            Parquet
+            的字典编码也能达到类似效果，但显式使用整数类型更可控。</p></li>
+            <li><p><strong>避免过深的嵌套。</strong> Parquet
+            支持任意深度的嵌套结构，但嵌套越深，Definition Level 和
+            Repetition Level
+            的开销越大，编解码越慢。如果可以，把嵌套结构展平。</p></li>
+            <li><p><strong>合理使用可选字段。</strong> Required
+            字段不需要存储 Definition Level（始终为最大值），比 Optional
+            字段少一个编码开销。如果某列不可能为 null，声明为
+            Required。</p></li>
+            </ol>
+            <h3 id="小文件合并">10.5 小文件合并</h3>
+            <p>小文件是 Parquet
+            使用中最常见的性能问题之一。大量小文件导致：</p>
+            <ul>
+            <li>元数据开销大：每个文件都有独立的 Footer 和 Schema。</li>
+            <li>I/O 次数多：打开每个文件都需要至少两次 I/O（读取 Footer
+            + 读取数据）。</li>
+            <li>调度开销大：每个文件可能产生一个独立的 Task。</li>
+            <li>压缩率低：数据量太少，编码和压缩的效率下降。</li>
+            </ul>
+            <p>合并小文件的方法：</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.dataset <span class="im">as</span> ds</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 读取包含大量小文件的目录</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a>dataset <span class="op">=</span> ds.dataset(<span class="st">&quot;small_files_dir&quot;</span>, <span class="bu">format</span><span class="op">=</span><span class="st">&quot;parquet&quot;</span>)</span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> dataset.to_table()</span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 写入合并后的文件</span></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a>pq.write_table(</span>
+<span id="cb43-10"><a href="#cb43-10" aria-hidden="true" tabindex="-1"></a>    table,</span>
+<span id="cb43-11"><a href="#cb43-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;merged.parquet&quot;</span>,</span>
+<span id="cb43-12"><a href="#cb43-12" aria-hidden="true" tabindex="-1"></a>    compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb43-13"><a href="#cb43-13" aria-hidden="true" tabindex="-1"></a>    row_group_size<span class="op">=</span><span class="dv">1000000</span>,</span>
+<span id="cb43-14"><a href="#cb43-14" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+            <p>对于 Spark 环境，可以使用 <code>coalesce()</code> 或
+            <code>repartition()</code> 控制输出文件数量：</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Spark 中控制输出文件数量</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a>df.coalesce(<span class="dv">10</span>).write.parquet(<span class="st">&quot;output_path&quot;</span>)</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 或按目标文件大小重新分区</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a>spark.conf.<span class="bu">set</span>(<span class="st">&quot;spark.sql.files.maxRecordsPerFile&quot;</span>, <span class="dv">1000000</span>)</span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a>df.write.parquet(<span class="st">&quot;output_path&quot;</span>)</span></code></pre></div>
+            <h3 id="写入性能优化">10.6 写入性能优化</h3>
+            <p>写入 Parquet 文件时的几个优化建议：</p>
+            <ol type="1">
+            <li><p><strong>批量写入。</strong> 避免逐行写入。每次
+            <code>write_table()</code> 应该传入至少几万行的数据。PyArrow
+            的写入器在内部按行组缓存数据，频繁调用小批量写入会增加
+            Python 层面的开销。</p></li>
+            <li><p><strong>选择合适的压缩级别。</strong> Zstd level 1-3
+            通常是写入速度和压缩率的最佳平衡点。级别 9
+            以上的写入速度会显著下降，但压缩率提升有限。</p></li>
+            <li><p><strong>禁用不需要的特性。</strong>
+            如果不需要统计信息（例如只做全表扫描），可以关闭统计写入以加速写入。如果某些列不需要字典编码（例如高基数字符串），显式禁用以避免字典构建的开销。</p></li>
+            </ol>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a>pq.write_table(</span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a>    table,</span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;fast_write.parquet&quot;</span>,</span>
+<span id="cb45-4"><a href="#cb45-4" aria-hidden="true" tabindex="-1"></a>    compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>,</span>
+<span id="cb45-5"><a href="#cb45-5" aria-hidden="true" tabindex="-1"></a>    compression_level<span class="op">=</span><span class="dv">1</span>,</span>
+<span id="cb45-6"><a href="#cb45-6" aria-hidden="true" tabindex="-1"></a>    write_statistics<span class="op">=</span><span class="va">False</span>,       <span class="co"># 不需要统计信息时关闭</span></span>
+<span id="cb45-7"><a href="#cb45-7" aria-hidden="true" tabindex="-1"></a>    use_dictionary<span class="op">=</span>[<span class="st">&quot;category&quot;</span>],  <span class="co"># 只对低基数列启用字典</span></span>
+<span id="cb45-8"><a href="#cb45-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+            <h3 id="读取性能优化">10.7 读取性能优化</h3>
+            <p>读取 Parquet 文件时的几个优化建议：</p>
+            <ol type="1">
+            <li><p><strong>始终使用投影下推。</strong>
+            只读取查询需要的列。这是 Parquet 最基本的优化手段。</p></li>
+            <li><p><strong>利用谓词下推。</strong>
+            把过滤条件传递给读取器，而不是读取全部数据后在应用层过滤。</p></li>
+            <li><p><strong>使用 <code>read_table</code>
+            而不是逐行读取。</strong> PyArrow 的批量读取利用了 SIMD
+            解码和内存预分配，比 Python
+            层面的逐行处理快几个数量级。</p></li>
+            <li><p><strong>预读元数据。</strong>
+            如果需要多次读取同一个文件的不同列，先读取元数据并缓存，避免重复的
+            Footer 读取。</p></li>
+            </ol>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 预读元数据</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a>pf <span class="op">=</span> pq.ParquetFile(<span class="st">&quot;large_file.parquet&quot;</span>)</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a>metadata <span class="op">=</span> pf.metadata  <span class="co"># 缓存元数据</span></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 后续按行组读取</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(metadata.num_row_groups):</span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a>    rg_table <span class="op">=</span> pf.read_row_group(i, columns<span class="op">=</span>[<span class="st">&quot;col_a&quot;</span>, <span class="st">&quot;col_b&quot;</span>])</span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 处理 rg_table</span></span></code></pre></div>
+            <ol start="5" type="1">
+            <li><strong>使用 <code>ParquetDataset</code>
+            读取分区数据。</strong> 它自动处理分区发现和分区裁剪。</li>
+            </ol>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a>dataset <span class="op">=</span> pq.ParquetDataset(</span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;partitioned_data&quot;</span>,</span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a>    filters<span class="op">=</span>[(<span class="st">&quot;date&quot;</span>, <span class="st">&quot;=&quot;</span>, <span class="st">&quot;2025-01-15&quot;</span>)],</span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> dataset.read(columns<span class="op">=</span>[<span class="st">&quot;user_id&quot;</span>, <span class="st">&quot;amount&quot;</span>])</span></code></pre></div>
+            <h3 id="schema-演化">10.8 Schema 演化</h3>
+            <p>Parquet 支持有限的 Schema 演化（Schema Evolution）：</p>
+            <ol type="1">
+            <li><strong>添加新列</strong>：新增的列在旧文件中自动填充为
+            null。这是最安全的演化操作。</li>
+            <li><strong>删除列</strong>：读取时指定不包含已删除列的列列表。旧文件中仍然包含该列的数据，但不会被读取。</li>
+            <li><strong>重命名列</strong>：Parquet
+            按列名匹配，重命名等同于删除旧列 + 新增新列。</li>
+            <li><strong>修改类型</strong>：不支持直接修改列的物理类型。需要写入新文件。</li>
+            </ol>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Schema 演化：读取添加了新列的混合数据集</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a>dataset <span class="op">=</span> ds.dataset(<span class="st">&quot;evolved_data&quot;</span>, <span class="bu">format</span><span class="op">=</span><span class="st">&quot;parquet&quot;</span>)</span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a><span class="co"># PyArrow 自动合并不同文件的 Schema</span></span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 旧文件中缺失的新列会被填充为 null</span></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> dataset.to_table()</span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(table.schema)</span></code></pre></div>
+            <p>在 Delta Lake 和 Apache Iceberg 等表格式中，Schema
+            演化有更完善的支持，包括类型安全的类型扩展（如 INT32 到
+            INT64）和列重命名追踪。如果需要频繁的 Schema 变更，建议在
+            Parquet 上层使用这些表格式。</p>
+            <h3 id="与其他格式的互操作">10.9 与其他格式的互操作</h3>
+            <p>Parquet 作为中间格式，经常需要与其他格式互转：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.csv <span class="im">as</span> csv</span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.json <span class="im">as</span> json_arrow</span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a><span class="co"># CSV → Parquet</span></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a>csv_table <span class="op">=</span> csv.read_csv(<span class="st">&quot;input.csv&quot;</span>)</span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a>pq.write_table(csv_table, <span class="st">&quot;from_csv.parquet&quot;</span>, compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>)</span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a><span class="co"># JSON → Parquet</span></span>
+<span id="cb49-11"><a href="#cb49-11" aria-hidden="true" tabindex="-1"></a>json_table <span class="op">=</span> json_arrow.read_json(<span class="st">&quot;input.json&quot;</span>)</span>
+<span id="cb49-12"><a href="#cb49-12" aria-hidden="true" tabindex="-1"></a>pq.write_table(json_table, <span class="st">&quot;from_json.parquet&quot;</span>, compression<span class="op">=</span><span class="st">&quot;zstd&quot;</span>)</span>
+<span id="cb49-13"><a href="#cb49-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-14"><a href="#cb49-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Parquet → CSV</span></span>
+<span id="cb49-15"><a href="#cb49-15" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pq.read_table(<span class="st">&quot;input.parquet&quot;</span>)</span>
+<span id="cb49-16"><a href="#cb49-16" aria-hidden="true" tabindex="-1"></a>csv.write_csv(table, <span class="st">&quot;output.csv&quot;</span>)</span></code></pre></div>
+            <p>CSV 和 JSON 转 Parquet
+            时需要注意类型推断的准确性。PyArrow 的 CSV Reader
+            会自动推断类型，但可能把整数推断为浮点数或把日期推断为字符串。显式指定
+            Schema 可以避免这个问题：</p>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a>schema <span class="op">=</span> pa.schema([</span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;id&quot;</span>, pa.int64()),</span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;name&quot;</span>, pa.string()),</span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;date&quot;</span>, pa.date32()),</span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;amount&quot;</span>, pa.decimal128(<span class="dv">10</span>, <span class="dv">2</span>)),</span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a>])</span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a>csv_table <span class="op">=</span> csv.read_csv(<span class="st">&quot;input.csv&quot;</span>, convert_options<span class="op">=</span>csv.ConvertOptions(</span>
+<span id="cb50-8"><a href="#cb50-8" aria-hidden="true" tabindex="-1"></a>    column_types<span class="op">=</span>schema,</span>
+<span id="cb50-9"><a href="#cb50-9" aria-hidden="true" tabindex="-1"></a>))</span></code></pre></div>
+            <h3 id="监控与诊断">10.10 监控与诊断</h3>
+            <p>生产环境中使用 Parquet 时，建议监控以下指标：</p>
+            <ol type="1">
+            <li><strong>文件大小分布</strong>：检查是否有大量小文件。</li>
+            <li><strong>行组大小分布</strong>：检查行组大小是否在合理范围内。</li>
+            <li><strong>列压缩率</strong>：识别压缩率异常低的列，考虑调整编码方式或排序策略。</li>
+            <li><strong>谓词下推命中率</strong>：检查有多少行组被统计信息过滤掉，评估数据排序和分区策略的效果。</li>
+            </ol>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> diagnose_parquet(file_path):</span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;诊断 Parquet 文件的健康状况。&quot;&quot;&quot;</span></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a>    file_size <span class="op">=</span> os.path.getsize(file_path)</span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a>    metadata <span class="op">=</span> pq.read_metadata(file_path)</span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;File: </span><span class="sc">{</span>file_path<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Size: </span><span class="sc">{</span>file_size<span class="sc">:,}</span><span class="ss"> bytes (</span><span class="sc">{</span>file_size <span class="op">/</span> <span class="dv">1024</span> <span class="op">/</span> <span class="dv">1024</span><span class="sc">:.1f}</span><span class="ss"> MB)&quot;</span>)</span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Rows: </span><span class="sc">{</span>metadata<span class="sc">.</span>num_rows<span class="sc">:,}</span><span class="ss">&quot;</span>)</span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Columns: </span><span class="sc">{</span>metadata<span class="sc">.</span>num_columns<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Row Groups: </span><span class="sc">{</span>metadata<span class="sc">.</span>num_row_groups<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Avg Row Group Size: &quot;</span></span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a>          <span class="ss">f&quot;</span><span class="sc">{</span>file_size <span class="op">/</span> metadata<span class="sc">.</span>num_row_groups <span class="op">/</span> <span class="dv">1024</span> <span class="op">/</span> <span class="dv">1024</span><span class="sc">:.1f}</span><span class="ss"> MB&quot;</span>)</span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Bytes per Row: </span><span class="sc">{</span>file_size <span class="op">/</span> metadata<span class="sc">.</span>num_rows<span class="sc">:.1f}</span><span class="ss">&quot;</span>)</span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>()</span>
+<span id="cb51-18"><a href="#cb51-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-19"><a href="#cb51-19" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 检查小行组</span></span>
+<span id="cb51-20"><a href="#cb51-20" aria-hidden="true" tabindex="-1"></a>    small_rg_count <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb51-21"><a href="#cb51-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(metadata.num_row_groups):</span>
+<span id="cb51-22"><a href="#cb51-22" aria-hidden="true" tabindex="-1"></a>        rg <span class="op">=</span> metadata.row_group(i)</span>
+<span id="cb51-23"><a href="#cb51-23" aria-hidden="true" tabindex="-1"></a>        rg_size_mb <span class="op">=</span> rg.total_byte_size <span class="op">/</span> <span class="dv">1024</span> <span class="op">/</span> <span class="dv">1024</span></span>
+<span id="cb51-24"><a href="#cb51-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> rg_size_mb <span class="op">&lt;</span> <span class="dv">10</span>:</span>
+<span id="cb51-25"><a href="#cb51-25" aria-hidden="true" tabindex="-1"></a>            small_rg_count <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="cb51-26"><a href="#cb51-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-27"><a href="#cb51-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> small_rg_count <span class="op">&gt;</span> <span class="dv">0</span>:</span>
+<span id="cb51-28"><a href="#cb51-28" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;[WARN] </span><span class="sc">{</span>small_rg_count<span class="sc">}</span><span class="ss"> row groups smaller than 10MB&quot;</span>)</span>
+<span id="cb51-29"><a href="#cb51-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-30"><a href="#cb51-30" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 检查列压缩率</span></span>
+<span id="cb51-31"><a href="#cb51-31" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="ch">\n</span><span class="sc">{</span><span class="st">&#39;Column&#39;</span><span class="sc">:&lt;30}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;Compression&#39;</span><span class="sc">:&gt;12}</span><span class="ss"> </span><span class="sc">{</span><span class="st">&#39;Ratio&#39;</span><span class="sc">:&gt;8}</span><span class="ss">&quot;</span>)</span>
+<span id="cb51-32"><a href="#cb51-32" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;-&quot;</span> <span class="op">*</span> <span class="dv">54</span>)</span>
+<span id="cb51-33"><a href="#cb51-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> j <span class="kw">in</span> <span class="bu">range</span>(metadata.num_columns):</span>
+<span id="cb51-34"><a href="#cb51-34" aria-hidden="true" tabindex="-1"></a>        total_comp <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb51-35"><a href="#cb51-35" aria-hidden="true" tabindex="-1"></a>        total_uncomp <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb51-36"><a href="#cb51-36" aria-hidden="true" tabindex="-1"></a>        col_name <span class="op">=</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb51-37"><a href="#cb51-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(metadata.num_row_groups):</span>
+<span id="cb51-38"><a href="#cb51-38" aria-hidden="true" tabindex="-1"></a>            col <span class="op">=</span> metadata.row_group(i).column(j)</span>
+<span id="cb51-39"><a href="#cb51-39" aria-hidden="true" tabindex="-1"></a>            col_name <span class="op">=</span> col.path_in_schema</span>
+<span id="cb51-40"><a href="#cb51-40" aria-hidden="true" tabindex="-1"></a>            total_comp <span class="op">+=</span> col.total_compressed_size</span>
+<span id="cb51-41"><a href="#cb51-41" aria-hidden="true" tabindex="-1"></a>            total_uncomp <span class="op">+=</span> col.total_uncompressed_size</span>
+<span id="cb51-42"><a href="#cb51-42" aria-hidden="true" tabindex="-1"></a>        ratio <span class="op">=</span> total_comp <span class="op">/</span> total_uncomp <span class="cf">if</span> total_uncomp <span class="op">&gt;</span> <span class="dv">0</span> <span class="cf">else</span> <span class="dv">0</span></span>
+<span id="cb51-43"><a href="#cb51-43" aria-hidden="true" tabindex="-1"></a>        flag <span class="op">=</span> <span class="st">&quot; [!]&quot;</span> <span class="cf">if</span> ratio <span class="op">&gt;</span> <span class="fl">0.9</span> <span class="cf">else</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb51-44"><a href="#cb51-44" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>col_name<span class="sc">:&lt;30}</span><span class="ss"> </span><span class="sc">{</span>col<span class="sc">.</span>compression<span class="sc">:&gt;12}</span><span class="ss"> </span><span class="sc">{</span>ratio<span class="sc">:&gt;7.1%}{</span>flag<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb51-45"><a href="#cb51-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-46"><a href="#cb51-46" aria-hidden="true" tabindex="-1"></a>diagnose_parquet(<span class="st">&quot;output.parquet&quot;</span>)</span></code></pre></div>
+            <p>输出中 <code>[!]</code> 标记的列压缩率高于
+            90%（接近不可压缩），可能需要关注。常见原因包括：数据本身随机性高（如
+            UUID、哈希值）、已经是压缩过的二进制数据、或者编码方式不匹配。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="论文">论文</h3>
+            <ol type="1">
+            <li><p>S. Melnik, A. Gubarev, J. J. Long, G. Romer, S.
+            Shivakumar, M. Tolton, T. Vassilakis. “Dremel: Interactive
+            Analysis of Web-Scale Datasets.” <em>VLDB</em>, 2010.
+            Parquet 嵌套编码方案的理论基础。</p></li>
+            <li><p>D. Lemire, L. Boytsov. “Decoding billions of integers
+            in milliseconds through vectorized bit packing.”
+            <em>Software: Practice and Experience</em>, 2015. Delta
+            Binary Packing 编码的参考实现。</p></li>
+            </ol>
+            <h3 id="规范与源码">规范与源码</h3>
+            <ol start="3" type="1">
+            <li><p>Apache Parquet Format 规范。<a
+            href="https://github.com/apache/parquet-format"
+            class="uri">https://github.com/apache/parquet-format</a>.
+            版本参考：2.10。</p></li>
+            <li><p>Apache Parquet Java 实现。<a
+            href="https://github.com/apache/parquet-java"
+            class="uri">https://github.com/apache/parquet-java</a>.
+            版本参考：1.14.x。</p></li>
+            <li><p>Apache Arrow（含 parquet-cpp）。<a
+            href="https://github.com/apache/arrow"
+            class="uri">https://github.com/apache/arrow</a>. PyArrow
+            的底层实现。</p></li>
+            </ol>
+            <h3 id="文档">文档</h3>
+            <ol start="6" type="1">
+            <li><p>PyArrow Parquet 文档。<a
+            href="https://arrow.apache.org/docs/python/parquet.html"
+            class="uri">https://arrow.apache.org/docs/python/parquet.html</a>.
+            Python API 参考。</p></li>
+            <li><p>Spark Parquet 数据源文档。<a
+            href="https://spark.apache.org/docs/latest/sql-data-sources-parquet.html"
+            class="uri">https://spark.apache.org/docs/latest/sql-data-sources-parquet.html</a>.
+            Spark 中的 Parquet 配置项。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../35-columnar-storage/columnar-storage.html">列式存储原理</a>
+            <strong>下一篇</strong>: <a
+            href="../37-arrow/arrow.html">Arrow 内存格式</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/02-parquet-format/02-parquet-format.html">【数据湖与开放表格式】Parquet 文件格式深拆</a></h3>
+                    <p>拆 Parquet 的物理结构：file → row group → column chunk → page，footer 里的 FileMetaData（Thrift）与 PAR1 magic。讲清 PLAIN/RLE-bitpacking/字典/DELTA_BINARY_PACKED/BYTE_STREAM_SPLIT 各自压谁，Dremel 的 repetition/definition level 如何表达嵌套，column index/offset index 与 split-block bloom filter 怎样让谓词在读盘前裁掉 page。基于本机 pyarrow 24.0.0 真实 dump footer 与编码。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/03-orc-format/03-orc-format.html">【数据湖与开放表格式】ORC 文件格式与 Parquet 对照</a></h3>
+                    <p>ORC 用 stripe 而非 row group、用三级统计（file/stripe/row-group index）而非独立 page index、用 PRESENT/DATA 等 stream 而非 page 组织一列。本文按 ORC 规范拆其文件尾（postscript + footer）、stripe 内部结构与 RLEv2 整数编码，并用本机 pyarrow 24.0.0 把同一份 30 万行数据写成 ORC 与 Parquet，对比真实体积与物理布局，最后给出什么场景仍用 ORC。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/04-arrow-memory/04-arrow-memory.html">【数据湖与开放表格式】Apache Arrow 内存格式与零拷贝</a></h3>
+                    <p>拆解 Arrow 列式内存布局（validity bitmap + value buffer + offset buffer）、零拷贝从何而来，以及 C Data Interface、IPC、Flight 三层跨边界传递。讲清 Arrow（内存计算格式）与 Parquet（磁盘存储格式）如何分工衔接。含 pyarrow 实测 C Data Interface 同地址零拷贝。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,2161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】数据完整性：从 fsync 到端到端校验 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="从 fsync
+语义、写屏障与电源故障到静默损坏与端到端校验——建立存储栈各层丢失/损坏认知；算法选型见
+checksum 篇，ZFS 实现见 zfs-integrity 篇。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="data-integrity, fsync, checksum, dif, write-barrier, power-loss, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/12-data-integrity/data-integrity.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】数据完整性：从 fsync 到端到端校验" />
+    <meta property="og:description" content="从 fsync 语义、写屏障与电源故障到静默损坏与端到端校验——建立存储栈各层丢失/损坏认知；算法选型见 checksum 篇，ZFS 实现见 zfs-integrity 篇。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/12-data-integrity/data-integrity.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="data-integrity" />
+    <meta property="article:tag" content="fsync" />
+    <meta property="article:tag" content="checksum" />
+    <meta property="article:tag" content="dif" />
+    <meta property="article:tag" content="write-barrier" />
+    <meta property="article:tag" content="power-loss" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】数据完整性：从 fsync 到端到端校验" />
+    <meta name="twitter:description" content="从 fsync 语义、写屏障与电源故障到静默损坏与端到端校验——建立存储栈各层丢失/损坏认知；算法选型见 checksum 篇，ZFS 实现见 zfs-integrity 篇。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】数据完整性：从 fsync 到端到端校验", "description": "从 fsync 语义、写屏障与电源故障到静默损坏与端到端校验——建立存储栈各层丢失/损坏认知；算法选型见 checksum 篇，ZFS 实现见 zfs-integrity 篇。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/12-data-integrity/data-integrity.html"}, "datePublished": "2025-08-21T00:00:00+00:00", "dateModified": "2026-07-25T06:26:02+00:00", "keywords": ["data-integrity", "fsync", "checksum", "dif", "write-barrier", "power-loss"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】数据完整性：从 fsync 到端到端校验</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-21</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#data-integrity</span> <span>#fsync</span> <span>#checksum</span> <span>#dif</span> <span>#write-barrier</span> <span>#power-loss</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/data-integrity.html">#data-integrity</a><a class="chip-link" href="/tags/fsync.html">#fsync</a><a class="chip-link" href="/tags/checksum.html">#checksum</a><a class="chip-link" href="/tags/dif.html">#dif</a><a class="chip-link" href="/tags/write-barrier.html">#write-barrier</a><a class="chip-link" href="/tags/power-loss.html">#power-loss</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/11-linux-async-io/linux-async-io.html">上一篇：【存储工程】Linux 异步 I/O：从 POSIX AIO 到 io_uring</a><a class="post-series-nav__link" href="/post/storage/13-filesystem-basics/filesystem-basics.html">下一篇：【存储工程】文件系统基础：inode、目录与 VFS</a></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一数据持久化的语义"
+                id="toc-一数据持久化的语义">一、数据持久化的语义</a>
+                <ul>
+                <li><a href="#写到磁盘到底意味着什么"
+                id="toc-写到磁盘到底意味着什么">1.1
+                “写到磁盘”到底意味着什么</a></li>
+                <li><a href="#fsync-与-fdatasync"
+                id="toc-fsync-与-fdatasync">1.2 fsync 与
+                fdatasync</a></li>
+                <li><a href="#sync_file_range部分刷新控制"
+                id="toc-sync_file_range部分刷新控制">1.3
+                sync_file_range：部分刷新控制</a></li>
+                <li><a href="#同步写模式o_sync-与-o_dsync"
+                id="toc-同步写模式o_sync-与-o_dsync">1.4
+                同步写模式：O_SYNC 与 O_DSYNC</a></li>
+                <li><a href="#持久化保证汇总"
+                id="toc-持久化保证汇总">1.5 持久化保证汇总</a></li>
+                <li><a href="#一个关键的误区"
+                id="toc-一个关键的误区">1.6 一个关键的误区</a></li>
+                </ul></li>
+                <li><a href="#二磁盘写缓存write-cache的风险"
+                id="toc-二磁盘写缓存write-cache的风险">二、磁盘写缓存（Write
+                Cache）的风险</a>
+                <ul>
+                <li><a href="#写缓存的工作原理"
+                id="toc-写缓存的工作原理">2.1 写缓存的工作原理</a></li>
+                <li><a href="#hdd-写缓存" id="toc-hdd-写缓存">2.2 HDD
+                写缓存</a></li>
+                <li><a href="#ssd-写缓存" id="toc-ssd-写缓存">2.3 SSD
+                写缓存</a></li>
+                <li><a href="#nvme-易失性写缓存vwc"
+                id="toc-nvme-易失性写缓存vwc">2.4 NVMe
+                易失性写缓存（VWC）</a></li>
+                <li><a href="#raid-控制器的电池备份写缓存"
+                id="toc-raid-控制器的电池备份写缓存">2.5 RAID
+                控制器的电池备份写缓存</a></li>
+                </ul></li>
+                <li><a href="#三写屏障write-barrier与-io-顺序"
+                id="toc-三写屏障write-barrier与-io-顺序">三、写屏障（Write
+                Barrier）与 I/O 顺序</a>
+                <ul>
+                <li><a href="#为什么写入顺序至关重要"
+                id="toc-为什么写入顺序至关重要">3.1
+                为什么写入顺序至关重要</a></li>
+                <li><a href="#写屏障的历史演变"
+                id="toc-写屏障的历史演变">3.2 写屏障的历史演变</a></li>
+                <li><a href="#req_preflush-与-req_fua"
+                id="toc-req_preflush-与-req_fua">3.3 REQ_PREFLUSH 与
+                REQ_FUA</a></li>
+                <li><a href="#文件系统如何使用-flush-和-fua"
+                id="toc-文件系统如何使用-flush-和-fua">3.4
+                文件系统如何使用 Flush 和 FUA</a></li>
+                <li><a href="#对性能的影响" id="toc-对性能的影响">3.5
+                对性能的影响</a></li>
+                </ul></li>
+                <li><a href="#四fsync-的代价与优化"
+                id="toc-四fsync-的代价与优化">四、fsync 的代价与优化</a>
+                <ul>
+                <li><a href="#fsync-延迟的构成"
+                id="toc-fsync-延迟的构成">4.1 fsync 延迟的构成</a></li>
+                <li><a href="#ext4-上的-fsync-代价"
+                id="toc-ext4-上的-fsync-代价">4.2 ext4 上的 fsync
+                代价</a></li>
+                <li><a href="#xfs-上的-fsync-代价"
+                id="toc-xfs-上的-fsync-代价">4.3 XFS 上的 fsync
+                代价</a></li>
+                <li><a href="#组提交group-commit"
+                id="toc-组提交group-commit">4.4 组提交（Group
+                Commit）</a></li>
+                <li><a href="#数据库的-wal-组提交"
+                id="toc-数据库的-wal-组提交">4.5 数据库的 WAL
+                组提交</a></li>
+                <li><a href="#测量-fsync-延迟"
+                id="toc-测量-fsync-延迟">4.6 测量 fsync 延迟</a></li>
+                </ul></li>
+                <li><a href="#五电源故障场景分析"
+                id="toc-五电源故障场景分析">五、电源故障场景分析</a>
+                <ul>
+                <li><a href="#电源故障时发生了什么"
+                id="toc-电源故障时发生了什么">5.1
+                电源故障时发生了什么</a></li>
+                <li><a href="#撕裂写torn-write"
+                id="toc-撕裂写torn-write">5.2 撕裂写（Torn
+                Write）</a></li>
+                <li><a href="#元数据不一致" id="toc-元数据不一致">5.3
+                元数据不一致</a></li>
+                <li><a href="#文件系统恢复日志回放"
+                id="toc-文件系统恢复日志回放">5.4
+                文件系统恢复：日志回放</a></li>
+                <li><a href="#数据库恢复wal-回放"
+                id="toc-数据库恢复wal-回放">5.5 数据库恢复：WAL
+                回放</a></li>
+                <li><a href="#测试电源故障" id="toc-测试电源故障">5.6
+                测试电源故障</a></li>
+                <li><a href="#真实世界的电源故障研究"
+                id="toc-真实世界的电源故障研究">5.7
+                真实世界的电源故障研究</a></li>
+                </ul></li>
+                <li><a href="#六静默数据损坏silent-data-corruption"
+                id="toc-六静默数据损坏silent-data-corruption">六、静默数据损坏（Silent
+                Data Corruption）</a>
+                <ul>
+                <li><a href="#什么是静默数据损坏"
+                id="toc-什么是静默数据损坏">6.1
+                什么是静默数据损坏</a></li>
+                <li><a href="#损坏的来源" id="toc-损坏的来源">6.2
+                损坏的来源</a></li>
+                <li><a href="#研究数据口径与边界"
+                id="toc-研究数据口径与边界">6.3
+                研究数据：口径与边界</a></li>
+                <li><a href="#为什么-raid-不能防止比特腐烂"
+                id="toc-为什么-raid-不能防止比特腐烂">6.4 为什么 RAID
+                不能防止比特腐烂</a></li>
+                <li><a href="#smart-的局限" id="toc-smart-的局限">6.5
+                SMART 的局限</a></li>
+                </ul></li>
+                <li><a href="#七校验和checksum策略"
+                id="toc-七校验和checksum策略">七、校验和（Checksum）策略</a>
+                <ul>
+                <li><a href="#为什么需要校验和"
+                id="toc-为什么需要校验和">7.1 为什么需要校验和</a></li>
+                <li><a href="#常用校验和算法"
+                id="toc-常用校验和算法">7.2 常用校验和算法</a></li>
+                <li><a href="#文件系统级校验和"
+                id="toc-文件系统级校验和">7.3 文件系统级校验和</a></li>
+                <li><a href="#数据库级校验和"
+                id="toc-数据库级校验和">7.4 数据库级校验和</a></li>
+                <li><a href="#选择合适的校验和算法"
+                id="toc-选择合适的校验和算法">7.5
+                选择合适的校验和算法</a></li>
+                <li><a href="#校验和的性能开销"
+                id="toc-校验和的性能开销">7.6 校验和的性能开销</a></li>
+                </ul></li>
+                <li><a href="#八端到端数据保护"
+                id="toc-八端到端数据保护">八、端到端数据保护</a>
+                <ul>
+                <li><a href="#端到端完整性的含义"
+                id="toc-端到端完整性的含义">8.1
+                端到端完整性的含义</a></li>
+                <li><a href="#t10-pidifdix" id="toc-t10-pidifdix">8.2
+                T10-PI（DIF/DIX）</a></li>
+                <li><a href="#dif-与-dix" id="toc-dif-与-dix">8.3 DIF 与
+                DIX</a></li>
+                <li><a href="#在-linux-上启用-difdix"
+                id="toc-在-linux-上启用-difdix">8.4 在 Linux 上启用
+                DIF/DIX</a></li>
+                <li><a href="#zfs-与-btrfs-的数据完整性对比"
+                id="toc-zfs-与-btrfs-的数据完整性对比">8.5 ZFS 与 Btrfs
+                的数据完整性对比</a></li>
+                <li><a href="#raid-扫描与验证"
+                id="toc-raid-扫描与验证">8.6 RAID 扫描与验证</a></li>
+                </ul></li>
+                <li><a href="#九数据完整性验证工具"
+                id="toc-九数据完整性验证工具">九、数据完整性验证工具</a>
+                <ul>
+                <li><a href="#表面扫描badblocks"
+                id="toc-表面扫描badblocks">9.1
+                表面扫描：badblocks</a></li>
+                <li><a href="#磁盘健康监控smartctl"
+                id="toc-磁盘健康监控smartctl">9.2
+                磁盘健康监控：smartctl</a></li>
+                <li><a href="#文件系统完整性检查"
+                id="toc-文件系统完整性检查">9.3
+                文件系统完整性检查</a></li>
+                <li><a href="#数据库完整性验证"
+                id="toc-数据库完整性验证">9.4 数据库完整性验证</a></li>
+                <li><a href="#综合完整性检查脚本"
+                id="toc-综合完整性检查脚本">9.5
+                综合完整性检查脚本</a></li>
+                </ul></li>
+                <li><a href="#十数据完整性最佳实践"
+                id="toc-十数据完整性最佳实践">十、数据完整性最佳实践</a>
+                <ul>
+                <li><a href="#纵深防御defense-in-depth"
+                id="toc-纵深防御defense-in-depth">10.1 纵深防御（Defense
+                in Depth）</a></li>
+                <li><a href="#文件系统校验和配置"
+                id="toc-文件系统校验和配置">10.2
+                文件系统校验和配置</a></li>
+                <li><a href="#数据库校验和配置"
+                id="toc-数据库校验和配置">10.3 数据库校验和配置</a></li>
+                <li><a href="#ups-与写缓存策略"
+                id="toc-ups-与写缓存策略">10.4 UPS 与写缓存策略</a></li>
+                <li><a href="#定期扫描计划" id="toc-定期扫描计划">10.5
+                定期扫描计划</a></li>
+                <li><a href="#监控与告警" id="toc-监控与告警">10.6
+                监控与告警</a></li>
+                <li><a href="#备份验证" id="toc-备份验证">10.7
+                备份验证</a></li>
+                </ul></li>
+                <li><a href="#十一开放问题"
+                id="toc-十一开放问题">十一、开放问题</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#规范与内核文档"
+                id="toc-规范与内核文档">规范与内核文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#关联篇目"
+                id="toc-关联篇目">关联篇目</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <blockquote>
+            <p><strong>本篇分工（完整性三部曲）</strong></p>
+            <table>
+            <colgroup>
+            <col style="width: 50%" />
+            <col style="width: 50%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>文章</th>
+            <th>分工</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><strong>本文</strong></td>
+            <td><code>fsync</code>、写缓存、写屏障、电源故障、RAID
+            盲区——<strong>损坏何时发生</strong></td>
+            </tr>
+            <tr>
+            <td><a href="../43-checksum/checksum.html">43
+            校验和与数据完整性</a></td>
+            <td>CRC / xxHash / SHA
+            选型、端到端原则、各系统校验实现——<strong>如何检测</strong></td>
+            </tr>
+            <tr>
+            <td><a href="../17-zfs-integrity/zfs-integrity.html">17
+            ZFS：数据完整性优先的存储栈</a></td>
+            <td>Merkle 树、CoW、scrub / 自愈——<strong>标杆 FS
+            落地</strong></td>
+            </tr>
+            </tbody>
+            </table>
+            </blockquote>
+            <p>数据丢失最令人恐惧的形式不是磁盘报错——而是数据悄无声息地变了，没有任何告警，没有任何日志，直到几个月后你从备份里恢复出一堆损坏的文件，才发现”完整性”这个词从来就不是理所当然的。</p>
+            <p>一个 <code>write()</code>
+            系统调用返回成功，数据就安全了吗？不。它只是拷贝到了内核的页缓存（Page
+            Cache）里。一次 <code>fsync()</code>
+            调用完成了，数据就落盘了吗？不一定——磁盘的写缓存可能还没刷到介质上。数据写到了磁盘上，就不会变了吗？更不是——静默数据损坏（Silent
+            Data
+            Corruption）随时可能发生，而且不会被操作系统或文件系统察觉。</p>
+            <p>本文从最基础的持久化语义开始，逐层向上，分析写缓存风险、写屏障机制、fsync
+            代价、电源故障场景、静默损坏现象，最终到校验和策略和端到端数据保护方案。目标是让读者建立起”数据从应用层到磁盘介质，每一层都可能丢失或损坏”的完整认知，并给出每一层的防护手段。<strong>校验和算法对比与
+            ZFS Merkle 细节</strong>分别见 <a
+            href="../43-checksum/checksum.html">43 checksum</a> 与 <a
+            href="../17-zfs-integrity/zfs-integrity.html">17
+            ZFS</a>。</p>
+            <hr />
+            <h2 id="一数据持久化的语义">一、数据持久化的语义</h2>
+            <h3 id="写到磁盘到底意味着什么">1.1
+            “写到磁盘”到底意味着什么</h3>
+            <p>应用程序调用 <code>write()</code>
+            写入数据时，实际发生的事情和大多数人的直觉相差甚远。理解持久化的完整语义链，是讨论数据完整性的前提。</p>
+            <p>一次写操作在 Linux 上经历以下路径：</p>
+            <pre class="text"><code>应用程序 write()
+    │
+    ▼
+内核页缓存（Page Cache）     ← write() 在此返回
+    │
+    ▼
+块设备层（Block Layer）
+    │
+    ▼
+磁盘控制器写缓存（Disk Write Cache）
+    │
+    ▼
+持久化介质（磁盘盘片 / NAND Flash）  ← 数据真正持久化</code></pre>
+            <p><code>write()</code>
+            系统调用的语义是：将数据从用户空间缓冲区拷贝到内核的页缓存中。一旦拷贝完成，<code>write()</code>
+            就返回成功。此时数据仅存在于易失性的 DRAM
+            中，如果系统崩溃或断电，数据就丢失了。</p>
+            <h3 id="fsync-与-fdatasync">1.2 fsync 与 fdatasync</h3>
+            <p><code>fsync()</code> 是 POSIX
+            标准定义的持久化接口，其语义是：将文件描述符关联的所有脏数据和元数据（Metadata）刷新到持久化存储设备上，并等待设备确认写入完成后才返回。</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co">// fsync：刷新文件数据 + 全部元数据</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fsync<span class="op">(</span><span class="dt">int</span> fd<span class="op">);</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">// fdatasync：刷新文件数据 + 必要元数据（跳过访问时间等）</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fdatasync<span class="op">(</span><span class="dt">int</span> fd<span class="op">);</span></span></code></pre></div>
+            <p>两者的区别在于元数据的范围：</p>
+            <table>
+            <colgroup>
+            <col style="width: 6%" />
+            <col style="width: 11%" />
+            <col style="width: 14%" />
+            <col style="width: 21%" />
+            <col style="width: 21%" />
+            <col style="width: 24%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>接口</th>
+            <th>刷新数据</th>
+            <th>文件大小变化</th>
+            <th>修改时间（mtime）</th>
+            <th>访问时间（atime）</th>
+            <th>inode 修改时间（ctime）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>fsync()</code></td>
+            <td>是</td>
+            <td>是</td>
+            <td>是</td>
+            <td>是</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td><code>fdatasync()</code></td>
+            <td>是</td>
+            <td>是</td>
+            <td>否（如果大小未变）</td>
+            <td>否</td>
+            <td>否（如果大小未变）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>fdatasync()</code>
+            的优势在于：当文件大小没有变化时（例如数据库在预分配的文件中覆盖写），它可以跳过
+            inode 的元数据更新，减少一次日志（Journal）提交。在 ext4
+            文件系统上，这意味着少一次日志屏障操作，延迟可以减少 30% 到
+            50%。</p>
+            <p>本节讲的是 <code>fsync()</code>
+            返回成功时的语义。它返回失败时反而更危险：脏页会被标记
+            clean、数据被丢弃，重试 <code>fsync()</code>
+            还会假报成功——详见 <a
+            href="../../linux/fsync-error-truth/fsync-error-truth.html">fsync
+            失败的真相：当它返回错误，你的数据可能已经没了</a>。</p>
+            <h3 id="sync_file_range部分刷新控制">1.3
+            sync_file_range：部分刷新控制</h3>
+            <p><code>sync_file_range()</code>
+            提供了更细粒度的控制，允许只刷新文件的一个字节范围，且不保证元数据被刷新：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sync_file_range<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> off64_t offset<span class="op">,</span> off64_t nbytes<span class="op">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>                    <span class="dt">unsigned</span> <span class="dt">int</span> flags<span class="op">);</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co">// flags 组合：</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co">// SYNC_FILE_RANGE_WAIT_BEFORE  等待已提交的写回完成</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co">// SYNC_FILE_RANGE_WRITE        发起写回请求</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="co">// SYNC_FILE_RANGE_WAIT_AFTER   等待写回完成</span></span></code></pre></div>
+            <p>典型用法是数据库在写预写日志（Write-Ahead
+            Log，WAL）时，先用 <code>sync_file_range()</code>
+            异步发起写回，然后在 <code>commit</code> 时再调用
+            <code>fdatasync()</code> 确保持久化。这种两阶段方式可以将
+            fsync 的延迟隐藏在事务处理的过程中。</p>
+            <p>PostgreSQL 从 9.5 版本开始采用这一策略，在
+            <code>XLogWrite</code> 函数中先调用
+            <code>sync_file_range(SYNC_FILE_RANGE_WRITE)</code>
+            发起异步写回，然后在 <code>XLogFlush</code> 中调用
+            <code>fdatasync()</code> 完成持久化。</p>
+            <h3 id="同步写模式o_sync-与-o_dsync">1.4 同步写模式：O_SYNC
+            与 O_DSYNC</h3>
+            <p>除了事后调用
+            <code>fsync()</code>，还可以在打开文件时指定同步写标志：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// O_SYNC：每次 write() 都等价于 write() + fsync()</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;data.db&quot;</span><span class="op">,</span> O_WRONLY <span class="op">|</span> O_SYNC<span class="op">);</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">// O_DSYNC：每次 write() 都等价于 write() + fdatasync()</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;data.db&quot;</span><span class="op">,</span> O_WRONLY <span class="op">|</span> O_DSYNC<span class="op">);</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co">// O_DIRECT | O_DSYNC：绕过页缓存 + 同步刷盘</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;data.db&quot;</span><span class="op">,</span> O_WRONLY <span class="op">|</span> O_DIRECT <span class="op">|</span> O_DSYNC<span class="op">);</span></span></code></pre></div>
+            <p><code>O_SYNC</code> 和 <code>O_DSYNC</code> 的区别与
+            <code>fsync()</code> 和 <code>fdatasync()</code>
+            的区别完全对应。使用 <code>O_DSYNC</code> 而非
+            <code>O_SYNC</code>
+            可以在大多数场景下获得更好的性能，因为每次写入不需要更新完整的
+            inode 元数据。</p>
+            <h3 id="持久化保证汇总">1.5 持久化保证汇总</h3>
+            <p>把上面的接口放在一起比较：</p>
+            <table>
+            <colgroup>
+            <col style="width: 21%" />
+            <col style="width: 18%" />
+            <col style="width: 21%" />
+            <col style="width: 10%" />
+            <col style="width: 28%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>接口 / 标志</th>
+            <th>数据持久化</th>
+            <th>元数据持久化</th>
+            <th>粒度</th>
+            <th>典型延迟（NVMe）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>write()</code></td>
+            <td>否</td>
+            <td>否</td>
+            <td>不适用</td>
+            <td>~1-5 us</td>
+            </tr>
+            <tr>
+            <td><code>sync_file_range(WRITE)</code></td>
+            <td>发起写回，不等待</td>
+            <td>否</td>
+            <td>字节范围</td>
+            <td>~1-5 us</td>
+            </tr>
+            <tr>
+            <td><code>fdatasync()</code></td>
+            <td>是</td>
+            <td>部分</td>
+            <td>整个文件</td>
+            <td>~20-100 us</td>
+            </tr>
+            <tr>
+            <td><code>fsync()</code></td>
+            <td>是</td>
+            <td>是</td>
+            <td>整个文件</td>
+            <td>~30-150 us</td>
+            </tr>
+            <tr>
+            <td><code>O_DSYNC</code></td>
+            <td>是（每次写）</td>
+            <td>部分（每次写）</td>
+            <td>每次 write</td>
+            <td>~20-100 us</td>
+            </tr>
+            <tr>
+            <td><code>O_SYNC</code></td>
+            <td>是（每次写）</td>
+            <td>是（每次写）</td>
+            <td>每次 write</td>
+            <td>~30-150 us</td>
+            </tr>
+            <tr>
+            <td><code>O_DIRECT + O_DSYNC</code></td>
+            <td>是（绕过缓存）</td>
+            <td>部分</td>
+            <td>每次 write</td>
+            <td>~10-50 us</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>注意：上表中的延迟数据是典型 NVMe SSD
+            上的量级估算，具体数值取决于设备型号、队列深度、文件系统类型等因素。</p>
+            <h3 id="一个关键的误区">1.6 一个关键的误区</h3>
+            <p>许多程序员认为 <code>fsync()</code>
+            返回成功就意味着数据一定安全了。但这个假设依赖于两个前提：</p>
+            <ol type="1">
+            <li>磁盘的写缓存（Write Cache）必须是断电安全的（Power-Loss
+            Protected），或者已被禁用；</li>
+            <li><code>fsync()</code>
+            的实现必须正确——而历史上，一些文件系统和内核版本的
+            <code>fsync()</code> 实现存在缺陷。</li>
+            </ol>
+            <p>第一个问题我们在下一节详细讨论。第二个问题，最著名的案例是
+            PostgreSQL 在 2018 年发现的”fsync 错误处理问题”：当
+            <code>fsync()</code> 因为底层 I/O 错误而失败时，Linux
+            内核会清除页面的脏标志（dirty
+            flag）。这意味着如果应用程序重试
+            <code>fsync()</code>，第二次调用会返回成功——因为页面已经不再是脏的了——但数据实际上并没有被持久化。这个问题在
+            Linux 4.13 及之前的内核中存在，在 5.x 系列中通过
+            <code>errseq_t</code> 机制得到了修复。</p>
+            <hr />
+            <h2 id="二磁盘写缓存write-cache的风险">二、磁盘写缓存（Write
+            Cache）的风险</h2>
+            <h3 id="写缓存的工作原理">2.1 写缓存的工作原理</h3>
+            <p>几乎所有现代存储设备都内置了写缓存（Write
+            Cache），也称为写回缓存（Write-Back
+            Cache）。其目的是吸收突发的写入请求，通过合并和重排序（Reordering）来提高写入性能。</p>
+            <p>对于 HDD（Hard Disk
+            Drive，机械硬盘），写缓存通常是磁盘控制器上的一块
+            DRAM，容量从 8 MB 到 256 MB 不等。写入请求先进入 DRAM
+            缓存，控制器向主机报告”写入完成”，然后在后台按照磁头的优化路径将数据写入磁盘盘片。</p>
+            <p>问题在于：DRAM 是易失性存储器。如果在数据从 DRAM
+            写入盘片之前发生断电，缓存中的数据就永久丢失了。</p>
+            <h3 id="hdd-写缓存">2.2 HDD 写缓存</h3>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 HDD 写缓存状态</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> hdparm <span class="at">-W</span> /dev/sda</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">/dev/sda:</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a> <span class="ex">write-caching</span> =  1 <span class="er">(</span><span class="ex">on</span><span class="kw">)</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用写缓存</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> hdparm <span class="at">-W</span> 0 /dev/sda</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用写缓存</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> hdparm <span class="at">-W</span> 1 /dev/sda</span></code></pre></div>
+            <p>大多数企业级 HDD
+            出厂时写缓存默认开启。禁用写缓存后，随机写 IOPS
+            会显著下降（因为每次写入都要等待磁头寻道和盘片旋转），但数据安全性得到保证。</p>
+            <p>实际工程中，数据库服务器上通常不需要禁用 HDD
+            写缓存——前提是有 RAID 控制器（RAID
+            Controller）带电池备份单元（Battery Backup Unit，BBU）。BBU
+            在断电后可以维持 RAID
+            控制器缓存中的数据数十小时，直到电源恢复后再将缓存内容刷入磁盘。</p>
+            <h3 id="ssd-写缓存">2.3 SSD 写缓存</h3>
+            <p>固态硬盘（Solid State
+            Drive，SSD）的写缓存情况更为复杂。SSD 控制器通常使用 DRAM
+            作为写缓存，但企业级 SSD
+            普遍配备了电容器（Capacitor）作为断电保护（Power-Loss
+            Protection，PLP）。当检测到电源中断时，电容器提供的电能足以将
+            DRAM 缓存中的数据刷入 NAND Flash。</p>
+            <pre class="text"><code>SSD 写缓存架构：
+
+消费级 SSD：
+  主机 → SSD DRAM 缓存（无断电保护）→ NAND Flash
+  风险：断电丢失缓存中的数据
+
+企业级 SSD：
+  主机 → SSD DRAM 缓存（电容断电保护）→ NAND Flash
+  断电时：电容供电 → DRAM 内容刷入 NAND Flash
+  风险：极低（电容失效、容量退化除外）</code></pre>
+            <p>判断一块 SSD
+            是否具备断电保护能力，不能只看产品定位。需要查看设备规格书中的
+            PLP 特性，或者通过 NVMe 标识信息确认：</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 NVMe SSD 的 Volatile Write Cache 特性</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nvme id-ctrl /dev/nvme0 <span class="kw">|</span> <span class="fu">grep</span> vwc</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">vwc</span>     : 1</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="co"># vwc=1 表示存在易失性写缓存</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 但这不意味着没有断电保护——PLP 是额外的硬件特性</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 需要查看设备规格书确认</span></span></code></pre></div>
+            <h3 id="nvme-易失性写缓存vwc">2.4 NVMe
+            易失性写缓存（VWC）</h3>
+            <p>NVMe（Non-Volatile Memory
+            Express）规范定义了易失性写缓存（Volatile Write
+            Cache，VWC）特性位。当 VWC
+            被启用时，设备可以在写入请求的数据到达非易失性介质之前就向主机报告完成。</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 VWC 状态</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nvme get-feature /dev/nvme0 <span class="at">-f</span> 0x06</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">get-feature:0x06</span> <span class="er">(</span><span class="ex">Volatile</span> Write Cache<span class="kw">)</span><span class="ex">,</span> Current value:0x00000001</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 值为 1 表示 VWC 已启用</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 值为 0 表示 VWC 已禁用或设备不支持 VWC</span></span></code></pre></div>
+            <p>当主机发送 Flush 命令时（对应用户空间的
+            <code>fsync()</code>），NVMe
+            设备会将易失性写缓存中的所有数据刷入非易失性介质，然后才报告
+            Flush 完成。因此，只要 <code>fsync()</code> 路径正确地向
+            NVMe 设备发送了 Flush 命令，即使 VWC
+            开启，数据持久化语义仍然是正确的。</p>
+            <h3 id="raid-控制器的电池备份写缓存">2.5 RAID
+            控制器的电池备份写缓存</h3>
+            <p>在企业级存储部署中，RAID
+            控制器通常配备了电池备份写缓存（Battery-Backed Write
+            Cache，BBWC）或闪存备份写缓存（Flash-Backed Write
+            Cache，FBWC）。</p>
+            <pre class="text"><code>BBWC 工作流程：
+  1. 主机发送写入请求
+  2. RAID 控制器将数据写入 DRAM 缓存
+  3. 控制器向主机报告&quot;写入完成&quot;
+  4. 控制器在后台将数据从缓存写入磁盘
+  5. 如果断电：电池维持 DRAM 数据（通常 48-72 小时）
+  6. 电源恢复后：控制器将缓存数据刷入磁盘
+
+FBWC 工作流程：
+  1-4 同上
+  5. 如果断电：控制器利用超级电容将 DRAM 数据拷贝到板载 Flash
+  6. 电源恢复后：从 Flash 恢复缓存数据，再写入磁盘</code></pre>
+            <p>FBWC 比 BBWC
+            更可靠，因为超级电容器（Supercapacitor）的寿命远长于锂电池，且不存在电池老化导致备份时间缩短的问题。</p>
+            <p>当 RAID
+            控制器的电池电量不足或电池失效时，控制器会自动切换到写通模式（Write-Through
+            Mode），此时每次写入都必须等待数据写入磁盘后才返回。这会导致写性能骤降。监控
+            RAID 控制器的电池状态是运维的基本要求：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查 MegaRAID 控制器电池状态</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> megacli <span class="at">-AdpBbuCmd</span> <span class="at">-GetBbuStatus</span> <span class="at">-aALL</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查 HP Smart Array 控制器缓存状态</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ssacli ctrl slot=0 show status</span></code></pre></div>
+            <hr />
+            <h2 id="三写屏障write-barrier与-io-顺序">三、写屏障（Write
+            Barrier）与 I/O 顺序</h2>
+            <h3 id="为什么写入顺序至关重要">3.1
+            为什么写入顺序至关重要</h3>
+            <p>日志式文件系统（Journaling
+            Filesystem）的正确性依赖于严格的写入顺序：先将事务写入日志区域，然后写屏障确保日志落盘，最后才将数据写入实际位置。如果写入顺序被打乱——例如磁盘的写缓存重排了请求——崩溃恢复时可能出现日志和数据不一致的情况。</p>
+            <p>考虑 ext4 文件系统在日志模式（Journal
+            Mode）下的典型写入序列：</p>
+            <pre class="text"><code>正确的写入顺序：
+  1. 写入日志描述符块（Journal Descriptor Block）
+  2. 写入日志数据块（Journal Data Blocks）
+  3. 屏障（Barrier）—— 确保 1、2 已落盘
+  4. 写入日志提交块（Journal Commit Block）
+  5. 屏障（Barrier）—— 确保 4 已落盘
+  6. 将数据从日志区域拷贝到实际位置（Checkpoint）
+
+如果步骤 3 的屏障缺失：
+  - 提交块可能先于数据块到达磁盘
+  - 此时断电，日志显示事务已提交
+  - 但日志中的数据块是旧的或未写入的
+  - 恢复时会把损坏的数据写入文件 → 静默损坏</code></pre>
+            <h3 id="写屏障的历史演变">3.2 写屏障的历史演变</h3>
+            <p>Linux 内核中的写屏障（Write
+            Barrier）经历了几次重大变化：</p>
+            <p><strong>2.6.x 时代</strong>：内核使用
+            <code>WRITE_BARRIER</code> 标志。一个带屏障的 I/O
+            请求会触发三个步骤：刷新磁盘写缓存（Cache
+            Flush）、写入数据、再次刷新缓存。这种方式简单但昂贵，因为每个屏障都会刷新整个磁盘缓存。</p>
+            <p><strong>3.x 时代</strong>：内核移除了旧的
+            <code>WRITE_BARRIER</code> 机制，替换为更精细的
+            <code>REQ_PREFLUSH</code> 和 <code>REQ_FUA</code>
+            标志。这一变更由 Christoph Hellwig 在 2011 年完成（内核
+            2.6.37 起开始引入，3.x 中完全替代）。</p>
+            <h3 id="req_preflush-与-req_fua">3.3 REQ_PREFLUSH 与
+            REQ_FUA</h3>
+            <p>现代 Linux 内核使用两个标志来控制写入的持久化顺序：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// REQ_PREFLUSH：在执行本次写入之前，先刷新设备的写缓存</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 确保在本次写入之前提交的所有写入都已持久化</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">// REQ_FUA：Force Unit Access</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co">// 要求本次写入的数据直接写入持久化介质，绕过设备的写缓存</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 组合使用示例（内核代码）：</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>bio<span class="op">-&gt;</span>bi_opf <span class="op">=</span> REQ_OP_WRITE <span class="op">|</span> REQ_PREFLUSH <span class="op">|</span> REQ_FUA<span class="op">;</span></span></code></pre></div>
+            <p>两者的区别：</p>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 22%" />
+            <col style="width: 22%" />
+            <col style="width: 33%" />
+            <col style="width: 22%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>标志</th>
+            <th>作用</th>
+            <th>影响范围</th>
+            <th>代价</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>REQ_PREFLUSH</code></td>
+            <td>执行写入前刷新设备缓存</td>
+            <td>所有已提交的写入</td>
+            <td>高（刷整个缓存）</td>
+            </tr>
+            <tr>
+            <td><code>REQ_FUA</code></td>
+            <td>本次写入直接落盘</td>
+            <td>仅本次写入</td>
+            <td>低（一次写入）</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="文件系统如何使用-flush-和-fua">3.4 文件系统如何使用
+            Flush 和 FUA</h3>
+            <p><strong>ext4</strong> 在提交日志事务时的策略：</p>
+            <pre class="text"><code>ext4 日志提交流程（jbd2）：
+  1. 写入日志描述符块和数据块
+  2. 发送 REQ_PREFLUSH（刷新设备缓存，确保数据块已落盘）
+  3. 写入提交块，带 REQ_FUA 标志（提交块直接落盘）
+
+这样：
+  - 步骤 2 保证了数据块在提交块之前到达介质
+  - 步骤 3 保证了提交块本身不会滞留在设备缓存中
+  - 崩溃恢复时：如果提交块存在，数据块一定完整</code></pre>
+            <p><strong>XFS</strong> 的日志提交策略类似，但 XFS
+            的日志（Log）结构与 ext4 的 jbd2 不同。XFS
+            使用循环日志缓冲区，通过 <code>xlog_sync()</code>
+            函数提交日志记录：</p>
+            <pre class="text"><code>XFS 日志提交：
+  1. 将日志记录写入 In-Core Log Buffer
+  2. 当缓冲区满或 fsync 触发：写入磁盘上的日志区域
+  3. 写入 Commit Record，带 REQ_PREFLUSH | REQ_FUA
+  4. 通知等待的 fsync 调用者：事务已提交</code></pre>
+            <h3 id="对性能的影响">3.5 对性能的影响</h3>
+            <p>缓存刷新操作的代价因设备类型而异：</p>
+            <pre class="text"><code>Flush 操作的典型延迟：
+
+HDD（7200 RPM）：
+  - Cache Flush：2-10 ms（取决于缓存中脏数据量）
+  - 这意味着每秒最多 100-500 次 Flush 操作
+
+SATA SSD：
+  - Cache Flush：0.1-1 ms
+  - FUA 通常不被 SATA 协议支持，退化为 Flush
+
+NVMe SSD：
+  - Cache Flush：10-100 us
+  - FUA：几乎无额外开销（硬件原生支持）</code></pre>
+            <p>NVMe 设备上 FUA 的高效性是其相对于 SATA
+            设备的一个重要优势。SATA 协议虽然定义了 FUA 位，但大多数
+            SATA 设备不支持它，内核会将 FUA
+            请求退化为一个普通写入加一次完整的缓存刷新。</p>
+            <p>可以通过查看内核日志确认设备对 Flush 和 FUA
+            的支持情况：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看块设备的 Flush/FUA 支持</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dmesg</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> <span class="st">&quot;write cache\|flush\|fua&quot;</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 典型输出示例：</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="co"># sd 0:0:0:0: [sda] Write cache: enabled, read cache: enabled, supports DPO and FUA</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="co"># nvme nvme0: 16/0/0 default/read/poll queues</span></span></code></pre></div>
+            <hr />
+            <h2 id="四fsync-的代价与优化">四、fsync 的代价与优化</h2>
+            <h3 id="fsync-延迟的构成">4.1 fsync 延迟的构成</h3>
+            <p>一次 <code>fsync()</code>
+            调用的延迟可以分解为以下几个部分：</p>
+            <pre class="text"><code>fsync() 延迟分解：
+
+1. 页缓存写回延迟
+   └─ 将脏页提交到块设备层的队列
+   └─ 如果脏页数量多，可能需要多次 I/O
+
+2. 文件系统日志提交延迟
+   └─ ext4：jbd2 日志提交（描述符 + 数据 + 提交块）
+   └─ XFS：日志强制刷新（log force）
+   └─ 包含 Flush + FUA 操作
+
+3. 设备写入延迟
+   └─ 数据和日志实际写入持久化介质的时间
+   └─ HDD：受寻道和旋转延迟影响
+   └─ SSD：受 NAND 编程延迟和垃圾回收影响
+
+4. 设备缓存刷新延迟
+   └─ Flush 命令导致设备刷新内部写缓存</code></pre>
+            <h3 id="ext4-上的-fsync-代价">4.2 ext4 上的 fsync 代价</h3>
+            <p>ext4 的日志系统 jbd2 在处理 <code>fsync()</code>
+            时，需要提交一个完整的日志事务。即使只修改了一个字节的文件数据，也至少需要写入：</p>
+            <ul>
+            <li>一个日志描述符块（32 字节有效数据，占一个块）</li>
+            <li>修改的文件数据块</li>
+            <li>修改的 inode 块（如果文件大小改变了）</li>
+            <li>一个日志提交块</li>
+            </ul>
+            <p>加上两次磁盘缓存刷新（提交前一次，提交后一次），一次
+            <code>fsync()</code> 至少需要 2 次 Flush + 若干次写入。</p>
+            <p>更严重的问题是：jbd2
+            使用的是全局日志。同一个文件系统上所有文件的
+            <code>fsync()</code>
+            共享同一个日志事务。这意味着如果两个不相关的文件同时调用
+            <code>fsync()</code>，它们的日志操作会被序列化。</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 用 strace 测量 fsync 延迟</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-e</span> trace=fsync <span class="at">-T</span> <span class="at">-p</span> <span class="va">$(</span><span class="fu">pidof</span> postgres<span class="va">)</span> <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-20</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co"># -T 显示每个系统调用的耗时</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="co"># fsync(34)                               = 0 &lt;0.000127&gt;</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="co"># fsync(34)                               = 0 &lt;0.000089&gt;</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="co"># fsync(34)                               = 0 &lt;0.002341&gt;  ← 异常值</span></span></code></pre></div>
+            <h3 id="xfs-上的-fsync-代价">4.3 XFS 上的 fsync 代价</h3>
+            <p>XFS 的日志提交（Log Force）比 ext4 的 jbd2
+            更高效，原因有两个：</p>
+            <ol type="1">
+            <li>XFS 使用延迟分配（Delayed
+            Allocation），减少了不必要的元数据日志操作；</li>
+            <li>XFS 的日志是真正的循环缓冲区，日志写入的粒度更细。</li>
+            </ol>
+            <p>但 XFS 的 <code>fsync()</code>
+            有一个特殊行为：它不仅会强制刷新当前文件的日志记录，还会刷新所有在该日志记录之前的日志记录。这是因为日志的有序性要求——不能只持久化后面的记录而跳过前面的。</p>
+            <h3 id="组提交group-commit">4.4 组提交（Group Commit）</h3>
+            <p>组提交（Group Commit）是优化 <code>fsync()</code>
+            性能最有效的技术之一。其核心思想是：多个并发的
+            <code>fsync()</code>
+            请求共享同一次日志提交和磁盘刷新操作。</p>
+            <pre class="text"><code>无组提交（串行 fsync）：
+  事务1 → fsync → Flush → 写日志 → Flush → 完成
+  事务2 → fsync → Flush → 写日志 → Flush → 完成
+  事务3 → fsync → Flush → 写日志 → Flush → 完成
+  总计：6 次 Flush
+
+有组提交：
+  事务1 ─┐
+  事务2 ─┤→ 合并 → Flush → 写日志(1+2+3) → Flush → 全部完成
+  事务3 ─┘
+  总计：2 次 Flush</code></pre>
+            <h3 id="数据库的-wal-组提交">4.5 数据库的 WAL 组提交</h3>
+            <p>数据库的预写日志（Write-Ahead Log，WAL）是
+            <code>fsync()</code> 最密集的使用场景。以 PostgreSQL
+            为例，WAL 组提交的实现：</p>
+            <pre class="text"><code>PostgreSQL WAL 组提交流程：
+
+1. 事务 A 完成，需要持久化 WAL
+2. 事务 A 获取 WAL 写入锁，成为 Leader
+3. 在等待锁期间，事务 B、C 也完成了
+4. Leader A 将 A、B、C 的 WAL 记录一起写入
+5. Leader A 调用一次 fdatasync()
+6. A、B、C 同时收到&quot;持久化完成&quot;的通知
+
+配置参数：
+  commit_delay = 10        # 微秒，等待更多事务加入
+  commit_siblings = 5      # 至少有这么多活跃事务时才等待</code></pre>
+            <p>MySQL/InnoDB 的组提交实现更为复杂，分为三个阶段：</p>
+            <pre class="text"><code>MySQL InnoDB 组提交：
+
+Flush 阶段：将 redo log 从 log buffer 写入操作系统缓存
+Sync 阶段：调用 fsync() 将 redo log 持久化
+Commit 阶段：写入 binlog 并提交事务
+
+每个阶段都有一个队列和一个 Leader：
+  - Leader 负责处理整个队列的操作
+  - 其他事务等待 Leader 完成
+
+参数：
+  innodb_flush_log_at_trx_commit = 1  # 每次提交都 fsync
+  sync_binlog = 1                      # 每次提交都同步 binlog</code></pre>
+            <h3 id="测量-fsync-延迟">4.6 测量 fsync 延迟</h3>
+            <p>在生产环境中监控 fsync
+            延迟是容量规划和故障排查的基础：</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法一：使用 perf 追踪 fsync 延迟分布</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> perf trace <span class="at">-e</span> fsync <span class="at">-p</span> <span class="va">$(</span><span class="fu">pidof</span> postgres<span class="va">)</span> <span class="at">--duration</span> 10000 <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">awk</span> <span class="st">&#39;/fsync/ {print $NF}&#39;</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-n</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-20</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法二：使用 bpftrace 统计 fsync 延迟直方图</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> bpftrace <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_enter_fsync { @start[tid] = nsecs; }</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_exit_fsync /@ start[tid]/ {</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a><span class="st">    @usecs = hist((nsecs - @start[tid]) / 1000);</span></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a><span class="st">    delete(@start[tid]);</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a><span class="st">&#39;</span> <span class="at">-c</span> <span class="st">&#39;sleep 10&#39;</span></span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-14"><a href="#cb22-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法三：简单的 fsync 延迟基准测试</span></span>
+<span id="cb22-15"><a href="#cb22-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 fio 测量</span></span>
+<span id="cb22-16"><a href="#cb22-16" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>fsync-test <span class="dt">\</span></span>
+<span id="cb22-17"><a href="#cb22-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">--filename</span><span class="op">=</span>testfile <span class="dt">\</span></span>
+<span id="cb22-18"><a href="#cb22-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>1G <span class="dt">\</span></span>
+<span id="cb22-19"><a href="#cb22-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">--bs</span><span class="op">=</span>4k <span class="dt">\</span></span>
+<span id="cb22-20"><a href="#cb22-20" aria-hidden="true" tabindex="-1"></a>    <span class="at">--rw</span><span class="op">=</span>randwrite <span class="dt">\</span></span>
+<span id="cb22-21"><a href="#cb22-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">--fsync</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb22-22"><a href="#cb22-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">--ioengine</span><span class="op">=</span>sync <span class="dt">\</span></span>
+<span id="cb22-23"><a href="#cb22-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">--runtime</span><span class="op">=</span>30 <span class="dt">\</span></span>
+<span id="cb22-24"><a href="#cb22-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">--time_based</span></span>
+<span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注输出中的 fsync/fdatasync/sync_file_range 延迟：</span></span>
+<span id="cb22-27"><a href="#cb22-27" aria-hidden="true" tabindex="-1"></a><span class="co">#   fsync/fdatasync/sync_file_range:</span></span>
+<span id="cb22-28"><a href="#cb22-28" aria-hidden="true" tabindex="-1"></a><span class="co">#     sync (usec): min=18, max=4523, avg=67.21, stdev=42.15</span></span></code></pre></div>
+            <hr />
+            <h2 id="五电源故障场景分析">五、电源故障场景分析</h2>
+            <h3 id="电源故障时发生了什么">5.1 电源故障时发生了什么</h3>
+            <p>断电是数据完整性面临的最严峻考验。从存储栈的各层来看，断电时会有以下影响：</p>
+            <pre class="text"><code>电源故障时各层的状态：
+
+应用层：
+  └─ 进程被立即终止，无清理机会
+  └─ 未调用 fsync 的数据：全部丢失
+
+页缓存层：
+  └─ 所有脏页（Dirty Pages）：全部丢失
+  └─ 这包括已 write() 但未 fsync() 的数据
+
+块设备层：
+  └─ I/O 调度队列中的请求：全部丢失
+
+磁盘写缓存：
+  └─ 无断电保护：数据丢失
+  └─ 有断电保护（PLP/BBU）：数据保留
+
+持久化介质：
+  └─ 已到达介质的数据：保留
+  └─ 但正在写入的数据可能出现&quot;撕裂写&quot;</code></pre>
+            <h3 id="撕裂写torn-write">5.2 撕裂写（Torn Write）</h3>
+            <p>撕裂写（Torn
+            Write）是指一次写操作只有部分数据到达了持久化介质。这通常发生在写操作被断电中断时。</p>
+            <p>对于
+            HDD，一个扇区（Sector）的写入是否原子取决于磁头在断电瞬间的位置。传统的
+            512 字节扇区写入通常被认为是原子的，但 4K
+            扇区的原子性取决于具体设备。</p>
+            <p>对于 SSD，NAND Flash
+            的编程操作以页（Page）为单位，典型大小为 4KB 或 16KB。一次
+            Flash 编程操作的原子性由 SSD
+            控制器保证，但跨页的写入不是原子的。</p>
+            <pre class="text"><code>撕裂写示例：
+
+应用写入 8KB 数据（两个 4KB 页）：
+  Page 1: [AAAA AAAA AAAA AAAA]  → 写入成功
+  Page 2: [BBBB BBBB BBBB BBBB]  → 断电，写入中断
+
+断电后磁盘上的状态：
+  Page 1: [AAAA AAAA AAAA AAAA]  ← 新数据
+  Page 2: [xxxx xxxx xxxx xxxx]  ← 旧数据或部分新数据
+
+如果这 8KB 是一个数据库页（Database Page）：
+  → 页的前半部分是新数据，后半部分是旧数据
+  → 校验和（Checksum）不匹配 → 检测到损坏
+  → 但如果没有校验和 → 静默损坏</code></pre>
+            <p>数据库通过以下策略防止撕裂写：</p>
+            <ol type="1">
+            <li><strong>双写缓冲（Doublewrite Buffer）</strong>：InnoDB
+            在写入数据页之前，先将页的副本写入一个连续的区域。恢复时如果检测到撕裂写，从双写缓冲区恢复完整的页。</li>
+            <li><strong>全页写入（Full Page Write）</strong>：PostgreSQL
+            在 WAL 检查点后第一次修改某个页时，将整个页的内容写入
+            WAL。恢复时用完整的页覆盖可能被撕裂的页。</li>
+            </ol>
+            <h3 id="元数据不一致">5.3 元数据不一致</h3>
+            <p>即使没有撕裂写，写入重排序也可能导致元数据不一致。最典型的场景是：</p>
+            <pre class="text"><code>场景：向文件追加数据
+
+正确顺序：
+  1. 分配新数据块
+  2. 写入数据
+  3. 更新 inode 的文件大小和块指针
+  4. fsync
+
+如果步骤 3 先于步骤 2 到达磁盘：
+  - 断电后：inode 指向一个已分配但未写入数据的块
+  - 读取该文件会得到旧数据或零
+  - 文件系统认为文件是完整的（元数据一致）
+  - 但数据是错误的 → 静默损坏</code></pre>
+            <p>ext4 在 <code>data=ordered</code>
+            模式下（默认模式）通过强制数据先于元数据写入来防止这种情况。但
+            <code>data=writeback</code> 模式下不提供这种保证——所以
+            <code>data=writeback</code>
+            虽然性能更高，但在断电场景下有数据损坏的风险。</p>
+            <h3 id="文件系统恢复日志回放">5.4
+            文件系统恢复：日志回放</h3>
+            <p>日志式文件系统通过日志回放（Journal
+            Replay）从崩溃中恢复：</p>
+            <pre class="text"><code>ext4 日志恢复流程：
+
+1. 挂载时检测到 Dirty Flag（上次未正常卸载）
+2. 扫描日志区域，查找已提交的事务
+   └─ 事务有完整的提交块 → 有效事务
+   └─ 事务没有提交块 → 不完整，丢弃
+3. 回放有效事务：
+   └─ 将日志中的数据块拷贝到实际位置
+4. 清除日志
+5. 正常挂载
+
+恢复时间取决于日志大小和未完成的事务数量。
+对于默认 128 MB 的日志，恢复通常在几秒内完成。</code></pre>
+            <h3 id="数据库恢复wal-回放">5.5 数据库恢复：WAL 回放</h3>
+            <p>数据库的恢复机制类似于文件系统的日志恢复，但在应用层面实现：</p>
+            <pre class="text"><code>PostgreSQL 崩溃恢复：
+
+1. 找到最近的检查点（Checkpoint）位置
+2. 从该位置开始顺序读取 WAL 记录
+3. 对每条 WAL 记录：
+   a. 检查对应的数据页是否需要重做
+   b. 如果页的 LSN &lt; WAL 记录的 LSN → 需要重做
+   c. 应用 WAL 记录到数据页
+4. 直到所有 WAL 记录处理完毕
+5. 进入正常运行模式
+
+关键依赖：
+  - WAL 文件必须完整（至少到最后一个已提交事务）
+  - 数据页即使被撕裂写损坏，也能通过 WAL 中的全页写入恢复
+  - 但 WAL 本身如果被撕裂写损坏：
+    - 如果是最后一条记录：视为未提交，丢弃
+    - 如果是中间记录：恢复失败，需要从备份恢复</code></pre>
+            <h3 id="测试电源故障">5.6 测试电源故障</h3>
+            <p>在开发和测试阶段模拟电源故障场景：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法一：使用 dm-flakey 模拟 I/O 故障</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建一个会随机丢失写入的设备映射</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置 dm-flakey：正常运行 30 秒，然后丢弃所有写入 5 秒</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;0 </span><span class="va">$(</span><span class="ex">blockdev</span> <span class="at">--getsz</span> /dev/sdb<span class="va">)</span><span class="st"> flakey /dev/sdb 0 30 5&quot;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> dmsetup create flakey-test</span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法二：使用 dm-flakey 只丢弃写入（保持读取正常）</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;0 </span><span class="va">$(</span><span class="ex">blockdev</span> <span class="at">--getsz</span> /dev/sdb<span class="va">)</span><span class="st"> flakey /dev/sdb 0 30 5 1 drop_writes&quot;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a>  <span class="fu">sudo</span> dmsetup create flakey-test</span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法三：使用 libeatmydata 完全禁用 fsync</span></span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a><span class="co"># （仅用于测试，了解应用在无 fsync 保护下的行为）</span></span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a><span class="va">LD_PRELOAD</span><span class="op">=</span>libeatmydata.so <span class="ex">./my_application</span></span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-16"><a href="#cb28-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 清理 dm-flakey 设备</span></span>
+<span id="cb28-17"><a href="#cb28-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dmsetup remove flakey-test</span></code></pre></div>
+            <p>更系统化的电源故障测试方法是使用专用的测试框架，例如
+            Jepsen 项目使用的方法：通过 IPMI 或 PDU（Power Distribution
+            Unit，电力分配单元）控制物理断电，然后检查数据库在恢复后数据是否一致。</p>
+            <h3 id="真实世界的电源故障研究">5.7
+            真实世界的电源故障研究</h3>
+            <p>2013 年，来自威斯康星大学麦迪逊分校（University of
+            Wisconsin-Madison）的研究团队发表了一项系统性的文件系统崩溃一致性研究。他们开发了一个名为
+            BOB（Block Order Breaker）的工具，系统地测试了
+            ext2、ext3、ext4、Btrfs、XFS 和 ReiserFS
+            在各种崩溃场景下的行为。</p>
+            <p>主要发现包括：</p>
+            <ul>
+            <li>ext4 在 <code>data=ordered</code>
+            模式下表现最稳定，但在特定的日志满（Journal
+            Full）场景下仍有问题；</li>
+            <li>Btrfs
+            由于采用写时复制（Copy-on-Write，COW）策略，在大多数场景下表现良好，但在快照相关操作中发现了问题；</li>
+            <li>所有被测试的文件系统都至少存在一个可能导致数据不一致的崩溃场景。</li>
+            </ul>
+            <p>这一研究表明：完全依赖文件系统来保证数据完整性是不够的。应用层（特别是数据库）需要自己的持久化策略和一致性验证机制。</p>
+            <hr />
+            <h2
+            id="六静默数据损坏silent-data-corruption">六、静默数据损坏（Silent
+            Data Corruption）</h2>
+            <h3 id="什么是静默数据损坏">6.1 什么是静默数据损坏</h3>
+            <p>静默数据损坏（Silent Data Corruption，也称
+            SDC）是指存储介质上的数据在没有任何错误报告的情况下发生了改变。与磁盘故障（I/O
+            错误）不同，SDC
+            不会触发任何告警——操作系统和文件系统认为数据是正常的，但读出的内容已经不是当初写入的了。</p>
+            <p>这类损坏也被称为”比特腐烂”（Bit
+            Rot），因为数据仿佛在”腐烂”——随时间推移悄无声息地改变。</p>
+            <h3 id="损坏的来源">6.2 损坏的来源</h3>
+            <p>静默数据损坏的来源多种多样：</p>
+            <pre class="text"><code>硬件层面：
+  1. 宇宙射线（Cosmic Rays）引起的位翻转（Bit Flip）
+     └─ DRAM 中的单粒子翻转事件（Single-Event Upset，SEU）
+     └─ ECC 内存可以纠正单比特错误，检测双比特错误
+     └─ 但如果数据在非 ECC 的路径上被损坏，ECC 无法保护
+
+  2. 磁盘固件缺陷（Firmware Bug）
+     └─ 固件在读取或写入时引入错误
+     └─ 某些固件版本的特定操作序列触发数据损坏
+     └─ 这是真实存在的问题，不是理论风险
+
+  3. 线缆和连接器问题
+     └─ SATA/SAS 线缆信号退化
+     └─ 连接器接触不良导致传输错误
+     └─ SATA 的 CRC 校验可以检测传输错误
+     └─ 但如果 CRC 本身被绕过（某些控制器缺陷），错误会传播
+
+  4. 控制器缺陷
+     └─ RAID 控制器在奇偶校验（Parity）计算中引入错误
+     └─ HBA（Host Bus Adapter）的 DMA 传输错误
+     └─ SSD 控制器的 ECC 解码错误
+
+软件层面：
+  5. 内核错误
+     └─ 页缓存管理缺陷导致错误的页被写入磁盘
+     └─ 块设备层的请求合并错误
+
+  6. 文件系统缺陷
+     └─ 块分配错误导致两个文件指向同一个数据块
+     └─ 日志回放逻辑错误</code></pre>
+            <h3 id="研究数据口径与边界">6.3 研究数据：口径与边界</h3>
+            <p>静默损坏的<strong>发生率</strong>高度依赖测量方法：是在读路径上做主动
+            checksum、依赖 FS 内置校验，还是等应用发现逻辑错误。以下只列
+            FAST / SIGMETRICS 等 A
+            级论文中可核对的表述，<strong>不合成「通用年化 SDC
+            率」</strong>。</p>
+            <p><strong>CERN 文件样本（Bairavasundaram et al., FAST
+            2008）</strong>：</p>
+            <p>论文报告 CERN 对约 <strong>300
+            万</strong>文件的校验扫描中，约 <strong>0.33%</strong>
+            出现校验和不匹配。样本为特定磁带/磁盘混合栈与校验策略，<strong>不能</strong>直接外推为「任意集群每盘每年
+            N 次 SDC」。</p>
+            <p><strong>NetApp 磁盘级统计（同上 FAST
+            2008）</strong>：</p>
+            <p>在约 <strong>150 万块</strong>磁盘、<strong>41
+            个月</strong>观测、<strong>主动校验和比对</strong>前提下，论文给出近线
+            SATA 与光纤通道盘上的不匹配频率（例如近线 SATA 约
+            <strong>每万盘每年 3000 次</strong>量级——见原文 Table /
+            正文，随接口与批次变化）。这是<strong>检测到的</strong>
+            mismatch，含 misdirected write、lost write
+            等类型，不等于「无校验条件下 OS 无感知的 bit rot 率」。</p>
+            <p><strong>Google DRAM（Schroeder, Pinheiro &amp; Weber,
+            SIGMETRICS 2009）</strong>：</p>
+            <p>约 <strong>8%</strong> DIMM
+            在年内至少一次<strong>可纠正</strong>内存错误；与磁盘 SDC
+            无直接换算关系。</p>
+            <p><strong>不宜引用的说法</strong>：把磁盘 AFR（Schroeder
+            &amp; Gibson, FAST 2007）百分比当作 SDC
+            率、或混用不同论文的「每 PB
+            读取一次错误」与「每盘每年」——口径不同，见 <a
+            href="../43-checksum/checksum.html">43 checksum §1.2</a> 与
+            §〇 开放问题。</p>
+            <p>共同结论仍是：<strong>大规模存储必须把 SDC
+            当作常态风险</strong>，而非极端边缘事件；检测手段见下一节与
+            <a href="../43-checksum/checksum.html">43 checksum</a>。</p>
+            <h3 id="为什么-raid-不能防止比特腐烂">6.4 为什么 RAID
+            不能防止比特腐烂</h3>
+            <p>传统 RAID
+            通过冗余（镜像或奇偶校验）来防止磁盘故障导致的数据丢失，但它对静默数据损坏的防护能力非常有限：</p>
+            <pre class="text"><code>RAID 对静默损坏的局限：
+
+RAID 1（镜像）：
+  - 两块盘的数据不一致时：RAID 无法判断哪个是正确的
+  - RAID 控制器通常选择主盘的数据 → 可能返回损坏的数据
+  - 除非有校验和来验证哪个副本是正确的
+
+RAID 5/6（奇偶校验）：
+  - 正常读取只读一块盘，不验证奇偶校验
+  - 只有在磁盘故障需要重建时才使用奇偶校验
+  - 如果一块盘有静默损坏，正常读取时不会被发现
+  - 如果另一块盘故障需要重建，损坏的数据会被用来计算 → 重建出错误的数据
+
+RAID 扫描（Scrubbing）：
+  - 后台读取所有数据并验证奇偶校验一致性
+  - 可以发现奇偶校验不一致的情况
+  - 但同样无法判断是数据盘错误还是奇偶校验盘错误
+  - 通常假设奇偶校验正确 → 可能&quot;修复&quot;出错误的数据</code></pre>
+            <h3 id="smart-的局限">6.5 SMART 的局限</h3>
+            <p>自监测分析和报告技术（Self-Monitoring, Analysis and
+            Reporting
+            Technology，SMART）可以报告磁盘的健康状态，包括重分配扇区数（Reallocated
+            Sector Count）、待重映射扇区数（Current Pending Sector
+            Count）等。但 SMART 无法检测静默数据损坏——因为 SMART
+            关注的是磁盘的物理健康状况（磁头定位、电机转速、温度等），而不是数据内容的正确性。</p>
+            <p>一个 SMART
+            报告完全健康的磁盘，仍然可能存在静默数据损坏。SMART
+            能做的最多是预警磁盘即将故障，给你时间做数据迁移——但对已经发生的静默损坏无能为力。</p>
+            <hr />
+            <h2
+            id="七校验和checksum策略">七、校验和（Checksum）策略</h2>
+            <h3 id="为什么需要校验和">7.1 为什么需要校验和</h3>
+            <p>前面的分析表明，从 DRAM
+            到磁盘的每一环都可能引入错误，而操作系统和文件系统的默认行为不会检测这些错误。校验和（Checksum）是检测数据损坏的最基本手段：在写入时计算数据的校验和并存储，在读取时重新计算并比较。如果不匹配，说明数据已被损坏。</p>
+            <p>算法对比、性能表与 Fletcher / xxHash / SHA 选型见
+            <strong><a href="../43-checksum/checksum.html">43
+            校验和与数据完整性</a></strong>；本节只保留与持久化路径相关的
+            FS / DB 落点。</p>
+            <h3 id="常用校验和算法">7.2 常用校验和算法</h3>
+            <pre class="text"><code>算法对比：
+
+CRC32C（Castagnoli CRC-32）：
+  - 输出：32 位
+  - 特点：多项式优化，对突发错误检测能力强
+  - 性能：~20 GB/s（使用 SSE 4.2 硬件指令）
+  - 使用者：Btrfs、ext4 元数据、iSCSI、PostgreSQL
+
+xxHash（xxHash64 / XXH3）：
+  - 输出：64 位 / 128 位
+  - 特点：极高的计算速度，良好的分布性
+  - 性能：~30-60 GB/s（取决于实现和数据长度）
+  - 使用者：Linux 内核（某些子系统）、LZ4 帧格式
+
+SHA-256：
+  - 输出：256 位
+  - 特点：密码学安全，碰撞率极低
+  - 性能：~0.5-1 GB/s（软件实现）/ ~5 GB/s（SHA-NI 硬件加速）
+  - 使用者：ZFS（可选）、Git、内容寻址存储
+
+Fletcher 校验和：
+  - 输出：可变（常用 Fletcher-4）
+  - 特点：计算简单，中等错误检测能力
+  - 性能：~10-20 GB/s
+  - 使用者：ZFS（默认校验和算法）</code></pre>
+            <h3 id="文件系统级校验和">7.3 文件系统级校验和</h3>
+            <p><strong>Btrfs</strong>
+            对每个数据块和元数据块都计算校验和，并将校验和存储在独立的校验和树（Checksum
+            Tree）中：</p>
+            <pre class="text"><code>Btrfs 校验和架构：
+
+数据块：
+  [数据块 0] → CRC32C → 存入校验和树
+  [数据块 1] → CRC32C → 存入校验和树
+  ...
+
+元数据块：
+  [B-tree 节点] → CRC32C → 存储在节点头部
+
+读取时：
+  1. 从磁盘读取数据块
+  2. 从校验和树读取期望的校验和
+  3. 对数据块计算实际校验和
+  4. 比较：匹配则返回数据，不匹配则报错
+  5. 如果有冗余副本（RAID 1/10），尝试从副本读取
+
+支持的算法（Linux 5.5+）：
+  - CRC32C（默认）
+  - xxHash64
+  - SHA-256
+  - BLAKE2b-256</code></pre>
+            <p><strong>ZFS</strong> 的校验和机制更为全面。ZFS 使用
+            Merkle 树（Merkle
+            Tree）结构：每个数据块的校验和存储在其父元数据块中，父元数据块的校验和又存储在更上层的元数据中，一直到超级块（Uberblock）。完整
+            blkptr 布局、算法表与 scrub 见 <strong><a
+            href="../17-zfs-integrity/zfs-integrity.html">17 ZFS
+            §3</a></strong> 与 <strong><a
+            href="../43-checksum/checksum.html">43 checksum
+            §8.1</a></strong>。</p>
+            <h3 id="数据库级校验和">7.4 数据库级校验和</h3>
+            <p><strong>PostgreSQL</strong> 从 9.3
+            版本开始支持页校验和（Page Checksum）。启用后，每个 8KB
+            数据页的头部会存储一个 16
+            位的校验和。每次读取数据页时，后台进程会验证校验和：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL 初始化集群时启用页校验和</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="ex">initdb</span> <span class="at">--data-checksums</span> <span class="at">-D</span> /var/lib/postgresql/data</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 对已有集群启用（需要停机）</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_checksums</span> <span class="at">--enable</span> <span class="at">-D</span> /var/lib/postgresql/data</span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查校验和是否已启用</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_controldata</span> /var/lib/postgresql/data <span class="kw">|</span> <span class="fu">grep</span> checksum</span>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb33-11"><a href="#cb33-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Data page checksum version:           1</span></span></code></pre></div>
+            <p><strong>InnoDB</strong>（MySQL 的默认存储引擎）对每个
+            16KB 数据页计算校验和，默认使用 CRC32 算法：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 InnoDB 校验和算法</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;innodb_checksum_algorithm&#39;</span>;</span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可选值：</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- crc32（默认，推荐）</span></span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- strict_crc32（仅接受 crc32 校验和）</span></span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- innodb（旧版算法，兼容 MySQL 5.5 之前版本）</span></span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- none（禁用校验和——危险！）</span></span></code></pre></div>
+            <h3 id="选择合适的校验和算法">7.5 选择合适的校验和算法</h3>
+            <pre class="text"><code>决策指南：
+
+场景                     推荐算法        原因
+─────────────────────────────────────────────────
+文件系统数据块            CRC32C         硬件加速，检测能力强
+数据库页                  CRC32C         同上
+网络传输校验              CRC32C         iSCSI/NVMe-oF 标准
+内容寻址存储              SHA-256        抗碰撞要求高
+去重系统                  SHA-256/BLAKE2 需要密码学安全
+快速数据校验（非安全场景） xxHash         极高性能
+ZFS 默认                  Fletcher-4     历史原因，平衡性能和检测能力</code></pre>
+            <h3 id="校验和的性能开销">7.6 校验和的性能开销</h3>
+            <p>校验和计算的 CPU 开销通常远小于 I/O
+            开销，但在高吞吐场景下仍然值得关注：</p>
+            <pre class="text"><code>校验和开销估算（单核，现代 x86 CPU）：
+
+算法       吞吐量          每 4KB 块耗时    占 NVMe 读取延迟比例
+─────────────────────────────────────────────────────────────
+CRC32C     ~20 GB/s       ~0.2 us          ~2%
+xxHash64   ~30 GB/s       ~0.13 us         ~1.3%
+SHA-256    ~1 GB/s        ~4 us            ~40%（过高）
+BLAKE2b    ~3 GB/s        ~1.3 us          ~13%
+
+结论：
+  - CRC32C 和 xxHash 的开销可忽略
+  - SHA-256 仅在需要密码学安全时使用
+  - 在 NVMe 高 IOPS 场景下，校验和计算可能成为 CPU 瓶颈
+  - 可以使用 SIMD 或多线程来分摊校验和计算</code></pre>
+            <hr />
+            <h2 id="八端到端数据保护">八、端到端数据保护</h2>
+            <h3 id="端到端完整性的含义">8.1 端到端完整性的含义</h3>
+            <p>端到端数据保护（End-to-End Data
+            Protection）的目标是：从数据在应用层生成的那一刻起，到数据被持久化到存储介质上，再到数据被读回应用层——在整个路径上的任何一个环节发生的数据损坏都能被检测到。</p>
+            <pre class="text"><code>数据保护的覆盖范围：
+
+传统方案（仅磁盘 ECC）：
+  应用 → 内核 → [HBA] → [线缆] → 磁盘控制器 → [ECC] → 介质
+                  ↑        ↑          ↑
+               无保护    无保护     无保护
+
+端到端方案（应用层校验和 + DIF）：
+  应用 → [校验和] → 内核 → [DIF] → HBA → [DIF] → 磁盘 → 介质
+    ↑                        ↑               ↑          ↑
+  应用校验               块层验证        传输验证     介质 ECC
+
+完整方案（ZFS/Btrfs + 应用校验和）：
+  应用 → [应用校验和] → 文件系统 → [块校验和] → 设备 → 介质
+    ↑                       ↑                      ↑
+  应用层验证             文件系统验证            设备层验证</code></pre>
+            <h3 id="t10-pidifdix">8.2 T10-PI（DIF/DIX）</h3>
+            <p>T10 保护信息（T10 Protection Information，T10-PI）是 SCSI
+            标准定义的端到端数据保护机制。它为每个逻辑扇区附加一个 8
+            字节的保护信息元组（Protection Information Tuple）：</p>
+            <pre class="text"><code>T10-PI 保护信息格式（每扇区 8 字节）：
+
++------------------+------------------+------------------+
+|  Guard Tag (2B)  |  App Tag (2B)    |  Ref Tag (4B)    |
++------------------+------------------+------------------+
+
+Guard Tag（保护标签）：
+  - 数据的 CRC16 校验和
+  - 用于检测数据传输过程中的比特翻转
+
+Application Tag（应用标签）：
+  - 由应用程序定义的标签
+  - 用于逻辑分区或标记
+
+Reference Tag（引用标签）：
+  - 通常设置为逻辑块地址（LBA）
+  - 用于检测&quot;写入错误位置&quot;（Misdirected Write）</code></pre>
+            <p>T10-PI 定义了三种保护类型：</p>
+            <pre class="text"><code>Type 1：Guard + App + Ref（Ref = LBA）
+  - 最严格，检测比特翻转和写入错误位置
+  - Reference Tag 与逻辑块地址绑定
+
+Type 2：Guard + App + Ref（Ref = 初始值 + 偏移）
+  - 类似 Type 1，但 Ref Tag 使用初始值加偏移量
+  - 支持非连续 LBA 的保护
+
+Type 3：Guard + App（Ref 不使用）
+  - 只检测比特翻转，不检测写入错误位置
+  - 灵活性最高</code></pre>
+            <h3 id="dif-与-dix">8.3 DIF 与 DIX</h3>
+            <p>数据完整性字段（Data Integrity
+            Field，DIF）和数据完整性扩展（Data Integrity
+            Extension，DIX）是 T10-PI 在 Linux 上的实现：</p>
+            <pre class="text"><code>DIF（Data Integrity Field）：
+  - 保护信息由 HBA 或磁盘控制器生成和验证
+  - 保护范围：HBA → 线缆 → 磁盘控制器 → 介质
+  - 不保护：主机内存 → HBA 的路径
+
+DIX（Data Integrity Extension）：
+  - 保护信息由操作系统（块层）生成
+  - 保护范围：操作系统 → HBA → 线缆 → 磁盘控制器 → 介质
+  - 覆盖了从操作系统到介质的完整路径</code></pre>
+            <h3 id="在-linux-上启用-difdix">8.4 在 Linux 上启用
+            DIF/DIX</h3>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查磁盘是否支持 DIF</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sg_readcap <span class="at">-l</span> /dev/sda</span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看保护信息类型</span></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出中 &quot;Protection information&quot; 部分：</span></span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a><span class="co"># prot_en=1 表示支持</span></span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a><span class="co"># p_type=1 表示 Type 1</span></span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 格式化磁盘以启用 DIF（危险操作！会擦除所有数据）</span></span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Type 1 保护，保护信息在最后 8 字节</span></span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sg_format <span class="at">--format</span> <span class="at">--fmtpinfo</span><span class="op">=</span>1 /dev/sda</span>
+<span id="cb41-12"><a href="#cb41-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-13"><a href="#cb41-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查块设备的完整性元数据</span></span>
+<span id="cb41-14"><a href="#cb41-14" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/integrity/format</span>
+<span id="cb41-15"><a href="#cb41-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：T10-DIF-TYPE1-CRC</span></span>
+<span id="cb41-16"><a href="#cb41-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-17"><a href="#cb41-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看完整性配置</span></span>
+<span id="cb41-18"><a href="#cb41-18" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/integrity/read_verify</span>
+<span id="cb41-19"><a href="#cb41-19" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/integrity/write_generate</span>
+<span id="cb41-20"><a href="#cb41-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 1 = 启用，0 = 禁用</span></span></code></pre></div>
+            <p>在实际部署中，DIF/DIX 的使用率并不高。原因包括：</p>
+            <ul>
+            <li>需要 HBA 和磁盘同时支持，硬件兼容性是障碍；</li>
+            <li>每个扇区额外 8 字节的元数据会降低有效容量；</li>
+            <li>软件栈的支持不够成熟，某些文件系统和数据库不能正确处理保护信息。</li>
+            </ul>
+            <p>我认为 DIF/DIX
+            更适合对数据完整性有极端要求的场景（金融系统、医疗影像存储），对于大多数互联网应用，文件系统级和应用级的校验和已经足够。</p>
+            <h3 id="zfs-与-btrfs-的数据完整性对比">8.5 ZFS 与 Btrfs
+            的数据完整性对比</h3>
+            <pre class="text"><code>特性                    ZFS                         Btrfs
+────────────────────────────────────────────────────────────────
+校验和算法              Fletcher-4（默认）           CRC32C（默认）
+                       SHA-256（可选）               xxHash/SHA-256/BLAKE2b
+校验和粒度              每个数据块                   每个数据块
+校验和存储              父元数据块中（Merkle 树）     独立的校验和树
+写时复制                是                           是
+自修复（Self-Healing）   是（RAID-Z/Mirror）          是（RAID 1/10）
+元数据冗余              自动 3 份副本                 可配置
+快照                    是                           是
+发送/接收               是                           是
+RAID 实现               RAID-Z1/Z2/Z3               内核 RAID（有限）
+内存需求                高（ARC 缓存）               低
+稳定性                  成熟                         仍在改进
+许可证                  CDDL（不含在内核主线）        GPL（内核主线）</code></pre>
+            <p>两者在数据完整性方面的核心区别在于校验和的存储位置。ZFS
+            的 Merkle
+            树结构意味着：如果一个数据块的校验和被损坏，其父块的校验和也会不匹配，从而可以检测到校验和本身的损坏。而
+            Btrfs
+            的独立校验和树虽然也有校验和保护，但校验和树本身是一个独立的
+            B
+            树结构，理论上存在一种（概率极低的）场景：数据块和校验和同时被以一致的方式损坏。</p>
+            <h3 id="raid-扫描与验证">8.6 RAID 扫描与验证</h3>
+            <p>对于使用硬件 RAID 或 Linux 软件 RAID（md）的系统，定期的
+            RAID 扫描（Scrubbing）是检测静默数据损坏的重要手段：</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux 软件 RAID 手动触发扫描</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> check <span class="op">&gt;</span> /sys/block/md0/md/sync_action</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看扫描进度</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/mdstat</span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看发现的不一致块数</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/md0/md/mismatch_cnt</span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-10"><a href="#cb43-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 自动定期扫描（大多数发行版默认每周日执行）</span></span>
+<span id="cb43-11"><a href="#cb43-11" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /etc/cron.d/mdadm</span>
+<span id="cb43-12"><a href="#cb43-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-13"><a href="#cb43-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 对于 ZFS</span></span>
+<span id="cb43-14"><a href="#cb43-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> zpool scrub tank</span>
+<span id="cb43-15"><a href="#cb43-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-16"><a href="#cb43-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 ZFS scrub 状态</span></span>
+<span id="cb43-17"><a href="#cb43-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> zpool status tank</span>
+<span id="cb43-18"><a href="#cb43-18" aria-hidden="true" tabindex="-1"></a><span class="co">#   scan: scrub in progress since Mon Aug 21 02:00:01 2025</span></span>
+<span id="cb43-19"><a href="#cb43-19" aria-hidden="true" tabindex="-1"></a><span class="co">#     256G scanned at 1.02G/s, 128G issued at 512M/s</span></span>
+<span id="cb43-20"><a href="#cb43-20" aria-hidden="true" tabindex="-1"></a><span class="co">#     0 repaired, 50.00% done</span></span>
+<span id="cb43-21"><a href="#cb43-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-22"><a href="#cb43-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 对于 Btrfs</span></span>
+<span id="cb43-23"><a href="#cb43-23" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs scrub start /mnt/data</span>
+<span id="cb43-24"><a href="#cb43-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-25"><a href="#cb43-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 Btrfs scrub 状态</span></span>
+<span id="cb43-26"><a href="#cb43-26" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs scrub status /mnt/data</span>
+<span id="cb43-27"><a href="#cb43-27" aria-hidden="true" tabindex="-1"></a><span class="co">#   Scrub started:    Mon Aug 21 02:00:01 2025</span></span>
+<span id="cb43-28"><a href="#cb43-28" aria-hidden="true" tabindex="-1"></a><span class="co">#   Status:           running</span></span>
+<span id="cb43-29"><a href="#cb43-29" aria-hidden="true" tabindex="-1"></a><span class="co">#   Duration:         0:05:23</span></span>
+<span id="cb43-30"><a href="#cb43-30" aria-hidden="true" tabindex="-1"></a><span class="co">#   Total to scrub:   256.00GiB</span></span>
+<span id="cb43-31"><a href="#cb43-31" aria-hidden="true" tabindex="-1"></a><span class="co">#   Bytes scrubbed:   128.00GiB</span></span>
+<span id="cb43-32"><a href="#cb43-32" aria-hidden="true" tabindex="-1"></a><span class="co">#   Errors:           0</span></span></code></pre></div>
+            <hr />
+            <h2 id="九数据完整性验证工具">九、数据完整性验证工具</h2>
+            <h3 id="表面扫描badblocks">9.1 表面扫描：badblocks</h3>
+            <p><code>badblocks</code>
+            是最基础的磁盘表面扫描工具，用于检测不可读的扇区（Bad
+            Sector）：</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 只读模式扫描（安全，不会破坏数据）</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> badblocks <span class="at">-sv</span> /dev/sdb</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 非破坏性读写测试（先读取原内容，写入测试模式，再恢复原内容）</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 警告：如果中途断电，数据会丢失</span></span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> badblocks <span class="at">-nsv</span> /dev/sdb</span>
+<span id="cb44-7"><a href="#cb44-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-8"><a href="#cb44-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 破坏性写入测试（会擦除所有数据！）</span></span>
+<span id="cb44-9"><a href="#cb44-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> badblocks <span class="at">-wsv</span> /dev/sdb</span>
+<span id="cb44-10"><a href="#cb44-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-11"><a href="#cb44-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 参数说明：</span></span>
+<span id="cb44-12"><a href="#cb44-12" aria-hidden="true" tabindex="-1"></a><span class="co"># -s 显示进度</span></span>
+<span id="cb44-13"><a href="#cb44-13" aria-hidden="true" tabindex="-1"></a><span class="co"># -v 详细输出</span></span>
+<span id="cb44-14"><a href="#cb44-14" aria-hidden="true" tabindex="-1"></a><span class="co"># -b 4096 指定块大小（默认 1024）</span></span>
+<span id="cb44-15"><a href="#cb44-15" aria-hidden="true" tabindex="-1"></a><span class="co"># -c 1024 每次测试的块数</span></span></code></pre></div>
+            <p><code>badblocks</code>
+            能检测物理层面的不可读扇区，但不能检测静默数据损坏——因为它只测试”能不能读写”，不测试”读出的内容是否正确”。</p>
+            <h3 id="磁盘健康监控smartctl">9.2
+            磁盘健康监控：smartctl</h3>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看磁盘整体健康状态</span></span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> smartctl <span class="at">-H</span> /dev/sda</span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-4"><a href="#cb45-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出关键 SMART 属性</span></span>
+<span id="cb45-5"><a href="#cb45-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> smartctl <span class="at">-A</span> /dev/sda</span>
+<span id="cb45-6"><a href="#cb45-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-7"><a href="#cb45-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注以下属性：</span></span>
+<span id="cb45-8"><a href="#cb45-8" aria-hidden="true" tabindex="-1"></a><span class="co">#   5  Reallocated_Sector_Ct    重分配扇区数（坏扇区被替换的数量）</span></span>
+<span id="cb45-9"><a href="#cb45-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 187  Reported_Uncorrect       不可纠正错误数</span></span>
+<span id="cb45-10"><a href="#cb45-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 188  Command_Timeout          命令超时次数</span></span>
+<span id="cb45-11"><a href="#cb45-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 197  Current_Pending_Sector   待重映射扇区数</span></span>
+<span id="cb45-12"><a href="#cb45-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 198  Offline_Uncorrectable    离线不可纠正扇区数</span></span>
+<span id="cb45-13"><a href="#cb45-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-14"><a href="#cb45-14" aria-hidden="true" tabindex="-1"></a><span class="co"># NVMe 磁盘的 SMART 信息</span></span>
+<span id="cb45-15"><a href="#cb45-15" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> smartctl <span class="at">-a</span> /dev/nvme0</span>
+<span id="cb45-16"><a href="#cb45-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-17"><a href="#cb45-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注：</span></span>
+<span id="cb45-18"><a href="#cb45-18" aria-hidden="true" tabindex="-1"></a><span class="co"># Critical Warning: 0x00</span></span>
+<span id="cb45-19"><a href="#cb45-19" aria-hidden="true" tabindex="-1"></a><span class="co"># Media and Data Integrity Errors: 0</span></span>
+<span id="cb45-20"><a href="#cb45-20" aria-hidden="true" tabindex="-1"></a><span class="co"># Error Information Log Entries: 0</span></span>
+<span id="cb45-21"><a href="#cb45-21" aria-hidden="true" tabindex="-1"></a><span class="co"># Warning Comp. Temperature: 70 Celsius</span></span>
+<span id="cb45-22"><a href="#cb45-22" aria-hidden="true" tabindex="-1"></a><span class="co"># Critical Comp. Temperature: 80 Celsius</span></span>
+<span id="cb45-23"><a href="#cb45-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-24"><a href="#cb45-24" aria-hidden="true" tabindex="-1"></a><span class="co"># 启动后台自检</span></span>
+<span id="cb45-25"><a href="#cb45-25" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> smartctl <span class="at">-t</span> short /dev/sda    <span class="co"># 短自检，约 2 分钟</span></span>
+<span id="cb45-26"><a href="#cb45-26" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> smartctl <span class="at">-t</span> long /dev/sda     <span class="co"># 长自检，可能数小时</span></span>
+<span id="cb45-27"><a href="#cb45-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-28"><a href="#cb45-28" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看自检结果</span></span>
+<span id="cb45-29"><a href="#cb45-29" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> smartctl <span class="at">-l</span> selftest /dev/sda</span></code></pre></div>
+            <h3 id="文件系统完整性检查">9.3 文件系统完整性检查</h3>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># ext4 文件系统检查（需要先卸载）</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /dev/sda1</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> e2fsck <span class="at">-f</span> /dev/sda1</span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a><span class="co"># XFS 在线扫描（不需要卸载，Linux 4.15+）</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> xfs_scrub /mnt/data</span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="co"># XFS 离线修复</span></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> xfs_repair /dev/sda1</span>
+<span id="cb46-10"><a href="#cb46-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-11"><a href="#cb46-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Btrfs 在线扫描</span></span>
+<span id="cb46-12"><a href="#cb46-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs scrub start /mnt/data</span>
+<span id="cb46-13"><a href="#cb46-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs scrub status /mnt/data</span>
+<span id="cb46-14"><a href="#cb46-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-15"><a href="#cb46-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Btrfs 文件系统检查（只读模式）</span></span>
+<span id="cb46-16"><a href="#cb46-16" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> btrfs check /dev/sda1</span>
+<span id="cb46-17"><a href="#cb46-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-18"><a href="#cb46-18" aria-hidden="true" tabindex="-1"></a><span class="co"># ZFS 扫描</span></span>
+<span id="cb46-19"><a href="#cb46-19" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> zpool scrub tank</span>
+<span id="cb46-20"><a href="#cb46-20" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> zpool status tank</span></code></pre></div>
+            <h3 id="数据库完整性验证">9.4 数据库完整性验证</h3>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL 页校验和验证</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法一：在线检查（需要 pg_stat_statements 或相关扩展）</span></span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 后端会在读取页时自动验证校验和</span></span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 损坏的页会记录在日志中：</span></span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a><span class="co"># </span><span class="al">WARNING</span><span class="co">: page verification failed, calculated checksum 12345</span></span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a><span class="co">#          but expected 54321</span></span>
+<span id="cb47-7"><a href="#cb47-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-8"><a href="#cb47-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法二：离线检查（需要停机）</span></span>
+<span id="cb47-9"><a href="#cb47-9" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_checksums</span> <span class="at">--check</span> <span class="at">-D</span> /var/lib/postgresql/data</span>
+<span id="cb47-10"><a href="#cb47-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-11"><a href="#cb47-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb47-12"><a href="#cb47-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Checksum scan completed</span></span>
+<span id="cb47-13"><a href="#cb47-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Data checksum version: 1</span></span>
+<span id="cb47-14"><a href="#cb47-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Files scanned:  12345</span></span>
+<span id="cb47-15"><a href="#cb47-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Blocks scanned: 678901</span></span>
+<span id="cb47-16"><a href="#cb47-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Bad checksums:  0</span></span></code></pre></div>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL/InnoDB 页校验和验证</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- innochecksum 工具（离线）</span></span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对单个表空间文件检查校验和：</span></span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- $ innochecksum /var/lib/mysql/mydb/mytable.ibd</span></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在线监控：查看校验和失败的页数</span></span>
+<span id="cb48-7"><a href="#cb48-7" aria-hidden="true" tabindex="-1"></a>SHOW STATUS <span class="kw">LIKE</span> <span class="st">&#39;Innodb_pages_read&#39;</span>;</span>
+<span id="cb48-8"><a href="#cb48-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-9"><a href="#cb48-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果怀疑有损坏，尝试全表扫描</span></span>
+<span id="cb48-10"><a href="#cb48-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 这会触发 InnoDB 读取并验证所有数据页</span></span>
+<span id="cb48-11"><a href="#cb48-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> mydb.mytable;</span>
+<span id="cb48-12"><a href="#cb48-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-13"><a href="#cb48-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果有损坏的页，错误日志中会出现：</span></span>
+<span id="cb48-14"><a href="#cb48-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- InnoDB: Database page corruption on disk or a failed</span></span>
+<span id="cb48-15"><a href="#cb48-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- file read of page [page_id]</span></span></code></pre></div>
+            <h3 id="综合完整性检查脚本">9.5 综合完整性检查脚本</h3>
+            <p>以下脚本展示了一个综合性的数据完整性检查流程的核心逻辑：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据完整性检查脚本</span></span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 用途：定期检查存储系统的数据完整性</span></span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 建议通过 cron 每周执行一次</span></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a><span class="va">LOG_FILE</span><span class="op">=</span><span class="st">&quot;/var/log/integrity-check.log&quot;</span></span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a><span class="va">ALERT_EMAIL</span><span class="op">=</span><span class="st">&quot;admin@example.com&quot;</span></span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a><span class="va">ERRORS</span><span class="op">=</span>0</span>
+<span id="cb49-11"><a href="#cb49-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-12"><a href="#cb49-12" aria-hidden="true" tabindex="-1"></a><span class="fu">log()</span> <span class="kw">{</span></span>
+<span id="cb49-13"><a href="#cb49-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">date</span> <span class="st">&#39;+%Y-%m-%d %H:%M:%S&#39;</span><span class="va">)</span><span class="st"> </span><span class="va">$1</span><span class="st">&quot;</span> <span class="op">&gt;&gt;</span> <span class="st">&quot;</span><span class="va">$LOG_FILE</span><span class="st">&quot;</span></span>
+<span id="cb49-14"><a href="#cb49-14" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb49-15"><a href="#cb49-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-16"><a href="#cb49-16" aria-hidden="true" tabindex="-1"></a><span class="fu">check_smart()</span> <span class="kw">{</span></span>
+<span id="cb49-17"><a href="#cb49-17" aria-hidden="true" tabindex="-1"></a>    <span class="bu">local</span> <span class="va">device</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$1</span><span class="st">&quot;</span></span>
+<span id="cb49-18"><a href="#cb49-18" aria-hidden="true" tabindex="-1"></a>    <span class="ex">log</span> <span class="st">&quot;检查 SMART 状态: </span><span class="va">$device</span><span class="st">&quot;</span></span>
+<span id="cb49-19"><a href="#cb49-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-20"><a href="#cb49-20" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 检查整体健康状态</span></span>
+<span id="cb49-21"><a href="#cb49-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="ot">! </span><span class="fu">sudo</span> smartctl <span class="at">-H</span> <span class="st">&quot;</span><span class="va">$device</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-q</span> <span class="st">&quot;PASSED&quot;</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-22"><a href="#cb49-22" aria-hidden="true" tabindex="-1"></a>        <span class="ex">log</span> <span class="st">&quot;警告: </span><span class="va">$device</span><span class="st"> SMART 健康检查未通过&quot;</span></span>
+<span id="cb49-23"><a href="#cb49-23" aria-hidden="true" tabindex="-1"></a>        <span class="va">ERRORS</span><span class="op">=</span><span class="va">$((ERRORS</span> <span class="op">+</span> <span class="dv">1</span><span class="va">))</span></span>
+<span id="cb49-24"><a href="#cb49-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">fi</span></span>
+<span id="cb49-25"><a href="#cb49-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-26"><a href="#cb49-26" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 检查关键属性</span></span>
+<span id="cb49-27"><a href="#cb49-27" aria-hidden="true" tabindex="-1"></a>    <span class="bu">local</span> <span class="va">reallocated</span></span>
+<span id="cb49-28"><a href="#cb49-28" aria-hidden="true" tabindex="-1"></a>    <span class="va">reallocated</span><span class="op">=</span><span class="va">$(</span><span class="fu">sudo</span> smartctl <span class="at">-A</span> <span class="st">&quot;</span><span class="va">$device</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb49-29"><a href="#cb49-29" aria-hidden="true" tabindex="-1"></a>        <span class="fu">awk</span> <span class="st">&#39;/Reallocated_Sector_Ct/ {print $10}&#39;</span><span class="va">)</span></span>
+<span id="cb49-30"><a href="#cb49-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">[</span> <span class="ot">-n</span> <span class="st">&quot;</span><span class="va">$reallocated</span><span class="st">&quot;</span> <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$reallocated</span><span class="st">&quot;</span> <span class="ot">-gt</span> 0 <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-31"><a href="#cb49-31" aria-hidden="true" tabindex="-1"></a>        <span class="ex">log</span> <span class="st">&quot;警告: </span><span class="va">$device</span><span class="st"> 有 </span><span class="va">$reallocated</span><span class="st"> 个重分配扇区&quot;</span></span>
+<span id="cb49-32"><a href="#cb49-32" aria-hidden="true" tabindex="-1"></a>        <span class="va">ERRORS</span><span class="op">=</span><span class="va">$((ERRORS</span> <span class="op">+</span> <span class="dv">1</span><span class="va">))</span></span>
+<span id="cb49-33"><a href="#cb49-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">fi</span></span>
+<span id="cb49-34"><a href="#cb49-34" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb49-35"><a href="#cb49-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-36"><a href="#cb49-36" aria-hidden="true" tabindex="-1"></a><span class="fu">check_raid()</span> <span class="kw">{</span></span>
+<span id="cb49-37"><a href="#cb49-37" aria-hidden="true" tabindex="-1"></a>    <span class="ex">log</span> <span class="st">&quot;检查 RAID 状态&quot;</span></span>
+<span id="cb49-38"><a href="#cb49-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-39"><a href="#cb49-39" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 检查 Linux 软件 RAID</span></span>
+<span id="cb49-40"><a href="#cb49-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">[</span> <span class="ot">-f</span> /proc/mdstat <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-41"><a href="#cb49-41" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 触发 RAID 扫描</span></span>
+<span id="cb49-42"><a href="#cb49-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> md <span class="kw">in</span> /sys/block/md<span class="pp">*</span>/md/sync_action<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb49-43"><a href="#cb49-43" aria-hidden="true" tabindex="-1"></a>            <span class="bu">[</span> <span class="ot">-f</span> <span class="st">&quot;</span><span class="va">$md</span><span class="st">&quot;</span> <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="bu">echo</span> check <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$md</span><span class="st">&quot;</span></span>
+<span id="cb49-44"><a href="#cb49-44" aria-hidden="true" tabindex="-1"></a>        <span class="cf">done</span></span>
+<span id="cb49-45"><a href="#cb49-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-46"><a href="#cb49-46" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 等待扫描完成</span></span>
+<span id="cb49-47"><a href="#cb49-47" aria-hidden="true" tabindex="-1"></a>        <span class="fu">sleep</span> 5</span>
+<span id="cb49-48"><a href="#cb49-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="fu">grep</span> <span class="at">-q</span> <span class="st">&quot;check&quot;</span> /sys/block/md<span class="pp">*</span>/md/sync_action <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb49-49"><a href="#cb49-49" aria-hidden="true" tabindex="-1"></a>            <span class="fu">sleep</span> 60</span>
+<span id="cb49-50"><a href="#cb49-50" aria-hidden="true" tabindex="-1"></a>        <span class="cf">done</span></span>
+<span id="cb49-51"><a href="#cb49-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-52"><a href="#cb49-52" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 检查不一致块数</span></span>
+<span id="cb49-53"><a href="#cb49-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> cnt <span class="kw">in</span> /sys/block/md<span class="pp">*</span>/md/mismatch_cnt<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb49-54"><a href="#cb49-54" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="bu">[</span> <span class="ot">-f</span> <span class="st">&quot;</span><span class="va">$cnt</span><span class="st">&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-55"><a href="#cb49-55" aria-hidden="true" tabindex="-1"></a>                <span class="bu">local</span> <span class="va">mismatches</span></span>
+<span id="cb49-56"><a href="#cb49-56" aria-hidden="true" tabindex="-1"></a>                <span class="va">mismatches</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> <span class="st">&quot;</span><span class="va">$cnt</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb49-57"><a href="#cb49-57" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$mismatches</span><span class="st">&quot;</span> <span class="ot">-gt</span> 0 <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-58"><a href="#cb49-58" aria-hidden="true" tabindex="-1"></a>                    <span class="bu">local</span> <span class="va">md_name</span></span>
+<span id="cb49-59"><a href="#cb49-59" aria-hidden="true" tabindex="-1"></a>                    <span class="va">md_name</span><span class="op">=</span><span class="va">$(</span><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$cnt</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-oP</span> <span class="st">&#39;md\d+&#39;</span><span class="va">)</span></span>
+<span id="cb49-60"><a href="#cb49-60" aria-hidden="true" tabindex="-1"></a>                    <span class="ex">log</span> <span class="st">&quot;警告: </span><span class="va">$md_name</span><span class="st"> 发现 </span><span class="va">$mismatches</span><span class="st"> 个不一致块&quot;</span></span>
+<span id="cb49-61"><a href="#cb49-61" aria-hidden="true" tabindex="-1"></a>                    <span class="va">ERRORS</span><span class="op">=</span><span class="va">$((ERRORS</span> <span class="op">+</span> <span class="dv">1</span><span class="va">))</span></span>
+<span id="cb49-62"><a href="#cb49-62" aria-hidden="true" tabindex="-1"></a>                <span class="cf">fi</span></span>
+<span id="cb49-63"><a href="#cb49-63" aria-hidden="true" tabindex="-1"></a>            <span class="cf">fi</span></span>
+<span id="cb49-64"><a href="#cb49-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">done</span></span>
+<span id="cb49-65"><a href="#cb49-65" aria-hidden="true" tabindex="-1"></a>    <span class="cf">fi</span></span>
+<span id="cb49-66"><a href="#cb49-66" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb49-67"><a href="#cb49-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-68"><a href="#cb49-68" aria-hidden="true" tabindex="-1"></a><span class="fu">check_filesystem()</span> <span class="kw">{</span></span>
+<span id="cb49-69"><a href="#cb49-69" aria-hidden="true" tabindex="-1"></a>    <span class="bu">local</span> <span class="va">mountpoint</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$1</span><span class="st">&quot;</span></span>
+<span id="cb49-70"><a href="#cb49-70" aria-hidden="true" tabindex="-1"></a>    <span class="bu">local</span> <span class="va">fstype</span></span>
+<span id="cb49-71"><a href="#cb49-71" aria-hidden="true" tabindex="-1"></a>    <span class="va">fstype</span><span class="op">=</span><span class="va">$(</span><span class="fu">df</span> <span class="at">-T</span> <span class="st">&quot;</span><span class="va">$mountpoint</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;NR==2 {print $2}&#39;</span><span class="va">)</span></span>
+<span id="cb49-72"><a href="#cb49-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-73"><a href="#cb49-73" aria-hidden="true" tabindex="-1"></a>    <span class="ex">log</span> <span class="st">&quot;检查文件系统: </span><span class="va">$mountpoint</span><span class="st"> (</span><span class="va">$fstype</span><span class="st">)&quot;</span></span>
+<span id="cb49-74"><a href="#cb49-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-75"><a href="#cb49-75" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="st">&quot;</span><span class="va">$fstype</span><span class="st">&quot;</span> <span class="kw">in</span></span>
+<span id="cb49-76"><a href="#cb49-76" aria-hidden="true" tabindex="-1"></a>        <span class="ss">btrfs</span><span class="kw">)</span></span>
+<span id="cb49-77"><a href="#cb49-77" aria-hidden="true" tabindex="-1"></a>            <span class="fu">sudo</span> btrfs scrub start <span class="at">-B</span> <span class="st">&quot;</span><span class="va">$mountpoint</span><span class="st">&quot;</span> <span class="dv">2</span><span class="op">&gt;&gt;</span> <span class="st">&quot;</span><span class="va">$LOG_FILE</span><span class="st">&quot;</span></span>
+<span id="cb49-78"><a href="#cb49-78" aria-hidden="true" tabindex="-1"></a>            <span class="bu">local</span> <span class="va">scrub_errors</span></span>
+<span id="cb49-79"><a href="#cb49-79" aria-hidden="true" tabindex="-1"></a>            <span class="va">scrub_errors</span><span class="op">=</span><span class="va">$(</span><span class="fu">sudo</span> btrfs scrub status <span class="st">&quot;</span><span class="va">$mountpoint</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb49-80"><a href="#cb49-80" aria-hidden="true" tabindex="-1"></a>                <span class="fu">grep</span> <span class="at">-oP</span> <span class="st">&#39;Error summary:\s+\K.*&#39;</span><span class="va">)</span></span>
+<span id="cb49-81"><a href="#cb49-81" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$scrub_errors</span><span class="st">&quot;</span> <span class="ot">!=</span> <span class="st">&quot;no errors found&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-82"><a href="#cb49-82" aria-hidden="true" tabindex="-1"></a>                <span class="ex">log</span> <span class="st">&quot;警告: Btrfs scrub 发现错误: </span><span class="va">$scrub_errors</span><span class="st">&quot;</span></span>
+<span id="cb49-83"><a href="#cb49-83" aria-hidden="true" tabindex="-1"></a>                <span class="va">ERRORS</span><span class="op">=</span><span class="va">$((ERRORS</span> <span class="op">+</span> <span class="dv">1</span><span class="va">))</span></span>
+<span id="cb49-84"><a href="#cb49-84" aria-hidden="true" tabindex="-1"></a>            <span class="cf">fi</span></span>
+<span id="cb49-85"><a href="#cb49-85" aria-hidden="true" tabindex="-1"></a>            <span class="cf">;;</span></span>
+<span id="cb49-86"><a href="#cb49-86" aria-hidden="true" tabindex="-1"></a>        <span class="ss">xfs</span><span class="kw">)</span></span>
+<span id="cb49-87"><a href="#cb49-87" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="bu">command</span> <span class="at">-v</span> xfs_scrub <span class="op">&amp;&gt;</span> /dev/null<span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-88"><a href="#cb49-88" aria-hidden="true" tabindex="-1"></a>                <span class="fu">sudo</span> xfs_scrub <span class="st">&quot;</span><span class="va">$mountpoint</span><span class="st">&quot;</span> <span class="dv">2</span><span class="op">&gt;&gt;</span> <span class="st">&quot;</span><span class="va">$LOG_FILE</span><span class="st">&quot;</span> <span class="kw">||</span> <span class="kw">{</span></span>
+<span id="cb49-89"><a href="#cb49-89" aria-hidden="true" tabindex="-1"></a>                    <span class="ex">log</span> <span class="st">&quot;警告: xfs_scrub 发现问题&quot;</span></span>
+<span id="cb49-90"><a href="#cb49-90" aria-hidden="true" tabindex="-1"></a>                    <span class="va">ERRORS</span><span class="op">=</span><span class="va">$((ERRORS</span> <span class="op">+</span> <span class="dv">1</span><span class="va">))</span></span>
+<span id="cb49-91"><a href="#cb49-91" aria-hidden="true" tabindex="-1"></a>                <span class="kw">}</span></span>
+<span id="cb49-92"><a href="#cb49-92" aria-hidden="true" tabindex="-1"></a>            <span class="cf">fi</span></span>
+<span id="cb49-93"><a href="#cb49-93" aria-hidden="true" tabindex="-1"></a>            <span class="cf">;;</span></span>
+<span id="cb49-94"><a href="#cb49-94" aria-hidden="true" tabindex="-1"></a>        <span class="pp">*</span><span class="kw">)</span></span>
+<span id="cb49-95"><a href="#cb49-95" aria-hidden="true" tabindex="-1"></a>            <span class="ex">log</span> <span class="st">&quot;跳过: </span><span class="va">$fstype</span><span class="st"> 不支持在线完整性检查&quot;</span></span>
+<span id="cb49-96"><a href="#cb49-96" aria-hidden="true" tabindex="-1"></a>            <span class="cf">;;</span></span>
+<span id="cb49-97"><a href="#cb49-97" aria-hidden="true" tabindex="-1"></a>    <span class="cf">esac</span></span>
+<span id="cb49-98"><a href="#cb49-98" aria-hidden="true" tabindex="-1"></a><span class="kw">}</span></span>
+<span id="cb49-99"><a href="#cb49-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-100"><a href="#cb49-100" aria-hidden="true" tabindex="-1"></a><span class="co"># 主流程</span></span>
+<span id="cb49-101"><a href="#cb49-101" aria-hidden="true" tabindex="-1"></a><span class="ex">log</span> <span class="st">&quot;=== 开始数据完整性检查 ===&quot;</span></span>
+<span id="cb49-102"><a href="#cb49-102" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-103"><a href="#cb49-103" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查所有磁盘的 SMART 状态</span></span>
+<span id="cb49-104"><a href="#cb49-104" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> dev <span class="kw">in</span> /dev/sd<span class="pp">?</span> /dev/nvme<span class="pp">?</span>n1<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb49-105"><a href="#cb49-105" aria-hidden="true" tabindex="-1"></a>    <span class="bu">[</span> <span class="ot">-b</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">&quot;</span> <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="ex">check_smart</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">&quot;</span></span>
+<span id="cb49-106"><a href="#cb49-106" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb49-107"><a href="#cb49-107" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-108"><a href="#cb49-108" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查 RAID</span></span>
+<span id="cb49-109"><a href="#cb49-109" aria-hidden="true" tabindex="-1"></a><span class="ex">check_raid</span></span>
+<span id="cb49-110"><a href="#cb49-110" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-111"><a href="#cb49-111" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查文件系统</span></span>
+<span id="cb49-112"><a href="#cb49-112" aria-hidden="true" tabindex="-1"></a><span class="ex">check_filesystem</span> <span class="st">&quot;/mnt/data&quot;</span></span>
+<span id="cb49-113"><a href="#cb49-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-114"><a href="#cb49-114" aria-hidden="true" tabindex="-1"></a><span class="co"># 汇总</span></span>
+<span id="cb49-115"><a href="#cb49-115" aria-hidden="true" tabindex="-1"></a><span class="ex">log</span> <span class="st">&quot;=== 检查完成，发现 </span><span class="va">$ERRORS</span><span class="st"> 个问题 ===&quot;</span></span>
+<span id="cb49-116"><a href="#cb49-116" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-117"><a href="#cb49-117" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$ERRORS</span><span class="st">&quot;</span> <span class="ot">-gt</span> 0 <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb49-118"><a href="#cb49-118" aria-hidden="true" tabindex="-1"></a>    <span class="ex">log</span> <span class="st">&quot;发送告警邮件到 </span><span class="va">$ALERT_EMAIL</span><span class="st">&quot;</span></span>
+<span id="cb49-119"><a href="#cb49-119" aria-hidden="true" tabindex="-1"></a>    <span class="ex">mail</span> <span class="at">-s</span> <span class="st">&quot;数据完整性告警: 发现 </span><span class="va">$ERRORS</span><span class="st"> 个问题&quot;</span> <span class="dt">\</span></span>
+<span id="cb49-120"><a href="#cb49-120" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;</span><span class="va">$ALERT_EMAIL</span><span class="st">&quot;</span> <span class="op">&lt;</span> <span class="st">&quot;</span><span class="va">$LOG_FILE</span><span class="st">&quot;</span></span>
+<span id="cb49-121"><a href="#cb49-121" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb49-122"><a href="#cb49-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-123"><a href="#cb49-123" aria-hidden="true" tabindex="-1"></a><span class="bu">exit</span> <span class="st">&quot;</span><span class="va">$ERRORS</span><span class="st">&quot;</span></span></code></pre></div>
+            <hr />
+            <h2 id="十数据完整性最佳实践">十、数据完整性最佳实践</h2>
+            <h3 id="纵深防御defense-in-depth">10.1 纵深防御（Defense in
+            Depth）</h3>
+            <p>数据完整性的核心策略是纵深防御：在存储栈的多个层次都部署校验和和验证机制，确保任何单一层次的故障都不会导致静默数据损坏传播到最终用户。</p>
+            <pre class="text"><code>推荐的纵深防御层次：
+
+第 1 层：应用层
+  └─ 关键数据的应用级校验和
+  └─ 例如：数据库页校验和、对象存储的 Content-MD5
+
+第 2 层：文件系统层
+  └─ 启用文件系统的数据校验和
+  └─ 推荐 Btrfs 或 ZFS
+  └─ 如果使用 ext4/XFS，至少启用元数据校验和
+
+第 3 层：块设备层
+  └─ RAID 定期扫描
+  └─ DIF/DIX（如果硬件支持）
+
+第 4 层：存储设备层
+  └─ SMART 监控
+  └─ 设备固件保持更新
+
+第 5 层：备份层
+  └─ 备份数据的校验和验证
+  └─ 定期恢复测试</code></pre>
+            <h3 id="文件系统校验和配置">10.2 文件系统校验和配置</h3>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Btrfs：创建带校验和的文件系统</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.btrfs <span class="at">-d</span> raid1 <span class="at">-m</span> raid1 /dev/sda /dev/sdb</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Btrfs：使用 xxHash 算法（性能更高）</span></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.btrfs <span class="at">--csum</span> xxhash /dev/sda</span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a><span class="co"># ZFS：创建带校验和的存储池</span></span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> zpool create tank mirror /dev/sda /dev/sdb</span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a><span class="co"># ZFS：设置校验和算法</span></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> zfs set checksum=sha256 tank/important-data</span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a><span class="co"># ext4：启用元数据校验和（创建时指定）</span></span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-O</span> metadata_csum /dev/sda1</span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a><span class="co"># XFS：启用元数据校验和（XFS v5 格式，默认启用）</span></span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.xfs <span class="at">-m</span> crc=1 /dev/sda1</span></code></pre></div>
+            <h3 id="数据库校验和配置">10.3 数据库校验和配置</h3>
+            <div class="sourceCode" id="cb52"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb52-1"><a href="#cb52-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL：启用页校验和</span></span>
+<span id="cb52-2"><a href="#cb52-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 新集群</span></span>
+<span id="cb52-3"><a href="#cb52-3" aria-hidden="true" tabindex="-1"></a><span class="ex">initdb</span> <span class="at">--data-checksums</span> <span class="at">-D</span> /var/lib/postgresql/data</span>
+<span id="cb52-4"><a href="#cb52-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-5"><a href="#cb52-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 已有集群（PostgreSQL 12+，需要停机）</span></span>
+<span id="cb52-6"><a href="#cb52-6" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_checksums</span> <span class="at">--enable</span> <span class="at">-D</span> /var/lib/postgresql/data</span>
+<span id="cb52-7"><a href="#cb52-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-8"><a href="#cb52-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 确认启用状态</span></span>
+<span id="cb52-9"><a href="#cb52-9" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-c</span> <span class="st">&quot;SHOW data_checksums;&quot;</span></span>
+<span id="cb52-10"><a href="#cb52-10" aria-hidden="true" tabindex="-1"></a><span class="co">#  data_checksums</span></span>
+<span id="cb52-11"><a href="#cb52-11" aria-hidden="true" tabindex="-1"></a><span class="co"># ----------------</span></span>
+<span id="cb52-12"><a href="#cb52-12" aria-hidden="true" tabindex="-1"></a><span class="co">#  on</span></span></code></pre></div>
+            <div class="sourceCode" id="cb53"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL/InnoDB：校验和默认启用</span></span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 确认配置</span></span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a>SHOW VARIABLES <span class="kw">LIKE</span> <span class="st">&#39;innodb_checksum_algorithm&#39;</span>;</span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 确保值为 crc32（默认值，性能最优）</span></span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-6"><a href="#cb53-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果使用旧版本升级，确认没有使用 none</span></span>
+<span id="cb53-7"><a href="#cb53-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- SET GLOBAL innodb_checksum_algorithm = &#39;crc32&#39;;</span></span></code></pre></div>
+            <h3 id="ups-与写缓存策略">10.4 UPS 与写缓存策略</h3>
+            <p>不间断电源（Uninterruptible Power
+            Supply，UPS）是数据完整性的基础设施保障：</p>
+            <pre class="text"><code>UPS + 写缓存的配置策略：
+
+有 UPS + 企业级 SSD（PLP）：
+  └─ 可以安全启用磁盘写缓存
+  └─ fsync 语义得到完整保证
+  └─ 性能最优
+
+有 UPS + 消费级 SSD（无 PLP）：
+  └─ 建议禁用磁盘写缓存
+  └─ 或者接受 UPS 电池耗尽时的数据丢失风险
+  └─ UPS 应配置为在电池电量低于 30% 时触发安全关机
+
+无 UPS + 企业级 SSD（PLP）：
+  └─ PLP 保护写缓存中的数据
+  └─ 但操作系统页缓存中的脏页会丢失
+  └─ 需要依赖 fsync 和 WAL 保证一致性
+
+无 UPS + 消费级 SSD（无 PLP）：
+  └─ 最高风险配置
+  └─ 必须禁用磁盘写缓存
+  └─ 且不能依赖文件系统的日志完整性
+  └─ 建议使用带校验和的文件系统（Btrfs/ZFS）
+
+RAID 控制器：
+  └─ 有 BBU/FBWC：启用写回缓存（Write-Back）
+  └─ BBU 电量低或失效：自动切换为写通（Write-Through）
+  └─ 监控告警：BBU 状态必须纳入监控</code></pre>
+            <h3 id="定期扫描计划">10.5 定期扫描计划</h3>
+            <div class="sourceCode" id="cb55"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb55-1"><a href="#cb55-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 推荐的扫描计划（通过 cron 或 systemd timer 实现）</span></span>
+<span id="cb55-2"><a href="#cb55-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-3"><a href="#cb55-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 每日：SMART 短自检</span></span>
+<span id="cb55-4"><a href="#cb55-4" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/cron.d/smart-check</span></span>
+<span id="cb55-5"><a href="#cb55-5" aria-hidden="true" tabindex="-1"></a><span class="ex">0</span> 3 <span class="pp">*</span> <span class="pp">*</span> <span class="pp">*</span> root smartctl <span class="at">-t</span> short /dev/sda</span>
+<span id="cb55-6"><a href="#cb55-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-7"><a href="#cb55-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 每周：RAID 扫描</span></span>
+<span id="cb55-8"><a href="#cb55-8" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/cron.d/raid-check</span></span>
+<span id="cb55-9"><a href="#cb55-9" aria-hidden="true" tabindex="-1"></a><span class="ex">0</span> 2 <span class="pp">*</span> <span class="pp">*</span> 0 root echo check <span class="op">&gt;</span> /sys/block/md0/md/sync_action</span>
+<span id="cb55-10"><a href="#cb55-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-11"><a href="#cb55-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 每周：Btrfs scrub</span></span>
+<span id="cb55-12"><a href="#cb55-12" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/cron.d/btrfs-scrub</span></span>
+<span id="cb55-13"><a href="#cb55-13" aria-hidden="true" tabindex="-1"></a><span class="ex">0</span> 2 <span class="pp">*</span> <span class="pp">*</span> 0 root btrfs scrub start /mnt/data</span>
+<span id="cb55-14"><a href="#cb55-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-15"><a href="#cb55-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 每月：ZFS scrub</span></span>
+<span id="cb55-16"><a href="#cb55-16" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/cron.d/zfs-scrub</span></span>
+<span id="cb55-17"><a href="#cb55-17" aria-hidden="true" tabindex="-1"></a><span class="ex">0</span> 2 1 <span class="pp">*</span> <span class="pp">*</span> root zpool scrub tank</span>
+<span id="cb55-18"><a href="#cb55-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-19"><a href="#cb55-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 每月：SMART 长自检</span></span>
+<span id="cb55-20"><a href="#cb55-20" aria-hidden="true" tabindex="-1"></a><span class="ex">0</span> 2 15 <span class="pp">*</span> <span class="pp">*</span> root smartctl <span class="at">-t</span> long /dev/sda</span>
+<span id="cb55-21"><a href="#cb55-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-22"><a href="#cb55-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 每季度：数据库校验和全量检查</span></span>
+<span id="cb55-23"><a href="#cb55-23" aria-hidden="true" tabindex="-1"></a><span class="co"># （需要在低峰期执行，会增加 I/O 负载）</span></span>
+<span id="cb55-24"><a href="#cb55-24" aria-hidden="true" tabindex="-1"></a><span class="ex">0</span> 2 1 1,4,7,10 <span class="pp">*</span> root pg_checksums <span class="at">--check</span> <span class="dt">\</span></span>
+<span id="cb55-25"><a href="#cb55-25" aria-hidden="true" tabindex="-1"></a>    <span class="at">-D</span> /var/lib/postgresql/data <span class="op">&gt;&gt;</span> /var/log/pg-checksum.log <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span></span></code></pre></div>
+            <h3 id="监控与告警">10.6 监控与告警</h3>
+            <p>数据完整性问题的发现越早，修复成本越低。以下是需要监控和告警的关键指标：</p>
+            <pre class="text"><code>磁盘层面：
+  - SMART 属性异常（Reallocated Sectors &gt; 0）
+  - SMART 自检失败
+  - I/O 错误计数增长（/proc/diskstats、dmesg）
+  - NVMe Media and Data Integrity Errors &gt; 0
+
+RAID 层面：
+  - RAID 扫描发现不一致块（mismatch_cnt &gt; 0）
+  - RAID 阵列降级（Degraded）
+  - BBU 电量低于阈值
+  - 热备盘（Hot Spare）被激活
+
+文件系统层面：
+  - Btrfs/ZFS scrub 发现错误
+  - ext4/XFS 内核日志中的校验和错误
+  - 文件系统只读挂载（Read-Only Remount）
+
+数据库层面：
+  - PostgreSQL：page verification failed 日志
+  - MySQL/InnoDB：page corruption 错误日志
+  - 校验和不匹配计数器增长
+
+备份层面：
+  - 备份校验和验证失败
+  - 备份恢复测试失败</code></pre>
+            <h3 id="备份验证">10.7 备份验证</h3>
+            <p>备份本身也可能存在数据损坏。一个从未验证过的备份，和没有备份之间的区别，只有在你真正需要恢复时才会体会到：</p>
+            <div class="sourceCode" id="cb57"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb57-1"><a href="#cb57-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL 备份验证</span></span>
+<span id="cb57-2"><a href="#cb57-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 使用 pg_verifybackup 验证基础备份的完整性</span></span>
+<span id="cb57-3"><a href="#cb57-3" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_verifybackup</span> /path/to/backup</span>
+<span id="cb57-4"><a href="#cb57-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb57-5"><a href="#cb57-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 定期恢复测试</span></span>
+<span id="cb57-6"><a href="#cb57-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 在测试环境中恢复备份，验证数据一致性</span></span>
+<span id="cb57-7"><a href="#cb57-7" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_restore</span> <span class="at">-d</span> test_db /path/to/backup/base.tar.gz</span>
+<span id="cb57-8"><a href="#cb57-8" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-d</span> test_db <span class="at">-c</span> <span class="st">&quot;SELECT count(*) FROM critical_table;&quot;</span></span>
+<span id="cb57-9"><a href="#cb57-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb57-10"><a href="#cb57-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 通用的文件备份验证</span></span>
+<span id="cb57-11"><a href="#cb57-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建备份时计算校验和</span></span>
+<span id="cb57-12"><a href="#cb57-12" aria-hidden="true" tabindex="-1"></a><span class="fu">find</span> /data <span class="at">-type</span> f <span class="at">-exec</span> sha256sum {} <span class="dt">\;</span> <span class="op">&gt;</span> /backup/checksums.sha256</span>
+<span id="cb57-13"><a href="#cb57-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb57-14"><a href="#cb57-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 验证备份文件的校验和</span></span>
+<span id="cb57-15"><a href="#cb57-15" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /backup/data</span>
+<span id="cb57-16"><a href="#cb57-16" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="at">-c</span> /backup/checksums.sha256</span>
+<span id="cb57-17"><a href="#cb57-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb57-18"><a href="#cb57-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb57-19"><a href="#cb57-19" aria-hidden="true" tabindex="-1"></a><span class="co"># file1.dat: OK</span></span>
+<span id="cb57-20"><a href="#cb57-20" aria-hidden="true" tabindex="-1"></a><span class="co"># file2.dat: OK</span></span>
+<span id="cb57-21"><a href="#cb57-21" aria-hidden="true" tabindex="-1"></a><span class="co"># file3.dat: FAILED    ← 数据损坏</span></span>
+<span id="cb57-22"><a href="#cb57-22" aria-hidden="true" tabindex="-1"></a><span class="co"># sha256sum: </span><span class="al">WARNING</span><span class="co">: 1 computed checksum did NOT match</span></span></code></pre></div>
+            <hr />
+            <h2 id="十一开放问题">十一、开放问题</h2>
+            <ol type="1">
+            <li><strong>崩溃一致性与 SDC 的边界</strong>：Pillai et
+            al.（OSDI 2014）表明应用不能假设任意 FS 在断电下一致——与 SDC
+            检测（checksum）是正交问题；统一测试框架仍缺。</li>
+            <li><strong>DIF/DIX uptake</strong>：T10-PI 在 Linux
+            块层可用，但与 ZFS/Btrfs
+            原生校验叠加时的语义分工未标准化（§8.2–8.4）。</li>
+            <li><strong>SDC 率可比性</strong>：field study 口径分裂（见
+            §6.3）；运维 SLA 多依赖 scrub 检出率而非先验概率。</li>
+            <li><strong>备份即最后防线</strong>：无 FS 校验的 ext4/XFS
+            上，应用 checksum 库与离线 sha256 扫描谁更
+            cost-effective——缺同 workload 公开对比。</li>
+            </ol>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="规范与内核文档">规范与内核文档</h3>
+            <ul>
+            <li>Linux
+            <code>Documentation/block/data-integrity.rst</code> —
+            DIF/DIX 块层框架</li>
+            <li>PostgreSQL WAL Configuration — <a
+            href="https://www.postgresql.org/docs/current/wal-configuration.html"
+            class="uri">https://www.postgresql.org/docs/current/wal-configuration.html</a></li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Pillai et al. (2014). <em>All File Systems Are Not
+            Created Equal.</em> OSDI — §5.7 崩溃一致性。</li>
+            <li>Bairavasundaram et al. (2008). <em>An Analysis of Data
+            Corruption in the Storage Stack.</em> FAST — §6.3。</li>
+            <li>Bairavasundaram et al. (2007). <em>Latent Sector
+            Errors.</em> SIGMETRICS。</li>
+            <li>Schroeder &amp; Gibson (2007). <em>Disk Failures in the
+            Real World.</em> FAST。</li>
+            <li>Schroeder, Pinheiro &amp; Weber (2009). <em>DRAM Errors
+            in the Wild.</em> SIGMETRICS。</li>
+            <li>Zheng et al. (2013). <em>Understanding the Robustness of
+            SSDs under Power Fault.</em> FAST — §5.6。</li>
+            <li>Bonwick &amp; Ahrens (2006). <em>The Zettabyte File
+            System.</em> StorageSS — ZFS 端到端校验起源。</li>
+            <li>Alagappan et al. (2018). <em>Protocol-Aware
+            Recovery.</em> FAST。</li>
+            </ul>
+            <h3 id="关联篇目">关联篇目</h3>
+            <ul>
+            <li><a href="../43-checksum/checksum.html">43
+            校验和与数据完整性</a></li>
+            <li><a href="../17-zfs-integrity/zfs-integrity.html">17
+            ZFS：数据完整性优先的存储栈</a></li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../11-linux-async-io/linux-async-io.html">Linux 异步
+            I/O：从 POSIX AIO 到 io_uring</a> <strong>下一篇</strong>:
+            <a
+            href="../13-filesystem-basics/filesystem-basics.html">文件系统基础：inode、目录与
+            VFS</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-21 · storage</p>
+                    <h3><a href="/post/storage/43-checksum/checksum.html">【存储工程】校验和与数据完整性</a></h3>
+                    <p>深入分析存储系统中的数据完整性保障——CRC32C、xxHash、SHA-256 的性能对比，静默数据损坏的检测与防护，端到端校验架构设计</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-26 · storage</p>
+                    <h3><a href="/post/storage/17-zfs-integrity/zfs-integrity.html">【存储工程】ZFS：数据完整性优先的存储栈</a></h3>
+                    <p>ZFS 三层架构、Merkle 端到端校验、CoW、ARC、RAID-Z 与运维；算法选型与 field study 口径见 checksum / data-integrity 篇。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-19 · storage</p>
+                    <h3><a href="/post/storage/10-direct-io/direct-io.html">【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</a></h3>
+                    <p>O_DIRECT 的语义、对齐约束、文件系统坑与何时该/不该绕过 Page Cache；io_uring 组合路径见 #79。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-15 · storage</p>
+                    <h3><a href="/post/storage/67-write-optimization/write-optimization.html">【存储工程】写入性能优化</a></h3>
+                    <p>深入分析存储写入性能优化——WAL 分组提交、批量写入、Write Buffer 调优、fsync 频率控制、写入限速与写停顿分析</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

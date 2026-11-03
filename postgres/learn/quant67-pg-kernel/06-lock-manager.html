@@ -1,0 +1,1275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+锁管理器的完整架构：SpinLock 自旋锁的硬件原语与使用边界、LWLock 从 PG
+9.4 前到 PG 16 LWLockWaitListLock 的三代演进、Heavyweight Lock 的
+LockAcquire() 完整路径和锁表结构、死锁检测 DeadLockCheck() 的等待图 DFS
+算法、行级锁 FOR UPDATE/FOR SHARE/FOR KEY SHARE 的 t_infomask
+实现，以及用 pg_locks 和 pg_blocking_pids()
+追踪生产锁等待链的诊断方法。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, lock-manager, spinlock, lwlock, heavyweight-lock, deadlock-detection, row-locks, pg-locks, concurrency, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/06-lock-manager/06-lock-manager.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系" />
+    <meta property="og:description" content="拆解 PostgreSQL 锁管理器的完整架构：SpinLock 自旋锁的硬件原语与使用边界、LWLock 从 PG 9.4 前到 PG 16 LWLockWaitListLock 的三代演进、Heavyweight Lock 的 LockAcquire() 完整路径和锁表结构、死锁检测 DeadLockCheck() 的等待图 DFS 算法、行级锁 FOR UPDATE/FOR SHARE/FOR KEY SHARE 的 t_infomask 实现，以及用 pg_locks 和 pg_blocking_pids() 追踪生产锁等待链的诊断方法。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/06-lock-manager/06-lock-manager.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="lock-manager" />
+    <meta property="article:tag" content="spinlock" />
+    <meta property="article:tag" content="lwlock" />
+    <meta property="article:tag" content="heavyweight-lock" />
+    <meta property="article:tag" content="deadlock-detection" />
+    <meta property="article:tag" content="row-locks" />
+    <meta property="article:tag" content="pg-locks" />
+    <meta property="article:tag" content="concurrency" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 锁管理器的完整架构：SpinLock 自旋锁的硬件原语与使用边界、LWLock 从 PG 9.4 前到 PG 16 LWLockWaitListLock 的三代演进、Heavyweight Lock 的 LockAcquire() 完整路径和锁表结构、死锁检测 DeadLockCheck() 的等待图 DFS 算法、行级锁 FOR UPDATE/FOR SHARE/FOR KEY SHARE 的 t_infomask 实现，以及用 pg_locks 和 pg_blocking_pids() 追踪生产锁等待链的诊断方法。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系", "description": "拆解 PostgreSQL 锁管理器的完整架构：SpinLock 自旋锁的硬件原语与使用边界、LWLock 从 PG 9.4 前到 PG 16 LWLockWaitListLock 的三代演进、Heavyweight Lock 的 LockAcquire() 完整路径和锁表结构、死锁检测 DeadLockCheck() 的等待图 DFS 算法、行级锁 FOR UPDATE/FOR SHARE/FOR KEY SHARE 的 t_infomask 实现，以及用 pg_locks 和 pg_blocking_pids() 追踪生产锁等待链的诊断方法。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/06-lock-manager/06-lock-manager.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "lock-manager", "spinlock", "lwlock", "heavyweight-lock", "deadlock-detection", "row-locks", "pg-locks", "concurrency"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#lock-manager</span> <span>#spinlock</span> <span>#lwlock</span> <span>#heavyweight-lock</span> <span>#deadlock-detection</span> <span>#row-locks</span> <span>#pg-locks</span> <span>#concurrency</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/lock-manager.html">#lock-manager</a><a class="chip-link" href="/tags/spinlock.html">#spinlock</a><a class="chip-link" href="/tags/lwlock.html">#lwlock</a><a class="chip-link" href="/tags/heavyweight-lock.html">#heavyweight-lock</a><a class="chip-link" href="/tags/deadlock-detection.html">#deadlock-detection</a><a class="chip-link" href="/tags/row-locks.html">#row-locks</a><a class="chip-link" href="/tags/pg-locks.html">#pg-locks</a><a class="chip-link" href="/tags/concurrency-53e20a.html">#concurrency</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#锁管理器从-spinlock-到死锁检测的三层体系"
+                id="toc-锁管理器从-spinlock-到死锁检测的三层体系">锁管理器：从
+                SpinLock 到死锁检测的三层体系</a>
+                <ul>
+                <li><a href="#一三层体系总览"
+                id="toc-一三层体系总览">一、三层体系总览</a></li>
+                <li><a href="#二spinlock最底层的自旋锁"
+                id="toc-二spinlock最底层的自旋锁">二、SpinLock：最底层的自旋锁</a>
+                <ul>
+                <li><a href="#实现原理"
+                id="toc-实现原理">实现原理</a></li>
+                </ul></li>
+                <li><a href="#三lwlock轻量级锁的三代演进"
+                id="toc-三lwlock轻量级锁的三代演进">三、LWLock：轻量级锁的三代演进</a>
+                <ul>
+                <li><a href="#定位与使用场景"
+                id="toc-定位与使用场景">定位与使用场景</a></li>
+                <li><a href="#第一代pg-9.4-之前的信号量实现"
+                id="toc-第一代pg-9.4-之前的信号量实现">第一代：PG 9.4
+                之前的信号量实现</a></li>
+                <li><a href="#第二代pg-9.5-的原子操作实现"
+                id="toc-第二代pg-9.5-的原子操作实现">第二代：PG 9.5+
+                的原子操作实现</a></li>
+                <li><a href="#lwlock-的排查"
+                id="toc-lwlock-的排查">LWLock 的排查</a></li>
+                <li><a href="#lockacquire-的完整路径"
+                id="toc-lockacquire-的完整路径">LockAcquire()
+                的完整路径</a></li>
+                </ul></li>
+                <li><a href="#五死锁检测deadlockcheck-的等待图算法"
+                id="toc-五死锁检测deadlockcheck-的等待图算法">五、死锁检测：DeadLockCheck()
+                的等待图算法</a>
+                <ul>
+                <li><a href="#触发时机"
+                id="toc-触发时机">触发时机</a></li>
+                <li><a href="#multixact多事务同时持有行共享锁"
+                id="toc-multixact多事务同时持有行共享锁">MultiXact：多事务同时持有行共享锁</a></li>
+                </ul></li>
+                <li><a href="#七运维与排查追踪锁等待链"
+                id="toc-七运维与排查追踪锁等待链">七、运维与排查：追踪锁等待链</a>
+                <ul>
+                <li><a href="#pg_locks-视图"
+                id="toc-pg_locks-视图">pg_locks 视图</a></li>
+                <li><a
+                href="#log_lock_waits-与-deadlock_timeout-的联合使用"
+                id="toc-log_lock_waits-与-deadlock_timeout-的联合使用">log_lock_waits
+                与 deadlock_timeout 的联合使用</a></li>
+                <li><a href="#终止阻塞进程"
+                id="toc-终止阻塞进程">终止阻塞进程</a></li>
+                <li><a href="#构造死锁"
+                id="toc-构造死锁">构造死锁</a></li>
+                <li><a href="#观察行级锁"
+                id="toc-观察行级锁">观察行级锁</a></li>
+                </ul></li>
+                <li><a href="#九关键要点"
+                id="toc-九关键要点">九、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#开发者讨论与文章"
+                id="toc-开发者讨论与文章">开发者讨论与文章</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="锁管理器从-spinlock-到死锁检测的三层体系">锁管理器：从
+            SpinLock 到死锁检测的三层体系</h1>
+            <p>一条 <code>UPDATE</code> 语句执行时，PG
+            内核里至少有三种不同粒度的锁在工作：CPU
+            指令级的自旋锁保护共享内存计数器、LWLock 保护 Buffer 的 pin
+            状态和页面内容、Heavyweight Lock
+            保证两个事务不能同时修改同一行。它们不是”选一个用”，而是按<strong>持锁时间和争用模式</strong>逐层分工。</p>
+            <p>三层体系的核心思路是：<strong>持锁越短，实现越底层</strong>。SpinLock
+            的临界区只有几十个 CPU 周期，用硬件原子指令自旋等待；LWLock
+            的临界区覆盖一次共享内存结构的读写，自旋几轮后进内核等待；Heavyweight
+            Lock
+            的临界区覆盖整个事务，等待队列、死锁检测、锁升级全在这一层处理。</p>
+            <p>本文从源码路径拆解这三层锁：它们各自解决什么问题、在什么场景下使用、实现上经历了哪些演进，以及在生产环境中如何通过
+            <code>pg_locks</code> 和 <code>pg_blocking_pids()</code>
+            追踪锁等待链。</p>
+            <hr />
+            <h2 id="一三层体系总览">一、三层体系总览</h2>
+            <p>PG
+            在共享内存中维护三类锁，选择哪一层取决于<strong>持锁时间</strong>和<strong>争用可能性</strong>：</p>
+            <table>
+            <colgroup>
+            <col style="width: 14%" />
+            <col style="width: 14%" />
+            <col style="width: 26%" />
+            <col style="width: 21%" />
+            <col style="width: 21%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>层级</th>
+            <th>实现</th>
+            <th>临界区时间</th>
+            <th>等待方式</th>
+            <th>典型用途</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>SpinLock</td>
+            <td>TAS/CAS + 自旋</td>
+            <td>~几十 ns</td>
+            <td>CPU 空转，不切换上下文</td>
+            <td>保护共享内存计数器、LWLock 内部状态</td>
+            </tr>
+            <tr>
+            <td>LWLock</td>
+            <td>原子操作 + 自旋 + semop</td>
+            <td>~几 us 到 ~几 ms</td>
+            <td>先自旋，超限后 semop 阻塞</td>
+            <td>Buffer pin、CLOG 页面、WAL 插入槽位</td>
+            </tr>
+            <tr>
+            <td>Heavyweight Lock</td>
+            <td>哈希表 + 等待队列 + 死锁检测</td>
+            <td>~ms 到事务级</td>
+            <td>立即进入等待队列</td>
+            <td>表锁 (ACCESS SHARE/EXCLUSIVE)、行锁 (FOR UPDATE/FOR
+            SHARE)</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>选择逻辑不是性能偏好，而是物理约束：SpinLock
+            的临界区不能有任何可能导致上下文切换的操作（包括内存分配、errno
+            检查、elog），因为它可能在中断上下文或信号处理器中执行。LWLock
+            允许持有者发生短暂的上下文切换，但不允许跨事务持锁。Heavyweight
+            Lock
+            支持事务结束时自动释放、死锁检测和锁升级，代价是获取和释放都需要查询哈希表并操作等待队列。</p>
+            <p>这三层锁构成了 PG 并发控制的地基：MVCC
+            解决了”读不阻塞写，写不阻塞读”，但 UPDATE 冲突、DDL
+            保护、共享内存结构的并发访问，仍然需要锁来协调。</p>
+            <hr />
+            <h2
+            id="二spinlock最底层的自旋锁">二、SpinLock：最底层的自旋锁</h2>
+            <h3 id="实现原理">实现原理</h3>
+            <p>SpinLock 是 PG
+            锁层级的最底层。它的核心语义是：<strong>用硬件原子指令（TAS
+            或
+            CAS）争用一个内存字，没拿到就原地空转（spin），拿到后执行临界区，执行完释放</strong>。整个过程没有系统调用，没有上下文切换。</p>
+            <p>PG 的 SpinLock 实现在
+            <code>src/include/storage/s_lock.h</code>
+            和对应平台的汇编文件中。核心数据结构是一个
+            <code>slock_t</code>，通常是 <code>unsigned char</code> 或
+            <code>int</code>：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/s_lock.h</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="dt">unsigned</span> <span class="dt">char</span> slock_t<span class="op">;</span>    <span class="co">// x86_64 平台</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 关键的 TAS (Test-And-Set) 宏：测试并设置锁</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co">// 返回 0（拿到锁）或 1（锁被占用）</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 在 x86_64 上用 xchgb 指令实现：</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co">//   movb $1, %al</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co">//   xchgb %al, (%rdi)    // 原子交换</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co">//   testb %al, %al        // 检查原值</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>获取 SpinLock 的函数签名和调用路径：</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/spin.h</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">int</span> s_lock<span class="op">(</span><span class="dt">volatile</span> slock_t <span class="op">*</span>lock<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>file<span class="op">,</span> <span class="dt">int</span> line<span class="op">);</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="co">// SpinLockAcquire 宏展开为 s_lock()</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#define SpinLockAcquire</span><span class="op">(</span><span class="pp">lock</span><span class="op">)</span><span class="pp"> s_lock</span><span class="op">(</span><span class="pp">lock</span><span class="op">,</span><span class="pp"> __FILE__</span><span class="op">,</span><span class="pp"> __LINE__</span><span class="op">)</span></span></code></pre></div>
+            <p><code>s_lock()</code> 执行一个忙等循环，每次迭代尝试原子
+            TAS，如果失败就执行 <code>pg_spin_delay()</code>
+            空转等待。在无竞争时，获取只需要一次原子交换（~10-20ns）；在有竞争时，等待者消耗
+            CPU 但不释放调度器。</p>
+            <p>释放 SpinLock 则是简单的原子写：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define SpinLockRelease</span><span class="op">(</span><span class="pp">lock</span><span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">*(</span><span class="pp">lock</span><span class="op">)</span><span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="dv">0</span><span class="op">;</span><span class="pp"> </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 在某些平台上使用原子 store 保证内存屏障</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 使用边界</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>SpinLock 的临界区必须满足极严格的约束：</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>临界区极短<span class="op">**</span>：几十个 CPU 指令周期以内。自旋等待不释放 CPU，持锁时间越长，浪费的 CPU 周期越多。</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>临界区不能触发上下文切换<span class="op">**</span>：不能调用 `palloc<span class="op">()</span>`（可能触发 malloc 和系统调用）、不能写 elog<span class="op">/</span>ereport（可能触发 syslog 写）、不能调用任何可能导致 `errno` 被修改的函数、不能获取 LWLock 或 Heavyweight Lock。</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> <span class="op">**</span>持有 SpinLock 时不能再次获取同一 SpinLock<span class="op">**</span>：不是可重入锁，会死锁。</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> <span class="op">**</span>在中断上下文中也可能需要 SpinLock<span class="op">**</span>：部分信号处理器会竞争 SpinLock，所以临界区必须信号安全。</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>PG 中 SpinLock 的典型使用场景：</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="co">// 例 1：更新共享内存中的统计计数器</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/postmaster/pgstat.c</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>SpinLockAcquire<span class="op">(&amp;</span>pgStatDBHashLock<span class="op">);</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="co">// ... 更新几个整数字段 ...</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>SpinLockRelease<span class="op">(&amp;</span>pgStatDBHashLock<span class="op">);</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="co">// 例 2：保护 LWLock 的内部状态</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/lmgr/lwlock.c</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="co">// LWLock 自身用 SpinLock 保护 wait list 操作</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>SpinLockAcquire<span class="op">(&amp;</span>lock<span class="op">-&gt;</span>waitlist_lock<span class="op">);</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="co">// ... 修改等待列表的指针 ...</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>SpinLockRelease<span class="op">(&amp;</span>lock<span class="op">-&gt;</span>waitlist_lock<span class="op">);</span></span></code></pre></div>
+            <p>PG 在可能竞争的场景下使用
+            SpinLock，但在单进程访问的路径下直接操作——例如初始化时，<code>ShmemInitStruct()</code>
+            不需要任何锁，因为 Postmaster 在 fork 之前是串行执行的。</p>
+            <hr />
+            <h2
+            id="三lwlock轻量级锁的三代演进">三、LWLock：轻量级锁的三代演进</h2>
+            <h3 id="定位与使用场景">定位与使用场景</h3>
+            <p>LWLock（Lightweight Lock）是 PG 中使用最频繁的锁。它位于
+            SpinLock 和 Heavyweight Lock 之间：临界区长到用 SpinLock
+            不划算（需要跨越几次函数调用），但又不需要事务语义和死锁检测。</p>
+            <p>LWLock 保护 PG 内部共享内存结构：</p>
+            <ul>
+            <li>每个 Buffer 的 content lock（读写页面内容时持有）</li>
+            <li>Buffer 的 I/O lock（从磁盘读取页面时持有）</li>
+            <li>WAL 插入锁（<code>WALInsertLocks</code>，分段保护 WAL
+            buffer 的不同区域）</li>
+            <li>CLOG 页面的 SLRU 锁</li>
+            <li><code>ProcArrayLock</code>（快照构建时需要）</li>
+            <li>子事务（<code>Subtrans</code>）和 multixact 的 SLRU
+            锁</li>
+            <li>关系扩展锁（表新增页面时）</li>
+            </ul>
+            <p>LWLock 支持两种模式： -
+            <strong>LW_SHARED</strong>（共享）：多个进程可以同时持有，用于只读访问。例如多个
+            Backend 可以同时以共享模式持有 Buffer content lock
+            来读取同一个页面。 -
+            <strong>LW_EXCLUSIVE</strong>（排他）：只有一个进程持有。例如在页面中写入数据、修改共享内存结构。</p>
+            <h3 id="第一代pg-9.4-之前的信号量实现">第一代：PG 9.4
+            之前的信号量实现</h3>
+            <p>PG 9.4 之前，LWLock 的实现直接依赖 System V 信号量。每个
+            LWLock 绑定一个
+            semaphore，获取锁时如果能立即拿到（原子自旋），就直接返回；如果拿不到，就
+            <code>semop()</code> 阻塞等待。</p>
+            <p>这个实现的主要问题是<strong>信号量不可伸缩</strong>：System
+            V 信号量集有数量上限（<code>SEMMNI</code> /
+            <code>SEMMNS</code>），而 PG 中 LWLock 的数量随
+            <code>shared_buffers</code> 增大而增长（每个 Buffer 至少 2
+            个 LWLock：content lock 和 I/O lock）。一个 8GB
+            <code>shared_buffers</code> 的实例（约 1048576 个 8KB
+            页面），需要 200 万个 LWLock——远超 System V
+            信号量的上限。</p>
+            <p>PG 9.4 引入的方案是”信号量池”：不再给每个 LWLock
+            分配独立的
+            semaphore，而是维护一个信号量池，等待者从池中获取一个信号量
+            ID。这在功能上解决了数量上限问题，但信号量分配和回收的簿记开销很高。</p>
+            <h3 id="第二代pg-9.5-的原子操作实现">第二代：PG 9.5+
+            的原子操作实现</h3>
+            <p>PG 9.5 开始，LWLock 的实现从依赖 System V
+            信号量彻底转向依赖 CPU 原子操作。核心思路是：<strong>LWLock
+            的状态字（<code>state</code>）用
+            <code>pg_atomic_uint32</code> 表示，通过
+            CAS（Compare-And-Swap）操作获取和释放锁，只有需要等待时才使用信号量</strong>。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/lwlock.h</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> LWLock <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    pg_atomic_uint32 state<span class="op">;</span>   <span class="co">// 锁状态：是否被持有、等待者计数</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    pg_atomic_uint32 nwaiters<span class="op">;</span> <span class="co">// 等待者数量（用于决定是否需要信号量唤醒）</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>             sema<span class="op">;</span>     <span class="co">// 信号量索引（仅在需要阻塞等待时使用）</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> LWLock<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>获取 LWLock 的流程（简化）：</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/lmgr/lwlock.c, LWLockAttemptLock()</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co">// 尝试用原子 CAS 获取锁</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">bool</span> LWLockAttemptLock<span class="op">(</span>LWLock <span class="op">*</span>lock<span class="op">,</span> LWLockMode mode<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    uint32 old_state <span class="op">=</span> pg_atomic_read_u32<span class="op">(&amp;</span>lock<span class="op">-&gt;</span>state<span class="op">);</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="kw">true</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        uint32 desired_state<span class="op">;</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>mode <span class="op">==</span> LW_EXCLUSIVE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 排他模式：如果当前 lock 未被持有（state 的 lock count 为 0），则获取</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>old_state <span class="op">&amp;</span> LW_FLAG_HAS_WAITERS <span class="op">||</span> old_state <span class="op">&amp;</span> LW_LOCK_MASK<span class="op">)</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span>  <span class="co">// 锁已被持有</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>            desired_state <span class="op">=</span> old_state <span class="op">|</span> LW_FLAG_HAS_WAITERS <span class="op">|</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span> <span class="co">// LW_SHARED</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 共享模式：如果当前没有被排他持有，则递增共享计数</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>old_state <span class="op">&amp;</span> LW_LOCK_MASK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>                <span class="co">// 排他锁持有中，不能获取共享锁</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>            desired_state <span class="op">=</span> old_state <span class="op">+</span> <span class="op">(</span><span class="dv">1</span> <span class="op">&lt;&lt;</span> LW_SHARED_SHIFT<span class="op">);</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>        <span class="co">// CAS 尝试设置新状态</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>pg_atomic_compare_exchange_u32<span class="op">(&amp;</span>lock<span class="op">-&gt;</span>state<span class="op">,</span> <span class="op">&amp;</span>old_state<span class="op">,</span> desired_state<span class="op">))</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>        <span class="co">// CAS 失败（其他进程同时修改了 state），重试</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>如果 <code>LWLockAttemptLock()</code> 返回
+            false，调用者进入等待路径
+            <code>LWLockWaitForVar()</code>。PG 9.5+
+            的等待策略是<strong>先自旋再阻塞</strong>：</p>
+            <ol type="1">
+            <li>循环调用 <code>LWLockAttemptLock()</code> 尝试 CAS
+            获取锁，最多自旋 <code>spins_per_delay</code> 次（默认 100
+            次，可通过 <code>pg_test_spin_delay</code> 校准）。</li>
+            <li>自旋仍失败后，递增 <code>nwaiters</code>，然后用
+            <code>pg_atomic_fetch_or_u32()</code> 在 <code>state</code>
+            中设置 <code>LW_FLAG_HAS_WAITERS</code> 标志位。</li>
+            <li>调用 <code>semop()</code> 在信号量上阻塞等待。</li>
+            <li>被唤醒后，回到步骤 1。</li>
+            </ol>
+            <p>这意味着当 LWLock
+            竞争激烈时，等待者不是一直空转——自旋仅作为”锁可能在几
+            microsecond 内释放”的优化，之后就让出 CPU。这种设计非常适合
+            PG 的典型负载：大多数 LWLock
+            的持锁时间非常短（一次内存读写），少数情况（I/O）才需要真正阻塞。</p>
+            <p>释放 LWLock 时，释放者检查 <code>nwaiters</code> 和
+            <code>LW_FLAG_HAS_WAITERS</code>：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/lmgr/lwlock.c, LWLockRelease()</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> LWLockRelease<span class="op">(</span>LWLock <span class="op">*</span>lock<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 更新 state，清除持有标志</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    old_state <span class="op">=</span> pg_atomic_sub_fetch_u32<span class="op">(&amp;</span>lock<span class="op">-&gt;</span>state<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 如果有等待者，唤醒它们</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>old_state <span class="op">&amp;</span> LW_FLAG_HAS_WAITERS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>        pg_atomic_fetch_and_u32<span class="op">(&amp;</span>lock<span class="op">-&gt;</span>state<span class="op">,</span> <span class="op">~</span>LW_FLAG_HAS_WAITERS<span class="op">);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 用 semop() 唤醒等待者</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>        PGSemaphoreUnlock<span class="op">(&amp;</span>lock<span class="op">-&gt;</span>sema<span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 第三代：PG 16 的 LWLockWaitListLock 优化</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>PG <span class="dv">16</span> 引入了一个微架构改进：<span class="op">**</span>`LWLockWaitListLock`<span class="op">**</span>。在 PG <span class="fl">9.5</span><span class="op">-</span><span class="dv">15</span> 的实现中，等待者共享同一个信号量并执行<span class="st">&quot;惊群&quot;</span>（thundering herd）式的唤醒：释放者调用 `semop<span class="op">()</span>` 唤醒所有等待者，每个等待者从 `semop<span class="op">()</span>` 返回后重新竞争 CAS。这在高并发时造成大量不必要的 CPU 消耗和缓存颠簸。</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>PG <span class="dv">16</span> 在 LWLock 结构中新增了 per<span class="op">-</span>lock 的等待列表锁：</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="co">// PG 16 的 LWLock 结构（简化）</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> LWLock <span class="op">{</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    pg_atomic_uint32 state<span class="op">;</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    pg_atomic_uint32 nwaiters<span class="op">;</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    proclist_head   waiters<span class="op">;</span>        <span class="co">// 等待者的双向链表</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    slock_t         waitlist_lock<span class="op">;</span>  <span class="co">// PG 16 新增：保护 waiters 链表的 spinlock</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> LWLock<span class="op">;</span></span></code></pre></div>
+            <p>关键改进：等待者不是全部醒来竞争
+            CAS，而是<strong>排队进入 <code>waiters</code>
+            链表，释放者按顺序逐个唤醒</strong>。这从根本上消除了惊群效应，在高并发
+            Buffer 访问场景下，LWLock 竞争的吞吐量提升可达
+            20-40%（具体数字因负载而异）。</p>
+            <h3 id="lwlock-的排查">LWLock 的排查</h3>
+            <p><code>pg_stat_activity</code> 的 <code>wait_event</code>
+            字段记录了 LWLock 等待：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, wait_event_type, wait_event, state, <span class="kw">query</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;LWLock&#39;</span>;</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>常见的 LWLock 等待事件含义：</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>| wait_event | 对应的锁 | 常见原因 |</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>|<span class="co">------------|---------|---------|</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>| `WALWriteLock` | WAL 写入锁 | 大量事务提交时 WAL 写入竞争 |</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>| `WALInsertLock` | WAL 插入锁 | PG <span class="fl">9.4</span><span class="op">-</span> 是瓶颈，PG <span class="fl">9.5</span><span class="op">+</span> 分段后大幅缓解 |</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>| `BufferContent` | Buffer 页面内容锁 | 并发读写同一页面（热点页） |</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>| `LockManager` | 重量级锁分区的 LWLock | 高并发锁获取<span class="op">/</span>释放 |</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>| `ProcArrayLock` | 进程数组锁 | 大量连接时 GetSnapshotData() 竞争 |</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>| `CLogControl` | CLOG SLRU 锁 | 大量事务状态查询<span class="op">/</span>更新 |</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>## 四、Heavyweight Lock：事务级的重量级锁</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>### 设计目标</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>Heavyweight Lock（在 PG 源码中直接称为 `LOCK`）是锁层级的最上层。它解决 SpinLock 和 LWLock 解决不了的问题：</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>事务语义<span class="op">**</span>：锁在事务结束时自动释放，支持 `ROLLBACK` 和子事务（savepoint）回滚。</span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>死锁检测<span class="op">**</span>：自动检测等待环路，选择一个事务回滚。</span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> <span class="op">**</span>锁升级<span class="op">/</span>转换<span class="op">**</span>：支持在共享锁和排他锁之间转换，支持锁强度的比较（`ACCESS SHARE` <span class="op">&lt;</span> `ROW SHARE` <span class="op">&lt;</span> `ROW EXCLUSIVE` <span class="op">&lt;</span> `SHARE <span class="kw">UPDATE</span> EXCLUSIVE` <span class="op">&lt;</span> `SHARE` <span class="op">&lt;</span> `SHARE <span class="kw">ROW</span> EXCLUSIVE` <span class="op">&lt;</span> `EXCLUSIVE` <span class="op">&lt;</span> `ACCESS EXCLUSIVE`）。</span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> <span class="op">**</span>等待队列<span class="op">**</span>：等待者按 FIFO 排队，支持队列跳跃（在特定条件下）。</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>PG 定义了 <span class="dv">8</span> 种锁模式，按强度递增：</span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>| 锁模式 | 数值 | 典型 SQL |</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>|<span class="co">-------|------|---------|</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>| `AccessShareLock` | <span class="dv">1</span> | `SELECT` |</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>| `RowShareLock` | <span class="dv">2</span> | `SELECT <span class="op">..</span>. <span class="cf">FOR</span> SHARE` |</span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>| `RowExclusiveLock` | <span class="dv">3</span> | `INSERT` <span class="op">/</span> `UPDATE` <span class="op">/</span> `DELETE` |</span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>| `ShareUpdateExclusiveLock` | <span class="dv">4</span> | `VACUUM`（不 FULL）、`ANALYZE`、`CREATE <span class="kw">INDEX</span> CONCURRENTLY` |</span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>| `ShareLock` | <span class="dv">5</span> | `CREATE INDEX`（非 CONCURRENTLY） |</span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>| `ShareRowExclusiveLock` | <span class="dv">6</span> | `CREATE TRIGGER` |</span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>| `ExclusiveLock` | <span class="dv">7</span> | `REFRESH <span class="kw">MATERIALIZED</span> <span class="kw">VIEW</span> CONCURRENTLY` |</span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>| `AccessExclusiveLock` | <span class="dv">8</span> | `ALTER TABLE`、`DROP TABLE`、`VACUUM FULL` |</span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a>这 <span class="dv">8</span> 种模式通过<span class="op">**</span>冲突矩阵<span class="op">**</span>（conflict table，`src<span class="op">/</span>backend<span class="op">/</span><span class="kw">storage</span><span class="op">/</span>lmgr<span class="op">/</span><span class="kw">lock</span>.c` 中的 `LockConflicts[]`）定义哪些模式可以共存。例如，`AccessShareLock` 和 `RowExclusiveLock` 不冲突——读和写可以并行——这是 MVCC 的核心优势。但 `AccessExclusiveLock` 和所有模式都冲突，所以 `ALTER TABLE` 会阻塞一切。</span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a>### <span class="kw">Lock</span> <span class="kw">hash</span> <span class="kw">table</span> 的结构</span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a>所有 Heavyweight <span class="kw">Lock</span> 存储在共享内存中的一个哈希表中，称为 `LockMethodLockHash`。哈希键由<span class="op">**</span>锁目标（locktag）<span class="op">**</span>组成：</span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> src<span class="op">/</span>include<span class="op">/</span><span class="kw">storage</span><span class="op">/</span><span class="kw">lock</span>.h</span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a>typedef struct LOCKTAG {</span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a>    uint32      locktag_field1;  <span class="op">//</span> 数据库 <span class="kw">OID</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a>    uint32      locktag_field2;  <span class="op">//</span> 关系 <span class="kw">OID</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a>    uint32      locktag_field3;  <span class="op">//</span> 页面号（页级锁）或 <span class="dv">0</span></span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true" tabindex="-1"></a>    uint32      locktag_field4;  <span class="op">//</span> 元组号（行级锁）或 <span class="dv">0</span></span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true" tabindex="-1"></a>    uint16      locktag_type;    <span class="op">//</span> 锁类型：LOCKTAG_RELATION <span class="op">/</span> LOCKTAG_PAGE <span class="op">/</span> LOCKTAG_TUPLE</span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true" tabindex="-1"></a>    <span class="op">//</span> <span class="op">..</span>.</span>
+<span id="cb5-58"><a href="#cb5-58" aria-hidden="true" tabindex="-1"></a>} LOCKTAG;</span></code></pre></div>
+            <p>哈希表的 entry 是 <code>LOCK</code> 结构体：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/lock.h</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> LOCK <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    LOCKTAG     tag<span class="op">;</span>            <span class="co">// 锁目标（哈希键）</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    LOCKMASK    grantMask<span class="op">;</span>      <span class="co">// 已授予的锁模式位掩码</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    LOCKMASK    waitMask<span class="op">;</span>       <span class="co">// 等待中的锁模式位掩码</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    SHM_QUEUE   procLocks<span class="op">;</span>      <span class="co">// 持有本锁的所有 PROCLOCK（链表）</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    SHM_QUEUE   waitProcs<span class="op">;</span>      <span class="co">// 等待本锁的进程队列</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         requested<span class="op">[</span><span class="dv">8</span><span class="op">];</span>   <span class="co">// 每种锁模式的总请求数</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         granted<span class="op">[</span><span class="dv">8</span><span class="op">];</span>     <span class="co">// 每种锁模式的已授予数</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         nRequested<span class="op">;</span>     <span class="co">// 总请求数</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         nGranted<span class="op">;</span>       <span class="co">// 总授予数</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> LOCK<span class="op">;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>每个进程对每个锁的持有信息存储在 `PROCLOCK` 结构体中：</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> PROCLOCK <span class="op">{</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    SHM_QUEUE   lockLink<span class="op">;</span>       <span class="co">// 链入 LOCK.procLocks</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    SHM_QUEUE   procLink<span class="op">;</span>       <span class="co">// 链入 PGPROC.procLocks</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    PROCLOCKTAG tag<span class="op">;</span>            <span class="co">// { LOCK, PGPROC }</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    LOCKMASK    holdMask<span class="op">;</span>       <span class="co">// 本进程持有的锁模式位掩码</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> PROCLOCK<span class="op">;</span></span></code></pre></div>
+            <p><code>PROCLOCK</code>
+            同时存在于两个链表中：<code>LOCK.procLocks</code>（从锁角度，哪些进程持有）和
+            <code>PGPROC.procLocks</code>（从进程角度，持有哪些锁）。这种双向索引使得锁释放和事务中止时的清理效率很高。</p>
+            <h3 id="lockacquire-的完整路径">LockAcquire()
+            的完整路径</h3>
+            <p><code>LockAcquire()</code> 是获取 Heavyweight Lock
+            的入口函数，定义在
+            <code>src/backend/storage/lmgr/lock.c</code>。调用路径：</p>
+            <pre class="text"><code>LockAcquire(locktag, lockmode, ...)
+  → LockAcquireExtended(locktag, lockmode, sessionLock, ...)
+    → SetupLockInTable()           // 1. 在共享内存哈希表中查找或创建 LOCK entry
+    → GrantLock()                  // 2. 尝试授予锁
+      → 如果不冲突 → 拿到锁，返回 LOCKACQUIRE_OK
+      → 如果冲突   → 进入等待路径
+    → WaitOnLock()                 // 3. 进入等待队列
+      → 将 PGPROC 加入 LOCK.waitProcs
+      → 设置 PGPROC.waitLock = lock
+      → 设置 PGPROC.waitStatus = STATUS_WAITING
+      → semop() 阻塞
+      → 被唤醒后 → GrantLock() 重新检查冲突</code></pre>
+            <p><code>GrantLock()</code> 的逻辑是核心：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/lmgr/lock.c（简化）</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">bool</span> GrantLock<span class="op">(</span>LOCK <span class="op">*</span>lock<span class="op">,</span> PROCLOCK <span class="op">*</span>proclock<span class="op">,</span> LOCKMODE lockmode<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 检查请求的锁模式是否与已授予的模式冲突</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!(</span>LockConflicts<span class="op">[</span>lockmode<span class="op">]</span> <span class="op">&amp;</span> lock<span class="op">-&gt;</span>grantMask<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 不冲突：授予锁</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        proclock<span class="op">-&gt;</span>holdMask <span class="op">|=</span> LOCKBIT_ON<span class="op">(</span>lockmode<span class="op">);</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        lock<span class="op">-&gt;</span>grantMask <span class="op">|=</span> LOCKBIT_ON<span class="op">(</span>lockmode<span class="op">);</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        lock<span class="op">-&gt;</span>granted<span class="op">[</span>lockmode<span class="op">]++;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 冲突：不能授予，等待者继续等待</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 锁获取的 fast path 优化</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>对于最常用的弱锁模式（通常是表级的 `AccessShareLock`），PG 提供了 <span class="op">**</span>fast path<span class="op">**</span> 优化：如果锁不冲突且锁请求不过多，`LockAcquire<span class="op">()</span>` 跳过哈希表查找，直接把锁记录在 `PGPROC` 的一个固定大小数组中（`fpLockBits`，默认 <span class="dv">16</span> 个槽位）。</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="co">// 判断是否能走 fast path</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">bool</span> FastPathLocalUseAllowed<span class="op">(</span>LOCKTAG <span class="op">*</span>locktag<span class="op">,</span> LOCKMODE lockmode<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 只有表级锁、行级锁可以使用 fast path</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 且锁模式不能强于 ShareUpdateExclusiveLock</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lockmode <span class="op">&gt;=</span> ShareUpdateExclusiveLock<span class="op">)</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 弱锁：尝试 fast path</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>fast path 的关键前提是 <code>AccessShareLock</code> 是 PG
+            中获取最频繁的锁——每条 <code>SELECT</code>
+            语句都需要它。跳过哈希表查找意味着不需要获取
+            <code>LockMgrLock</code>（保护哈希表的 LWLock），大幅减少该
+            LWLock 的竞争。</p>
+            <hr />
+            <h2
+            id="五死锁检测deadlockcheck-的等待图算法">五、死锁检测：DeadLockCheck()
+            的等待图算法</h2>
+            <h3 id="触发时机">触发时机</h3>
+            <p>死锁检测由 <code>CheckDeadLock()</code> 触发，在
+            <code>ProcSleep()</code>（进程等待锁时进入）中被调用。关键
+            GUC 是 <code>deadlock_timeout</code>（默认
+            1s）：进程在等待队列中阻塞时，每隔
+            <code>deadlock_timeout</code>
+            毫秒被唤醒一次，执行死锁检测。</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/lmgr/proc.c, ProcSleep()</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 等待进程在等待队列中的主循环</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">(</span>waiting<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 等待 deadlock_timeout 毫秒</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    timeout <span class="op">=</span> deadlock_timeout<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    WaitOnLock<span class="op">(&amp;</span>locallock<span class="op">,</span> lock<span class="op">,</span> proclock<span class="op">,</span> <span class="op">&amp;</span>timeout<span class="op">);</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 超时唤醒：执行死锁检测</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>CheckDeadLock<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 检测到死锁且本进程被选为牺牲者</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>        ereport<span class="op">(</span>ERROR<span class="op">,</span> <span class="op">(</span>errcode<span class="op">(</span>ERRCODE_T_R_DEADLOCK_DETECTED<span class="op">),</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>                errmsg<span class="op">(</span><span class="st">&quot;deadlock detected&quot;</span><span class="op">),</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>                errdetail_hint<span class="op">(...)));</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 检查锁是否可用</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>GrantLock<span class="op">(</span>lock<span class="op">,</span> proclock<span class="op">,</span> lockmode<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>        waiting <span class="op">=</span> <span class="kw">false</span><span class="op">;</span>  <span class="co">// 拿到锁，退出循环</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 否则继续等待</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>注意 `deadlock_timeout` 的双重作用：它同时控制死锁检测间隔和 `log_lock_waits` 的报告阈值。当一个进程等待锁超过 `deadlock_timeout` 时，如果 `log_lock_waits <span class="op">=</span> on`，PG 会记录一条日志。</span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 等待图（Wait-For Graph）的构建</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>`DeadLockCheck<span class="op">()</span>` 的核心算法在 `src<span class="op">/</span>backend<span class="op">/</span>storage<span class="op">/</span>lmgr<span class="op">/</span>deadlock<span class="op">.</span>c` 中。它是一个基于 DFS（深度优先搜索）的环路检测算法。</span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>等待图是隐式构建的，不预先创建完整图：</span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/lmgr/deadlock.c, DeadLockCheck()</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a><span class="co">// 从当前进程出发，BFS 搜索等待图中的环路</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> DeadLockCheck<span class="op">(</span>PGPROC <span class="op">*</span>proc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 初始化：从当前等待进程出发</span></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a>    nDeadlockDetails <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a>    visitedProcs <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a>    nPossibleConstraints <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a>    curConstraints <span class="op">=</span> waitingConstraints<span class="op">;</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 第一个被访问的节点是当前进程</span></span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 检查从它出发是否能在等待图中走回自身</span></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>FindLockCycle<span class="op">(</span>proc<span class="op">,</span> possibleConstraints<span class="op">,</span> <span class="op">&amp;</span>nSoftEdges<span class="op">))</span></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span>  <span class="co">// 没有环路</span></span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 找到了环路：确定牺牲者</span></span>
+<span id="cb9-48"><a href="#cb9-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 筛选环路中最适合回滚的事务</span></span>
+<span id="cb9-49"><a href="#cb9-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb9-50"><a href="#cb9-50" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>核心搜索函数 <code>FindLockCycle()</code> 做递归
+            DFS：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/lmgr/deadlock.c（简化）</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">bool</span> FindLockCycle<span class="op">(</span>PGPROC <span class="op">*</span>checkProc<span class="op">,</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>                          EDGE <span class="op">*</span>softEdges<span class="op">,</span> <span class="dt">int</span> <span class="op">*</span>nSoftEdges<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 找到 checkProc 正在等待的锁</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    lock <span class="op">=</span> checkProc<span class="op">-&gt;</span>waitLock<span class="op">;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lock <span class="op">==</span> NULL<span class="op">)</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 遍历持有该锁的所有进程（lockedBy）</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> each PROCLOCK held on this lock <span class="op">{</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>        PGPROC <span class="op">*</span>holder <span class="op">=</span> proclock<span class="op">-&gt;</span>tag<span class="op">.</span>myProc<span class="op">;</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 如果 holder 也在等待某个锁，继续向深处搜索</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>holder<span class="op">-&gt;</span>waitLock <span class="op">!=</span> NULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>holder <span class="op">==</span> startProc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>                <span class="co">// 找到了回到起点的环路！</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>FindLockCycle<span class="op">(</span>holder<span class="op">,</span> softEdges<span class="op">,</span> nSoftEdges<span class="op">))</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 牺牲者选择</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>检测到环路后，不是任意回滚一个事务。`DeadLockCheck<span class="op">()</span>` 通过以下策略选择牺牲者：</span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>选择所有环路中涉及的事务集合<span class="op">**</span>。</span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>排除已经在回滚的事务<span class="op">**</span>（因为它们会自动释放锁）。</span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> <span class="op">**</span>选择回滚代价最小的事务<span class="op">**</span>，优先考虑：已经执行时间最短的、锁请求最少的、事务 ID 最新的。</span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>当死锁被检测到时，PG 中止选中的事务并返回错误：</span></code></pre></div>
+            <p>ERROR: deadlock detected DETAIL: Process 12345 waits for
+            ShareLock on transaction 67890; blocked by process 12346.
+            Process 12346 waits for ShareLock on transaction 67890;
+            blocked by process 12345. HINT: See server log for query
+            details.</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co">### 行级锁的死锁检测</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">行级锁（FOR</span> UPDATE / FOR SHARE）也会触发死锁检测。行级锁的等待信息存储在 <span class="kw">`</span><span class="ex">PGPROC</span><span class="kw">`</span> 的 <span class="kw">`</span><span class="ex">waitLock</span><span class="kw">`</span> 中，<span class="kw">`</span><span class="ex">LOCKTAG</span><span class="kw">`</span> 的 <span class="kw">`</span><span class="ex">locktag_type</span><span class="kw">`</span> 为 <span class="kw">`</span><span class="ex">LOCKTAG_TUPLE</span><span class="kw">`</span>，<span class="kw">`</span><span class="ex">locktag_field4</span><span class="kw">`</span> 是等待的元组的事务 ID。死锁检测算法对行级锁和表级锁使用相同的 BFS 路径。</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">---</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co">## 六、行级锁：FOR UPDATE/FOR SHARE 与 t_infomask</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co">### 行级锁的语义</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="ex">PG</span> 的 MVCC 使得 <span class="kw">`</span><span class="ex">SELECT</span><span class="kw">`</span> 不需要读锁——每个查询通过快照看到数据库的一致版本。但 <span class="kw">`</span><span class="ex">SELECT</span> ... FOR UPDATE<span class="kw">`</span> 和 <span class="kw">`</span><span class="ex">SELECT</span> ... FOR SHARE<span class="kw">`</span> 需要一种机制阻止其他事务修改行，同时不需要在共享内存中为每行创建独立锁对象。</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="ex">PG</span> 的方案是<span class="pp">**</span>把锁信息写在行本身<span class="pp">**</span>：Heap Tuple Header 中的 <span class="kw">`</span><span class="ex">t_infomask</span><span class="kw">`</span> 字段包含三个 lock bit：</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">c</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> src/include/access/htup_details.h</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="co">#define HEAP_XMAX_KEYSHR_LOCK   0x0010  // xmax 是 key-shared 锁（FOR KEY SHARE，FK 检查用）</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="co">#define HEAP_XMAX_EXCL_LOCK     0x0040  // xmax 是排他锁（FOR UPDATE）</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a><span class="co">#define HEAP_XMAX_LOCK_ONLY     0x0080  // xmax 是锁而非删除</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="co">#define HEAP_XMAX_IS_MULTI      0x1000  // xmax 是 MultiXactId</span></span></code></pre></div>
+            <p>三个标志位的组合对应三种行级锁：</p>
+            <ul>
+            <li><code>FOR UPDATE</code>：<code>HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK</code>（0x00C0），<code>xmax</code>
+            设为当前事务 XID</li>
+            <li><code>FOR SHARE</code>：<code>HEAP_XMAX_LOCK_ONLY</code>（0x0080），不设
+            <code>KEYSHR</code> 也不设 <code>EXCL</code></li>
+            <li><code>FOR KEY SHARE</code>：<code>HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK</code>（0x0090），FK
+            检查时自动获取</li>
+            </ul>
+            <p>当执行 <code>SELECT ... FOR UPDATE</code> 时，PG 设置
+            tuple header 的 <code>xmax</code> 为当前事务的
+            <code>xid</code>，并设置
+            <code>HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK</code>。后续的其他事务在尝试获取该行的冲突锁时，会看到
+            <code>xmax</code> 被一个活跃事务持有，并进入等待队列。</p>
+            <h3
+            id="multixact多事务同时持有行共享锁">MultiXact：多事务同时持有行共享锁</h3>
+            <p>当多个事务同时对同一行执行
+            <code>SELECT ... FOR SHARE</code> 时，<code>xmax</code>
+            只能存一个事务 ID。PG 的解决方案是
+            <strong>MultiXact</strong>（多事务 ID）：把多个事务 ID
+            打包成一个 <code>MultiXactId</code>，存储在 tuple header 的
+            <code>xmax</code> 位置，同时设置
+            <code>HEAP_XMAX_IS_MULTI</code> 标志位。</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define HEAP_XMAX_IS_MULTI      </span><span class="bn">0x1000</span><span class="pp">  </span><span class="co">// xmax 是 MultiXactId，不是单独的事务 ID</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>MultiXact 的状态存储在 `src<span class="op">/</span>backend<span class="op">/</span>access<span class="op">/</span>transam<span class="op">/</span>multixact<span class="op">.</span>c` 管理的 SLRU（Simple LRU）结构中，包含成员事务列表和每个成员的锁模式。这是一个复杂的子系统，涉及自己的 freezing 策略和 wraparound 风险。</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 行级锁的等待机制</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>行级锁等待和表级锁使用相同的 Heavyweight Lock 基础设施。每个 `PGPROC` 通过 `waitLock` 字段指向等待的 `LOCK` 对象：</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/heap/heapam.c（简化）</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="co">// XactLockTableWait() 用于等待目标事务提交或回滚</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="co">// 这是行级锁等待的核心</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> XactLockTableWait<span class="op">(</span>TransactionId xid<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>    LOCKTAG tag<span class="op">;</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>    SET_LOCKTAG_TRANSACTION<span class="op">(</span>tag<span class="op">,</span> xid<span class="op">);</span>  <span class="co">// 锁目标是事务 ID</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 在锁表中获取锁（等待目标事务完成）</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>    LockAcquire<span class="op">(&amp;</span>tag<span class="op">,</span> ShareLock<span class="op">,</span> <span class="kw">false</span><span class="op">,</span> <span class="kw">false</span><span class="op">);</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 拿到锁意味着目标事务已经提交或回滚</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>    LockRelease<span class="op">(&amp;</span>tag<span class="op">,</span> ShareLock<span class="op">,</span> <span class="kw">false</span><span class="op">);</span></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>当一个事务试图对一行执行 FOR UPDATE 而该行被另一个事务以
+            FOR UPDATE 锁住时，等待的是<strong>目标事务的事务
+            ID</strong>，而不是行本身。这种间接等待机制使得死锁检测的等待图以事务为节点，而不是以行为节点——大大简化了检测算法。</p>
+            <hr />
+            <h2
+            id="七运维与排查追踪锁等待链">七、运维与排查：追踪锁等待链</h2>
+            <h3 id="pg_locks-视图">pg_locks 视图</h3>
+            <p><code>pg_locks</code>
+            是诊断锁问题的核心视图。它直接读取共享内存中的锁表：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>    locktype,              <span class="co">-- relation, tuple, transactionid, virtualxid, object, ...</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">database</span>,              <span class="co">-- 数据库 OID</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    relation:<span class="ch">:regclass</span>,    <span class="co">-- 关系名</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    page,                  <span class="co">-- 页面号（页级锁）</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    tuple,                 <span class="co">-- 元组号（行级锁）</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    virtualxid,            <span class="co">-- 虚拟事务 ID</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    transactionid,         <span class="co">-- 事务 ID</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">mode</span>,                  <span class="co">-- 锁模式：AccessShareLock, RowExclusiveLock, ...</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>    granted,               <span class="co">-- t = 已授予, f = 等待中</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>    pid,                   <span class="co">-- 持有或等待锁的进程 PID</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>    waitstart              <span class="co">-- 等待开始时间（仅 waiting 的进程有值）</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> pid, granted;</span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>这个查询给出当前所有的锁状态。<span class="ot">&quot;正在等待&quot;</span>的锁（`granted <span class="op">=</span> false`）是排查锁等待链的入口。</span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>### 阻塞链追踪：pg_blocking_pids()</span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>`pg_blocking_pids(pid)` 是最实用的锁诊断函数：给定一个进程 PID，返回阻塞它的所有进程的 PID：</span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>    pid,</span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>    pg_blocking_pids(pid) <span class="kw">AS</span> blocked_by,</span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>    wait_event_type,</span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    wait_event,</span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>    state,</span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">query</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;Lock&#39;</span></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> pid <span class="op">!=</span> pg_backend_pid();</span></code></pre></div>
+            <p>追踪完整的等待链——A 等 B，B 等 C：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 递归查找锁等待链</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> RECURSIVE wait_chain <span class="kw">AS</span> (</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 基准：所有正在等待锁的进程</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>        pid,</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>        pg_blocking_pids(pid) <span class="kw">AS</span> blockers,</span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>        state,</span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">query</span>,</span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>        <span class="dv">1</span> <span class="kw">AS</span> <span class="kw">level</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;Lock&#39;</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> pid <span class="op">!=</span> pg_backend_pid()</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">UNION</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 递归：找到阻塞者，以及阻塞者的阻塞者</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a>        blocked.pid,</span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a>        pg_blocking_pids(blocked.pid),</span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a>        blocked.state,</span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a>        blocked.<span class="kw">query</span>,</span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>        wc.<span class="kw">level</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> pg_stat_activity blocked</span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a>    <span class="kw">JOIN</span> wait_chain wc <span class="kw">ON</span> blocked.pid <span class="op">=</span> <span class="kw">ANY</span>(wc.blockers)</span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> pg_blocking_pids(blocked.pid) <span class="op">!=</span> <span class="dt">ARRAY</span>[]:<span class="ch">:int</span>[]</span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> pid, blockers, state, <span class="kw">level</span>, <span class="kw">query</span></span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> wait_chain</span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">level</span>, pid;</span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a>### 哪些进程持锁最久</span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-34"><a href="#cb14-34" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb14-35"><a href="#cb14-35" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb14-36"><a href="#cb14-36" aria-hidden="true" tabindex="-1"></a>    l.pid,</span>
+<span id="cb14-37"><a href="#cb14-37" aria-hidden="true" tabindex="-1"></a>    a.usename,</span>
+<span id="cb14-38"><a href="#cb14-38" aria-hidden="true" tabindex="-1"></a>    a.application_name,</span>
+<span id="cb14-39"><a href="#cb14-39" aria-hidden="true" tabindex="-1"></a>    a.state,</span>
+<span id="cb14-40"><a href="#cb14-40" aria-hidden="true" tabindex="-1"></a>    a.query_start,</span>
+<span id="cb14-41"><a href="#cb14-41" aria-hidden="true" tabindex="-1"></a>    now() <span class="op">-</span> a.query_start <span class="kw">AS</span> query_duration,</span>
+<span id="cb14-42"><a href="#cb14-42" aria-hidden="true" tabindex="-1"></a>    a.xact_start,</span>
+<span id="cb14-43"><a href="#cb14-43" aria-hidden="true" tabindex="-1"></a>    now() <span class="op">-</span> a.xact_start <span class="kw">AS</span> xact_duration,</span>
+<span id="cb14-44"><a href="#cb14-44" aria-hidden="true" tabindex="-1"></a>    l.<span class="kw">mode</span>,</span>
+<span id="cb14-45"><a href="#cb14-45" aria-hidden="true" tabindex="-1"></a>    l.locktype,</span>
+<span id="cb14-46"><a href="#cb14-46" aria-hidden="true" tabindex="-1"></a>    l.relation:<span class="ch">:regclass</span> <span class="kw">AS</span> relation,</span>
+<span id="cb14-47"><a href="#cb14-47" aria-hidden="true" tabindex="-1"></a>    l.granted,</span>
+<span id="cb14-48"><a href="#cb14-48" aria-hidden="true" tabindex="-1"></a>    a.<span class="kw">query</span></span>
+<span id="cb14-49"><a href="#cb14-49" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks l</span>
+<span id="cb14-50"><a href="#cb14-50" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity a <span class="kw">ON</span> l.pid <span class="op">=</span> a.pid</span>
+<span id="cb14-51"><a href="#cb14-51" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> l.granted <span class="op">=</span> <span class="kw">true</span></span>
+<span id="cb14-52"><a href="#cb14-52" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l.locktype <span class="op">=</span> <span class="st">&#39;relation&#39;</span></span>
+<span id="cb14-53"><a href="#cb14-53" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l.relation <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span id="cb14-54"><a href="#cb14-54" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> a.xact_start <span class="kw">NULLS</span> <span class="fu">LAST</span>;</span></code></pre></div>
+            <p>重点看 <code>xact_duration</code>
+            大的进程——长事务是锁积压的根源。</p>
+            <h3
+            id="log_lock_waits-与-deadlock_timeout-的联合使用">log_lock_waits
+            与 deadlock_timeout 的联合使用</h3>
+            <p>在 <code>postgresql.conf</code> 中配置：</p>
+            <pre class="text"><code>log_lock_waits = on
+deadlock_timeout = 1s        # 默认值</code></pre>
+            <p><code>log_lock_waits = on</code>
+            的效果：当一个进程等待锁定超过 <code>deadlock_timeout</code>
+            毫秒时，PG 生成一条日志：</p>
+            <pre class="text"><code>LOG:  process 12345 still waiting for ShareLock on transaction 67890 after 1000.123 ms
+DETAIL:  Process holding the lock: 12346. Wait queue: ...</code></pre>
+            <p>这让你在死锁检测之外，也能及时发现”一个进程等锁等了很久”的问题——它可能不是死锁（等待图没有环），但可能是长事务持锁不释放引起的等待雪崩。</p>
+            <p>调整 <code>deadlock_timeout</code> 的权衡： -
+            设得太小（如 100ms）：死锁检测更频繁，CPU
+            开销增加（每次检测都要扫描锁表构建等待图），<code>log_lock_waits</code>
+            日志也可能过于频繁。 - 设得太大（如
+            10s）：死锁检测变慢，死锁事务等待更久才被回滚。但对于已知死锁概率极低的负载（如以只读查询为主、很少出现并发
+            DML 冲突的场景），适当调大可以减少开销。</p>
+            <h3 id="终止阻塞进程">终止阻塞进程</h3>
+            <p>当确认某个进程是锁等待链的根源（例如一个 idle in
+            transaction 的进程持锁不释放）：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 先看目标进程的会话信息</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, state, <span class="kw">query</span>, xact_start,</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> xact_start <span class="kw">AS</span> xact_age</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pid <span class="op">=</span> <span class="dv">12345</span>;</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 终止进程（发送 SIGTERM，允许事务清理）</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_terminate_backend(<span class="dv">12345</span>);</span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 更强制的方式（发送 SIGKILL 信号等价物，不做清理）</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- SELECT pg_cancel_backend(12345);  -- 仅取消当前查询，不终止连接</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>`pg_terminate_backend()` 发送 `SIGTERM` 信号给目标进程，目标进程在下一个 `CHECK_FOR_INTERRUPTS()` 调用处检测到并执行事务回滚和锁释放。如果目标进程卡在内核 I<span class="op">/</span>O 中（如阻塞在磁盘读取），可能需要等待 I<span class="op">/</span>O 超时才能响应。</span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>## 八、实验：构造并观察锁等待</span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>### 构造表级锁等待</span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>在 <span class="kw">Session</span> A 中：</span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a><span class="kw">LOCK</span> <span class="kw">TABLE</span> test_table <span class="kw">IN</span> <span class="kw">ACCESS</span> <span class="kw">EXCLUSIVE</span> <span class="kw">MODE</span>;</span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 不要 COMMIT，保持持锁状态</span></span></code></pre></div>
+            <p>在 Session B 中：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> test_table;</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 阻塞，等待 AccessShareLock</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>在 <span class="kw">Session</span> C（诊断窗口）中观察：</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    pid,</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">mode</span>,</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>    granted,</span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>    relation:<span class="ch">:regclass</span>,</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>    waitstart</span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks</span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relation <span class="op">=</span> <span class="st">&#39;test_table&#39;</span>:<span class="ch">:regclass</span></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> <span class="kw">NOT</span> granted;</span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, pg_blocking_pids(pid), wait_event, <span class="kw">query</span></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pid <span class="op">=</span> (<span class="kw">SELECT</span> pid <span class="kw">FROM</span> pg_locks</span>
+<span id="cb18-21"><a href="#cb18-21" aria-hidden="true" tabindex="-1"></a>             <span class="kw">WHERE</span> relation <span class="op">=</span> <span class="st">&#39;test_table&#39;</span>:<span class="ch">:regclass</span></span>
+<span id="cb18-22"><a href="#cb18-22" aria-hidden="true" tabindex="-1"></a>               <span class="kw">AND</span> <span class="kw">NOT</span> granted</span>
+<span id="cb18-23"><a href="#cb18-23" aria-hidden="true" tabindex="-1"></a>             <span class="kw">LIMIT</span> <span class="dv">1</span>);</span></code></pre></div>
+            <h3 id="构造死锁">构造死锁</h3>
+            <p>Session A：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 持有 id=1 的 RowExclusiveLock</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="kw">Session</span> B：</span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a><span class="cf">BEGIN</span>;</span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">-</span> <span class="dv">50</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">2</span>;</span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 持有 id=2 的 RowExclusiveLock</span></span></code></pre></div>
+            <p>然后 Session A 试图更新 id=2：</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">+</span> <span class="dv">100</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">2</span>;</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 等待 id=2 的锁，被 Session B 阻塞</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="kw">Session</span> B 试图更新 <span class="kw">id</span><span class="op">=</span><span class="dv">1</span>：</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance <span class="op">=</span> balance <span class="op">+</span> <span class="dv">50</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 等待 id=1 的锁，被 Session A 阻塞，形成环路</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 等待 deadlock_timeout 后，PG 检测到死锁，回滚其中一个事务：</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- ERROR: deadlock detected</span></span></code></pre></div>
+            <h3 id="观察行级锁">观察行级锁</h3>
+            <p><code>sql -- 看到 tuple 级别的锁 SELECT     locktype,     mode,     granted,     transactionid,     pid FROM pg_locks WHERE locktype IN ('transactionid', 'tuple');</code>text</p>
+            <p>行级锁的 <code>locktype</code> 通常是
+            <code>transactionid</code>（等待目标事务）或
+            <code>tuple</code>（等待元组）。<code>tuple</code>
+            锁用于当多个等待者竞争同一个元组时，确保它们按顺序醒来。</p>
+            <hr />
+            <h2 id="九关键要点">九、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>三层锁体系各有不可替代的定位</strong>。SpinLock
+            用硬件指令保护微秒级临界区，不能发生上下文切换。LWLock 用
+            CAS + 信号量保护共享内存结构，先自旋后阻塞。Heavyweight Lock
+            提供事务语义、死锁检测和等待队列。</p></li>
+            <li><p><strong>LWLock 经历了三代演进</strong>。PG 9.4 前用
+            System V 信号量，9.5+ 转向 CAS 原子操作，PG 16 的
+            <code>LWLockWaitListLock</code> 用 per-lock
+            等待链表消除了惊群效应。</p></li>
+            <li><p><strong>Heavyweight Lock
+            的核心是锁表和冲突矩阵</strong>。<code>LockAcquire()</code>
+            通过哈希表查找
+            locktag、用冲突矩阵判断能否授予、不能授予则进入 FIFO
+            等待队列。fast path 优化跳过了大部分
+            <code>AccessShareLock</code> 的哈希表操作。</p></li>
+            <li><p><strong>死锁检测是 BFS 等待图算法</strong>。每隔
+            <code>deadlock_timeout</code>
+            毫秒触发一次，从等待进程出发搜索环路，选择回滚代价最小的事务作为牺牲者。</p></li>
+            <li><p><strong>行级锁通过 t_infomask 的 lock bits
+            实现</strong>。<code>HEAP_XMAX_LOCK_ONLY</code> 和
+            <code>HEAP_XMAX_EXCL_LOCK</code> 区分 FOR SHARE 和 FOR
+            UPDATE，MultiXact 处理多个事务同时持有行共享锁。</p></li>
+            <li><p><strong><code>pg_locks</code> +
+            <code>pg_blocking_pids()</code>
+            是排查锁问题的首要工具</strong>。结合
+            <code>pg_stat_activity</code> 和
+            <code>log_lock_waits</code>，可以追踪完整的锁等待链并定位根因。</p></li>
+            </ol>
+            <p>上一章：<a
+            href="../05-buffer-manager/05-buffer-manager.html">Buffer
+            Manager</a> 下一章：<a
+            href="../07-transaction-subxact/07-transaction-subxact.html">事务与子事务</a>，拆解事务状态机、子事务（savepoint）的栈式实现、2PC
+            的 WAL 记录和状态文件，以及事务 ID 分配的回卷保护。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/storage/lmgr/lwlock.c</code>：LWLockAcquire(),
+            LWLockRelease(), LWLockWaitForVar(), LWLockInitialize()</li>
+            <li><code>src/backend/storage/lmgr/lock.c</code>：LockAcquire(),
+            LockRelease(), LockReleaseAll(), GrantLock(),
+            FastPathGrantRelationLock()</li>
+            <li><code>src/backend/storage/lmgr/deadlock.c</code>：DeadLockCheck(),
+            FindLockCycle(), DeadLockReport()</li>
+            <li><code>src/backend/storage/lmgr/proc.c</code>：ProcSleep(),
+            ProcWakeup(), CheckDeadLock()</li>
+            <li><code>src/backend/storage/lmgr/lmgr.c</code>：LockRelationOid(),
+            UnlockRelationOid() – 高层锁管理接口</li>
+            <li><code>src/include/storage/lock.h</code>：LOCK, LOCKTAG,
+            PROCLOCK, LockMethodData 结构体定义</li>
+            <li><code>src/include/storage/lwlock.h</code>：LWLock,
+            LWLockPadded 结构体定义</li>
+            <li><code>src/include/storage/s_lock.h</code>：SpinLock
+            TAS/CAS 实现（平台依赖部分）</li>
+            <li><code>src/include/storage/spin.h</code>：SpinLockAcquire(),
+            SpinLockRelease() 宏</li>
+            <li><code>src/include/access/htup_details.h</code>：HEAP_XMAX_LOCK_ONLY
+            / HEAP_XMAX_EXCL_LOCK / HEAP_XMAX_KEYSHR_LOCK /
+            HEAP_XMAX_IS_MULTI 标志位</li>
+            <li><code>src/backend/access/heap/heapam.c</code>：heap_lock_tuple()
+            – 行级锁的入口</li>
+            <li><code>src/backend/access/transam/multixact.c</code>：MultiXact
+            管理</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 13: Concurrency
+            Control（锁模式、冲突矩阵、行级锁语义）</li>
+            <li>PostgreSQL Documentation, Chapter 28:
+            Reliability（<code>deadlock_timeout</code>,
+            <code>log_lock_waits</code> 的 GUC 定义）</li>
+            <li>PostgreSQL Documentation, Chapter 50: Overview of
+            PostgreSQL Internals, Section 50.3: Lock Management</li>
+            <li>PostgreSQL Documentation, Section 28.3.1: Lock
+            Monitoring（<code>pg_locks</code> 视图字段说明）</li>
+            <li>PostgreSQL Documentation, Section 9.27: System
+            Administration Functions（<code>pg_blocking_pids()</code>,
+            <code>pg_terminate_backend()</code> 等）</li>
+            </ul>
+            <h3 id="开发者讨论与文章">开发者讨论与文章</h3>
+            <ul>
+            <li>pgsql-hackers 邮件列表：PG 9.5 LWLock
+            原子操作实现（commit <code>ab5192a</code>
+            及其讨论线程）</li>
+            <li>pgsql-hackers 邮件列表：PG 16
+            <code>LWLockWaitListLock</code>（commit <code>4f299e4</code>
+            的讨论与设计权衡）</li>
+            <li>Andres Freund, “Improving LWLock Scalability” (PGCon
+            2015) – 原子操作 LWLock 的设计思路</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/21-monitoring/21-monitoring.html">【PG 内核】监控体系与告警设计：从内核机制出发定义该监控什么</a></h3>
+                    <p>不从 Grafana 模板照抄，而是从 PG 内核机制推导出必须监控的六个维度：连接与 wait_event、存储膨胀与 XID wraparound、WAL 与复制延迟、查询性能突变、锁等待链、以及 shared_buffers 命中率骗局。每个维度配具体 SQL 和指标解读，告警阈值给出内核依据而非拍脑袋数字，同时盘点 pg_stat_statements queryid 冲突、track_io_timing 开销、pg_stat_activity 自身代价等监控工具本身的陷阱。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/22-classic-failures/22-classic-failures.html">【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因</a></h3>
+                    <p>拆解 PG 生产环境中最危险的五种故障模式——连接风暴与 work_mem 连锁效应、事务 ID wraparound 危机完整时间线、replication slot 溢出多米诺效应、OOM 连锁 kill、长事务 idle in transaction 隐性破坏。每个故障给出可复现的触发方法、Mermaid 时序图标注事件节点和排查断点、排查 SQL 脚本和修复边界，以及监控埋点策略让下次提前发现而非事后救火。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/23-perf-investigation/23-perf-investigation.html">【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链</a></h3>
+                    <p>不是工具箱罗列，而是一条按顺序推进的调查链：从 pg_stat_statements 定位可疑 queryid，到 EXPLAIN (ANALYZE, BUFFERS) 解剖执行计划，到 pg_stat_activity + wait_event 诊断等待类型，到 pg_locks + pg_blocking_pids() 追踪锁等待树，最后用 OS 层工具（iostat/perf/bpftrace）确认物理瓶颈。覆盖三个特殊场景：计划缓存的快慢切换、CPU 100% 无慢查询的 LWLock 自旋根因、命中率 99% 但 IO 打满的统计骗局。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

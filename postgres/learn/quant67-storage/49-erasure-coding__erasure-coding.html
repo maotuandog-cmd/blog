@@ -1,0 +1,1794 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】纠删码原理与存储效率 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="深入剖析纠删码的数学原理与工程实践——Reed-Solomon
+编码、编码矩阵与恢复过程、参数选择、降级读性能、局部修复码，以及在
+MinIO/Ceph 中的配置实战" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="erasure-coding, reed-solomon, storage-efficiency, data-protection, lrc, galois-field, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/49-erasure-coding/erasure-coding.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】纠删码原理与存储效率" />
+    <meta property="og:description" content="深入剖析纠删码的数学原理与工程实践——Reed-Solomon 编码、编码矩阵与恢复过程、参数选择、降级读性能、局部修复码，以及在 MinIO/Ceph 中的配置实战" />
+    <meta property="og:url" content="https://quant67.com/post/storage/49-erasure-coding/erasure-coding.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="erasure-coding" />
+    <meta property="article:tag" content="reed-solomon" />
+    <meta property="article:tag" content="storage-efficiency" />
+    <meta property="article:tag" content="data-protection" />
+    <meta property="article:tag" content="lrc" />
+    <meta property="article:tag" content="galois-field" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】纠删码原理与存储效率" />
+    <meta name="twitter:description" content="深入剖析纠删码的数学原理与工程实践——Reed-Solomon 编码、编码矩阵与恢复过程、参数选择、降级读性能、局部修复码，以及在 MinIO/Ceph 中的配置实战" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】纠删码原理与存储效率", "description": "深入剖析纠删码的数学原理与工程实践——Reed-Solomon 编码、编码矩阵与恢复过程、参数选择、降级读性能、局部修复码，以及在 MinIO/Ceph 中的配置实战", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/49-erasure-coding/erasure-coding.html"}, "datePublished": "2025-09-27T00:00:00+00:00", "dateModified": "2026-08-07T14:46:07+00:00", "keywords": ["erasure-coding", "reed-solomon", "storage-efficiency", "data-protection", "lrc", "galois-field"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】纠删码原理与存储效率</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-27</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#erasure-coding</span> <span>#reed-solomon</span> <span>#storage-efficiency</span> <span>#data-protection</span> <span>#lrc</span> <span>#galois-field</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/erasure-coding.html">#erasure-coding</a><a class="chip-link" href="/tags/reed-solomon.html">#reed-solomon</a><a class="chip-link" href="/tags/storage-efficiency.html">#storage-efficiency</a><a class="chip-link" href="/tags/data-protection.html">#data-protection</a><a class="chip-link" href="/tags/lrc.html">#lrc</a><a class="chip-link" href="/tags/galois-field-251e4c.html">#galois-field</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/48-minio/minio.html">上一篇：【存储工程】MinIO 原理和架构</a><a class="post-series-nav__link" href="/post/storage/50-object-gateway/object-gateway.html">下一篇：【存储工程】对象存储网关与兼容层</a></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一副本与纠删码的工程权衡"
+                id="toc-一副本与纠删码的工程权衡">一、副本与纠删码的工程权衡</a>
+                <ul>
+                <li><a href="#空间效率对比" id="toc-空间效率对比">1.1
+                空间效率对比</a></li>
+                <li><a href="#修复开销对比" id="toc-修复开销对比">1.2
+                修复开销对比</a></li>
+                <li><a href="#读写性能对比" id="toc-读写性能对比">1.3
+                读写性能对比</a></li>
+                </ul></li>
+                <li><a href="#二纠删码基本原理"
+                id="toc-二纠删码基本原理">二、纠删码基本原理</a>
+                <ul>
+                <li><a href="#从奇偶校验到纠删码"
+                id="toc-从奇偶校验到纠删码">2.1
+                从奇偶校验到纠删码</a></li>
+                <li><a href="#有限域伽罗瓦域"
+                id="toc-有限域伽罗瓦域">2.2 有限域（伽罗瓦域）</a></li>
+                <li><a href="#为什么需要有限域"
+                id="toc-为什么需要有限域">2.3 为什么需要有限域</a></li>
+                </ul></li>
+                <li><a href="#三reed-solomon-编码"
+                id="toc-三reed-solomon-编码">三、Reed-Solomon 编码</a>
+                <ul>
+                <li><a href="#编码的线性代数视角"
+                id="toc-编码的线性代数视角">3.1
+                编码的线性代数视角</a></li>
+                <li><a href="#范德蒙矩阵" id="toc-范德蒙矩阵">3.2
+                范德蒙矩阵</a></li>
+                <li><a href="#柯西矩阵" id="toc-柯西矩阵">3.3
+                柯西矩阵</a></li>
+                <li><a href="#mds-码的含义" id="toc-mds-码的含义">3.4
+                MDS 码的含义</a></li>
+                </ul></li>
+                <li><a href="#四编码与解码过程"
+                id="toc-四编码与解码过程">四、编码与解码过程</a>
+                <ul>
+                <li><a href="#编码过程详解" id="toc-编码过程详解">4.1
+                编码过程详解</a></li>
+                <li><a href="#解码过程数据恢复"
+                id="toc-解码过程数据恢复">4.2
+                解码过程（数据恢复）</a></li>
+                <li><a href="#高斯消元在-gf28-上的实现"
+                id="toc-高斯消元在-gf28-上的实现">4.3 高斯消元在 GF(2^8)
+                上的实现</a></li>
+                <li><a href="#编解码的计算复杂度"
+                id="toc-编解码的计算复杂度">4.4
+                编解码的计算复杂度</a></li>
+                </ul></li>
+                <li><a href="#五参数选择工程"
+                id="toc-五参数选择工程">五、参数选择工程</a>
+                <ul>
+                <li><a href="#k-和-m-的基本权衡"
+                id="toc-k-和-m-的基本权衡">5.1 k 和 m
+                的基本权衡</a></li>
+                <li><a href="#可靠性分析" id="toc-可靠性分析">5.2
+                可靠性分析</a></li>
+                <li><a href="#常见参数选择" id="toc-常见参数选择">5.3
+                常见参数选择</a></li>
+                <li><a href="#条带大小stripe-size的影响"
+                id="toc-条带大小stripe-size的影响">5.4 条带大小（Stripe
+                Size）的影响</a></li>
+                </ul></li>
+                <li><a href="#六降级读的性能分析"
+                id="toc-六降级读的性能分析">六、降级读的性能分析</a>
+                <ul>
+                <li><a href="#什么是降级读" id="toc-什么是降级读">6.1
+                什么是降级读</a></li>
+                <li><a href="#降级读的开销" id="toc-降级读的开销">6.2
+                降级读的开销</a></li>
+                <li><a href="#多块故障时的降级读"
+                id="toc-多块故障时的降级读">6.3
+                多块故障时的降级读</a></li>
+                <li><a href="#网络放大的工程影响"
+                id="toc-网络放大的工程影响">6.4
+                网络放大的工程影响</a></li>
+                <li><a href="#降级读优化策略"
+                id="toc-降级读优化策略">6.5 降级读优化策略</a></li>
+                </ul></li>
+                <li><a href="#七局部修复码"
+                id="toc-七局部修复码">七、局部修复码</a>
+                <ul>
+                <li><a href="#标准-rs-编码的修复痛点"
+                id="toc-标准-rs-编码的修复痛点">7.1 标准 RS
+                编码的修复痛点</a></li>
+                <li><a href="#lrc-的核心思想"
+                id="toc-lrc-的核心思想">7.2 LRC 的核心思想</a></li>
+                <li><a href="#azure-的-lrc-实践"
+                id="toc-azure-的-lrc-实践">7.3 Azure 的 LRC
+                实践</a></li>
+                <li><a href="#lrc-的代价" id="toc-lrc-的代价">7.4 LRC
+                的代价</a></li>
+                </ul></li>
+                <li><a href="#八纠删码在-minio-中的实现"
+                id="toc-八纠删码在-minio-中的实现">八、纠删码在 MinIO
+                中的实现</a>
+                <ul>
+                <li><a href="#minio-纠删码架构"
+                id="toc-minio-纠删码架构">8.1 MinIO 纠删码架构</a></li>
+                <li><a href="#minio-纠删码配置"
+                id="toc-minio-纠删码配置">8.2 MinIO 纠删码配置</a></li>
+                <li><a href="#对象写入流程" id="toc-对象写入流程">8.3
+                对象写入流程</a></li>
+                <li><a href="#minio-纠删码的工程细节"
+                id="toc-minio-纠删码的工程细节">8.4 MinIO
+                纠删码的工程细节</a></li>
+                <li><a href="#minio-参数选择建议"
+                id="toc-minio-参数选择建议">8.5 MinIO
+                参数选择建议</a></li>
+                </ul></li>
+                <li><a href="#九纠删码在-ceph-中的实现"
+                id="toc-九纠删码在-ceph-中的实现">九、纠删码在 Ceph
+                中的实现</a>
+                <ul>
+                <li><a href="#ceph-ec-pool-基础"
+                id="toc-ceph-ec-pool-基础">9.1 Ceph EC Pool
+                基础</a></li>
+                <li><a href="#ceph-支持的纠删码插件"
+                id="toc-ceph-支持的纠删码插件">9.2 Ceph
+                支持的纠删码插件</a></li>
+                <li><a href="#创建和使用-ec-pool"
+                id="toc-创建和使用-ec-pool">9.3 创建和使用 EC
+                Pool</a></li>
+                <li><a href="#ec-pool-的限制"
+                id="toc-ec-pool-的限制">9.4 EC Pool 的限制</a></li>
+                <li><a href="#ceph-ec-pool-调优"
+                id="toc-ceph-ec-pool-调优">9.5 Ceph EC Pool
+                调优</a></li>
+                <li><a href="#cephfs-和-rgw-中的纠删码"
+                id="toc-cephfs-和-rgw-中的纠删码">9.6 CephFS 和 RGW
+                中的纠删码</a></li>
+                </ul></li>
+                <li><a href="#十纠删码性能基准测试"
+                id="toc-十纠删码性能基准测试">十、纠删码性能基准测试</a>
+                <ul>
+                <li><a href="#编解码吞吐量" id="toc-编解码吞吐量">10.1
+                编解码吞吐量</a></li>
+                <li><a href="#端到端写入性能"
+                id="toc-端到端写入性能">10.2 端到端写入性能</a></li>
+                <li><a href="#修复性能" id="toc-修复性能">10.3
+                修复性能</a></li>
+                <li><a href="#测试工具" id="toc-测试工具">10.4
+                测试工具</a></li>
+                <li><a href="#性能调优要点" id="toc-性能调优要点">10.5
+                性能调优要点</a></li>
+                </ul></li>
+                <li><a href="#十一参考文献"
+                id="toc-十一参考文献">十一、参考文献</a>
+                <ul>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#软件与库"
+                id="toc-软件与库">软件与库</a></li>
+                <li><a href="#书籍" id="toc-书籍">书籍</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>分布式存储系统面对的核心矛盾之一，是数据可靠性与存储效率之间的冲突。三副本（3-way
+            Replication）简单可靠，但存储利用率只有 33%——存 1 PB
+            的有效数据需要 3 PB
+            的裸容量。对于大规模冷数据和温数据场景，这个代价太高了。纠删码（Erasure
+            Coding）提供了一种用计算换空间的方案：通过对数据块做数学编码生成校验块，在同等容错能力下把存储利用率提升到
+            60%~80%。</p>
+            <p>但纠删码不是银弹。它引入了编解码的 CPU
+            开销、降级读（Degraded
+            Read）时的网络放大、以及修复单个块时需要跨节点拉取多个块的重建代价。理解这些权衡，需要从数学原理到工程参数做一次完整的拆解。</p>
+            <p>本文从副本与纠删码的工程对比出发，逐步深入有限域算术、Reed-Solomon
+            编码矩阵、编解码过程、参数选择策略、降级读分析、局部修复码（LRC），最后落到
+            MinIO 和 Ceph 中的实际配置。</p>
+            <blockquote>
+            <p><strong>适用范围</strong>
+            本文讨论的纠删码主要指基于有限域的分组码，重点是
+            Reed-Solomon（RS）编码及其变体。卷积码、喷泉码等不在讨论范围内。涉及的软件版本：MinIO
+            RELEASE.2024-11-07、Ceph
+            18.x（Reef）。不同版本的默认参数和行为可能有差异。</p>
+            </blockquote>
+            <hr />
+            <h2
+            id="一副本与纠删码的工程权衡">一、副本与纠删码的工程权衡</h2>
+            <h3 id="空间效率对比">1.1 空间效率对比</h3>
+            <p>副本策略的存储开销是固定的倍数关系。三副本的存储利用率为
+            1/3，即约 33%。纠删码的存储利用率取决于数据块数 k 和校验块数
+            m 的比值，公式为 k/(k+m)。</p>
+            <table>
+            <thead>
+            <tr>
+            <th>冗余策略</th>
+            <th>配置</th>
+            <th>容错块数</th>
+            <th>存储利用率</th>
+            <th>存 1 PB 数据所需裸容量</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>二副本</td>
+            <td>2 副本</td>
+            <td>1</td>
+            <td>50.0%</td>
+            <td>2.0 PB</td>
+            </tr>
+            <tr>
+            <td>三副本</td>
+            <td>3 副本</td>
+            <td>2</td>
+            <td>33.3%</td>
+            <td>3.0 PB</td>
+            </tr>
+            <tr>
+            <td>RS(4,2)</td>
+            <td>4 数据 + 2 校验</td>
+            <td>2</td>
+            <td>66.7%</td>
+            <td>1.5 PB</td>
+            </tr>
+            <tr>
+            <td>RS(6,3)</td>
+            <td>6 数据 + 3 校验</td>
+            <td>3</td>
+            <td>66.7%</td>
+            <td>1.5 PB</td>
+            </tr>
+            <tr>
+            <td>RS(8,4)</td>
+            <td>8 数据 + 4 校验</td>
+            <td>4</td>
+            <td>66.7%</td>
+            <td>1.5 PB</td>
+            </tr>
+            <tr>
+            <td>RS(10,4)</td>
+            <td>10 数据 + 4 校验</td>
+            <td>4</td>
+            <td>71.4%</td>
+            <td>1.4 PB</td>
+            </tr>
+            <tr>
+            <td>RS(16,4)</td>
+            <td>16 数据 + 4 校验</td>
+            <td>4</td>
+            <td>80.0%</td>
+            <td>1.25 PB</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>RS(10,4) 与三副本都能在「丢 2 块」时保持可恢复，但
+            RS(10,4) 的设计容错是 4 块，存储利用率约 71.4% 对 33.3%。在
+            PB
+            级采购里，利用率差会变成<strong>同有效容量下裸盘数量差</strong>；具体省多少钱取决于盘价、机柜与电费，本文不把它换算成美元口号。</p>
+            <h3 id="修复开销对比">1.2 修复开销对比</h3>
+            <p>副本的修复逻辑简单：从存活副本拷贝一份完整数据到新节点。修复一个
+            1 TB 的副本，网络传输量就是 1 TB。</p>
+            <p>纠删码的修复复杂得多。以 RS(10,4)
+            为例，恢复一个丢失的数据块需要从其他节点读取至少 k=10
+            个块，通过矩阵运算重建丢失块，再写入新节点。修复一个块的网络传输量是块大小的
+            k 倍。如果每个块是 256 MB，那么恢复一个块需要传输 2.5 GB
+            的数据，而不是仅仅 256 MB。</p>
+            <p>这就是纠删码的修复放大（Repair
+            Amplification）问题。修复放大系数 = 修复时需要读取的数据量 /
+            丢失的数据量。对于标准 RS(k,m) 编码，修复放大系数为 k。</p>
+            <pre class="text"><code>副本修复：
+  Node A (存活) --[拷贝 1 块]--&gt; Node X (新节点)
+  网络传输: 1 x 块大小
+
+RS(10,4) 修复：
+  Node 1 --[读 Block 1]--\
+  Node 2 --[读 Block 2]---\
+  Node 3 --[读 Block 3]----\
+  Node 4 --[读 Block 4]-----\
+  Node 5 --[读 Block 5]------+--&gt; 重建节点：矩阵运算恢复丢失块
+  Node 6 --[读 Block 6]------/
+  Node 7 --[读 Block 7]-----/
+  Node 8 --[读 Block 8]----/
+  Node 9 --[读 Block 9]---/
+  Node 10 -[读 Block 10]-/
+  网络传输: 10 x 块大小</code></pre>
+            <h3 id="读写性能对比">1.3 读写性能对比</h3>
+            <p><strong>写入路径</strong>：副本写入只需要把数据拷贝到多个节点，不需要计算。纠删码写入需要先对
+            k 个数据块做编码运算生成 m 个校验块，再把 k+m
+            个块分别写入不同节点。编码运算在现代 CPU 上通过 SIMD
+            指令（如 AVX2、AVX-512）加速后，吞吐量可以达到数
+            GB/s，对于大块顺序写入来说开销可控。但对于小对象写入，编码的固定开销会变得显著。</p>
+            <p><strong>读取路径</strong>：正常情况下，副本读取可以从任意一个副本读取完整数据。纠删码读取需要从
+            k
+            个节点各读取一个块，然后拼装成完整数据。这意味着一次读取的延迟取决于最慢的那个节点（尾延迟问题）。</p>
+            <p><strong>降级读</strong>：当某个节点不可用时，副本可以直接切换到另一个副本，延迟几乎不变。纠删码的降级读需要额外读取校验块并执行解码运算来重建丢失的数据块，延迟和带宽开销都会增加。</p>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>三副本</th>
+            <th>RS(10,4) 纠删码</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>存储利用率</td>
+            <td>33.3%</td>
+            <td>71.4%</td>
+            </tr>
+            <tr>
+            <td>容错块数</td>
+            <td>2</td>
+            <td>4</td>
+            </tr>
+            <tr>
+            <td>写入计算开销</td>
+            <td>无</td>
+            <td>编码运算（可 SIMD 加速）</td>
+            </tr>
+            <tr>
+            <td>正常读延迟</td>
+            <td>低（单节点读取）</td>
+            <td>较高（k 节点并行读取，受尾延迟影响）</td>
+            </tr>
+            <tr>
+            <td>降级读开销</td>
+            <td>几乎无额外开销</td>
+            <td>需额外读取校验块 + 解码运算</td>
+            </tr>
+            <tr>
+            <td>修复网络开销</td>
+            <td>1 倍块大小</td>
+            <td>k 倍块大小</td>
+            </tr>
+            <tr>
+            <td>修复时间</td>
+            <td>短</td>
+            <td>长（受修复放大影响）</td>
+            </tr>
+            <tr>
+            <td>适用场景</td>
+            <td>热数据、低延迟、小对象</td>
+            <td>温冷数据、大对象、容量敏感</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>工程判断：在实际生产中，大多数系统采用混合策略。元数据和小对象用三副本保证低延迟和快速恢复；大对象和冷数据用纠删码节省空间。Ceph
+            的典型部署就是 metadata pool 用三副本，data pool
+            用纠删码。</p>
+            <hr />
+            <h2 id="二纠删码基本原理">二、纠删码基本原理</h2>
+            <h3 id="从奇偶校验到纠删码">2.1 从奇偶校验到纠删码</h3>
+            <p>RAID-5 的奇偶校验（Parity）是纠删码的最简单形式。假设有 k
+            个数据块 D0, D1, …, D(k-1)，RAID-5
+            通过异或运算（XOR）生成一个校验块 P：</p>
+            <pre class="text"><code>P = D0 XOR D1 XOR D2 XOR ... XOR D(k-1)</code></pre>
+            <p>如果任意一个数据块丢失，比如 D2
+            丢失，可以通过对剩余块做异或来恢复：</p>
+            <pre class="text"><code>D2 = D0 XOR D1 XOR D3 XOR ... XOR D(k-1) XOR P</code></pre>
+            <p>但 RAID-5 只能容忍一个块丢失。要容忍 m
+            个块同时丢失，需要生成 m
+            个独立的校验块。这就需要比简单异或更强大的数学工具——有限域上的线性代数。</p>
+            <h3 id="有限域伽罗瓦域">2.2 有限域（伽罗瓦域）</h3>
+            <p>纠删码的数学基础是有限域（Finite
+            Field），也叫伽罗瓦域（Galois Field），记作
+            GF(q)。有限域是一个包含有限个元素的集合，在这个集合上定义了加法和乘法运算，且满足封闭性、结合律、交换律、分配律，以及每个非零元素都有乘法逆元。</p>
+            <p>存储系统中最常用的是 GF(2^8)，即包含 256
+            个元素的有限域。选择 GF(2^8) 的原因很实际：一个字节正好 8
+            位，可以表示 GF(2^8)
+            中的一个元素。这样数据块中的每个字节都可以看作 GF(2^8)
+            中的一个元素，所有编解码运算都在字节级别进行。</p>
+            <h4 id="gf28-的运算规则">GF(2^8) 的运算规则</h4>
+            <p>GF(2^8) 中的加法就是按位异或（XOR）：</p>
+            <pre class="text"><code>GF(2^8) 加法:
+  a + b = a XOR b
+
+例如:
+  0x57 + 0x83 = 01010111 XOR 10000011 = 11010100 = 0xD4</code></pre>
+            <p>加法的逆运算也是异或，即 a - b = a XOR b = a + b。在
+            GF(2^8) 中，加法和减法是同一个运算。</p>
+            <p>GF(2^8) 中的乘法比较复杂。每个元素被看作 GF(2)
+            上的多项式（系数为 0 或
+            1），乘法是多项式乘法对一个不可约多项式（Irreducible
+            Polynomial）取模。AES
+            标准和许多纠删码实现使用的不可约多项式是：</p>
+            <pre class="text"><code>p(x) = x^8 + x^4 + x^3 + x + 1    (对应二进制 100011011，十六进制 0x11B)</code></pre>
+            <p>例如，计算 0x57 * 0x83 在 GF(2^8) 中的结果：</p>
+            <pre class="text"><code>0x57 = x^6 + x^4 + x^2 + x + 1
+0x83 = x^7 + x + 1
+
+多项式乘法（系数在 GF(2) 中，即模 2）:
+(x^6 + x^4 + x^2 + x + 1)(x^7 + x + 1)
+= x^13 + x^11 + x^9 + x^8 + x^7
+  + x^7 + x^5 + x^3 + x^2 + x
+  + x^6 + x^4 + x^2 + x + 1
+= x^13 + x^11 + x^9 + x^8 + x^6 + x^5 + x^4 + x^3 + 1
+  （GF(2) 中相同项抵消：x^7 + x^7 = 0, x^2 + x^2 = 0, x + x = 0）
+
+再对 p(x) = x^8 + x^4 + x^3 + x + 1 取模，得到最终结果。</code></pre>
+            <p>实际工程实现中不会每次都做多项式乘法。常用的加速方法有两种：</p>
+            <ol type="1">
+            <li><strong>查表法</strong>：预先计算 256 x 256 的乘法表（64
+            KB），查表完成乘法。</li>
+            <li><strong>对数/反对数表法</strong>：GF(2^8)
+            的非零元素可以用生成元（Generator）的幂次表示。将乘法转换为对数相加：a
+            * b = g^(log_g(a) + log_g(b))。只需要两张 256
+            字节的对数表和反对数表。</li>
+            </ol>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># GF(2^8) 对数/反对数表构建（不可约多项式 0x11D，生成元 2）</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 以下是示意逻辑，实际实现可参考 Intel ISA-L 或 Jerasure 库</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> build_gf_tables(primitive_poly<span class="op">=</span><span class="bn">0x11D</span>):</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    exp_table <span class="op">=</span> [<span class="dv">0</span>] <span class="op">*</span> <span class="dv">512</span>  <span class="co"># 反对数表</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    log_table <span class="op">=</span> [<span class="dv">0</span>] <span class="op">*</span> <span class="dv">256</span>  <span class="co"># 对数表</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> <span class="dv">1</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">255</span>):</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        exp_table[i] <span class="op">=</span> x</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>        log_table[x] <span class="op">=</span> i</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>        x <span class="op">&lt;&lt;=</span> <span class="dv">1</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> x <span class="op">&amp;</span> <span class="bn">0x100</span>:</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>            x <span class="op">^=</span> primitive_poly</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 填充 exp_table 的后半部分以简化模运算</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">255</span>, <span class="dv">512</span>):</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>        exp_table[i] <span class="op">=</span> exp_table[i <span class="op">-</span> <span class="dv">255</span>]</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> exp_table, log_table</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> gf_mul(a, b, exp_table, log_table):</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;GF(2^8) 乘法&quot;&quot;&quot;</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> a <span class="op">==</span> <span class="dv">0</span> <span class="kw">or</span> b <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> exp_table[log_table[a] <span class="op">+</span> log_table[b]]</span></code></pre></div>
+            <h3 id="为什么需要有限域">2.3 为什么需要有限域</h3>
+            <p>一个自然的问题是：为什么不能用普通的整数运算来做纠删码？原因在于整数运算不满足纠删码所需的数学性质。</p>
+            <p>纠删码的编解码本质上是求解线性方程组。解方程需要做除法（求逆矩阵）。在普通整数域上，除法可能产生无限小数（如
+            1/3），无法精确表示。而在有限域上，每个非零元素都有精确的乘法逆元，除法总是精确的。</p>
+            <p>同时，有限域中的运算结果仍然在域内（封闭性）。GF(2^8)
+            中任意两个字节做加法或乘法，结果仍然是一个字节。这保证了编码后的校验块大小与数据块相同。</p>
+            <hr />
+            <h2 id="三reed-solomon-编码">三、Reed-Solomon 编码</h2>
+            <h3 id="编码的线性代数视角">3.1 编码的线性代数视角</h3>
+            <p>Reed-Solomon（RS）编码是最广泛使用的纠删码。RS
+            编码的核心思想可以用矩阵乘法表达：</p>
+            <pre class="text"><code>编码矩阵 (n x k)  *  数据向量 (k x 1)  =  编码向量 (n x 1)
+
+其中:
+  n = k + m （总块数 = 数据块数 + 校验块数）
+  k = 数据块数
+  m = 校验块数</code></pre>
+            <p>编码矩阵（Encoding Matrix）的上半部分是 k x k
+            的单位矩阵（Identity Matrix），下半部分是 m x k
+            的校验矩阵（Parity Matrix）。这样编码后的前 k
+            个块就是原始数据块（系统码，Systematic Code），后 m
+            个块是校验块。</p>
+            <pre class="text"><code>编码矩阵 G (n x k):
+
+     | 1  0  0  ...  0 |        -- 单位矩阵 I_k (k x k)
+     | 0  1  0  ...  0 |           保证编码后前 k 块 = 原始数据
+     | 0  0  1  ...  0 |
+G =  | .  .  .  ...  . |
+     | 0  0  0  ...  1 |
+     |-----------------|
+     | p00 p01 p02 ... |        -- 校验矩阵 P (m x k)
+     | p10 p11 p12 ... |           生成 m 个校验块
+     | .   .   .   ... |
+
+编码过程:
+     | D0 |        | D0 |       数据块（原样保留）
+     | D1 |        | D1 |
+     | D2 |        | D2 |
+G *  | .. |   =    | .. |
+     | Dk |        | Dk |
+                   | C0 |       校验块（计算得出）
+                   | C1 |
+                   | .. |</code></pre>
+            <p>每个校验块 Ci 是所有数据块的线性组合：</p>
+            <pre class="text"><code>C0 = p00*D0 + p01*D1 + p02*D2 + ... + p0(k-1)*D(k-1)
+C1 = p10*D0 + p11*D1 + p12*D2 + ... + p1(k-1)*D(k-1)
+...</code></pre>
+            <p>其中加法和乘法都在 GF(2^8) 上进行。</p>
+            <h3 id="范德蒙矩阵">3.2 范德蒙矩阵</h3>
+            <p>经典的 RS 编码使用范德蒙矩阵（Vandermonde
+            Matrix）作为编码矩阵的基础。范德蒙矩阵的元素由 n
+            个不同的评估点（Evaluation Points） x0, x1, …, x(n-1)
+            确定：</p>
+            <pre class="text"><code>范德蒙矩阵 V (n x k):
+
+     | 1   x0    x0^2   ...  x0^(k-1)   |
+     | 1   x1    x1^2   ...  x1^(k-1)   |
+V =  | 1   x2    x2^2   ...  x2^(k-1)   |
+     | .   .     .      ...  .           |
+     | 1   x(n-1) x(n-1)^2 ... x(n-1)^(k-1) |</code></pre>
+            <p>范德蒙矩阵有一个关键性质：只要 x0, x1, …, x(n-1)
+            两两不同，则 V 的任意 k 行构成的 k x k
+            子矩阵都是可逆的。这个性质保证了：从 n 个编码块中任意选取 k
+            个，都能通过求解线性方程组恢复原始数据。这正是纠删码”任意 m
+            个块丢失都能恢复”的数学保证。</p>
+            <p>为了构造系统码（前 k
+            个输出块就是原始数据块），通常的做法是：</p>
+            <ol type="1">
+            <li>取范德蒙矩阵的前 k 行构成 k x k 子矩阵 V_top。</li>
+            <li>计算 V_top 的逆矩阵。</li>
+            <li>用 V * V_top^(-1)
+            得到系统化的编码矩阵，其上半部分自动变成单位矩阵。</li>
+            </ol>
+            <h3 id="柯西矩阵">3.3 柯西矩阵</h3>
+            <p>柯西矩阵（Cauchy
+            Matrix）是另一种常用的编码矩阵构造方法，由 Jim Blomer、Malik
+            Kalfane、Richard Karp 和 Marek Karpinski 在 1995
+            年提出，后被 James Plank 等人进一步优化用于纠删码。</p>
+            <p>柯西矩阵的元素定义为：</p>
+            <pre class="text"><code>C[i][j] = 1 / (xi + yj)
+
+其中 xi 和 yj 是从 GF(2^w) 中选取的元素，且 xi != yj 对所有 i,j 成立，
+所有 xi 两两不同，所有 yj 两两不同。
+加法和除法都在 GF(2^w) 上进行。</code></pre>
+            <p>柯西矩阵相比范德蒙矩阵的优势在于：</p>
+            <ol type="1">
+            <li><strong>天然满足 MDS
+            性质</strong>：柯西矩阵的任意子方阵都是非奇异的（可逆的），不需要额外的矩阵变换来构造系统码。</li>
+            <li><strong>更高效的位矩阵实现</strong>：柯西矩阵可以展开为二进制位矩阵（Binary
+            Bit Matrix），将 GF(2^8)
+            上的乘法转换为纯异或运算。这使得编码可以完全用 XOR
+            完成，避免了 GF 乘法的开销。</li>
+            </ol>
+            <pre class="text"><code>柯西矩阵 vs 范德蒙矩阵对比:
+
+范德蒙矩阵:
+  + 构造直观
+  + 数学性质清晰
+  - 需要 GF 乘法（查表或对数表）
+  - 系统码构造需要矩阵求逆
+
+柯西矩阵:
+  + 任意子矩阵可逆（天然 MDS）
+  + 可展开为 XOR 运算
+  + 编码速度通常更快
+  - 构造时需选择合适的 xi, yj</code></pre>
+            <p>Jerasure 库和 Intel ISA-L
+            库都支持柯西矩阵实现。在实际性能测试中，基于柯西矩阵的 XOR
+            实现通常比范德蒙矩阵的查表实现快 20%~40%，尤其在 SIMD
+            加速下优势更明显。</p>
+            <h3 id="mds-码的含义">3.4 MDS 码的含义</h3>
+            <p>RS 编码是一种最大距离可分码（Maximum Distance Separable
+            Code，MDS Code）。MDS 码的含义是：对于给定的 n（总块数）和
+            k（数据块数），RS
+            编码达到了理论上最优的容错能力——最小汉明距离（Minimum
+            Hamming Distance） d = n - k + 1 = m + 1。</p>
+            <p>换句话说，RS(k,m) 编码能容忍任意 m
+            个块同时丢失，且没有任何编码方案能在相同的冗余度下做得更好。这是辛格尔顿界（Singleton
+            Bound）的结论。</p>
+            <hr />
+            <h2 id="四编码与解码过程">四、编码与解码过程</h2>
+            <h3 id="编码过程详解">4.1 编码过程详解</h3>
+            <p>以 RS(4,2) 为例，k=4 个数据块，m=2
+            个校验块。假设编码矩阵的校验部分如下（元素在 GF(2^8)
+            中）：</p>
+            <pre class="text"><code>编码矩阵 G (6 x 4):
+
+     | 1  0  0  0 |   -- 单位矩阵
+     | 0  1  0  0 |
+     | 0  0  1  0 |
+     | 0  0  0  1 |
+     |------------|
+     | 1  1  1  1 |   -- 校验行 0: C0 = D0 + D1 + D2 + D3 (全 1 行 = XOR 校验)
+     | 1  2  4  8 |   -- 校验行 1: C1 = D0 + 2*D1 + 4*D2 + 8*D3 (GF 乘法)</code></pre>
+            <p>编码过程：</p>
+            <pre class="text"><code>输入数据块 (每块假设为单字节简化演示):
+  D0 = 0x03, D1 = 0x07, D2 = 0x0B, D3 = 0x0F
+
+校验块计算 (GF(2^8) 运算):
+  C0 = 1*0x03 + 1*0x07 + 1*0x0B + 1*0x0F
+     = 0x03 XOR 0x07 XOR 0x0B XOR 0x0F
+     = 0x00                                    (XOR 校验)
+
+  C1 = 1*0x03 + 2*0x07 + 4*0x0B + 8*0x0F
+     = 0x03 + 0x0E + 0x2C + 0x78              (GF(2^8) 乘法和加法)
+     (具体结果取决于所选的不可约多项式)
+
+编码输出: [D0, D1, D2, D3, C0, C1] = [0x03, 0x07, 0x0B, 0x0F, C0, C1]</code></pre>
+            <p>实际系统中，数据块不是单字节而是数百 KB 到数 MB
+            的数据切片。编码按字节逐位进行：对所有块的第 i
+            个字节位置，用编码矩阵的校验行做 GF(2^8)
+            运算，生成校验块的第 i 个字节。</p>
+            <h3 id="解码过程数据恢复">4.2 解码过程（数据恢复）</h3>
+            <p>假设 RS(4,2) 编码后的 6 个块中，D1 和 D3 丢失了。剩余 4
+            个块为 D0, D2, C0, C1。</p>
+            <p>恢复步骤：</p>
+            <p><strong>第一步：从编码矩阵中选取与存活块对应的行，构成解码矩阵。</strong></p>
+            <p>存活块对应的行是第 0 行（D0）、第 2 行（D2）、第 4
+            行（C0）、第 5 行（C1）：</p>
+            <pre class="text"><code>解码子矩阵 A (4 x 4):
+
+     | 1  0  0  0 |   -- D0 对应行
+     | 0  0  1  0 |   -- D2 对应行
+     | 1  1  1  1 |   -- C0 对应行
+     | 1  2  4  8 |   -- C1 对应行</code></pre>
+            <p><strong>第二步：计算解码子矩阵的逆矩阵。</strong></p>
+            <pre class="text"><code>A^(-1) = ?   (在 GF(2^8) 上做矩阵求逆)
+
+矩阵求逆使用高斯消元法（Gaussian Elimination），
+所有运算在 GF(2^8) 上进行。</code></pre>
+            <p><strong>第三步：用逆矩阵乘以存活块向量，恢复原始数据。</strong></p>
+            <pre class="text"><code>| D0 |         | D0 |
+| D1 |         | D2 |
+| D2 | = A^(-1) * | C0 |
+| D3 |         | C1 |
+
+逆矩阵的第 1 行和第 3 行分别给出 D1 和 D3 的恢复公式。</code></pre>
+            <p>关键点在于：由于编码矩阵的 MDS 性质，任意 k
+            行构成的子矩阵都可逆。因此无论哪些块丢失，只要存活块数 &gt;=
+            k，就一定能恢复所有数据。</p>
+            <h3 id="高斯消元在-gf28-上的实现">4.3 高斯消元在 GF(2^8)
+            上的实现</h3>
+            <p>解码的核心操作是 GF(2^8) 上的矩阵求逆。以下是高斯消元法在
+            GF(2^8) 上的实现逻辑：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> gf_matrix_inverse(matrix, k, exp_table, log_table):</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="co">    在 GF(2^8) 上对 k x k 矩阵求逆（高斯-约旦消元法）。</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="co">    matrix: k x k 的二维数组，元素为 0-255 的整数。</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="co">    返回逆矩阵，若不可逆则抛出异常。</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="co">    &quot;&quot;&quot;</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 构造增广矩阵 [matrix | I]</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> k</span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a>    aug <span class="op">=</span> [[<span class="dv">0</span>] <span class="op">*</span> (<span class="dv">2</span> <span class="op">*</span> n) <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(n)]</span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(n):</span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> j <span class="kw">in</span> <span class="bu">range</span>(n):</span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a>            aug[i][j] <span class="op">=</span> matrix[i][j]</span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a>        aug[i][n <span class="op">+</span> i] <span class="op">=</span> <span class="dv">1</span>  <span class="co"># 单位矩阵部分</span></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 前向消元</span></span>
+<span id="cb19-16"><a href="#cb19-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> col <span class="kw">in</span> <span class="bu">range</span>(n):</span>
+<span id="cb19-17"><a href="#cb19-17" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 寻找主元（pivot）</span></span>
+<span id="cb19-18"><a href="#cb19-18" aria-hidden="true" tabindex="-1"></a>        pivot_row <span class="op">=</span> <span class="op">-</span><span class="dv">1</span></span>
+<span id="cb19-19"><a href="#cb19-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> row <span class="kw">in</span> <span class="bu">range</span>(col, n):</span>
+<span id="cb19-20"><a href="#cb19-20" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> aug[row][col] <span class="op">!=</span> <span class="dv">0</span>:</span>
+<span id="cb19-21"><a href="#cb19-21" aria-hidden="true" tabindex="-1"></a>                pivot_row <span class="op">=</span> row</span>
+<span id="cb19-22"><a href="#cb19-22" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span></span>
+<span id="cb19-23"><a href="#cb19-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> pivot_row <span class="op">==</span> <span class="op">-</span><span class="dv">1</span>:</span>
+<span id="cb19-24"><a href="#cb19-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">raise</span> <span class="pp">ValueError</span>(<span class="st">&quot;矩阵不可逆&quot;</span>)</span>
+<span id="cb19-25"><a href="#cb19-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-26"><a href="#cb19-26" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 交换行</span></span>
+<span id="cb19-27"><a href="#cb19-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> pivot_row <span class="op">!=</span> col:</span>
+<span id="cb19-28"><a href="#cb19-28" aria-hidden="true" tabindex="-1"></a>            aug[col], aug[pivot_row] <span class="op">=</span> aug[pivot_row], aug[col]</span>
+<span id="cb19-29"><a href="#cb19-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-30"><a href="#cb19-30" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 归一化主元行: 乘以主元的逆</span></span>
+<span id="cb19-31"><a href="#cb19-31" aria-hidden="true" tabindex="-1"></a>        pivot_val <span class="op">=</span> aug[col][col]</span>
+<span id="cb19-32"><a href="#cb19-32" aria-hidden="true" tabindex="-1"></a>        pivot_inv <span class="op">=</span> gf_inverse(pivot_val, exp_table, log_table)</span>
+<span id="cb19-33"><a href="#cb19-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> j <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">2</span> <span class="op">*</span> n):</span>
+<span id="cb19-34"><a href="#cb19-34" aria-hidden="true" tabindex="-1"></a>            aug[col][j] <span class="op">=</span> gf_mul(aug[col][j], pivot_inv, exp_table, log_table)</span>
+<span id="cb19-35"><a href="#cb19-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-36"><a href="#cb19-36" aria-hidden="true" tabindex="-1"></a>        <span class="co"># 消去其他行中该列的元素</span></span>
+<span id="cb19-37"><a href="#cb19-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> row <span class="kw">in</span> <span class="bu">range</span>(n):</span>
+<span id="cb19-38"><a href="#cb19-38" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> row <span class="op">==</span> col:</span>
+<span id="cb19-39"><a href="#cb19-39" aria-hidden="true" tabindex="-1"></a>                <span class="cf">continue</span></span>
+<span id="cb19-40"><a href="#cb19-40" aria-hidden="true" tabindex="-1"></a>            factor <span class="op">=</span> aug[row][col]</span>
+<span id="cb19-41"><a href="#cb19-41" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> factor <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb19-42"><a href="#cb19-42" aria-hidden="true" tabindex="-1"></a>                <span class="cf">continue</span></span>
+<span id="cb19-43"><a href="#cb19-43" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> j <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">2</span> <span class="op">*</span> n):</span>
+<span id="cb19-44"><a href="#cb19-44" aria-hidden="true" tabindex="-1"></a>                aug[row][j] <span class="op">^=</span> gf_mul(factor, aug[col][j], exp_table, log_table)</span>
+<span id="cb19-45"><a href="#cb19-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-46"><a href="#cb19-46" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 提取逆矩阵（增广矩阵的右半部分）</span></span>
+<span id="cb19-47"><a href="#cb19-47" aria-hidden="true" tabindex="-1"></a>    inverse <span class="op">=</span> [[aug[i][n <span class="op">+</span> j] <span class="cf">for</span> j <span class="kw">in</span> <span class="bu">range</span>(n)] <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(n)]</span>
+<span id="cb19-48"><a href="#cb19-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> inverse</span>
+<span id="cb19-49"><a href="#cb19-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-50"><a href="#cb19-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-51"><a href="#cb19-51" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> gf_inverse(a, exp_table, log_table):</span>
+<span id="cb19-52"><a href="#cb19-52" aria-hidden="true" tabindex="-1"></a>    <span class="co">&quot;&quot;&quot;GF(2^8) 乘法逆元: a^(-1) = g^(255 - log_g(a))&quot;&quot;&quot;</span></span>
+<span id="cb19-53"><a href="#cb19-53" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> a <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb19-54"><a href="#cb19-54" aria-hidden="true" tabindex="-1"></a>        <span class="cf">raise</span> <span class="pp">ValueError</span>(<span class="st">&quot;零元素没有乘法逆元&quot;</span>)</span>
+<span id="cb19-55"><a href="#cb19-55" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> exp_table[<span class="dv">255</span> <span class="op">-</span> log_table[a]]</span></code></pre></div>
+            <h3 id="编解码的计算复杂度">4.4 编解码的计算复杂度</h3>
+            <p>编码的计算复杂度为 O(m * k * B)，其中 B
+            是每个块的字节数。对于 RS(10,4)，编码一个条带需要 4 * 10 =
+            40 次 GF 乘法（每字节），乘以块大小。</p>
+            <p>解码（恢复）的计算复杂度包含两部分：</p>
+            <ol type="1">
+            <li>矩阵求逆：O(k^3)，只需要做一次（每次故障模式变化时）。</li>
+            <li>矩阵-向量乘法：O(k^2 * B)，对每个字节位置都要做。</li>
+            </ol>
+            <p>下面用 Mermaid 图展示完整的编解码数据流：</p>
+            <pre class="mermaid"><code>flowchart TD
+    subgraph 编码过程
+        A[原始数据] --&gt; B[切分为 k 个数据块]
+        B --&gt; C[D0, D1, ..., Dk-1]
+        C --&gt; D[编码矩阵校验行 x 数据块]
+        D --&gt; E[生成 m 个校验块 C0, C1, ..., Cm-1]
+        C --&gt; F[数据块 + 校验块分发到 n 个节点]
+        E --&gt; F
+    end
+
+    subgraph 解码过程
+        G[检测到块丢失] --&gt; H[从存活节点收集 k 个块]
+        H --&gt; I[提取对应编码矩阵行构成子矩阵]
+        I --&gt; J[GF 上矩阵求逆]
+        J --&gt; K[逆矩阵 x 存活块向量]
+        K --&gt; L[恢复丢失的数据块]
+    end</code></pre>
+            <hr />
+            <h2 id="五参数选择工程">五、参数选择工程</h2>
+            <h3 id="k-和-m-的基本权衡">5.1 k 和 m 的基本权衡</h3>
+            <p>RS(k,m) 中的两个参数决定了系统的所有关键特性：</p>
+            <ul>
+            <li><strong>k（数据块数）</strong>：k 越大，存储利用率
+            k/(k+m)
+            越高，但编解码计算量增大，修复放大系数增大，单次读取需要访问的节点数增多。</li>
+            <li><strong>m（校验块数）</strong>：m
+            越大，容错能力越强，但存储开销 m/(k+m) 增大。</li>
+            </ul>
+            <pre class="text"><code>k/(k+m) 存储利用率随 k 变化（固定 m=4）:
+
+k=4:  4/8  = 50.0%   ████████░░░░░░░░
+k=6:  6/10 = 60.0%   ██████████░░░░░░
+k=8:  8/12 = 66.7%   ███████████░░░░░
+k=10: 10/14= 71.4%   ████████████░░░░
+k=12: 12/16= 75.0%   ████████████░░░░
+k=16: 16/20= 80.0%   █████████████░░░
+k=20: 20/24= 83.3%   ██████████████░░
+k=32: 32/36= 88.9%   ███████████████░</code></pre>
+            <h3 id="可靠性分析">5.2 可靠性分析</h3>
+            <p>存储系统的可靠性通常用年化数据丢失概率（Annual Data Loss
+            Probability）来衡量。假设单块年故障率为 p（典型值：HDD 约
+            2%~4%，SSD 约 0.5%~1%），RS(k,m)
+            编码的数据丢失需要在修复完成之前同时有 m+1 个块故障。</p>
+            <p>对于 RS(k,m)，在不考虑修复速度的简化模型下，n
+            个块中同时有 m+1 个或更多块故障的概率为：</p>
+            <pre class="text"><code>P_loss ≈ C(n, m+1) * p^(m+1)
+
+其中 n = k + m, C(n, m+1) 是组合数。</code></pre>
+            <p>以 p = 3%（年化磁盘故障率）为例：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>编码参数</th>
+            <th>n</th>
+            <th>容错块数 m</th>
+            <th>丢失概率（量级）</th>
+            <th>等效可靠性</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>三副本</td>
+            <td>3</td>
+            <td>2</td>
+            <td>C(3,3) * 0.03^3 = 2.7e-5</td>
+            <td>99.997%</td>
+            </tr>
+            <tr>
+            <td>RS(4,2)</td>
+            <td>6</td>
+            <td>2</td>
+            <td>C(6,3) * 0.03^3 = 5.4e-4</td>
+            <td>99.95%</td>
+            </tr>
+            <tr>
+            <td>RS(6,3)</td>
+            <td>9</td>
+            <td>3</td>
+            <td>C(9,4) * 0.03^4 = 1.0e-4</td>
+            <td>99.99%</td>
+            </tr>
+            <tr>
+            <td>RS(10,4)</td>
+            <td>14</td>
+            <td>4</td>
+            <td>C(14,5) * 0.03^5 = 4.9e-6</td>
+            <td>99.9995%</td>
+            </tr>
+            <tr>
+            <td>RS(16,4)</td>
+            <td>20</td>
+            <td>4</td>
+            <td>C(20,5) * 0.03^5 = 3.8e-5</td>
+            <td>99.996%</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>注意上面的简化模型没有考虑修复时间。实际中，一个块故障后，系统开始修复，修复期间如果又有块故障才会导致数据丢失。因此实际可靠性还取决于修复速度（Mean
+            Time To Repair, MTTR）。</p>
+            <p>更精确的马尔可夫模型（Markov
+            Model）考虑了故障率、修复率和状态转移。一般结论是：RS(10,4)
+            在年化数据丢失概率上可以达到 10^(-9) 到 10^(-12)
+            的量级，远优于三副本。但前提是修复速度足够快——如果修复窗口太长（比如人工更换磁盘需要数天），多块同时故障的概率会显著上升。</p>
+            <h3 id="常见参数选择">5.3 常见参数选择</h3>
+            <table>
+            <colgroup>
+            <col style="width: 18%" />
+            <col style="width: 28%" />
+            <col style="width: 34%" />
+            <col style="width: 18%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>场景</th>
+            <th>推荐参数</th>
+            <th>存储利用率</th>
+            <th>理由</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>小规模集群（4~8 节点）</td>
+            <td>RS(4,2) 或 RS(6,2)</td>
+            <td>66%~75%</td>
+            <td>节点数少，k 不能太大</td>
+            </tr>
+            <tr>
+            <td>中等规模集群（12~20 节点）</td>
+            <td>RS(10,4) 或 RS(8,3)</td>
+            <td>71%~72%</td>
+            <td>平衡利用率和修复开销</td>
+            </tr>
+            <tr>
+            <td>大规模冷存储</td>
+            <td>RS(16,4) 或 RS(14,3)</td>
+            <td>80%~82%</td>
+            <td>冷数据修复窗口长，可接受</td>
+            </tr>
+            <tr>
+            <td>跨机架部署</td>
+            <td>RS(6,3)，每机架放 3 块</td>
+            <td>66%</td>
+            <td>机架级容错</td>
+            </tr>
+            <tr>
+            <td>跨数据中心</td>
+            <td>RS(6,3) 或 RS(4,2)</td>
+            <td>66%~66%</td>
+            <td>网络带宽昂贵，k 不宜大</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="条带大小stripe-size的影响">5.4 条带大小（Stripe
+            Size）的影响</h3>
+            <p>条带大小（Stripe
+            Size）是指编码前每个数据块的大小。条带大小的选择影响：</p>
+            <ol type="1">
+            <li><strong>小对象效率</strong>：如果条带大小为 1
+            MB，那么一个 100 KB 的对象也要占用 1 MB 的条带空间（加上
+            padding），浪费严重。MinIO
+            对小对象的处理是将多个小对象打包到一个条带中。</li>
+            <li><strong>编解码粒度</strong>：条带越大，单次编解码的数据量越大，SIMD
+            加速效果越好，但内存占用也越大。</li>
+            <li><strong>修复粒度</strong>：条带越大，修复一个丢失块需要读取的数据量越大。</li>
+            </ol>
+            <p>MinIO 的默认条带大小等于对象大小除以数据块数
+            k。对于大对象，MinIO
+            会将对象按条带切分为多个条带组（Part）。Ceph 的 EC Pool
+            中，条带大小通过 <code>stripe_width</code>
+            参数控制，默认为对象大小。</p>
+            <hr />
+            <h2 id="六降级读的性能分析">六、降级读的性能分析</h2>
+            <h3 id="什么是降级读">6.1 什么是降级读</h3>
+            <p>降级读（Degraded
+            Read）发生在部分块不可用（节点宕机、磁盘故障、网络超时）时，系统通过读取其他存活块并执行解码运算来重建丢失的数据块，从而完成读请求。</p>
+            <p>正常读取 RS(k,m) 编码的数据，客户端需要从 k
+            个节点各读一个数据块，然后拼装。降级读时，缺失了某些数据块，需要额外读取校验块来补偿。</p>
+            <h3 id="降级读的开销">6.2 降级读的开销</h3>
+            <p>以 RS(10,4) 为例，假设 D3 所在节点不可用：</p>
+            <pre class="text"><code>正常读:
+  从 Node 0~9 各读 D0~D9，拼装成完整数据
+  读取量: 10 个数据块
+  计算量: 无
+
+降级读 (D3 不可用):
+  从 Node 0,1,2,4,5,6,7,8,9 读 D0,D1,D2,D4~D9 (9 个数据块)
+  从 Node 10 读 C0 (1 个校验块)
+  通过解码矩阵重建 D3
+  读取量: 仍然是 10 个块（9 个数据块 + 1 个校验块）
+  计算量: 矩阵求逆 + 矩阵乘法</code></pre>
+            <p>降级读的读取量与正常读相同（都是 k
+            个块），但增加了两个额外开销：</p>
+            <ol type="1">
+            <li><strong>计算开销</strong>：解码需要矩阵运算。矩阵求逆可以缓存（同一故障模式下只需算一次），矩阵-向量乘法的开销与编码类似。</li>
+            <li><strong>延迟路径变长</strong>：可能多碰校验节点，并加上解码计算。公开材料与运维经验里，降级读
+            P99 相对正常读变差很常见，但「高
+            30%~100%」这类区间<strong>不是</strong>本文的实测结论；要引用必须写明对象大小、故障模式、库与硬件。定性结论只保留：降级读支付额外计算与可能更差的尾延迟。</li>
+            </ol>
+            <h3 id="多块故障时的降级读">6.3 多块故障时的降级读</h3>
+            <p>当多个块同时不可用时，降级读的开销进一步增加。以 RS(10,4)
+            中 D1 和 D5 同时不可用为例：</p>
+            <pre class="text"><code>从存活的 8 个数据节点读 D0,D2,D3,D4,D6,D7,D8,D9
+从 2 个校验节点读 C0, C1
+通过 10x10 解码矩阵重建 D1 和 D5
+读取量: 10 个块（8 数据 + 2 校验）
+计算量: 更大的解码矩阵运算</code></pre>
+            <p>需要注意的是，如果不可用的块超过 m
+            个，数据就无法恢复了——这是 RS(k,m) 的硬性限制。</p>
+            <h3 id="网络放大的工程影响">6.4 网络放大的工程影响</h3>
+            <p>降级读的网络放大（Network
+            Amplification）是指为了读取一个小范围的数据，需要从网络上拉取远超实际需要的数据量。</p>
+            <p>假设客户端只需要读取对象中某个 4 KB
+            的偏移范围。在三副本方案中，直接从一个副本读取 4 KB 即可。在
+            RS(10,4) 方案中：</p>
+            <ol type="1">
+            <li>首先要确定这 4 KB 落在哪个数据块的哪个位置。</li>
+            <li>如果正好是完整块的一部分，可以直接从对应节点读取 4
+            KB。</li>
+            <li>如果该节点不可用，就需要从其他 k
+            个节点各读取对应位置的数据（每个节点读 4 KB / k = 约 400
+            字节），再解码重建。</li>
+            </ol>
+            <p>对于小范围随机读，纠删码的网络放大可以很显著。这也是纠删码不适合热数据小对象随机读的核心原因之一。</p>
+            <h3 id="降级读优化策略">6.5 降级读优化策略</h3>
+            <p>工程中常用的降级读优化策略包括：</p>
+            <ol type="1">
+            <li><strong>并行读取</strong>：同时向 k+m
+            个节点发起读请求，取最先返回的 k
+            个结果。这样即使部分节点响应慢，也不需要等待。MinIO
+            采用这种策略。</li>
+            <li><strong>解码矩阵缓存</strong>：对于同一故障模式（同样的块不可用组合），解码矩阵只需要计算一次，后续可以复用。</li>
+            <li><strong>热备节点</strong>：预先在额外节点上存储部分数据的副本，降级读时直接从热备读取，避免解码运算。</li>
+            <li><strong>局部修复码（LRC）</strong>：通过引入局部校验块，使得单块故障修复只需要读取少量块。这是下一节的主题。</li>
+            </ol>
+            <hr />
+            <h2 id="七局部修复码">七、局部修复码</h2>
+            <h3 id="标准-rs-编码的修复痛点">7.1 标准 RS
+            编码的修复痛点</h3>
+            <p>标准 RS(k,m) 编码的修复放大系数为 k。对于
+            RS(12,4)，修复一个块需要读取 12 个块的数据。在 PB
+            级集群中，单块修复可能产生数 TB
+            的跨节点网络流量，严重影响前台业务。</p>
+            <p>更关键的是，存储系统中绝大多数故障是单块故障（Single
+            Failure）。根据 Google 和 Microsoft 的公开数据，超过 98%
+            的修复事件是单块修复。为了优化这个最常见的场景，研究者提出了局部修复码（Locally
+            Repairable Code，LRC）。</p>
+            <h3 id="lrc-的核心思想">7.2 LRC 的核心思想</h3>
+            <p>LRC
+            的核心思想是：在全局校验块之外，额外引入局部校验块（Local
+            Parity）。每个局部校验块只覆盖一个数据块子组（Group），单块故障时只需读取同组的块即可修复，不需要读取所有块。</p>
+            <p>以 Azure 使用的 LRC(12,2,2) 为例：12 个数据块分成 2
+            组，每组 6 个，每组有 1 个局部校验块，全局有 2
+            个全局校验块。总共 12 + 2 + 2 = 16 个块。</p>
+            <pre class="text"><code>LRC(12,2,2) 布局:
+
+组 A:  D0  D1  D2  D3  D4  D5   LA     (LA = D0 XOR D1 XOR ... XOR D5)
+组 B:  D6  D7  D8  D9  D10 D11  LB     (LB = D6 XOR D7 XOR ... XOR D11)
+全局:  G0  G1                           (G0, G1 是所有 12 个数据块的 RS 校验)
+
+总块数: 16
+存储利用率: 12/16 = 75%</code></pre>
+            <p><strong>单块故障修复</strong>：假设 D2
+            丢失，只需要读取同组的 D0, D1, D3, D4, D5 和
+            LA，通过异或恢复 D2。修复放大系数从 12 降低到 6。</p>
+            <p><strong>多块故障修复</strong>：如果同组有 2
+            个块同时丢失（如 D2 和
+            D4），局部校验块不够用，需要使用全局校验块 G0、G1
+            配合其他组的数据块做完整的 RS 解码。</p>
+            <h3 id="azure-的-lrc-实践">7.3 Azure 的 LRC 实践</h3>
+            <p>Microsoft Azure Storage 在 2012 年的论文《Erasure Coding
+            in Windows Azure Storage》中详细介绍了其 LRC 方案。Azure
+            使用 LRC(12,2,2) 作为主要的纠删码配置：</p>
+            <ul>
+            <li>12 个数据块 + 2 个局部校验块 + 2 个全局校验块 = 16
+            个块</li>
+            <li>存储利用率：12/16 = 75%（对比三副本的
+            33%，节省超过一半的存储成本）</li>
+            <li>单块修复放大系数：6（对比标准 RS(12,4) 的 12）</li>
+            <li>可容忍的最大同时故障数：4（任意 3 块故障，以及部分 4
+            块故障模式）</li>
+            </ul>
+            <p>Azure 报告的工程收益：</p>
+            <ol type="1">
+            <li>存储开销从三副本的 3x 降低到 1.33x。</li>
+            <li>单块修复的网络流量减少 50%。</li>
+            <li>修复操作对前台延迟的影响降低。</li>
+            </ol>
+            <pre class="text"><code>标准 RS(12,4) vs LRC(12,2,2) 修复对比:
+
+RS(12,4) 修复 D2:
+  读取: D0 D1 D3 D4 D5 D6 D7 D8 D9 D10 D11 C0   (12 块)
+  网络: 12 x 块大小
+
+LRC(12,2,2) 修复 D2:
+  读取: D0 D1 D3 D4 D5 LA                          (6 块)
+  网络: 6 x 块大小
+
+修复带宽减少: 50%</code></pre>
+            <h3 id="lrc-的代价">7.4 LRC 的代价</h3>
+            <p>LRC 不是免费的午餐。相比标准 RS 编码，LRC
+            有以下代价：</p>
+            <ol type="1">
+            <li><strong>存储利用率略有下降</strong>：LRC(12,2,2)
+            的利用率是 75%，而 RS(12,4) 的利用率也是 75%。但 LRC
+            总共需要 16 个块（12 数据 + 2 局部 + 2 全局），RS(12,4) 只需
+            16 个块（12 数据 + 4 校验）。看起来利用率相同，但 LRC
+            的容错模式更受限——LRC 不是 MDS 码，某些 4
+            块故障模式下无法恢复。</li>
+            <li><strong>编码复杂度增加</strong>：需要维护局部校验和全局校验两套逻辑。</li>
+            <li><strong>不是所有故障模式都能恢复</strong>：LRC(12,2,2)
+            不能容忍所有 4 块同时故障的情况。例如，如果组 A 中有 3
+            个块同时丢失（超出局部校验能力）且全局校验也不够用。</li>
+            </ol>
+            <p>工程判断：在大规模集群（数千节点以上）中，单块故障的频率远高于多块同时故障。LRC
+            用少量的最大容错能力下降，换取了大幅的修复效率提升。对于大多数云存储场景，这是划算的。</p>
+            <hr />
+            <h2 id="八纠删码在-minio-中的实现">八、纠删码在 MinIO
+            中的实现</h2>
+            <h3 id="minio-纠删码架构">8.1 MinIO 纠删码架构</h3>
+            <p>MinIO 是一个高性能的 S3
+            兼容对象存储，原生支持纠删码。MinIO
+            的纠删码实现围绕纠删集（Erasure Set）这个概念组织。</p>
+            <p>一个纠删集是一组磁盘，MinIO
+            在这组磁盘上对对象做纠删码编码。每个纠删集的磁盘数量就是 n =
+            k + m。纠删集内的磁盘分布在不同的节点上以实现容错。</p>
+            <pre class="text"><code>MinIO 集群示例 (4 节点，每节点 4 块盘，共 16 块盘):
+
+Node 1:  disk0  disk1  disk2  disk3
+Node 2:  disk4  disk5  disk6  disk7
+Node 3:  disk8  disk9  disk10 disk11
+Node 4:  disk12 disk13 disk14 disk15
+
+纠删集 (Erasure Set) 大小 = 16
+默认: k=8 数据块, m=8 校验块
+存储利用率: 50%
+
+也可配置为 k=12, m=4:
+存储利用率: 75%</code></pre>
+            <h3 id="minio-纠删码配置">8.2 MinIO 纠删码配置</h3>
+            <p>MinIO
+            的纠删码参数在启动时通过磁盘布局隐式确定。每个纠删集的磁盘数决定了
+            n，校验块数 m 可以通过环境变量
+            <code>MINIO_STORAGE_CLASS_STANDARD</code> 设置。</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启动 MinIO 分布式集群（4 节点，每节点 4 块盘）</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 纠删集大小 = 16</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="ex">minio</span> server http://node{1...4}/data/disk{1...4}</span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置标准存储类别的校验块数为 4（即 k=12, m=4）</span></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_STORAGE_CLASS_STANDARD</span><span class="op">=</span><span class="st">&quot;EC:4&quot;</span></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置低冗余存储类别的校验块数为 2（即 k=14, m=2）</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MINIO_STORAGE_CLASS_RRS</span><span class="op">=</span><span class="st">&quot;EC:2&quot;</span></span></code></pre></div>
+            <p>MinIO 对校验块数 m 的取值范围有限制：</p>
+            <pre class="text"><code>最小值: m &gt;= 2  （MinIO 要求至少 2 个校验块）
+最大值: m &lt;= n/2 （校验块数不能超过总块数的一半）
+默认值: m = n/2 （等分数据块和校验块）</code></pre>
+            <h3 id="对象写入流程">8.3 对象写入流程</h3>
+            <p>当客户端向 MinIO 写入一个对象时：</p>
+            <ol type="1">
+            <li>MinIO 根据对象名的哈希确定它属于哪个纠删集。</li>
+            <li>将对象数据切分为 k 个数据块（大小均等）。</li>
+            <li>使用编码矩阵计算 m 个校验块。</li>
+            <li>将 k + m 个块分别写入纠删集中的 k + m 块磁盘。</li>
+            <li>同时在每块磁盘上写入对象的元数据（<code>xl.meta</code>），包含纠删码参数、块校验和等。</li>
+            </ol>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 MinIO 纠删码状态</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin info myminio <span class="at">--json</span> <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例（删减版）:</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="co"># {</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;erasure_set_count&quot;: 1,</span></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;drives_per_set&quot;: 16,</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;standard_parity&quot;: 4,</span></span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;rrs_parity&quot;: 2,</span></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;drives_online&quot;: 16,</span></span>
+<span id="cb30-11"><a href="#cb30-11" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;drives_offline&quot;: 0</span></span>
+<span id="cb30-12"><a href="#cb30-12" aria-hidden="true" tabindex="-1"></a><span class="co"># }</span></span></code></pre></div>
+            <h3 id="minio-纠删码的工程细节">8.4 MinIO
+            纠删码的工程细节</h3>
+            <p><strong>小对象处理</strong>：对于小于条带大小的对象，MinIO
+            不会拆分为多个块，而是将整个对象作为一个数据单元，计算校验并分发。这避免了小对象的
+            padding 浪费。</p>
+            <p><strong>位衰减保护（Bitrot Protection）</strong>：MinIO
+            对每个块计算 HighwayHash
+            校验和，存储在元数据中。读取时验证校验和，发现静默数据损坏（Silent
+            Data Corruption）时自动触发修复。</p>
+            <p><strong>并发修复</strong>：MinIO
+            支持后台修复（Healing），自动检测丢失或损坏的块并从存活块重建。修复操作可以限速以避免影响前台请求。</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动触发 MinIO 修复</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin heal myminio/mybucket <span class="at">--recursive</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看修复状态</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> admin heal myminio/mybucket <span class="at">--recursive</span> <span class="at">--dry-run</span></span></code></pre></div>
+            <h3 id="minio-参数选择建议">8.5 MinIO 参数选择建议</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>集群规模</th>
+            <th>纠删集大小</th>
+            <th>建议 EC 配置</th>
+            <th>存储利用率</th>
+            <th>容错</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>4 节点 x 1 盘</td>
+            <td>4</td>
+            <td>EC:2 (k=2, m=2)</td>
+            <td>50%</td>
+            <td>2 块</td>
+            </tr>
+            <tr>
+            <td>4 节点 x 4 盘</td>
+            <td>16</td>
+            <td>EC:4 (k=12, m=4)</td>
+            <td>75%</td>
+            <td>4 块</td>
+            </tr>
+            <tr>
+            <td>8 节点 x 2 盘</td>
+            <td>16</td>
+            <td>EC:4 (k=12, m=4)</td>
+            <td>75%</td>
+            <td>4 块</td>
+            </tr>
+            <tr>
+            <td>16 节点 x 1 盘</td>
+            <td>16</td>
+            <td>EC:4 (k=12, m=4)</td>
+            <td>75%</td>
+            <td>4 块</td>
+            </tr>
+            <tr>
+            <td>32 节点 x 1 盘</td>
+            <td>16（多个集合）</td>
+            <td>EC:4</td>
+            <td>75%</td>
+            <td>4 块</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>MinIO 的纠删集大小有上限（当前版本最大为
+            16）。当磁盘总数超过 16 时，MinIO
+            自动将磁盘分成多个纠删集。</p>
+            <hr />
+            <h2 id="九纠删码在-ceph-中的实现">九、纠删码在 Ceph
+            中的实现</h2>
+            <h3 id="ceph-ec-pool-基础">9.1 Ceph EC Pool 基础</h3>
+            <p>Ceph 通过纠删码池（Erasure Code Pool，EC
+            Pool）支持纠删码。EC Pool 中的每个对象被切分为 k 个数据块和
+            m 个校验块，分布在 k+m 个不同的 OSD（Object Storage
+            Daemon）上。</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建纠删码配置（profile）</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd erasure-code-profile set my-ec-profile <span class="dt">\</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a>    k=8 m=3 <span class="dt">\</span></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a>    plugin=jerasure <span class="dt">\</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a>    technique=reed_sol_van</span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看配置详情</span></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd erasure-code-profile get my-ec-profile</span>
+<span id="cb32-9"><a href="#cb32-9" aria-hidden="true" tabindex="-1"></a><span class="co"># k=8</span></span>
+<span id="cb32-10"><a href="#cb32-10" aria-hidden="true" tabindex="-1"></a><span class="co"># m=3</span></span>
+<span id="cb32-11"><a href="#cb32-11" aria-hidden="true" tabindex="-1"></a><span class="co"># plugin=jerasure</span></span>
+<span id="cb32-12"><a href="#cb32-12" aria-hidden="true" tabindex="-1"></a><span class="co"># technique=reed_sol_van</span></span>
+<span id="cb32-13"><a href="#cb32-13" aria-hidden="true" tabindex="-1"></a><span class="co"># w=8</span></span></code></pre></div>
+            <h3 id="ceph-支持的纠删码插件">9.2 Ceph
+            支持的纠删码插件</h3>
+            <p>Ceph 提供多个纠删码插件，各有特点：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>插件</th>
+            <th>编码算法</th>
+            <th>特点</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>jerasure</td>
+            <td>RS（范德蒙/柯西）</td>
+            <td>默认插件，成熟稳定</td>
+            <td>通用场景</td>
+            </tr>
+            <tr>
+            <td>isa</td>
+            <td>RS（Intel ISA-L）</td>
+            <td>利用 Intel SIMD 指令加速</td>
+            <td>Intel CPU 环境</td>
+            </tr>
+            <tr>
+            <td>lrc</td>
+            <td>LRC</td>
+            <td>局部修复码，降低修复开销</td>
+            <td>大规模集群</td>
+            </tr>
+            <tr>
+            <td>shec</td>
+            <td>SHEC</td>
+            <td>分层纠删码</td>
+            <td>特定容错需求</td>
+            </tr>
+            <tr>
+            <td>clay</td>
+            <td>Clay Code</td>
+            <td>最优修复带宽</td>
+            <td>研究性质</td>
+            </tr>
+            </tbody>
+            </table>
+            <h4 id="jerasure-插件">jerasure 插件</h4>
+            <p>jerasure 是 Ceph 默认的纠删码插件，基于 Jerasure
+            库实现。支持多种编码技术：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 Reed-Solomon 范德蒙矩阵</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd erasure-code-profile set rs-van-profile <span class="dt">\</span></span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a>    k=6 m=3 <span class="dt">\</span></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a>    plugin=jerasure <span class="dt">\</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a>    technique=reed_sol_van</span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用柯西矩阵（通常更快）</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd erasure-code-profile set cauchy-profile <span class="dt">\</span></span>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a>    k=6 m=3 <span class="dt">\</span></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a>    plugin=jerasure <span class="dt">\</span></span>
+<span id="cb33-11"><a href="#cb33-11" aria-hidden="true" tabindex="-1"></a>    technique=cauchy_good</span></code></pre></div>
+            <h4 id="isa-插件">isa 插件</h4>
+            <p>isa 插件使用 Intel Intelligent Storage Acceleration
+            Library（ISA-L），利用 SSE、AVX2、AVX-512 等 SIMD
+            指令集加速编解码。在 Intel CPU 上，isa
+            插件的编解码吞吐量通常比 jerasure 高 2~5 倍。</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 ISA-L 插件</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd erasure-code-profile set isa-profile <span class="dt">\</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a>    k=8 m=4 <span class="dt">\</span></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a>    plugin=isa <span class="dt">\</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a>    technique=reed_sol_van</span></code></pre></div>
+            <h4 id="lrc-插件">lrc 插件</h4>
+            <p>Ceph 的 lrc
+            插件实现了局部修复码。配置时需要指定局部组的大小和局部校验块数。</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 LRC 配置</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="co"># k=8 数据块，m=3 全局校验块，l=4（每 4 个数据块一组，每组 1 个局部校验块）</span></span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd erasure-code-profile set lrc-profile <span class="dt">\</span></span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a>    plugin=lrc <span class="dt">\</span></span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a>    k=8 m=3 l=4 <span class="dt">\</span></span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a>    crush-failure-domain=host</span></code></pre></div>
+            <h3 id="创建和使用-ec-pool">9.3 创建和使用 EC Pool</h3>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 EC Pool</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd pool create my-ec-pool erasure my-ec-profile</span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置 CRUSH 故障域（确保块分布在不同主机上）</span></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd pool set my-ec-pool crush_rule replicated_rule</span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 Pool 状态</span></span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd pool ls detail <span class="kw">|</span> <span class="fu">grep</span> my-ec-pool</span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a><span class="co"># EC Pool 需要一个 replicated cache tier 来支持覆盖写</span></span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 cache tier</span></span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd pool create my-ec-cache replicated</span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd tier add my-ec-pool my-ec-cache</span>
+<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd tier cache-mode my-ec-cache writeback</span>
+<span id="cb36-15"><a href="#cb36-15" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd tier set-overlay my-ec-pool my-ec-cache</span></code></pre></div>
+            <h3 id="ec-pool-的限制">9.4 EC Pool 的限制</h3>
+            <p>Ceph EC Pool 有一些与 replicated pool 不同的限制：</p>
+            <ol type="1">
+            <li><strong>不支持原地覆盖写（In-place
+            Overwrite）</strong>：EC Pool
+            中的对象默认只能追加和整体替换，不能部分覆盖。这是因为部分覆盖需要读取整个条带、修改、重新编码、写回，开销很大。RBD（块设备）可以通过
+            cache tier 或 BlueStore 的 partial stripe write
+            机制来规避这个限制。</li>
+            <li><strong>不支持 omap</strong>：EC Pool 中的对象不支持
+            omap（Object Map）操作，因为 omap 是在 OSD
+            本地存储的键值数据，无法参与纠删码编码。</li>
+            <li><strong>最小写入单元</strong>：EC Pool
+            的最小写入单元是一个条带（stripe_width = k *
+            chunk_size），小于条带大小的写入也会占用一个完整条带。</li>
+            </ol>
+            <h3 id="ceph-ec-pool-调优">9.5 Ceph EC Pool 调优</h3>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整条带大小（影响小对象效率和编解码粒度）</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值取决于 OSD 的 bluestore_min_alloc_size</span></span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd pool set my-ec-pool stripe_width 65536</span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整 CRUSH 规则确保跨主机分布</span></span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd crush rule create-erasure my-ec-rule my-ec-profile</span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> osd pool set my-ec-pool crush_rule my-ec-rule</span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 监控 EC Pool 的恢复状态</span></span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> pg ls-by-pool my-ec-pool <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> <span class="st">&quot;active+clean&quot;</span></span>
+<span id="cb37-11"><a href="#cb37-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-12"><a href="#cb37-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看恢复速度和限流</span></span>
+<span id="cb37-13"><a href="#cb37-13" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> daemon osd.0 config get osd_recovery_max_active</span>
+<span id="cb37-14"><a href="#cb37-14" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> daemon osd.0 config get osd_recovery_sleep</span>
+<span id="cb37-15"><a href="#cb37-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-16"><a href="#cb37-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整恢复速率（生产环境建议限速避免影响前台）</span></span>
+<span id="cb37-17"><a href="#cb37-17" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> tell osd.<span class="pp">*</span> injectargs <span class="st">&#39;--osd_recovery_max_active 3&#39;</span></span>
+<span id="cb37-18"><a href="#cb37-18" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> tell osd.<span class="pp">*</span> injectargs <span class="st">&#39;--osd_recovery_sleep 0.1&#39;</span></span></code></pre></div>
+            <h3 id="cephfs-和-rgw-中的纠删码">9.6 CephFS 和 RGW
+            中的纠删码</h3>
+            <p><strong>CephFS</strong>：CephFS 支持将数据池设置为 EC
+            Pool，元数据池必须是 replicated
+            pool。这符合”热元数据用副本，冷数据用纠删码”的最佳实践。</p>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="co"># CephFS 使用 EC Pool 作为数据池</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ceph</span> fs add_data_pool cephfs my-ec-pool</span></code></pre></div>
+            <p><strong>RGW（RADOS Gateway）</strong>：RGW
+            可以为不同的存储类别（Storage
+            Class）配置不同的数据池。将冷数据类别指向 EC
+            Pool，热数据类别指向 replicated pool。</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co"># RGW 多池配置示例（配置文件片段）</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 以下为 RGW 的 zone group 配置中的 placement targets 设置：</span></span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a><span class="co"># &quot;storage_classes&quot;: {</span></span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a><span class="co">#     &quot;STANDARD&quot;: {</span></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="co">#         &quot;data_pool&quot;: &quot;default.rgw.buckets.data&quot;       &lt;-- replicated pool</span></span>
+<span id="cb39-6"><a href="#cb39-6" aria-hidden="true" tabindex="-1"></a><span class="co">#     },</span></span>
+<span id="cb39-7"><a href="#cb39-7" aria-hidden="true" tabindex="-1"></a><span class="co">#     &quot;COLD&quot;: {</span></span>
+<span id="cb39-8"><a href="#cb39-8" aria-hidden="true" tabindex="-1"></a><span class="co">#         &quot;data_pool&quot;: &quot;default.rgw.buckets.data.ec&quot;    &lt;-- EC pool</span></span>
+<span id="cb39-9"><a href="#cb39-9" aria-hidden="true" tabindex="-1"></a><span class="co">#     }</span></span>
+<span id="cb39-10"><a href="#cb39-10" aria-hidden="true" tabindex="-1"></a><span class="co"># }</span></span></code></pre></div>
+            <hr />
+            <h2 id="十纠删码性能基准测试">十、纠删码性能基准测试</h2>
+            <h3 id="编解码吞吐量">10.1 编解码吞吐量</h3>
+            <p>纠删码的编解码性能高度依赖 CPU
+            指令集支持和库实现质量。以下是几个主流库的性能特征对比（引用数据，非自行测试）。</p>
+            <p>根据 Intel ISA-L 官方基准测试和 Ceph 社区性能报告，在
+            Intel Xeon Scalable 处理器上，使用 AVX-512
+            指令集时的典型编码吞吐量：</p>
+            <table>
+            <colgroup>
+            <col style="width: 17%" />
+            <col style="width: 19%" />
+            <col style="width: 23%" />
+            <col style="width: 23%" />
+            <col style="width: 17%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>编码库</th>
+            <th>编码配置</th>
+            <th>编码吞吐量</th>
+            <th>解码吞吐量</th>
+            <th>指令集</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Intel ISA-L</td>
+            <td>RS(10,4)</td>
+            <td>约 20~40 GB/s</td>
+            <td>约 10~20 GB/s</td>
+            <td>AVX-512</td>
+            </tr>
+            <tr>
+            <td>Intel ISA-L</td>
+            <td>RS(10,4)</td>
+            <td>约 8~15 GB/s</td>
+            <td>约 5~10 GB/s</td>
+            <td>AVX2</td>
+            </tr>
+            <tr>
+            <td>Jerasure (cauchy)</td>
+            <td>RS(10,4)</td>
+            <td>约 2~5 GB/s</td>
+            <td>约 1~3 GB/s</td>
+            <td>SSE/AVX2</td>
+            </tr>
+            <tr>
+            <td>Jerasure (vandermonde)</td>
+            <td>RS(10,4)</td>
+            <td>约 1~3 GB/s</td>
+            <td>约 0.5~2 GB/s</td>
+            <td>SSE/AVX2</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>以上数据为单核吞吐量的数量级，实际值受 CPU
+            型号、内存带宽、数据块大小等因素影响。关键结论是：ISA-L 在
+            Intel 平台上的编解码性能显著优于纯软件实现的
+            Jerasure，AVX-512 相比 AVX2 约有 1.5~2 倍的提升。</p>
+            <h3 id="端到端写入性能">10.2 端到端写入性能</h3>
+            <p>纠删码的端到端写入性能不仅取决于编码计算速度，还取决于网络传输和磁盘写入。MinIO
+            等产品的公开参考架构常给出「大对象接近网卡线速、小对象受
+            IOPS/元数据限制」这类<strong>定性</strong>描述。那不是可移植的吞吐数字：离开具体
+            release、EC
+            参数、盘与网卡，不能写成集群承诺。需要数字时在目标拓扑上用
+            <code>warp</code> / <code>rados bench</code>
+            自测，并记录完整环境字段。</p>
+            <p>定性上仍成立的只有：</p>
+            <ul>
+            <li>大对象（MB 级以上）路径上，ISA-L
+            量级的编码很少先于网络或磁盘成为瓶颈；</li>
+            <li>小对象路径上，条带对齐、仲裁与每对象元数据开销更容易先爆。</li>
+            </ul>
+            <h3 id="修复性能">10.3 修复性能</h3>
+            <p>修复性能主要受网络带宽和磁盘 I/O 限制。以 RS(10,4)
+            为例，修复一个 1 TB 的 OSD：</p>
+            <pre class="text"><code>修复数据量: 需要从 10 个 OSD 各读取约 1 TB 数据 = 10 TB 网络读取
+修复写入量: 将重建的数据写入新 OSD = 1 TB 磁盘写入
+
+假设:
+  - 网络可用带宽（修复用）: 1 Gbps = 125 MB/s（限速后）
+  - 10 个源 OSD 并行读取，每个限速 125 MB/s
+
+修复时间估算:
+  - 网络传输: 1 TB / 125 MB/s = 约 2.2 小时（单 OSD 贡献的传输时间）
+  - 实际修复时间受最慢节点限制，通常 2~6 小时
+
+对比三副本修复:
+  - 网络传输: 1 TB / 125 MB/s = 约 2.2 小时
+  - 三副本修复传输量更少，但修复速度主要受限于磁盘 I/O</code></pre>
+            <p>LRC 编码的修复优势在此时体现：LRC(12,2,2)
+            修复单块只需读取 6 个块而不是 12
+            个，修复网络流量减半，修复时间相应缩短。</p>
+            <h3 id="测试工具">10.4 测试工具</h3>
+            <p>评估纠删码性能时，常用以下工具：</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># MinIO 性能测试: 使用 warp 工具</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="co"># warp 是 MinIO 官方的 S3 性能测试工具</span></span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a><span class="ex">warp</span> mixed <span class="dt">\</span></span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--host</span><span class="op">=</span>node1:9000,node2:9000,node3:9000,node4:9000 <span class="dt">\</span></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--access-key</span><span class="op">=</span>minioadmin <span class="dt">\</span></span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--secret-key</span><span class="op">=</span>minioadmin <span class="dt">\</span></span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--obj.size</span><span class="op">=</span>10MiB <span class="dt">\</span></span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--duration</span><span class="op">=</span>5m</span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Ceph 性能测试: 使用 rados bench</span></span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 对 EC Pool 做顺序写入测试</span></span>
+<span id="cb41-12"><a href="#cb41-12" aria-hidden="true" tabindex="-1"></a><span class="ex">rados</span> bench <span class="at">-p</span> my-ec-pool 60 write <span class="at">--no-cleanup</span></span>
+<span id="cb41-13"><a href="#cb41-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-14"><a href="#cb41-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 对 EC Pool 做顺序读取测试</span></span>
+<span id="cb41-15"><a href="#cb41-15" aria-hidden="true" tabindex="-1"></a><span class="ex">rados</span> bench <span class="at">-p</span> my-ec-pool 60 seq</span>
+<span id="cb41-16"><a href="#cb41-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-17"><a href="#cb41-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 对 EC Pool 做随机读取测试</span></span>
+<span id="cb41-18"><a href="#cb41-18" aria-hidden="true" tabindex="-1"></a><span class="ex">rados</span> bench <span class="at">-p</span> my-ec-pool 60 rand</span>
+<span id="cb41-19"><a href="#cb41-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-20"><a href="#cb41-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 编解码库独立测试: Intel ISA-L 自带 benchmark</span></span>
+<span id="cb41-21"><a href="#cb41-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 需要从源码编译 ISA-L</span></span>
+<span id="cb41-22"><a href="#cb41-22" aria-hidden="true" tabindex="-1"></a><span class="co"># cd isa-l &amp;&amp; make &amp;&amp; ./erasure_code/erasure_code_perf</span></span></code></pre></div>
+            <h3 id="性能调优要点">10.5 性能调优要点</h3>
+            <ol type="1">
+            <li><strong>选择合适的编码库</strong>：在 Intel CPU
+            上优先使用 ISA-L（Ceph 的 isa 插件），利用 SIMD 加速。ARM
+            平台上可考虑 NEON 优化的实现。</li>
+            <li><strong>控制 k 的大小</strong>：k
+            越大，单次读写涉及的节点越多，尾延迟越高。k=8~12
+            是多数场景的平衡点。</li>
+            <li><strong>合理设置修复限速</strong>：修复不限速会占满网络带宽，影响前台业务。建议设置修复带宽上限为总带宽的
+            10%~20%。</li>
+            <li><strong>调整条带大小</strong>：条带太小导致编解码效率低（SIMD
+            批量处理的收益小），条带太大导致内存占用高和小对象浪费。通常
+            64 KB~1 MB 是合理范围。</li>
+            <li><strong>监控降级读比例</strong>：通过监控系统跟踪降级读发生的频率和延迟。降级读比例持续偏高时，说明集群的磁盘故障率或网络问题需要关注。</li>
+            </ol>
+            <hr />
+            <h2 id="十一参考文献">十一、参考文献</h2>
+            <h3 id="论文">论文</h3>
+            <ol type="1">
+            <li><p>Reed, I. S., &amp; Solomon, G. (1960). <em>Polynomial
+            Codes Over Certain Finite Fields</em>. Journal of the
+            Society for Industrial and Applied Mathematics, 8(2),
+            300-304. Reed-Solomon 编码的原始论文。</p></li>
+            <li><p>Plank, J. S. (2013). <em>Erasure Codes for Storage
+            Systems: A Brief Primer</em>. ;login: USENIX Magazine,
+            38(6). 面向存储系统的纠删码入门综述。</p></li>
+            <li><p>Huang, C., Simitci, H., Xu, Y., et al. (2012).
+            <em>Erasure Coding in Windows Azure Storage</em>. USENIX ATC
+            ’12. Azure LRC 方案的详细介绍，包括 LRC(12,2,2)
+            的设计与生产部署经验。</p></li>
+            <li><p>Rashmi, K. V., Shah, N. B., &amp; Kumar, P. V.
+            (2011). <em>Optimal Exact-Regenerating Codes for Distributed
+            Storage at the MSR and MBR Points via a Product-Matrix
+            Construction</em>. IEEE Transactions on Information Theory.
+            最优再生码的理论基础。</p></li>
+            <li><p>Sathiamoorthy, M., Asteris, M., Papailiopoulos, D.,
+            et al. (2013). <em>XORing Elephants: Novel Erasure Codes for
+            Big Data</em>. VLDB ’13.
+            面向大数据的纠删码优化方案。</p></li>
+            <li><p>Plank, J. S., &amp; Xu, L. (2006). <em>Optimizing
+            Cauchy Reed-Solomon Codes for Fault-Tolerant Network Storage
+            Applications</em>. IEEE NCA-06. 柯西 RS 编码优化。</p></li>
+            </ol>
+            <h3 id="软件与库">软件与库</h3>
+            <ol start="7" type="1">
+            <li><p>Intel ISA-L (Intelligent Storage Acceleration
+            Library). <a href="https://github.com/intel/isa-l"
+            class="uri">https://github.com/intel/isa-l</a>. Intel
+            提供的存储加速库，包含高性能纠删码实现。</p></li>
+            <li><p>Jerasure. <a
+            href="https://github.com/tsuraan/Jerasure"
+            class="uri">https://github.com/tsuraan/Jerasure</a>. James
+            Plank 开发的纠删码库，Ceph 默认使用。</p></li>
+            <li><p>MinIO 官方文档 - Erasure Coding. <a
+            href="https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html"
+            class="uri">https://min.io/docs/minio/linux/operations/concepts/erasure-coding.html</a>.
+            MinIO 纠删码配置与原理说明。</p></li>
+            <li><p>Ceph 官方文档 - Erasure Code. <a
+            href="https://docs.ceph.com/en/latest/rados/operations/erasure-code/"
+            class="uri">https://docs.ceph.com/en/latest/rados/operations/erasure-code/</a>.
+            Ceph 纠删码池的创建、配置和插件说明。</p></li>
+            <li><p>Ceph 官方文档 - Erasure Code Profiles. <a
+            href="https://docs.ceph.com/en/latest/rados/operations/erasure-code-profile/"
+            class="uri">https://docs.ceph.com/en/latest/rados/operations/erasure-code-profile/</a>.
+            Ceph 纠删码配置文件参数详解。</p></li>
+            </ol>
+            <h3 id="书籍">书籍</h3>
+            <ol start="12" type="1">
+            <li><p>Blahut, R. E. (2003). <em>Algebraic Codes for Data
+            Transmission</em>. Cambridge University Press.
+            有限域和纠删码的数学基础教材。</p></li>
+            <li><p>Lin, S., &amp; Costello, D. J. (2004). <em>Error
+            Control Coding: Fundamentals and Applications</em> (2nd
+            ed.). Pearson. 编码理论的经典教材，涵盖 RS
+            编码的详细数学推导。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../48-minio/minio.html">MinIO 原理和架构</a>
+            <strong>下一篇</strong>: <a
+            href="../50-object-gateway/object-gateway.html">对象存储网关与兼容层</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-06 · storage</p>
+                    <h3><a href="/post/storage/58-data-durability/data-durability.html">【存储工程】数据持久性工程</a></h3>
+                    <p>深入分析数据持久性的工程计算——故障率模型、多副本与纠删码的持久性推导、相关故障的影响、实际数据丢失案例与持久性计算器实现</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-26 · storage</p>
+                    <h3><a href="/post/storage/48-minio/minio.html">【存储工程】MinIO 原理和架构</a></h3>
+                    <p>钉住 MinIO 的 Erasure Set / Server Pool / xl.meta 共置模型与读写修复路径；同时写清 AGPL、上游 archived 状态，以及哪些结论来自源码文档、哪些不能当性能承诺。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-29 · storage</p>
+                    <h3><a href="/post/storage/51-object-performance/object-performance.html">【存储工程】对象存储性能工程</a></h3>
+                    <p>全面剖析对象存储的性能优化——大文件并发分片、小文件打包策略、列表操作陷阱、CDN 集成、传输加速与基准测试方法论</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-08-03 · storage</p>
+                    <h3><a href="/post/storage/39-vector-storage/vector-storage.html">【存储工程】向量存储与 ANN 索引</a></h3>
+                    <p>存储工程视角的向量检索入门：L2/余弦/内积的几何意义与归一化等价、暴力基线、LSH/HNSW/量化直觉与 FAISS 选型；算法深度与生产引擎内核外链到 db-frontier 与 vector-engine。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

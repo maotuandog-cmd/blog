@@ -1,0 +1,1833 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】Btrfs：写时复制文件系统 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="btrfs, cow, snapshot, subvolume, compression, raid, checksum, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/16-btrfs-cow/btrfs-cow.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】Btrfs：写时复制文件系统" />
+    <meta property="og:description" content="ext4 和 XFS 走的是&quot;就地更新&quot;路线：数据写到哪个块，就直接覆盖那个块。这条路线简单、高效，但有一个根本性的问题——如果写到一半断电，磁盘上的数据处于半新半旧的状态，文件系统就损坏了。日志（Journal）机制可以缓解这个问题，但它本质上是&quot;先写一遍日志，再写一遍数据&quot;，写放大不可避免。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/16-btrfs-cow/btrfs-cow.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="btrfs" />
+    <meta property="article:tag" content="cow" />
+    <meta property="article:tag" content="snapshot" />
+    <meta property="article:tag" content="subvolume" />
+    <meta property="article:tag" content="compression" />
+    <meta property="article:tag" content="raid" />
+    <meta property="article:tag" content="checksum" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】Btrfs：写时复制文件系统" />
+    <meta name="twitter:description" content="ext4 和 XFS 走的是&quot;就地更新&quot;路线：数据写到哪个块，就直接覆盖那个块。这条路线简单、高效，但有一个根本性的问题——如果写到一半断电，磁盘上的数据处于半新半旧的状态，文件系统就损坏了。日志（Journal）机制可以缓解这个问题，但它本质上是&quot;先写一遍日志，再写一遍数据&quot;，写放大不可避免。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】Btrfs：写时复制文件系统", "description": "ext4 和 XFS 走的是\"就地更新\"路线：数据写到哪个块，就直接覆盖那个块。这条路线简单、高效，但有一个根本性的问题——如果写到一半断电，磁盘上的数据处于半新半旧的状态，文件系统就损坏了。日志（Journal）机制可以缓解这个问题，但它本质上是\"先写一遍日志，再写一遍数据\"，写放大不可避免。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/16-btrfs-cow/btrfs-cow.html"}, "datePublished": "2025-08-25T00:00:00+00:00", "dateModified": "2026-04-15T10:56:08+00:00", "keywords": ["btrfs", "cow", "snapshot", "subvolume", "compression", "raid", "checksum"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】Btrfs：写时复制文件系统</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-25</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#btrfs</span> <span>#cow</span> <span>#snapshot</span> <span>#subvolume</span> <span>#compression</span> <span>#raid</span> <span>#checksum</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/15-xfs-architecture/xfs-architecture.html">上一篇：【存储工程】XFS 架构：大文件与高并发</a><a class="post-series-nav__link" href="/post/storage/17-zfs-integrity/zfs-integrity.html">下一篇：【存储工程】ZFS：数据完整性优先的存储栈</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/btrfs.html">#btrfs</a><a class="chip-link" href="/tags/cow.html">#cow</a><a class="chip-link" href="/tags/snapshot.html">#snapshot</a><a class="chip-link" href="/tags/subvolume.html">#subvolume</a><a class="chip-link" href="/tags/compression.html">#compression</a><a class="chip-link" href="/tags/raid.html">#raid</a><a class="chip-link" href="/tags/checksum.html">#checksum</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一btrfs-设计目标与-cow-原理"
+                id="toc-一btrfs-设计目标与-cow-原理">一、Btrfs
+                设计目标与 CoW 原理</a>
+                <ul>
+                <li><a href="#设计目标" id="toc-设计目标">1.1
+                设计目标</a></li>
+                <li><a href="#什么是写时复制"
+                id="toc-什么是写时复制">1.2 什么是写时复制</a></li>
+                <li><a href="#cow-的代价" id="toc-cow-的代价">1.3 CoW
+                的代价</a></li>
+                <li><a href="#cow-与日志的对比"
+                id="toc-cow-与日志的对比">1.4 CoW 与日志的对比</a></li>
+                </ul></li>
+                <li><a href="#二cow-b-tree-数据结构"
+                id="toc-二cow-b-tree-数据结构">二、CoW B-Tree
+                数据结构</a>
+                <ul>
+                <li><a href="#树中之树tree-of-trees"
+                id="toc-树中之树tree-of-trees">2.1 树中之树（Tree of
+                Trees）</a></li>
+                <li><a href="#b-tree-节点格式"
+                id="toc-b-tree-节点格式">2.2 B-Tree 节点格式</a></li>
+                <li><a href="#内部节点与叶子节点"
+                id="toc-内部节点与叶子节点">2.3
+                内部节点与叶子节点</a></li>
+                <li><a href="#cow-语义在-b-tree-上的实现"
+                id="toc-cow-语义在-b-tree-上的实现">2.4 CoW 语义在
+                B-Tree 上的实现</a></li>
+                <li><a href="#事务与代generation"
+                id="toc-事务与代generation">2.5
+                事务与代（Generation）</a></li>
+                </ul></li>
+                <li><a href="#三子卷subvolume与快照snapshot"
+                id="toc-三子卷subvolume与快照snapshot">三、子卷（Subvolume）与快照（Snapshot）</a>
+                <ul>
+                <li><a href="#子卷的概念" id="toc-子卷的概念">3.1
+                子卷的概念</a></li>
+                <li><a href="#创建和管理子卷"
+                id="toc-创建和管理子卷">3.2 创建和管理子卷</a></li>
+                <li><a href="#默认子卷与挂载"
+                id="toc-默认子卷与挂载">3.3 默认子卷与挂载</a></li>
+                <li><a href="#快照的原理" id="toc-快照的原理">3.4
+                快照的原理</a></li>
+                <li><a href="#创建和管理快照"
+                id="toc-创建和管理快照">3.5 创建和管理快照</a></li>
+                <li><a href="#快照的实际空间开销"
+                id="toc-快照的实际空间开销">3.6
+                快照的实际空间开销</a></li>
+                <li><a href="#嵌套子卷的注意事项"
+                id="toc-嵌套子卷的注意事项">3.7
+                嵌套子卷的注意事项</a></li>
+                </ul></li>
+                <li><a href="#四透明压缩"
+                id="toc-四透明压缩">四、透明压缩</a>
+                <ul>
+                <li><a href="#压缩算法选择" id="toc-压缩算法选择">4.1
+                压缩算法选择</a></li>
+                <li><a href="#压缩级别" id="toc-压缩级别">4.2
+                压缩级别</a></li>
+                <li><a href="#compress-与-compress-force-的区别"
+                id="toc-compress-与-compress-force-的区别">4.3 compress
+                与 compress-force 的区别</a></li>
+                <li><a href="#按文件设置压缩属性"
+                id="toc-按文件设置压缩属性">4.4
+                按文件设置压缩属性</a></li>
+                <li><a href="#压缩比基准测试"
+                id="toc-压缩比基准测试">4.5 压缩比基准测试</a></li>
+                <li><a href="#压缩对性能的影响"
+                id="toc-压缩对性能的影响">4.6 压缩对性能的影响</a></li>
+                </ul></li>
+                <li><a href="#五内置-raid" id="toc-五内置-raid">五、内置
+                RAID</a>
+                <ul>
+                <li><a href="#btrfs-raid-概述"
+                id="toc-btrfs-raid-概述">5.1 Btrfs RAID 概述</a></li>
+                <li><a href="#创建多设备文件系统"
+                id="toc-创建多设备文件系统">5.2
+                创建多设备文件系统</a></li>
+                <li><a href="#元数据镜像metadata-mirroring"
+                id="toc-元数据镜像metadata-mirroring">5.3
+                元数据镜像（Metadata Mirroring）</a></li>
+                <li><a href="#在线添加和移除设备"
+                id="toc-在线添加和移除设备">5.4
+                在线添加和移除设备</a></li>
+                <li><a href="#raid-56-的已知问题"
+                id="toc-raid-56-的已知问题">5.5 RAID-5/6
+                的已知问题</a></li>
+                <li><a href="#raid-配置的最佳实践"
+                id="toc-raid-配置的最佳实践">5.6 RAID
+                配置的最佳实践</a></li>
+                </ul></li>
+                <li><a href="#六数据校验与自修复"
+                id="toc-六数据校验与自修复">六、数据校验与自修复</a>
+                <ul>
+                <li><a href="#逐块校验和per-block-checksum"
+                id="toc-逐块校验和per-block-checksum">6.1
+                逐块校验和（Per-block Checksum）</a></li>
+                <li><a href="#校验和的存储与验证"
+                id="toc-校验和的存储与验证">6.2
+                校验和的存储与验证</a></li>
+                <li><a href="#scrub主动数据完整性检查"
+                id="toc-scrub主动数据完整性检查">6.3
+                Scrub：主动数据完整性检查</a></li>
+                <li><a href="#自修复self-healing"
+                id="toc-自修复self-healing">6.4
+                自修复（Self-healing）</a></li>
+                <li><a href="#数据完整性与硬件层的关系"
+                id="toc-数据完整性与硬件层的关系">6.5
+                数据完整性与硬件层的关系</a></li>
+                </ul></li>
+                <li><a href="#七sendreceive-增量同步"
+                id="toc-七sendreceive-增量同步">七、Send/Receive
+                增量同步</a>
+                <ul>
+                <li><a href="#sendreceive-概述"
+                id="toc-sendreceive-概述">7.1 Send/Receive 概述</a></li>
+                <li><a href="#全量发送" id="toc-全量发送">7.2
+                全量发送</a></li>
+                <li><a href="#增量发送" id="toc-增量发送">7.3
+                增量发送</a></li>
+                <li><a href="#增量同步的效率分析"
+                id="toc-增量同步的效率分析">7.4
+                增量同步的效率分析</a></li>
+                <li><a href="#自动化备份脚本"
+                id="toc-自动化备份脚本">7.5 自动化备份脚本</a></li>
+                <li><a href="#sendreceive-的限制"
+                id="toc-sendreceive-的限制">7.6 Send/Receive
+                的限制</a></li>
+                </ul></li>
+                <li><a href="#八碎片化与空间管理"
+                id="toc-八碎片化与空间管理">八、碎片化与空间管理</a>
+                <ul>
+                <li><a href="#cow-碎片化的成因"
+                id="toc-cow-碎片化的成因">8.1 CoW 碎片化的成因</a></li>
+                <li><a href="#autodefrag-挂载选项"
+                id="toc-autodefrag-挂载选项">8.2 autodefrag
+                挂载选项</a></li>
+                <li><a href="#手动碎片整理" id="toc-手动碎片整理">8.3
+                手动碎片整理</a></li>
+                <li><a href="#balance块组重新分配"
+                id="toc-balance块组重新分配">8.4
+                Balance：块组重新分配</a></li>
+                <li><a href="#space-cache-v2free-space-tree"
+                id="toc-space-cache-v2free-space-tree">8.5 Space Cache
+                v2（Free Space Tree）</a></li>
+                <li><a href="#空间使用的查看与分析"
+                id="toc-空间使用的查看与分析">8.6
+                空间使用的查看与分析</a></li>
+                </ul></li>
+                <li><a href="#九btrfs-管理实战"
+                id="toc-九btrfs-管理实战">九、Btrfs 管理实战</a>
+                <ul>
+                <li><a href="#文件系统创建与挂载"
+                id="toc-文件系统创建与挂载">9.1
+                文件系统创建与挂载</a></li>
+                <li><a href="#子卷管理命令汇总"
+                id="toc-子卷管理命令汇总">9.2 子卷管理命令汇总</a></li>
+                <li><a href="#快照管理命令汇总"
+                id="toc-快照管理命令汇总">9.3 快照管理命令汇总</a></li>
+                <li><a href="#文件系统维护命令"
+                id="toc-文件系统维护命令">9.4 文件系统维护命令</a></li>
+                <li><a href="#设备管理命令" id="toc-设备管理命令">9.5
+                设备管理命令</a></li>
+                <li><a href="#配额管理" id="toc-配额管理">9.6
+                配额管理</a></li>
+                <li><a href="#检查与修复" id="toc-检查与修复">9.7
+                检查与修复</a></li>
+                <li><a href="#性能调优选项" id="toc-性能调优选项">9.8
+                性能调优选项</a></li>
+                <li><a href="#监控与告警" id="toc-监控与告警">9.9
+                监控与告警</a></li>
+                </ul></li>
+                <li><a href="#十btrfs-生产评估"
+                id="toc-十btrfs-生产评估">十、Btrfs 生产评估</a>
+                <ul>
+                <li><a href="#suse-的选择" id="toc-suse-的选择">10.1
+                SUSE 的选择</a></li>
+                <li><a href="#facebookmeta-的大规模使用"
+                id="toc-facebookmeta-的大规模使用">10.2 Facebook/Meta
+                的大规模使用</a></li>
+                <li><a href="#fedora-桌面的采用"
+                id="toc-fedora-桌面的采用">10.3 Fedora
+                桌面的采用</a></li>
+                <li><a href="#已知局限性" id="toc-已知局限性">10.4
+                已知局限性</a></li>
+                <li><a href="#btrfs-上的数据库工作负载"
+                id="toc-btrfs-上的数据库工作负载">10.5 Btrfs
+                上的数据库工作负载</a></li>
+                <li><a href="#btrfs-上的虚拟机磁盘镜像"
+                id="toc-btrfs-上的虚拟机磁盘镜像">10.6 Btrfs
+                上的虚拟机磁盘镜像</a></li>
+                <li><a href="#什么时候用-btrfs"
+                id="toc-什么时候用-btrfs">10.7 什么时候用 Btrfs</a></li>
+                <li><a href="#btrfs-与-zfs-的选型对比"
+                id="toc-btrfs-与-zfs-的选型对比">10.8 Btrfs 与 ZFS
+                的选型对比</a></li>
+                <li><a href="#btrfs-的发展方向"
+                id="toc-btrfs-的发展方向">10.9 Btrfs 的发展方向</a></li>
+                </ul></li>
+                <li><a href="#附参考资料"
+                id="toc-附参考资料">附：参考资料</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>ext4 和 XFS
+            走的是”就地更新”路线：数据写到哪个块，就直接覆盖那个块。这条路线简单、高效，但有一个根本性的问题——如果写到一半断电，磁盘上的数据处于半新半旧的状态，文件系统就损坏了。日志（Journal）机制可以缓解这个问题，但它本质上是”先写一遍日志，再写一遍数据”，写放大不可避免。</p>
+            <p>Btrfs（B-tree File
+            System）选了另一条路：写时复制（Copy-on-Write，CoW）。修改数据时不覆盖原块，而是把新数据写到新位置，然后原子地更新指针。这个看似简单的设计选择，像多米诺骨牌一样带出了一整套能力——零开销快照、内置校验、透明压缩、多设备管理——全部内建在文件系统里，不依赖外部工具。</p>
+            <p>Btrfs 由甲骨文（Oracle）的 Chris Mason 在 2007
+            年启动开发，2009 年合入 Linux 2.6.29
+            主线内核。它的设计目标直白：做一个功能上能对标
+            ZFS，但原生运行在 Linux
+            内核里的现代文件系统。经过十多年发展，Btrfs 已经成为 SUSE
+            Linux Enterprise 的默认文件系统，Facebook（现
+            Meta）在其生产环境大规模使用，Fedora 从 33
+            版开始也将其作为桌面默认选择。</p>
+            <p>本文从 CoW 的核心原理讲起，逐层拆解 Btrfs 的 B-Tree
+            结构、子卷与快照机制、透明压缩、内置
+            RAID、数据校验与自修复、增量同步、碎片化管理，最后落到生产环境的实战命令和选型评估。所有命令示例基于
+            Linux 6.1 内核，在 openSUSE Leap 15.5 和 Ubuntu 22.04
+            上验证。</p>
+            <hr />
+            <h2 id="一btrfs-设计目标与-cow-原理">一、Btrfs 设计目标与
+            CoW 原理</h2>
+            <h3 id="设计目标">1.1 设计目标</h3>
+            <p>Btrfs 的设计目标可以归纳为五个方面：</p>
+            <ol type="1">
+            <li><strong>数据完整性</strong>：每个数据块和元数据块都携带校验和（Checksum），读取时自动验证，发现损坏立即报告；</li>
+            <li><strong>高效快照</strong>：快照的创建是 O(1)
+            操作，不需要复制任何数据，占用空间仅随后续修改增长；</li>
+            <li><strong>灵活的存储池</strong>：多个物理设备可以组成一个逻辑文件系统，支持在线添加、移除、替换设备；</li>
+            <li><strong>透明压缩</strong>：文件数据在写入磁盘前自动压缩，读取时自动解压，对应用完全透明；</li>
+            <li><strong>自修复能力</strong>：在多副本配置下，检测到数据损坏后可以从正确的副本自动恢复。</li>
+            </ol>
+            <p>这些目标的共同基础就是写时复制（CoW）机制。</p>
+            <h3 id="什么是写时复制">1.2 什么是写时复制</h3>
+            <p>传统文件系统（如 ext4）采用就地更新（In-place
+            Update）策略：</p>
+            <pre class="text"><code>就地更新流程：
+1. 应用写入文件偏移 0-4KB 的新数据
+2. 文件系统找到该偏移对应的磁盘块 X
+3. 直接将新数据覆盖写入磁盘块 X
+4. 如果此刻断电，块 X 上的数据可能是半新半旧的</code></pre>
+            <p>CoW 的做法完全不同：</p>
+            <pre class="text"><code>CoW 流程：
+1. 应用写入文件偏移 0-4KB 的新数据
+2. 文件系统分配一个新的磁盘块 Y
+3. 将新数据写入磁盘块 Y
+4. 更新元数据指针：文件偏移 0-4KB 现在指向块 Y（而非块 X）
+5. 释放旧块 X（如果没有快照引用它）
+6. 如果写入块 Y 时断电，旧块 X 完好无损，文件系统仍然一致</code></pre>
+            <p>关键点在于第 4 步——指针更新本身也是 CoW
+            的。修改一个数据块，需要更新它的父节点指针；更新父节点，又需要更新父节点的父节点……一直向上传播到树根（Root）。整棵树的根指针更新是一个原子操作（通常借助超级块的原子写入），这就保证了文件系统在任何时刻都是一致的。</p>
+            <h3 id="cow-的代价">1.3 CoW 的代价</h3>
+            <p>CoW 不是免费的午餐。它带来了两个固有问题：</p>
+            <p><strong>写放大（Write
+            Amplification）</strong>：修改一个叶子节点，整条路径到根节点都要重写。如果树的深度为
+            4，一次 4KB 的数据修改可能触发 4 次 16KB 的元数据写入。不过
+            Btrfs 通过延迟分配（Delayed
+            Allocation）和批量提交（Transaction
+            Commit）来摊销这个开销——多次修改可以合并到同一次事务提交中，共享路径上的节点只写一次。</p>
+            <p><strong>碎片化（Fragmentation）</strong>：因为新数据总是写到新位置，文件的物理布局会随着修改变得碎片化。对于顺序读取的大文件（如数据库数据文件、虚拟机磁盘镜像），碎片化会严重影响性能。Btrfs
+            提供了 <code>autodefrag</code>
+            挂载选项和手动碎片整理工具来缓解这个问题（详见第八节）。</p>
+            <h3 id="cow-与日志的对比">1.4 CoW 与日志的对比</h3>
+            <p>下面对比 CoW 和传统日志机制：</p>
+            <pre class="text"><code>┌──────────────┬──────────────────────┬─────────────────────┐
+│   特性       │  日志（Journal）     │  CoW                │
+├──────────────┼──────────────────────┼─────────────────────┤
+│ 一致性保证   │ 重放日志恢复         │ 天然原子，无需恢复  │
+│ 写放大       │ 数据写两次           │ 路径复制            │
+│ 快照支持     │ 需要额外机制（LVM）  │ 天然支持            │
+│ 碎片化       │ 较少                 │ 较多                │
+│ 崩溃恢复速度 │ 与日志大小成正比     │ 几乎即时            │
+│ 实现复杂度   │ 中等                 │ 较高                │
+└──────────────┴──────────────────────┴─────────────────────┘</code></pre>
+            <p>Btrfs 选择 CoW
+            不是因为它在所有维度都更好，而是因为它在快照、校验、多设备管理等方面天然适合，这些功能在日志型文件系统上需要大量额外代码才能实现。</p>
+            <hr />
+            <h2 id="二cow-b-tree-数据结构">二、CoW B-Tree 数据结构</h2>
+            <h3 id="树中之树tree-of-trees">2.1 树中之树（Tree of
+            Trees）</h3>
+            <p>Btrfs 的核心数据结构是一棵 B-Tree
+            的森林，官方称为”树中之树”（Tree of
+            Trees）。整个文件系统由多棵 B-Tree
+            组成，每棵树负责不同类型的数据：</p>
+            <pre class="text"><code>Btrfs 的树结构：
+
+Root Tree（根树）
+├── FS Tree（文件系统树） ── 存储文件、目录的 inode 和数据引用
+├── Extent Tree（区段树） ── 管理磁盘空间分配
+├── Chunk Tree（块组树）  ── 逻辑地址到物理地址的映射
+├── Device Tree（设备树） ── 物理设备信息
+├── Checksum Tree（校验树）── 数据块的校验和
+├── Log Tree（日志树）    ── fsync 优化用的小型日志
+├── UUID Tree（UUID 树）  ── 子卷和快照的 UUID 索引
+└── Quota Tree（配额树）  ── 子卷配额信息</code></pre>
+            <p>所有这些树共享同一种 B-Tree
+            节点格式，通过根树的根节点串联起来。根树本身的根节点地址记录在超级块（Superblock）中。</p>
+            <h3 id="b-tree-节点格式">2.2 B-Tree 节点格式</h3>
+            <p>Btrfs 的 B-Tree 节点大小默认为 16KB（可通过
+            <code>mkfs.btrfs -n</code> 设置为 4KB 到
+            64KB）。每个节点包含一个头部和若干键值对：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 节点头部（简化） */</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> btrfs_header <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    u8  csum<span class="op">[</span><span class="dv">32</span><span class="op">];</span>        <span class="co">/* 本节点的校验和 */</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    u8  fsid<span class="op">[</span><span class="dv">16</span><span class="op">];</span>        <span class="co">/* 文件系统 UUID */</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    u64 bytenr<span class="op">;</span>          <span class="co">/* 本节点在磁盘上的字节偏移 */</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    u64 flags<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    u64 generation<span class="op">;</span>      <span class="co">/* 事务代数 */</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    u64 owner<span class="op">;</span>           <span class="co">/* 所属树的 ID */</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    u32 nritems<span class="op">;</span>         <span class="co">/* 本节点包含的条目数 */</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    u8  level<span class="op">;</span>           <span class="co">/* 层级：0=叶子节点 */</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* 搜索键（Key）：三元组 */</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> btrfs_key <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    u64 objectid<span class="op">;</span>        <span class="co">/* 对象 ID（如 inode 号） */</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    u8  type<span class="op">;</span>            <span class="co">/* 条目类型 */</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    u64 offset<span class="op">;</span>          <span class="co">/* 类型相关的偏移量 */</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>键的三元组设计非常精巧。以文件数据为例：<code>objectid</code>
+            是 inode 号，<code>type</code> 是
+            <code>EXTENT_DATA</code>，<code>offset</code>
+            是文件内偏移。这样同一个 inode
+            的所有数据范围自然地排列在一起，范围查询极其高效。</p>
+            <h3 id="内部节点与叶子节点">2.3 内部节点与叶子节点</h3>
+            <p>内部节点（Internal
+            Node）的每个条目包含一个键和一个指向子节点的块指针：</p>
+            <pre class="text"><code>内部节点布局：
+┌──────────────────────────────────────────────────┐
+│ Header (csum, generation, level, nritems, ...)   │
+├──────────┬──────────┬──────────┬──────────────────┤
+│ Key₀     │ Key₁     │ Key₂     │ ...              │
+│ BlockPtr₀│ BlockPtr₁│ BlockPtr₂│ ...              │
+└──────────┴──────────┴──────────┴──────────────────┘</code></pre>
+            <p>叶子节点（Leaf
+            Node）的条目包含键和内联数据（或对数据块的引用）：</p>
+            <pre class="text"><code>叶子节点布局：
+┌──────────────────────────────────────────────────┐
+│ Header                                           │
+├──────────┬──────────┬──────────┬──────────────────┤
+│ Item₀    │ Item₁    │ Item₂    │ ...              │ ← 从前向后增长
+│          │          │          │                  │
+│          │     [Free Space]                       │
+│          │                                        │
+│ Data₂    │ Data₁    │ Data₀    │                  │ ← 从后向前增长
+└──────────┴──────────┴──────────┴──────────────────┘</code></pre>
+            <p>叶子节点使用双向增长的布局：条目头从前向后排列，数据从后向前填充，两者在中间相遇时节点满。这种设计减少了插入和删除时的数据移动。</p>
+            <h3 id="cow-语义在-b-tree-上的实现">2.4 CoW 语义在 B-Tree
+            上的实现</h3>
+            <p>当修改一个叶子节点的数据时，CoW 的传播过程如下：</p>
+            <pre class="text"><code>修改前：                           修改后：
+                                   
+    Root [gen=100]                     Root&#39; [gen=101]
+    /    \                             /    \
+   A      B [gen=98]                  A      B&#39; [gen=101]
+  / \    / \                         / \    / \
+ a1 a2  b1  b2                     a1 a2  b1  b2&#39;
+                                              ↑
+                                          新分配的叶子
+                                          （b2 的修改副本）
+
+注：A 和 a1、a2 没有被修改，所以原封不动地被新根引用。
+    只有 Root→B→b2 这条路径被复制了。
+    旧的 Root、B、b2 如果没有快照引用，会被回收。</code></pre>
+            <p>这就是 CoW B-Tree
+            的核心：<strong>只复制修改路径上的节点，未修改的子树通过共享引用避免复制</strong>。这也是快照能做到零开销的原因——创建快照只需要增加一个对当前根节点的引用。</p>
+            <h3 id="事务与代generation">2.5 事务与代（Generation）</h3>
+            <p>Btrfs
+            使用事务代（Generation）来管理一致性。每次事务提交，代数加一。每个节点头部记录了它被最后修改的代数。这个设计有两个重要用途：</p>
+            <ol type="1">
+            <li><strong>一致性检查</strong>：父节点记录的子节点代数必须大于等于子节点头部的代数，否则说明数据不一致；</li>
+            <li><strong>增量发送</strong>：<code>btrfs send</code>
+            可以通过比较两个快照之间的代数差异，快速找到被修改的节点（详见第七节）。</li>
+            </ol>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件系统的当前事务代数</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> inspect-internal dump-super /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> generation</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>generation              125847</code></pre>
+            <hr />
+            <h2
+            id="三子卷subvolume与快照snapshot">三、子卷（Subvolume）与快照（Snapshot）</h2>
+            <h3 id="子卷的概念">3.1 子卷的概念</h3>
+            <p>子卷（Subvolume）是 Btrfs
+            最具特色的功能之一。一个子卷是文件系统内部的一棵独立的文件系统树（FS
+            Tree），拥有自己的 inode
+            空间和目录层级。可以把子卷理解为”文件系统中的文件系统”。</p>
+            <p>子卷的特点：</p>
+            <ul>
+            <li><strong>轻量</strong>：创建子卷不分配任何数据块，只创建一个新的
+            FS Tree 根节点；</li>
+            <li><strong>共享空间</strong>：所有子卷共享同一个存储池的空间，不需要预先划分大小；</li>
+            <li><strong>独立挂载</strong>：每个子卷可以单独挂载，使用不同的挂载选项；</li>
+            <li><strong>嵌套</strong>：子卷内部可以再创建子卷，形成层级结构。</li>
+            </ul>
+            <h3 id="创建和管理子卷">3.2 创建和管理子卷</h3>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建子卷</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume create /mnt/btrfs/@home</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume create /mnt/btrfs/@var</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume create /mnt/btrfs/@snapshots</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 列出所有子卷</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume list /mnt/btrfs</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>ID 256 gen 100 top level 5 path @home
+ID 257 gen 98  top level 5 path @var
+ID 258 gen 95  top level 5 path @snapshots</code></pre>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看子卷详细信息</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume show /mnt/btrfs/@home</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>@home
+        Name:                   @home
+        UUID:                   a1b2c3d4-e5f6-7890-abcd-ef1234567890
+        Parent UUID:            -
+        Received UUID:          -
+        Creation time:          2025-08-25 10:30:00 +0800
+        Subvolume ID:           256
+        Generation:             100
+        Gen at creation:        90
+        Parent ID:              5
+        Top level ID:           5
+        Flags:                  -
+        Send transid:           0
+        Send time:              2025-08-25 10:30:00 +0800
+        Receive transid:        0
+        Receive time:           -
+        Snapshot(s):</code></pre>
+            <h3 id="默认子卷与挂载">3.3 默认子卷与挂载</h3>
+            <p>Btrfs
+            的顶层目录（Top-level，ID=5）本身就是一个子卷。可以通过设置默认子卷来控制不带
+            <code>subvol</code> 选项挂载时看到的内容：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置默认子卷</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume set-default 256 /mnt/btrfs</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 挂载特定子卷</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> subvol=@home /dev/sda1 /home</span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> subvolid=257 /dev/sda1 /var</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 /etc/fstab 中配置</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/sda1  /      btrfs  defaults,subvol=@       0 0</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/sda1  /home  btrfs  defaults,subvol=@home   0 0</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/sda1  /var   btrfs  defaults,subvol=@var    0 0</span></span></code></pre></div>
+            <h3 id="快照的原理">3.4 快照的原理</h3>
+            <p>快照（Snapshot）本质上是一个特殊的子卷——它在创建时共享源子卷的整棵
+            FS Tree。创建快照的操作只有两步：</p>
+            <ol type="1">
+            <li>在根树中创建一个新的 FS Tree
+            根节点，指向源子卷的根节点；</li>
+            <li>将源子卷根节点的引用计数加一。</li>
+            </ol>
+            <pre class="text"><code>创建快照前：                       创建快照后：
+
+Root Tree                          Root Tree
+    │                                  │
+    ├── FS Tree @home (ID=256)         ├── FS Tree @home (ID=256)
+    │       │                          │       │
+    │       Root ──→ [数据块群]        │       Root ──→ [数据块群] ←── Root
+    │                                  │                              │
+    │                                  │                     FS Tree @snap (ID=259)
+    │                                  │                              │
+    └── ...                            └── ...                 新建子卷条目</code></pre>
+            <p>因为 CoW 语义，后续对 <code>@home</code>
+            的修改会创建新的节点副本，而快照仍然引用旧节点。两者只在被修改的部分产生差异，未修改的数据块继续共享。</p>
+            <h3 id="创建和管理快照">3.5 创建和管理快照</h3>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建只读快照</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> /mnt/btrfs/@home <span class="dt">\</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>    /mnt/btrfs/@snapshots/home-2025-08-25</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建可写快照</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot /mnt/btrfs/@home <span class="dt">\</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>    /mnt/btrfs/@snapshots/home-writable</span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 删除快照（与删除子卷操作相同）</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume delete /mnt/btrfs/@snapshots/home-writable</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看快照占用的独占空间（需要启用配额）</span></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> qgroup show /mnt/btrfs</span></code></pre></div>
+            <h3 id="快照的实际空间开销">3.6 快照的实际空间开销</h3>
+            <p>快照刚创建时不占用额外空间。随着源子卷的数据被修改，快照需要保留旧版本的数据块，空间开销才开始增长：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用配额系统来跟踪空间使用</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> quota enable /mnt/btrfs</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看每个子卷/快照的空间使用</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> qgroup show <span class="at">-reF</span> /mnt/btrfs</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>qgroupid         rfer         excl
+--------         ----         ----
+0/256        12.50GiB     10.20GiB
+0/257         3.80GiB      3.80GiB
+0/259        12.50GiB      2.30GiB   ← 快照独占 2.3G（源子卷修改了这么多）</code></pre>
+            <p><code>rfer</code>（Referenced）是子卷引用的总数据量，<code>excl</code>（Exclusive）是该子卷独占的、删除后可以释放的空间。</p>
+            <h3 id="嵌套子卷的注意事项">3.7 嵌套子卷的注意事项</h3>
+            <p>子卷可以嵌套，但有一个重要限制：<strong>快照不会递归地包含嵌套子卷的内容</strong>。如果
+            <code>@home</code> 内部有一个嵌套子卷
+            <code>@home/docker</code>，对 <code>@home</code>
+            创建快照时，<code>docker</code>
+            子卷在快照中会显示为一个空目录。</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 嵌套子卷示例</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume create /mnt/btrfs/@home/docker</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 对 @home 创建快照——docker 子卷不会被包含</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> /mnt/btrfs/@home <span class="dt">\</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>    /mnt/btrfs/@snapshots/home-snap</span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="co"># /mnt/btrfs/@snapshots/home-snap/docker 是一个空目录</span></span></code></pre></div>
+            <p>最佳实践是将需要独立快照的目录设计为平级子卷，而不是嵌套子卷。典型的布局如下：</p>
+            <pre class="text"><code>顶层（ID=5）
+├── @           ← 挂载到 /
+├── @home       ← 挂载到 /home
+├── @var        ← 挂载到 /var
+├── @docker     ← 挂载到 /var/lib/docker
+└── @snapshots  ← 挂载到 /.snapshots</code></pre>
+            <hr />
+            <h2 id="四透明压缩">四、透明压缩</h2>
+            <h3 id="压缩算法选择">4.1 压缩算法选择</h3>
+            <p>Btrfs 支持三种压缩算法（Compression Algorithm）：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>算法</th>
+            <th>引入内核版本</th>
+            <th>压缩比</th>
+            <th>压缩速度</th>
+            <th>解压速度</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>zlib</td>
+            <td>2.6.29</td>
+            <td>高</td>
+            <td>慢</td>
+            <td>中等</td>
+            <td>归档存储，空间优先</td>
+            </tr>
+            <tr>
+            <td>LZO</td>
+            <td>2.6.38</td>
+            <td>中</td>
+            <td>快</td>
+            <td>快</td>
+            <td>通用场景</td>
+            </tr>
+            <tr>
+            <td>zstd</td>
+            <td>4.14</td>
+            <td>高</td>
+            <td>快</td>
+            <td>快</td>
+            <td>推荐默认选择</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>zstd（Zstandard）是目前推荐的首选算法。它在压缩比上接近
+            zlib，但速度快得多；在速度上接近 LZO，但压缩比好得多。</p>
+            <h3 id="压缩级别">4.2 压缩级别</h3>
+            <p>zstd 支持从 1 到 15 的压缩级别（Compression Level），zlib
+            支持 1 到 9：</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 zstd 默认级别（3）</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> compress=zstd /dev/sda1 /mnt</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 指定 zstd 压缩级别</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> compress=zstd:6 /dev/sda1 /mnt</span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 zlib</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> compress=zlib:6 /dev/sda1 /mnt</span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 LZO</span></span>
+<span id="cb23-11"><a href="#cb23-11" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> compress=lzo /dev/sda1 /mnt</span></code></pre></div>
+            <h3 id="compress-与-compress-force-的区别">4.3 compress 与
+            compress-force 的区别</h3>
+            <p>Btrfs
+            有一个启发式机制：如果检测到文件的前几个块压缩后体积没有明显缩小，就会标记该文件为不可压缩（<code>NOCOMPRESS</code>
+            标志），后续写入不再尝试压缩。</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 普通压缩：遇到不可压缩数据会自动跳过</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> compress=zstd /dev/sda1 /mnt</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 强制压缩：始终尝试压缩，忽略启发式判断</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> compress-force=zstd /dev/sda1 /mnt</span></code></pre></div>
+            <p>对于已知内容混合的场景（如包含大量文本文件和少量已压缩媒体文件的目录），默认的
+            <code>compress</code>
+            通常是更好的选择。<code>compress-force</code>
+            适用于你确定大部分数据可压缩的场景。</p>
+            <h3 id="按文件设置压缩属性">4.4 按文件设置压缩属性</h3>
+            <p>除了全局挂载选项，还可以按文件或目录设置压缩属性（Property）：</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 为目录设置压缩属性（新创建的文件继承）</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> property set /mnt/logs compression zstd</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看压缩属性</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> property get /mnt/logs compression</span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 清除压缩属性</span></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> property set /mnt/logs compression <span class="st">&quot;&quot;</span></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 chattr 设置不压缩标志</span></span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a><span class="fu">chattr</span> +m /mnt/data/video.mp4    <span class="co"># NOCOMPRESS 标志</span></span></code></pre></div>
+            <p>注意：修改压缩属性只影响后续写入的数据。已存在的数据需要通过碎片整理触发重新压缩：</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 对已有文件触发重新压缩</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem defragment <span class="at">-r</span> <span class="at">-czstd</span> /mnt/logs/</span></code></pre></div>
+            <h3 id="压缩比基准测试">4.5 压缩比基准测试</h3>
+            <p>以下是在一台配备 NVMe SSD
+            的服务器上，对不同类型数据的压缩效果测试：</p>
+            <pre class="text"><code>测试环境：AMD EPYC 7543，NVMe SSD（Samsung 980 PRO 1TB）
+数据集：Linux 6.1 内核源码（约 1.3GB）
+
+┌──────────────┬───────────┬────────────┬────────────┬───────────┐
+│ 算法         │ 原始大小  │ 压缩后大小 │ 压缩比     │ 写入速度  │
+├──────────────┼───────────┼────────────┼────────────┼───────────┤
+│ 无压缩       │ 1.30 GiB  │ 1.30 GiB   │ 1.00x      │ 2.1 GB/s  │
+│ lzo          │ 1.30 GiB  │ 0.78 GiB   │ 1.67x      │ 1.8 GB/s  │
+│ zstd:1       │ 1.30 GiB  │ 0.52 GiB   │ 2.50x      │ 1.6 GB/s  │
+│ zstd:3       │ 1.30 GiB  │ 0.47 GiB   │ 2.77x      │ 1.4 GB/s  │
+│ zstd:6       │ 1.30 GiB  │ 0.43 GiB   │ 3.02x      │ 0.9 GB/s  │
+│ zstd:15      │ 1.30 GiB  │ 0.39 GiB   │ 3.33x      │ 0.2 GB/s  │
+│ zlib:6       │ 1.30 GiB  │ 0.44 GiB   │ 2.95x      │ 0.4 GB/s  │
+│ zlib:9       │ 1.30 GiB  │ 0.43 GiB   │ 3.02x      │ 0.3 GB/s  │
+└──────────────┴───────────┴────────────┴────────────┴───────────┘</code></pre>
+            <pre class="text"><code>数据集：PostgreSQL 数据库转储文件（约 50GB，纯文本 SQL）
+
+┌──────────────┬───────────┬────────────┬────────────┐
+│ 算法         │ 原始大小  │ 压缩后大小 │ 压缩比     │
+├──────────────┼───────────┼────────────┼────────────┤
+│ 无压缩       │ 50.0 GiB  │ 50.0 GiB   │ 1.00x      │
+│ lzo          │ 50.0 GiB  │ 22.7 GiB   │ 2.20x      │
+│ zstd:3       │ 50.0 GiB  │ 10.2 GiB   │ 4.90x      │
+│ zlib:6       │ 50.0 GiB  │ 9.8 GiB    │ 5.10x      │
+└──────────────┴───────────┴────────────┴────────────┘</code></pre>
+            <p>关键结论：<strong>zstd:3
+            是大多数场景的最佳平衡点</strong>。它的压缩比接近
+            zlib:6，但写入速度快 3
+            倍以上。只有在存储空间极其紧张且对写入性能不敏感的归档场景，才值得使用更高的压缩级别。</p>
+            <h3 id="压缩对性能的影响">4.6 压缩对性能的影响</h3>
+            <p>压缩并不总是降低性能。对于 I/O 带宽受限的场景（如
+            HDD、网络存储），压缩可以减少实际需要传输的数据量，反而提升吞吐量：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件的压缩统计</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="ex">compsize</span> /mnt/data/</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>Processed 28453 files, 3891 regular extents (3891 inline).
+Type       Perc     Disk Usage   Uncompressed Referenced
+TOTAL       38%      4.8G         12.5G        12.5G
+none       100%      1.2G          1.2G         1.2G
+zstd        32%      3.6G         11.3G        11.3G</code></pre>
+            <p><code>compsize</code> 工具（需要单独安装）可以显示 Btrfs
+            文件系统的实际压缩效果。<code>Perc</code>
+            列显示压缩后的数据占原始大小的百分比。</p>
+            <hr />
+            <h2 id="五内置-raid">五、内置 RAID</h2>
+            <h3 id="btrfs-raid-概述">5.1 Btrfs RAID 概述</h3>
+            <p>Btrfs 内置了多设备管理和 RAID（Redundant Array of
+            Independent Disks，独立磁盘冗余阵列）功能，不需要依赖 mdadm
+            或硬件 RAID 控制器。它的 RAID 实现基于块组（Block
+            Group）级别的条带化和镜像，而非传统 RAID 的全盘级别。</p>
+            <p>支持的 RAID 配置档案（Profile）：</p>
+            <pre class="text"><code>┌────────────┬──────────┬──────────┬────────────┬──────────────────┐
+│ 配置档案   │ 最少设备 │ 空间利用 │ 容错能力   │ 状态             │
+├────────────┼──────────┼──────────┼────────────┼──────────────────┤
+│ single     │ 1        │ 100%     │ 无         │ 稳定             │
+│ dup        │ 1        │ 50%      │ 无（注1）  │ 稳定             │
+│ raid0      │ 2        │ 100%     │ 无         │ 稳定             │
+│ raid1      │ 2        │ 50%      │ 1块盘故障  │ 稳定             │
+│ raid1c3    │ 3        │ 33%      │ 2块盘故障  │ 稳定（5.5+）     │
+│ raid1c4    │ 4        │ 25%      │ 3块盘故障  │ 稳定（5.5+）     │
+│ raid10     │ 4        │ 50%      │ 取决于布局 │ 稳定             │
+│ raid5      │ 3        │ (N-1)/N  │ 1块盘故障  │ 不稳定（写洞）   │
+│ raid6      │ 4        │ (N-2)/N  │ 2块盘故障  │ 不稳定（写洞）   │
+└────────────┴──────────┴──────────┴────────────┴──────────────────┘
+注1：dup 在同一设备上存储两份副本，可以防范部分扇区损坏，但无法防范整盘故障。</code></pre>
+            <h3 id="创建多设备文件系统">5.2 创建多设备文件系统</h3>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 RAID-1 文件系统（数据和元数据都镜像）</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">-d</span> raid1 <span class="at">-m</span> raid1 /dev/sdb /dev/sdc</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建混合配置：数据 RAID-0，元数据 RAID-1</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">-d</span> raid0 <span class="at">-m</span> raid1 /dev/sdb /dev/sdc /dev/sdd</span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 挂载多设备文件系统</span></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> /dev/sdb /mnt/btrfs</span>
+<span id="cb32-9"><a href="#cb32-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-10"><a href="#cb32-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件系统的设备组成</span></span>
+<span id="cb32-11"><a href="#cb32-11" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem show /mnt/btrfs</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>Label: none  uuid: 12345678-abcd-efgh-ijkl-1234567890ab
+        Total devices 2 FS bytes used 15.30GiB
+        devid    1 size 100.00GiB used 20.00GiB path /dev/sdb
+        devid    2 size 100.00GiB used 20.00GiB path /dev/sdc</code></pre>
+            <h3 id="元数据镜像metadata-mirroring">5.3
+            元数据镜像（Metadata Mirroring）</h3>
+            <p>即使数据不做 RAID，Btrfs
+            默认也会对元数据进行保护。在单设备上，元数据默认使用
+            <code>dup</code>（双份存储）；在多设备上，默认使用
+            <code>raid1</code>。这是因为元数据丢失比数据丢失更具灾难性——一个损坏的元数据节点可能导致整个子树不可访问。</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看块组的分配情况</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem df /mnt/btrfs</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>Data, RAID1: total=40.00GiB, used=15.30GiB
+System, RAID1: total=32.00MiB, used=16.00KiB
+Metadata, RAID1: total=2.00GiB, used=512.00MiB
+GlobalReserve, single: total=128.00MiB, used=0.00B</code></pre>
+            <h3 id="在线添加和移除设备">5.4 在线添加和移除设备</h3>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加新设备</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> device add /dev/sdd /mnt/btrfs</span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加后需要重新平衡数据分布</span></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance start <span class="at">-dconvert</span><span class="op">=</span>raid1 <span class="at">-mconvert</span><span class="op">=</span>raid1 /mnt/btrfs</span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 移除设备（数据会自动迁移到剩余设备）</span></span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> device remove /dev/sdc /mnt/btrfs</span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 替换故障设备</span></span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> replace start /dev/sdc /dev/sde /mnt/btrfs</span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看替换进度</span></span>
+<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> replace status /mnt/btrfs</span></code></pre></div>
+            <h3 id="raid-56-的已知问题">5.5 RAID-5/6 的已知问题</h3>
+            <p>Btrfs 的 RAID-5/6 实现存在一个严重的问题——写洞（Write
+            Hole）。这个问题在 mdadm 的 RAID-5/6 中也存在，但 mdadm 有
+            bitmap 机制来缓解。</p>
+            <p>写洞的本质：在一次条带（Stripe）写入过程中，如果系统崩溃，可能出现数据块和校验块不一致的状态。重启后，RAID
+            层无法判断哪个块是正确的。</p>
+            <pre class="text"><code>RAID-5 写洞场景：
+
+正常写入一个条带：
+  Disk1: [D1_new]  Disk2: [D2]  Disk3: [P_new]
+  
+崩溃点：D1_new 已写入，P_new 尚未写入
+  Disk1: [D1_new]  Disk2: [D2]  Disk3: [P_old]
+
+重启后：
+  P_old 是基于 D1_old 和 D2 计算的
+  但 D1 已经变成了 D1_new
+  校验不一致 → 无法确定哪个盘的数据是正确的</code></pre>
+            <p><strong>生产建议：不要在生产环境使用 Btrfs 的
+            RAID-5/6。</strong> 如果需要 RAID-5/6 级别的容错，可以在
+            mdadm RAID-5/6 之上创建 Btrfs 单设备文件系统，或者使用 Btrfs
+            的 RAID-1/RAID-1c3/RAID-10。</p>
+            <h3 id="raid-配置的最佳实践">5.6 RAID 配置的最佳实践</h3>
+            <pre class="text"><code>┌───────────────────────┬─────────────────────────────────┐
+│ 场景                  │ 推荐配置                        │
+├───────────────────────┼─────────────────────────────────┤
+│ 桌面/笔记本单盘       │ data=single, meta=dup           │
+│ 双盘镜像              │ data=raid1, meta=raid1          │
+│ 三盘以上，容错优先    │ data=raid1c3, meta=raid1c3      │
+│ 四盘以上，性能与容错  │ data=raid10, meta=raid1c3       │
+│ 大容量存储池          │ data=raid1, meta=raid1c3        │
+│ 需要 RAID-5/6 容错    │ mdadm RAID-5/6 + btrfs single  │
+└───────────────────────┴─────────────────────────────────┘</code></pre>
+            <hr />
+            <h2 id="六数据校验与自修复">六、数据校验与自修复</h2>
+            <h3 id="逐块校验和per-block-checksum">6.1
+            逐块校验和（Per-block Checksum）</h3>
+            <p>Btrfs
+            对每个数据块和元数据块都计算校验和（Checksum），默认使用
+            CRC32C 算法。从 Linux 5.5 开始，还支持更强的校验算法：</p>
+            <pre class="text"><code>┌──────────────┬────────────┬─────────────┬──────────────────┐
+│ 算法         │ 校验和长度 │ 碰撞概率    │ 引入内核版本     │
+├──────────────┼────────────┼─────────────┼──────────────────┤
+│ crc32c       │ 4 字节     │ 1/2³²       │ 2.6.29（默认）   │
+│ xxhash64     │ 8 字节     │ 1/2⁶⁴       │ 5.5              │
+│ sha256       │ 32 字节    │ 极低        │ 5.5              │
+│ blake2b-256  │ 32 字节    │ 极低        │ 5.5              │
+└──────────────┴────────────┴─────────────┴──────────────────┘</code></pre>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建使用 xxhash64 校验的文件系统</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">--csum</span> xxhash64 /dev/sda1</span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建使用 blake2b 校验的文件系统</span></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">--csum</span> blake2b /dev/sda1</span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前文件系统使用的校验算法</span></span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> inspect-internal dump-super /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> csum_type</span></code></pre></div>
+            <h3 id="校验和的存储与验证">6.2 校验和的存储与验证</h3>
+            <p>校验和存储在专门的校验树（Checksum
+            Tree）中。每次读取数据块时，Btrfs
+            会重新计算校验和并与存储的值比较：</p>
+            <pre class="text"><code>数据读取校验流程：
+
+1. 应用请求读取文件 offset 0-4KB
+2. Btrfs 在 FS Tree 中找到对应的数据区段（Extent）引用
+3. 从磁盘读取数据块
+4. 从校验树中查找该数据块的存储校验和
+5. 计算读取数据的校验和
+6. 比较两个校验和：
+   - 匹配：返回数据给应用
+   - 不匹配：报告 I/O 错误（或尝试自修复）</code></pre>
+            <p>对于元数据块，校验和直接存储在节点头部的
+            <code>csum</code> 字段中，不需要查询校验树。</p>
+            <h3 id="scrub主动数据完整性检查">6.3
+            Scrub：主动数据完整性检查</h3>
+            <p>Scrub 是 Btrfs
+            的主动数据完整性验证工具。它会读取文件系统中的每个数据块和元数据块，验证校验和，并报告（或修复）发现的错误：</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启动 scrub（后台运行）</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> scrub start /mnt/btrfs</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 scrub 状态</span></span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> scrub status /mnt/btrfs</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>UUID:             12345678-abcd-efgh-ijkl-1234567890ab
+Scrub started:    Sun Aug 25 02:00:00 2025
+Status:           finished
+Duration:         0:15:32
+Total to scrub:   150.30GiB
+Rate:             165.83MiB/s
+Error summary:    csum=2
+  Corrected:      2
+  Uncorrectable:  0</code></pre>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 暂停和恢复 scrub</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> scrub cancel /mnt/btrfs</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> scrub resume /mnt/btrfs</span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置定时 scrub（systemd timer）</span></span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> enable btrfs-scrub@-.timer        <span class="co"># 根文件系统</span></span>
+<span id="cb44-7"><a href="#cb44-7" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> enable btrfs-scrub@mnt-data.timer <span class="co"># /mnt/data</span></span></code></pre></div>
+            <h3 id="自修复self-healing">6.4 自修复（Self-healing）</h3>
+            <p>在多副本配置（RAID-1、RAID-1c3、RAID-10 等）下，Btrfs
+            可以自动修复损坏的数据块：</p>
+            <pre class="text"><code>自修复流程：
+
+1. 读取数据块 X 的副本 A
+2. 校验和不匹配 → 副本 A 损坏
+3. 读取数据块 X 的副本 B（位于另一块磁盘）
+4. 校验和匹配 → 副本 B 正确
+5. 用副本 B 的内容覆盖副本 A → 修复完成
+6. 返回正确数据给应用
+7. 写入内核日志：BTRFS info: read error corrected</code></pre>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 模拟数据损坏并验证自修复（仅用于测试）</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 先创建一个 RAID-1 文件系统</span></span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">-d</span> raid1 <span class="at">-m</span> raid1 /dev/sdb /dev/sdc</span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> /dev/sdb /mnt/test</span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 写入测试文件</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/urandom of=/mnt/test/testfile bs=1M count=100</span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sync</span></span>
+<span id="cb46-9"><a href="#cb46-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-10"><a href="#cb46-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 记录文件的校验和</span></span>
+<span id="cb46-11"><a href="#cb46-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> /mnt/test/testfile <span class="op">&gt;</span> /mnt/test/checksum.txt</span>
+<span id="cb46-12"><a href="#cb46-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-13"><a href="#cb46-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 卸载文件系统</span></span>
+<span id="cb46-14"><a href="#cb46-14" aria-hidden="true" tabindex="-1"></a><span class="fu">umount</span> /mnt/test</span>
+<span id="cb46-15"><a href="#cb46-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-16"><a href="#cb46-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 在一块盘上制造损坏（覆盖部分数据区域）</span></span>
+<span id="cb46-17"><a href="#cb46-17" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/dev/sdb bs=1M count=10 seek=500</span>
+<span id="cb46-18"><a href="#cb46-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-19"><a href="#cb46-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 重新挂载并验证</span></span>
+<span id="cb46-20"><a href="#cb46-20" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> /dev/sdb /mnt/test</span>
+<span id="cb46-21"><a href="#cb46-21" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="at">-c</span> /mnt/test/checksum.txt</span>
+<span id="cb46-22"><a href="#cb46-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 应输出：testfile: OK（Btrfs 自动从 /dev/sdc 读取了正确数据）</span></span>
+<span id="cb46-23"><a href="#cb46-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-24"><a href="#cb46-24" aria-hidden="true" tabindex="-1"></a><span class="co"># 运行 scrub 修复损坏的副本</span></span>
+<span id="cb46-25"><a href="#cb46-25" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> scrub start <span class="at">-B</span> /mnt/test</span></code></pre></div>
+            <h3 id="数据完整性与硬件层的关系">6.5
+            数据完整性与硬件层的关系</h3>
+            <p>Btrfs 的校验和可以检测到以下类型的数据损坏：</p>
+            <ul>
+            <li><strong>位翻转（Bit
+            Rot）</strong>：磁盘介质老化导致的静默数据损坏；</li>
+            <li><strong>固件缺陷（Firmware
+            Bug）</strong>：磁盘控制器错误地写入或读取数据；</li>
+            <li><strong>幻影写入（Phantom
+            Write）</strong>：磁盘报告写入成功但实际未写入；</li>
+            <li><strong>错位写入（Misdirected
+            Write）</strong>：数据被写到了错误的位置。</li>
+            </ul>
+            <p>但 Btrfs 的校验和<strong>无法</strong>防范：</p>
+            <ul>
+            <li><strong>内存错误（Memory Error）</strong>：如果 RAM
+            中的数据在写入磁盘前就已损坏，Btrfs
+            会为损坏的数据计算一个”正确的”校验和。使用 ECC
+            内存（Error-Correcting Code
+            Memory）是防范这类问题的正确做法。</li>
+            </ul>
+            <hr />
+            <h2 id="七sendreceive-增量同步">七、Send/Receive
+            增量同步</h2>
+            <h3 id="sendreceive-概述">7.1 Send/Receive 概述</h3>
+            <p><code>btrfs send</code> 和 <code>btrfs receive</code> 是
+            Btrfs 内置的增量备份机制。<code>send</code>
+            将一个只读快照序列化为一个数据流（Stream），<code>receive</code>
+            在目标端将这个数据流还原为一个只读快照。</p>
+            <pre class="text"><code>Send/Receive 工作原理：
+
+源端：                              目标端：
+                                   
+ @data ──快照──→ snap_new           
+     │           │                  snap_new&#39;
+     │       btrfs send ──→ [数据流] ──→ btrfs receive
+     │           │                      │
+     └──快照──→ snap_old ·· 参照 ··→ snap_old&#39;</code></pre>
+            <h3 id="全量发送">7.2 全量发送</h3>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建只读快照</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> /mnt/source/@data <span class="dt">\</span></span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a>    /mnt/source/@snapshots/data-snap-001</span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 全量发送到本地目标</span></span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> send /mnt/source/@snapshots/data-snap-001 <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb48-7"><a href="#cb48-7" aria-hidden="true" tabindex="-1"></a>    <span class="ex">btrfs</span> receive /mnt/backup/</span>
+<span id="cb48-8"><a href="#cb48-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-9"><a href="#cb48-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 全量发送到远程主机</span></span>
+<span id="cb48-10"><a href="#cb48-10" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> send /mnt/source/@snapshots/data-snap-001 <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb48-11"><a href="#cb48-11" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ssh</span> backup-server <span class="st">&quot;btrfs receive /mnt/backup/&quot;</span></span>
+<span id="cb48-12"><a href="#cb48-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-13"><a href="#cb48-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 发送到文件（离线传输）</span></span>
+<span id="cb48-14"><a href="#cb48-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> send /mnt/source/@snapshots/data-snap-001 <span class="dt">\</span></span>
+<span id="cb48-15"><a href="#cb48-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">-f</span> /mnt/external/backup-001.btrfs</span></code></pre></div>
+            <h3 id="增量发送">7.3 增量发送</h3>
+            <p>增量发送是 <code>btrfs send</code>
+            的精髓。它通过比较两个快照之间的差异，只发送变化的数据：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 第一次：全量发送</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> /mnt/source/@data <span class="dt">\</span></span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a>    /mnt/source/@snapshots/data-snap-001</span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> send /mnt/source/@snapshots/data-snap-001 <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a>    <span class="ex">btrfs</span> receive /mnt/backup/</span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 后续：增量发送</span></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> /mnt/source/@data <span class="dt">\</span></span>
+<span id="cb49-9"><a href="#cb49-9" aria-hidden="true" tabindex="-1"></a>    /mnt/source/@snapshots/data-snap-002</span>
+<span id="cb49-10"><a href="#cb49-10" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> send <span class="at">-p</span> /mnt/source/@snapshots/data-snap-001 <span class="dt">\</span></span>
+<span id="cb49-11"><a href="#cb49-11" aria-hidden="true" tabindex="-1"></a>    /mnt/source/@snapshots/data-snap-002 <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb49-12"><a href="#cb49-12" aria-hidden="true" tabindex="-1"></a>    <span class="ex">btrfs</span> receive /mnt/backup/</span>
+<span id="cb49-13"><a href="#cb49-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-14"><a href="#cb49-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 再次增量</span></span>
+<span id="cb49-15"><a href="#cb49-15" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> /mnt/source/@data <span class="dt">\</span></span>
+<span id="cb49-16"><a href="#cb49-16" aria-hidden="true" tabindex="-1"></a>    /mnt/source/@snapshots/data-snap-003</span>
+<span id="cb49-17"><a href="#cb49-17" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> send <span class="at">-p</span> /mnt/source/@snapshots/data-snap-002 <span class="dt">\</span></span>
+<span id="cb49-18"><a href="#cb49-18" aria-hidden="true" tabindex="-1"></a>    /mnt/source/@snapshots/data-snap-003 <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb49-19"><a href="#cb49-19" aria-hidden="true" tabindex="-1"></a>    <span class="ex">btrfs</span> receive /mnt/backup/</span></code></pre></div>
+            <p><code>-p</code>（parent）参数指定父快照。<code>btrfs send</code>
+            会利用 B-Tree
+            的代（Generation）信息，快速定位两个快照之间新增、修改和删除的数据。这比
+            rsync
+            的逐文件比较高效得多，因为它在文件系统元数据层面操作，不需要遍历所有文件。</p>
+            <h3 id="增量同步的效率分析">7.4 增量同步的效率分析</h3>
+            <pre class="text"><code>假设场景：
+- 源文件系统总数据量：500 GiB
+- 两次快照之间修改了 2 GiB 数据
+- 新增了 1000 个小文件（总计 500 MiB）
+- 删除了 200 个文件
+
+rsync 全量比较：
+- 需要读取源端和目标端所有文件的元数据
+- 对于修改的文件，需要计算校验和比较
+- 耗时：约 30 分钟（大部分时间花在文件遍历和校验上）
+
+btrfs send 增量：
+- 只比较 B-Tree 中 generation 变化的节点
+- 直接定位到修改的数据块
+- 耗时：约 2 分钟（主要是传输 2.5 GiB 的数据）</code></pre>
+            <h3 id="自动化备份脚本">7.5 自动化备份脚本</h3>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="co"># btrfs-backup.sh - 自动化增量备份脚本</span></span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a><span class="va">SOURCE_VOL</span><span class="op">=</span><span class="st">&quot;/mnt/data/@important&quot;</span></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a><span class="va">SNAP_DIR</span><span class="op">=</span><span class="st">&quot;/mnt/data/@snapshots&quot;</span></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a><span class="va">BACKUP_DIR</span><span class="op">=</span><span class="st">&quot;/mnt/backup&quot;</span></span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a><span class="va">DATE</span><span class="op">=</span><span class="va">$(</span><span class="fu">date</span> +%Y%m%d-%H%M%S<span class="va">)</span></span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a><span class="va">SNAP_NAME</span><span class="op">=</span><span class="st">&quot;important-</span><span class="va">${DATE}</span><span class="st">&quot;</span></span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a><span class="va">RETENTION</span><span class="op">=</span>30  <span class="co"># 保留最近 30 个快照</span></span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建新的只读快照</span></span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> <span class="st">&quot;</span><span class="va">${SOURCE_VOL}</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">${SNAP_DIR}</span><span class="st">/</span><span class="va">${SNAP_NAME}</span><span class="st">&quot;</span></span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 找到上一个快照作为父快照</span></span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a><span class="va">PREV_SNAP</span><span class="op">=</span><span class="va">$(</span><span class="fu">ls</span> <span class="at">-1d</span> <span class="st">&quot;</span><span class="va">${SNAP_DIR}</span><span class="st">&quot;</span>/important-<span class="pp">*</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-2</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-1</span><span class="va">)</span></span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-18"><a href="#cb51-18" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">${PREV_SNAP}</span><span class="st">&quot;</span> <span class="ot">=</span> <span class="st">&quot;</span><span class="va">${SNAP_DIR}</span><span class="st">/</span><span class="va">${SNAP_NAME}</span><span class="st">&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb51-19"><a href="#cb51-19" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 没有上一个快照，全量发送</span></span>
+<span id="cb51-20"><a href="#cb51-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;全量发送：</span><span class="va">${SNAP_NAME}</span><span class="st">&quot;</span></span>
+<span id="cb51-21"><a href="#cb51-21" aria-hidden="true" tabindex="-1"></a>    <span class="ex">btrfs</span> send <span class="st">&quot;</span><span class="va">${SNAP_DIR}</span><span class="st">/</span><span class="va">${SNAP_NAME}</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb51-22"><a href="#cb51-22" aria-hidden="true" tabindex="-1"></a>        <span class="ex">btrfs</span> receive <span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">/&quot;</span></span>
+<span id="cb51-23"><a href="#cb51-23" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span></span>
+<span id="cb51-24"><a href="#cb51-24" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 增量发送</span></span>
+<span id="cb51-25"><a href="#cb51-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;增量发送：</span><span class="va">${SNAP_NAME}</span><span class="st">（基于 </span><span class="va">$(</span><span class="fu">basename</span> <span class="va">${PREV_SNAP})</span><span class="st">）&quot;</span></span>
+<span id="cb51-26"><a href="#cb51-26" aria-hidden="true" tabindex="-1"></a>    <span class="ex">btrfs</span> send <span class="at">-p</span> <span class="st">&quot;</span><span class="va">${PREV_SNAP}</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">${SNAP_DIR}</span><span class="st">/</span><span class="va">${SNAP_NAME}</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb51-27"><a href="#cb51-27" aria-hidden="true" tabindex="-1"></a>        <span class="ex">btrfs</span> receive <span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">/&quot;</span></span>
+<span id="cb51-28"><a href="#cb51-28" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb51-29"><a href="#cb51-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-30"><a href="#cb51-30" aria-hidden="true" tabindex="-1"></a><span class="co"># 清理过期快照（源端和目标端同步清理）</span></span>
+<span id="cb51-31"><a href="#cb51-31" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-1d</span> <span class="st">&quot;</span><span class="va">${SNAP_DIR}</span><span class="st">&quot;</span>/important-<span class="pp">*</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-n</span> <span class="at">-</span><span class="va">${RETENTION}</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb51-32"><a href="#cb51-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="bu">read</span> <span class="va">snap</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb51-33"><a href="#cb51-33" aria-hidden="true" tabindex="-1"></a>        <span class="bu">echo</span> <span class="st">&quot;删除过期快照：</span><span class="va">$(</span><span class="fu">basename</span> <span class="va">${snap})</span><span class="st">&quot;</span></span>
+<span id="cb51-34"><a href="#cb51-34" aria-hidden="true" tabindex="-1"></a>        <span class="ex">btrfs</span> subvolume delete <span class="st">&quot;</span><span class="va">${snap}</span><span class="st">&quot;</span></span>
+<span id="cb51-35"><a href="#cb51-35" aria-hidden="true" tabindex="-1"></a>        <span class="ex">btrfs</span> subvolume delete <span class="st">&quot;</span><span class="va">${BACKUP_DIR}</span><span class="st">/</span><span class="va">$(</span><span class="fu">basename</span> <span class="va">${snap})</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb51-36"><a href="#cb51-36" aria-hidden="true" tabindex="-1"></a>            <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb51-37"><a href="#cb51-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">done</span></span>
+<span id="cb51-38"><a href="#cb51-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-39"><a href="#cb51-39" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;备份完成：</span><span class="va">${SNAP_NAME}</span><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="sendreceive-的限制">7.6 Send/Receive 的限制</h3>
+            <ul>
+            <li><strong>只读快照</strong>：<code>btrfs send</code>
+            只能发送只读快照。如果需要在目标端修改数据，需要先创建一个可写快照；</li>
+            <li><strong>父快照依赖</strong>：增量发送的目标端必须存在对应的父快照。如果父快照被删除，只能重新全量发送；</li>
+            <li><strong>不跨文件系统</strong>：send 流是 Btrfs
+            特有格式，目标必须是 Btrfs 文件系统；</li>
+            <li><strong>UUID 匹配</strong>：目标端的父快照 UUID
+            必须与源端的 <code>Received UUID</code> 匹配。</li>
+            </ul>
+            <hr />
+            <h2 id="八碎片化与空间管理">八、碎片化与空间管理</h2>
+            <h3 id="cow-碎片化的成因">8.1 CoW 碎片化的成因</h3>
+            <p>CoW
+            文件系统天然容易产生碎片化（Fragmentation）。原因很直观：文件的初始写入可能是顺序的，但后续修改总是分配新块，这些新块可能分布在磁盘的任意位置。</p>
+            <pre class="text"><code>文件初始写入（顺序）：
+Block: [100][101][102][103][104][105][106][107]
+
+经过多次修改后（碎片化）：
+Block: [100][205][102][310][104][450][106][520]
+      原始块 ^新块 原始块  ^新块 原始块  ^新块</code></pre>
+            <p>碎片化对 HDD 的影响远大于 SSD。HDD
+            的随机读取需要磁头寻道，碎片化导致大量寻道操作，严重降低顺序读取性能。SSD
+            没有机械寻道，碎片化的影响主要体现在 I/O
+            请求合并效率的降低。</p>
+            <h3 id="autodefrag-挂载选项">8.2 autodefrag 挂载选项</h3>
+            <p><code>autodefrag</code> 是 Btrfs
+            内置的自动碎片整理（Automatic Defragmentation）机制：</p>
+            <div class="sourceCode" id="cb53"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用自动碎片整理</span></span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> autodefrag /dev/sda1 /mnt</span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 /etc/fstab 中启用</span></span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/sda1  /mnt  btrfs  defaults,autodefrag  0 0</span></span></code></pre></div>
+            <p><code>autodefrag</code>
+            的工作原理：在每次数据提交时，检测到碎片化的区段（Extent），将其标记为需要整理。一个内核后台线程会定期处理这些标记，将碎片化的小区段合并为连续的大区段。</p>
+            <p>注意：<code>autodefrag</code>
+            适合频繁小写入的工作负载（如数据库、虚拟机磁盘），但对于大文件顺序写入的场景（如日志文件），它的开销大于收益。</p>
+            <h3 id="手动碎片整理">8.3 手动碎片整理</h3>
+            <div class="sourceCode" id="cb54"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb54-1"><a href="#cb54-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 对单个文件进行碎片整理</span></span>
+<span id="cb54-2"><a href="#cb54-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem defragment /mnt/data/database.db</span>
+<span id="cb54-3"><a href="#cb54-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb54-4"><a href="#cb54-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 对目录递归进行碎片整理</span></span>
+<span id="cb54-5"><a href="#cb54-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem defragment <span class="at">-r</span> /mnt/data/</span>
+<span id="cb54-6"><a href="#cb54-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb54-7"><a href="#cb54-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 碎片整理时同时设置压缩</span></span>
+<span id="cb54-8"><a href="#cb54-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem defragment <span class="at">-r</span> <span class="at">-czstd</span> /mnt/data/</span>
+<span id="cb54-9"><a href="#cb54-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb54-10"><a href="#cb54-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 控制碎片整理的目标区段大小</span></span>
+<span id="cb54-11"><a href="#cb54-11" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem defragment <span class="at">-t</span> 32M /mnt/data/database.db</span></code></pre></div>
+            <p><strong>重要警告</strong>：碎片整理会破坏快照之间的数据共享。碎片整理后，原本快照和当前数据共享的块会变成各自独立的副本，导致空间使用量暴增。如果依赖快照节省空间，谨慎使用碎片整理。</p>
+            <h3 id="balance块组重新分配">8.4 Balance：块组重新分配</h3>
+            <p>Balance 操作重新分配块组（Block
+            Group）中的数据。它的主要用途是：</p>
+            <ol type="1">
+            <li><strong>转换 RAID 配置档案</strong>：如从 single 转换为
+            raid1；</li>
+            <li><strong>平衡多设备间的数据分布</strong>：添加新设备后，让数据均匀分布；</li>
+            <li><strong>回收未充分利用的块组</strong>：释放大量删除后留下的空闲块组。</li>
+            </ol>
+            <div class="sourceCode" id="cb55"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb55-1"><a href="#cb55-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 全量 balance（非常耗时，不推荐）</span></span>
+<span id="cb55-2"><a href="#cb55-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance start /mnt/btrfs</span>
+<span id="cb55-3"><a href="#cb55-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-4"><a href="#cb55-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 只平衡使用率低于 50% 的数据块组</span></span>
+<span id="cb55-5"><a href="#cb55-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance start <span class="at">-dusage</span><span class="op">=</span>50 /mnt/btrfs</span>
+<span id="cb55-6"><a href="#cb55-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-7"><a href="#cb55-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 只平衡使用率低于 30% 的元数据块组</span></span>
+<span id="cb55-8"><a href="#cb55-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance start <span class="at">-musage</span><span class="op">=</span>30 /mnt/btrfs</span>
+<span id="cb55-9"><a href="#cb55-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-10"><a href="#cb55-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 转换 RAID 配置</span></span>
+<span id="cb55-11"><a href="#cb55-11" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance start <span class="at">-dconvert</span><span class="op">=</span>raid1 <span class="at">-mconvert</span><span class="op">=</span>raid1 /mnt/btrfs</span>
+<span id="cb55-12"><a href="#cb55-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-13"><a href="#cb55-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 balance 进度</span></span>
+<span id="cb55-14"><a href="#cb55-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance status /mnt/btrfs</span>
+<span id="cb55-15"><a href="#cb55-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-16"><a href="#cb55-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 暂停和恢复 balance</span></span>
+<span id="cb55-17"><a href="#cb55-17" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance pause /mnt/btrfs</span>
+<span id="cb55-18"><a href="#cb55-18" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance resume /mnt/btrfs</span>
+<span id="cb55-19"><a href="#cb55-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-20"><a href="#cb55-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 取消 balance</span></span>
+<span id="cb55-21"><a href="#cb55-21" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance cancel /mnt/btrfs</span></code></pre></div>
+            <h3 id="space-cache-v2free-space-tree">8.5 Space Cache
+            v2（Free Space Tree）</h3>
+            <p>Btrfs 需要快速知道哪些磁盘空间是空闲的。早期版本使用
+            space_cache
+            v1，它在每个块组开头存储一个空闲空间位图（Bitmap）。这种方式的问题是：在大型文件系统上，加载空闲空间缓存可能需要很长时间。</p>
+            <p>Space Cache v2（也叫 Free Space Tree）使用一棵专门的
+            B-Tree 来管理空闲空间信息。它的优势：</p>
+            <ul>
+            <li><strong>快速挂载</strong>：不需要扫描每个块组的位图；</li>
+            <li><strong>事务安全</strong>：空闲空间信息也纳入 CoW
+            事务保护；</li>
+            <li><strong>可扩展</strong>：适用于 PB 级文件系统。</li>
+            </ul>
+            <div class="sourceCode" id="cb56"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb56-1"><a href="#cb56-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建文件系统时启用 space_cache v2（现代内核默认启用）</span></span>
+<span id="cb56-2"><a href="#cb56-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">-O</span> free-space-tree /dev/sda1</span>
+<span id="cb56-3"><a href="#cb56-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-4"><a href="#cb56-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 在挂载时从 v1 迁移到 v2</span></span>
+<span id="cb56-5"><a href="#cb56-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> clear_cache,space_cache=v2 /dev/sda1 /mnt</span>
+<span id="cb56-6"><a href="#cb56-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-7"><a href="#cb56-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看是否启用了 space_cache v2</span></span>
+<span id="cb56-8"><a href="#cb56-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> inspect-internal dump-super /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> FREE_SPACE_TREE</span></code></pre></div>
+            <h3 id="空间使用的查看与分析">8.6 空间使用的查看与分析</h3>
+            <div class="sourceCode" id="cb57"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb57-1"><a href="#cb57-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件系统整体使用情况</span></span>
+<span id="cb57-2"><a href="#cb57-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem usage /mnt/btrfs</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>Overall:
+    Device size:                 200.00GiB
+    Device allocated:             85.03GiB
+    Device unallocated:          114.97GiB
+    Device missing:                  0.00B
+    Device slack:                    0.00B
+    Used:                         60.15GiB
+    Free (estimated):            135.42GiB      (min: 77.94GiB)
+    Free (statfs, df):           135.42GiB
+    Data ratio:                       1.00
+    Metadata ratio:                   2.00
+    Global reserve:              256.00MiB      (used: 0.00B)
+    Multiple profiles:                  no
+
+Data,single: Size:80.00GiB, Used:58.20GiB (72.75%)
+   /dev/sdb       80.00GiB
+
+Metadata,DUP: Size:2.00GiB, Used:960.50MiB (46.90%)
+   /dev/sdb        4.00GiB
+
+System,DUP: Size:8.00MiB, Used:16.00KiB (0.20%)
+   /dev/sdb       16.00MiB
+
+Unallocated:
+   /dev/sdb      114.97GiB</code></pre>
+            <p>注意 <code>Device allocated</code> 和 <code>Used</code>
+            的区别：Btrfs
+            先将磁盘空间分配为块组，再在块组内分配给文件。<code>allocated</code>
+            是已分配的块组总量，<code>Used</code>
+            是块组内实际使用的量。如果出现”磁盘空间不足”但
+            <code>df</code>
+            显示还有空间，可能是块组分配策略的问题，需要运行
+            <code>btrfs balance</code> 回收空闲块组。</p>
+            <hr />
+            <h2 id="九btrfs-管理实战">九、Btrfs 管理实战</h2>
+            <h3 id="文件系统创建与挂载">9.1 文件系统创建与挂载</h3>
+            <div class="sourceCode" id="cb59"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb59-1"><a href="#cb59-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 基本创建</span></span>
+<span id="cb59-2"><a href="#cb59-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> /dev/sda1</span>
+<span id="cb59-3"><a href="#cb59-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-4"><a href="#cb59-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 指定标签和节点大小</span></span>
+<span id="cb59-5"><a href="#cb59-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">-L</span> mydata <span class="at">-n</span> 16k /dev/sda1</span>
+<span id="cb59-6"><a href="#cb59-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-7"><a href="#cb59-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 指定校验算法</span></span>
+<span id="cb59-8"><a href="#cb59-8" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">--csum</span> xxhash64 /dev/sda1</span>
+<span id="cb59-9"><a href="#cb59-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-10"><a href="#cb59-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 混合模式（适合小型设备，数据和元数据混合存储）</span></span>
+<span id="cb59-11"><a href="#cb59-11" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.btrfs</span> <span class="at">-M</span> /dev/sda1</span>
+<span id="cb59-12"><a href="#cb59-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb59-13"><a href="#cb59-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 推荐的挂载选项</span></span>
+<span id="cb59-14"><a href="#cb59-14" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> compress=zstd:3,space_cache=v2,noatime /dev/sda1 /mnt</span></code></pre></div>
+            <p>推荐的 <code>/etc/fstab</code> 配置：</p>
+            <pre class="text"><code># Btrfs 根分区推荐挂载选项
+UUID=xxx  /      btrfs  defaults,subvol=@,compress=zstd:3,noatime,space_cache=v2  0 0
+UUID=xxx  /home  btrfs  defaults,subvol=@home,compress=zstd:3,noatime             0 0
+UUID=xxx  /var   btrfs  defaults,subvol=@var,compress=zstd:3,noatime              0 0</code></pre>
+            <h3 id="子卷管理命令汇总">9.2 子卷管理命令汇总</h3>
+            <div class="sourceCode" id="cb61"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb61-1"><a href="#cb61-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建子卷</span></span>
+<span id="cb61-2"><a href="#cb61-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume create /mnt/@data</span>
+<span id="cb61-3"><a href="#cb61-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-4"><a href="#cb61-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 列出子卷</span></span>
+<span id="cb61-5"><a href="#cb61-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume list /mnt</span>
+<span id="cb61-6"><a href="#cb61-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume list <span class="at">-a</span> /mnt          <span class="co"># 包括绝对路径</span></span>
+<span id="cb61-7"><a href="#cb61-7" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume list <span class="at">-t</span> /mnt          <span class="co"># 表格格式</span></span>
+<span id="cb61-8"><a href="#cb61-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume list <span class="at">-s</span> /mnt          <span class="co"># 只列出快照</span></span>
+<span id="cb61-9"><a href="#cb61-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-10"><a href="#cb61-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看子卷信息</span></span>
+<span id="cb61-11"><a href="#cb61-11" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume show /mnt/@data</span>
+<span id="cb61-12"><a href="#cb61-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-13"><a href="#cb61-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 删除子卷</span></span>
+<span id="cb61-14"><a href="#cb61-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume delete /mnt/@data</span>
+<span id="cb61-15"><a href="#cb61-15" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume delete <span class="at">-c</span> /mnt/@data  <span class="co"># 提交后再返回（确保空间立即释放）</span></span>
+<span id="cb61-16"><a href="#cb61-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-17"><a href="#cb61-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置默认子卷</span></span>
+<span id="cb61-18"><a href="#cb61-18" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume set-default 256 /mnt</span>
+<span id="cb61-19"><a href="#cb61-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-20"><a href="#cb61-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 获取默认子卷</span></span>
+<span id="cb61-21"><a href="#cb61-21" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume get-default /mnt</span></code></pre></div>
+            <h3 id="快照管理命令汇总">9.3 快照管理命令汇总</h3>
+            <div class="sourceCode" id="cb62"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb62-1"><a href="#cb62-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建只读快照</span></span>
+<span id="cb62-2"><a href="#cb62-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot <span class="at">-r</span> /mnt/@data /mnt/@snapshots/data-<span class="va">$(</span><span class="fu">date</span> +%Y%m%d<span class="va">)</span></span>
+<span id="cb62-3"><a href="#cb62-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb62-4"><a href="#cb62-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建可写快照</span></span>
+<span id="cb62-5"><a href="#cb62-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot /mnt/@data /mnt/@snapshots/data-writable</span>
+<span id="cb62-6"><a href="#cb62-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb62-7"><a href="#cb62-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 从快照回滚</span></span>
+<span id="cb62-8"><a href="#cb62-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法1：重命名子卷</span></span>
+<span id="cb62-9"><a href="#cb62-9" aria-hidden="true" tabindex="-1"></a><span class="fu">mv</span> /mnt/@data /mnt/@data.broken</span>
+<span id="cb62-10"><a href="#cb62-10" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot /mnt/@snapshots/data-20250825 /mnt/@data</span>
+<span id="cb62-11"><a href="#cb62-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb62-12"><a href="#cb62-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法2：删除旧子卷，从快照创建新子卷</span></span>
+<span id="cb62-13"><a href="#cb62-13" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume delete /mnt/@data</span>
+<span id="cb62-14"><a href="#cb62-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume snapshot /mnt/@snapshots/data-20250825 /mnt/@data</span></code></pre></div>
+            <h3 id="文件系统维护命令">9.4 文件系统维护命令</h3>
+            <div class="sourceCode" id="cb63"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb63-1"><a href="#cb63-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件系统信息</span></span>
+<span id="cb63-2"><a href="#cb63-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem show             <span class="co"># 所有 Btrfs 文件系统</span></span>
+<span id="cb63-3"><a href="#cb63-3" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem show /mnt        <span class="co"># 指定挂载点</span></span>
+<span id="cb63-4"><a href="#cb63-4" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem df /mnt          <span class="co"># 空间分配详情</span></span>
+<span id="cb63-5"><a href="#cb63-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem usage /mnt       <span class="co"># 详细空间使用报告</span></span>
+<span id="cb63-6"><a href="#cb63-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem du /mnt/somedir  <span class="co"># 目录空间使用（考虑共享区段）</span></span>
+<span id="cb63-7"><a href="#cb63-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-8"><a href="#cb63-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 在线调整大小</span></span>
+<span id="cb63-9"><a href="#cb63-9" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem resize +50G /mnt   <span class="co"># 扩展 50G</span></span>
+<span id="cb63-10"><a href="#cb63-10" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem resize <span class="at">-20G</span> /mnt   <span class="co"># 缩减 20G</span></span>
+<span id="cb63-11"><a href="#cb63-11" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem resize max /mnt    <span class="co"># 扩展到设备最大容量</span></span>
+<span id="cb63-12"><a href="#cb63-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb63-13"><a href="#cb63-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 标签管理</span></span>
+<span id="cb63-14"><a href="#cb63-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem label /mnt <span class="st">&quot;my-data&quot;</span></span>
+<span id="cb63-15"><a href="#cb63-15" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem label /mnt           <span class="co"># 查看标签</span></span></code></pre></div>
+            <h3 id="设备管理命令">9.5 设备管理命令</h3>
+            <div class="sourceCode" id="cb64"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看设备统计（I/O 错误计数）</span></span>
+<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> device stats /mnt</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>[/dev/sdb].write_io_errs    0
+[/dev/sdb].read_io_errs     0
+[/dev/sdb].flush_io_errs    0
+[/dev/sdb].corruption_errs  0
+[/dev/sdb].generation_errs  0</code></pre>
+            <div class="sourceCode" id="cb66"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb66-1"><a href="#cb66-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 重置错误计数</span></span>
+<span id="cb66-2"><a href="#cb66-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> device stats <span class="at">-z</span> /mnt</span>
+<span id="cb66-3"><a href="#cb66-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb66-4"><a href="#cb66-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加设备</span></span>
+<span id="cb66-5"><a href="#cb66-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> device add /dev/sdc /mnt</span>
+<span id="cb66-6"><a href="#cb66-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb66-7"><a href="#cb66-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 移除设备</span></span>
+<span id="cb66-8"><a href="#cb66-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> device remove /dev/sdb /mnt</span>
+<span id="cb66-9"><a href="#cb66-9" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> device remove missing /mnt  <span class="co"># 移除已丢失的设备</span></span>
+<span id="cb66-10"><a href="#cb66-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb66-11"><a href="#cb66-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 替换设备</span></span>
+<span id="cb66-12"><a href="#cb66-12" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> replace start /dev/sdb /dev/sdd /mnt</span>
+<span id="cb66-13"><a href="#cb66-13" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> replace status /mnt</span>
+<span id="cb66-14"><a href="#cb66-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> replace cancel /mnt</span></code></pre></div>
+            <h3 id="配额管理">9.6 配额管理</h3>
+            <div class="sourceCode" id="cb67"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb67-1"><a href="#cb67-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用配额</span></span>
+<span id="cb67-2"><a href="#cb67-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> quota enable /mnt</span>
+<span id="cb67-3"><a href="#cb67-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb67-4"><a href="#cb67-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看配额组</span></span>
+<span id="cb67-5"><a href="#cb67-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> qgroup show /mnt</span>
+<span id="cb67-6"><a href="#cb67-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> qgroup show <span class="at">-reF</span> /mnt  <span class="co"># 人类可读格式，包含独占空间</span></span>
+<span id="cb67-7"><a href="#cb67-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb67-8"><a href="#cb67-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置配额限制</span></span>
+<span id="cb67-9"><a href="#cb67-9" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> qgroup limit 50G 0/256 /mnt      <span class="co"># 限制子卷 256 使用 50G</span></span>
+<span id="cb67-10"><a href="#cb67-10" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> qgroup limit none 0/256 /mnt     <span class="co"># 取消限制</span></span>
+<span id="cb67-11"><a href="#cb67-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb67-12"><a href="#cb67-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用配额</span></span>
+<span id="cb67-13"><a href="#cb67-13" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> quota disable /mnt</span></code></pre></div>
+            <p><strong>注意</strong>：Btrfs
+            的配额功能（qgroup）在历史上有性能问题，特别是在频繁创建和删除快照的场景。从
+            Linux 6.1 开始（引入
+            squota——简单配额），性能有了显著改善。在启用配额之前，建议评估对工作负载的影响。</p>
+            <h3 id="检查与修复">9.7 检查与修复</h3>
+            <div class="sourceCode" id="cb68"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb68-1"><a href="#cb68-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查文件系统（需要先卸载）</span></span>
+<span id="cb68-2"><a href="#cb68-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> check /dev/sda1</span>
+<span id="cb68-3"><a href="#cb68-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb68-4"><a href="#cb68-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 只读模式检查（默认，安全）</span></span>
+<span id="cb68-5"><a href="#cb68-5" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> check <span class="at">--readonly</span> /dev/sda1</span>
+<span id="cb68-6"><a href="#cb68-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb68-7"><a href="#cb68-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 低内存模式检查（适合内存不足的系统）</span></span>
+<span id="cb68-8"><a href="#cb68-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> check <span class="at">--mode</span><span class="op">=</span>lowmem /dev/sda1</span>
+<span id="cb68-9"><a href="#cb68-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb68-10"><a href="#cb68-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 修复模式（谨慎使用，建议先备份）</span></span>
+<span id="cb68-11"><a href="#cb68-11" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> check <span class="at">--repair</span> /dev/sda1</span>
+<span id="cb68-12"><a href="#cb68-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb68-13"><a href="#cb68-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 抢救数据（当文件系统严重损坏时）</span></span>
+<span id="cb68-14"><a href="#cb68-14" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> rescue super-recover /dev/sda1  <span class="co"># 恢复超级块</span></span>
+<span id="cb68-15"><a href="#cb68-15" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> rescue chunk-recover /dev/sda1  <span class="co"># 恢复块映射</span></span>
+<span id="cb68-16"><a href="#cb68-16" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> restore /dev/sda1 /mnt/rescue/  <span class="co"># 提取可恢复的文件</span></span></code></pre></div>
+            <h3 id="性能调优选项">9.8 性能调优选项</h3>
+            <div class="sourceCode" id="cb69"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb69-1"><a href="#cb69-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 推荐的挂载选项组合（SSD）</span></span>
+<span id="cb69-2"><a href="#cb69-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> noatime,compress=zstd:3,space_cache=v2,discard=async /dev/nvme0n1p1 /mnt</span>
+<span id="cb69-3"><a href="#cb69-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb69-4"><a href="#cb69-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 推荐的挂载选项组合（HDD）</span></span>
+<span id="cb69-5"><a href="#cb69-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> btrfs <span class="at">-o</span> noatime,compress=zstd:3,space_cache=v2,autodefrag /dev/sda1 /mnt</span></code></pre></div>
+            <p>挂载选项详解：</p>
+            <pre class="text"><code>┌──────────────────┬──────────────────────────────────────────────────┐
+│ 选项             │ 说明                                             │
+├──────────────────┼──────────────────────────────────────────────────┤
+│ noatime          │ 不更新访问时间戳，减少元数据写入                 │
+│ compress=zstd:3  │ 使用 zstd 压缩，级别 3                          │
+│ space_cache=v2   │ 使用 Free Space Tree，加快空闲空间查找           │
+│ discard=async    │ 异步 TRIM，适用于 SSD                           │
+│ autodefrag       │ 自动碎片整理，适用于 HDD 或小写入工作负载       │
+│ commit=120       │ 事务提交间隔（秒），增大可提高吞吐但增加风险    │
+│ ssd              │ 针对 SSD 优化（通常自动检测）                   │
+│ nossd            │ 禁用 SSD 优化                                   │
+│ thread_pool=N    │ 工作线程数，默认为 min(CPU数, 8)                │
+│ max_inline=2048  │ 内联数据的最大大小（字节）                      │
+└──────────────────┴──────────────────────────────────────────────────┘</code></pre>
+            <h3 id="监控与告警">9.9 监控与告警</h3>
+            <div class="sourceCode" id="cb71"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb71-1"><a href="#cb71-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 btrfs device stats 监控磁盘错误</span></span>
+<span id="cb71-2"><a href="#cb71-2" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb71-3"><a href="#cb71-3" aria-hidden="true" tabindex="-1"></a><span class="co"># btrfs-monitor.sh - 监控 Btrfs 设备错误</span></span>
+<span id="cb71-4"><a href="#cb71-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-5"><a href="#cb71-5" aria-hidden="true" tabindex="-1"></a><span class="va">MOUNTPOINT</span><span class="op">=</span><span class="st">&quot;/mnt/data&quot;</span></span>
+<span id="cb71-6"><a href="#cb71-6" aria-hidden="true" tabindex="-1"></a><span class="va">ALERT_THRESHOLD</span><span class="op">=</span>0</span>
+<span id="cb71-7"><a href="#cb71-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-8"><a href="#cb71-8" aria-hidden="true" tabindex="-1"></a><span class="va">errors</span><span class="op">=</span><span class="va">$(</span><span class="ex">btrfs</span> device stats <span class="st">&quot;</span><span class="va">${MOUNTPOINT}</span><span class="st">&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb71-9"><a href="#cb71-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">awk</span> <span class="at">-F</span><span class="st">&#39; &#39;</span> <span class="st">&#39;{sum += $NF} END {print sum}&#39;</span><span class="va">)</span></span>
+<span id="cb71-10"><a href="#cb71-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb71-11"><a href="#cb71-11" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">${errors}</span><span class="st">&quot;</span> <span class="ot">-gt</span> <span class="st">&quot;</span><span class="va">${ALERT_THRESHOLD}</span><span class="st">&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb71-12"><a href="#cb71-12" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;警告：Btrfs 设备在 </span><span class="va">${MOUNTPOINT}</span><span class="st"> 上检测到 </span><span class="va">${errors}</span><span class="st"> 个错误&quot;</span></span>
+<span id="cb71-13"><a href="#cb71-13" aria-hidden="true" tabindex="-1"></a>    <span class="ex">btrfs</span> device stats <span class="st">&quot;</span><span class="va">${MOUNTPOINT}</span><span class="st">&quot;</span></span>
+<span id="cb71-14"><a href="#cb71-14" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 可以在此处添加邮件或消息通知</span></span>
+<span id="cb71-15"><a href="#cb71-15" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span></code></pre></div>
+            <div class="sourceCode" id="cb72"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb72-1"><a href="#cb72-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 通过 sysfs 查看 Btrfs 运行时信息</span></span>
+<span id="cb72-2"><a href="#cb72-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/btrfs/<span class="pp">*</span>/allocation/data/total_bytes</span>
+<span id="cb72-3"><a href="#cb72-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/btrfs/<span class="pp">*</span>/allocation/data/bytes_used</span>
+<span id="cb72-4"><a href="#cb72-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/btrfs/<span class="pp">*</span>/allocation/metadata/total_bytes</span>
+<span id="cb72-5"><a href="#cb72-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/btrfs/<span class="pp">*</span>/allocation/metadata/bytes_used</span></code></pre></div>
+            <hr />
+            <h2 id="十btrfs-生产评估">十、Btrfs 生产评估</h2>
+            <h3 id="suse-的选择">10.1 SUSE 的选择</h3>
+            <p>SUSE Linux Enterprise Server（SLES）从 12 版开始将 Btrfs
+            作为系统分区的默认文件系统。SUSE
+            的方案有几个值得注意的设计决策：</p>
+            <ul>
+            <li><strong>根分区用 Btrfs，数据分区用 XFS</strong>：SUSE
+            建议将 <code>/</code> 放在 Btrfs
+            上（利用快照做系统回滚），将 <code>/home</code>
+            和数据库等大数据目录放在 XFS 上；</li>
+            <li><strong>Snapper 集成</strong>：SUSE 开发了 Snapper
+            工具，自动在
+            <code>zypper</code>（软件包管理器）操作前后创建快照，系统升级出问题可以一键回滚；</li>
+            <li><strong>只使用稳定功能</strong>：SUSE 明确不支持
+            RAID-5/6，推荐使用 RAID-1 或外部 RAID。</li>
+            </ul>
+            <div class="sourceCode" id="cb73"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb73-1"><a href="#cb73-1" aria-hidden="true" tabindex="-1"></a><span class="co"># SUSE Snapper 典型操作</span></span>
+<span id="cb73-2"><a href="#cb73-2" aria-hidden="true" tabindex="-1"></a><span class="ex">snapper</span> list                    <span class="co"># 列出所有快照</span></span>
+<span id="cb73-3"><a href="#cb73-3" aria-hidden="true" tabindex="-1"></a><span class="ex">snapper</span> create <span class="at">-d</span> <span class="st">&quot;before update&quot;</span> <span class="co"># 手动创建快照</span></span>
+<span id="cb73-4"><a href="#cb73-4" aria-hidden="true" tabindex="-1"></a><span class="ex">snapper</span> rollback 42             <span class="co"># 回滚到快照 42</span></span>
+<span id="cb73-5"><a href="#cb73-5" aria-hidden="true" tabindex="-1"></a><span class="ex">snapper</span> diff 41..42             <span class="co"># 查看两个快照之间的差异</span></span></code></pre></div>
+            <h3 id="facebookmeta-的大规模使用">10.2 Facebook/Meta
+            的大规模使用</h3>
+            <p>Facebook（现 Meta）是 Btrfs 最大的企业级用户之一。Chris
+            Mason 在离开 Oracle 后加入 Facebook，继续推动 Btrfs
+            的开发。Facebook 的使用方式：</p>
+            <ul>
+            <li><strong>操作系统分区</strong>：所有服务器的
+            <code>/</code> 分区使用 Btrfs，利用压缩节省 SSD
+            空间，利用快照加速系统部署和回滚；</li>
+            <li><strong>压缩节省成本</strong>：zstd 压缩在典型 Web
+            服务器上可以节省 20-30% 的 SSD
+            空间，在百万台服务器的规模下，这意味着巨大的成本节约；</li>
+            <li><strong>不使用 Btrfs RAID</strong>：Facebook
+            的存储冗余在应用层解决（如 HDFS、RocksDB
+            的多副本），文件系统层面使用 Btrfs single 配置；</li>
+            <li><strong>深度参与内核开发</strong>：Facebook 的工程师是
+            Btrfs
+            内核代码的主要贡献者之一，许多稳定性改进来自他们的生产环境反馈。</li>
+            </ul>
+            <h3 id="fedora-桌面的采用">10.3 Fedora 桌面的采用</h3>
+            <p>Fedora 从 33 版（2020 年发布）开始将 Btrfs
+            作为桌面安装的默认文件系统。其方案的要点：</p>
+            <ul>
+            <li><strong>透明压缩</strong>：默认启用
+            <code>compress=zstd:1</code>；</li>
+            <li><strong>平级子卷布局</strong>：<code>@</code>（根）和
+            <code>@home</code> 作为平级子卷；</li>
+            <li><strong>不使用 Btrfs
+            RAID</strong>：桌面系统通常是单盘配置。</li>
+            </ul>
+            <h3 id="已知局限性">10.4 已知局限性</h3>
+            <p>尽管 Btrfs 已经相当成熟，但仍有一些需要注意的局限：</p>
+            <pre class="text"><code>┌────────────────────────┬────────────────────────────────────────────────┐
+│ 局限                   │ 详情                                           │
+├────────────────────────┼────────────────────────────────────────────────┤
+│ RAID-5/6 不稳定        │ 写洞问题未解决，生产环境不可用                 │
+│ 碎片化                 │ CoW 导致碎片化，对 HDD 随机读性能影响显著      │
+│ 数据库工作负载         │ 随机小写入 + CoW = 严重碎片化和写放大           │
+│ 配额性能               │ qgroup 在大量快照时开销显著（6.1 后改善）       │
+│ reflink 跨子卷不支持   │ cp --reflink 不能跨子卷使用                    │
+│ swap 文件限制          │ 交换文件需要特殊设置（nodatacow, 固定大小）     │
+│ NFS 导出               │ 子卷导出需要特殊配置                           │
+│ fsck 能力              │ btrfs check --repair 功能不如 e2fsck 成熟      │
+└────────────────────────┴────────────────────────────────────────────────┘</code></pre>
+            <h3 id="btrfs-上的数据库工作负载">10.5 Btrfs
+            上的数据库工作负载</h3>
+            <p>数据库（特别是像 MySQL InnoDB、PostgreSQL
+            这样的传统关系数据库）通常不适合直接运行在 Btrfs
+            上。原因：</p>
+            <ol type="1">
+            <li>数据库自己管理数据文件的物理布局，CoW
+            会破坏这种布局优化；</li>
+            <li>随机小写入 + CoW = 大量碎片化 + 写放大；</li>
+            <li>数据库自己有 WAL（预写日志），不需要文件系统层面的 CoW
+            保护。</li>
+            </ol>
+            <p>如果必须在 Btrfs 上运行数据库，建议的做法：</p>
+            <div class="sourceCode" id="cb75"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb75-1"><a href="#cb75-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 为数据库数据目录禁用 CoW</span></span>
+<span id="cb75-2"><a href="#cb75-2" aria-hidden="true" tabindex="-1"></a><span class="fu">chattr</span> +C /var/lib/mysql/</span>
+<span id="cb75-3"><a href="#cb75-3" aria-hidden="true" tabindex="-1"></a><span class="fu">chattr</span> +C /var/lib/postgresql/</span>
+<span id="cb75-4"><a href="#cb75-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb75-5"><a href="#cb75-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者在创建目录时就设置 NOCOW</span></span>
+<span id="cb75-6"><a href="#cb75-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> /var/lib/mysql</span>
+<span id="cb75-7"><a href="#cb75-7" aria-hidden="true" tabindex="-1"></a><span class="fu">chattr</span> +C /var/lib/mysql</span>
+<span id="cb75-8"><a href="#cb75-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 注意：chattr +C 只对空目录或新文件生效</span></span></code></pre></div>
+            <p><code>+C</code>
+            标志（NOCOW）禁用了该目录下新文件的写时复制。这意味着这些文件会被就地更新，失去了
+            CoW
+            的保护（校验和也会被禁用），但避免了碎片化和写放大。这本质上是让文件系统在该目录下退化为类似
+            ext4 的行为。</p>
+            <h3 id="btrfs-上的虚拟机磁盘镜像">10.6 Btrfs
+            上的虚拟机磁盘镜像</h3>
+            <p>虚拟机磁盘镜像（如 QCOW2、raw
+            格式）面临与数据库类似的问题。但 Btrfs
+            提供了一些针对性的优化：</p>
+            <div class="sourceCode" id="cb76"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb76-1"><a href="#cb76-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法1：为 VM 磁盘目录设置 NOCOW</span></span>
+<span id="cb76-2"><a href="#cb76-2" aria-hidden="true" tabindex="-1"></a><span class="fu">chattr</span> +C /var/lib/libvirt/images/</span>
+<span id="cb76-3"><a href="#cb76-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb76-4"><a href="#cb76-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法2：使用 reflink 快速克隆 VM 镜像</span></span>
+<span id="cb76-5"><a href="#cb76-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">--reflink</span><span class="op">=</span>always base.qcow2 vm-clone-01.qcow2</span>
+<span id="cb76-6"><a href="#cb76-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">--reflink</span><span class="op">=</span>always base.qcow2 vm-clone-02.qcow2</span>
+<span id="cb76-7"><a href="#cb76-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 两个克隆共享 base 的所有数据块，只有修改部分占用额外空间</span></span></code></pre></div>
+            <p><code>reflink</code> 复制是 Btrfs
+            的一个强大功能。它创建文件的”浅拷贝”——新文件和原文件共享所有数据块，只有后续修改的部分才分配新空间。这对于
+            VM 模板部署非常高效。</p>
+            <h3 id="什么时候用-btrfs">10.7 什么时候用 Btrfs</h3>
+            <pre class="text"><code>推荐使用 Btrfs 的场景：
+✓ 需要文件系统级快照和回滚（如桌面系统、开发环境）
+✓ 需要透明压缩节省空间（如日志服务器、构建服务器）
+✓ 需要数据完整性校验（如长期存档）
+✓ 需要灵活的多设备存储池（小规模 NAS）
+✓ 需要增量备份（btrfs send/receive）
+✓ 使用 SUSE Linux Enterprise（官方推荐和支持）
+
+不推荐使用 Btrfs 的场景：
+✗ 需要 RAID-5/6 级别的容错
+✗ 高性能数据库工作负载（PostgreSQL、MySQL 等）
+✗ 对文件系统修复工具的成熟度有严格要求
+✗ 需要极致的顺序 I/O 性能（如大型视频文件存储）
+✗ 生产环境的关键数据且团队没有 Btrfs 运维经验</code></pre>
+            <h3 id="btrfs-与-zfs-的选型对比">10.8 Btrfs 与 ZFS
+            的选型对比</h3>
+            <pre class="text"><code>┌──────────────────┬──────────────────────┬──────────────────────┐
+│ 维度             │ Btrfs                │ ZFS                  │
+├──────────────────┼──────────────────────┼──────────────────────┤
+│ 内核集成         │ 原生内核模块         │ 外部模块（许可证）   │
+│ 许可证           │ GPLv2                │ CDDL（与 GPL 不兼容）│
+│ RAID 稳定性      │ 1/10 稳定，5/6 不可用│ RAID-Z1/Z2/Z3 成熟  │
+│ 压缩             │ zstd/lzo/zlib        │ lz4/zstd/gzip        │
+│ 快照             │ 可写快照             │ 只读快照+克隆        │
+│ 发送/接收        │ 支持                 │ 支持                 │
+│ 去重             │ 离线去重（慢）       │ 在线/离线去重        │
+│ 缓存层           │ 无                   │ ARC/L2ARC/SLOG       │
+│ 内存需求         │ 低                   │ 高（推荐 1GB/TB）    │
+│ 社区             │ Linux 内核社区       │ OpenZFS 社区         │
+│ 企业支持         │ SUSE                 │ Ubuntu（Canonical）  │
+│ 成熟度           │ 逐步成熟             │ 非常成熟（20+ 年）   │
+└──────────────────┴──────────────────────┴──────────────────────┘</code></pre>
+            <p>简单总结：如果你在 Linux
+            上需要一个与内核深度集成、许可证无争议、功能丰富的现代文件系统，且不需要
+            RAID-5/6，Btrfs
+            是自然的选择。如果你需要企业级存储池管理、成熟的
+            RAID-Z、丰富的缓存层，且不介意外部内核模块和较高的内存开销，ZFS
+            更合适。</p>
+            <h3 id="btrfs-的发展方向">10.9 Btrfs 的发展方向</h3>
+            <p>截至 2025 年，Btrfs 社区正在积极推进的方向包括：</p>
+            <ul>
+            <li><strong>RAID-5/6
+            写洞修复</strong>：虽然进展缓慢，但仍然是长期目标；</li>
+            <li><strong>extent tree
+            v2</strong>：重新设计区段树，解决大型文件系统的扩展性问题；</li>
+            <li><strong>带区（Zoned）设备支持</strong>：适配 ZNS（Zoned
+            Namespace）SSD 和 SMR（Shingled Magnetic
+            Recording）HDD；</li>
+            <li><strong>在线
+            fsck</strong>：不需要卸载文件系统即可进行一致性检查；</li>
+            <li><strong>简单配额（squota）</strong>：更高效的配额实现，减少性能开销。</li>
+            </ul>
+            <hr />
+            <h2 id="附参考资料">附：参考资料</h2>
+            <ol type="1">
+            <li>Btrfs Wiki 官方文档：<a
+            href="https://btrfs.wiki.kernel.org/">https://btrfs.wiki.kernel.org/</a></li>
+            <li>Btrfs 内核文档：<a
+            href="https://www.kernel.org/doc/html/latest/filesystems/btrfs.html">https://www.kernel.org/doc/html/latest/filesystems/btrfs.html</a></li>
+            <li>Btrfs 设计文档（原始）：<a
+            href="https://btrfs.wiki.kernel.org/index.php/Design_notes">https://btrfs.wiki.kernel.org/index.php/Design_notes</a></li>
+            <li>Chris Mason, “Btrfs: The Linux B-Tree Filesystem”, Linux
+            Plumbers Conference, 2008</li>
+            <li>Btrfs 源码（Linux 内核）：<a
+            href="https://github.com/torvalds/linux/tree/master/fs/btrfs">https://github.com/torvalds/linux/tree/master/fs/btrfs</a></li>
+            <li>SUSE Btrfs 管理指南：<a
+            href="https://documentation.suse.com/sles/15-SP5/html/SLES-all/cha-snapper.html">https://documentation.suse.com/sles/15-SP5/html/SLES-all/cha-snapper.html</a></li>
+            <li>Facebook/Meta Btrfs 使用报告：<a
+            href="https://facebookmicrosites.github.io/btrfs/">https://facebookmicrosites.github.io/btrfs/</a></li>
+            <li>Fedora Btrfs 变更提案：<a
+            href="https://fedoraproject.org/wiki/Changes/BtrfsByDefault">https://fedoraproject.org/wiki/Changes/BtrfsByDefault</a></li>
+            <li>zstd 压缩算法：<a
+            href="https://facebook.github.io/zstd/">https://facebook.github.io/zstd/</a></li>
+            <li>compsize 工具：<a
+            href="https://github.com/kilobyte/compsize">https://github.com/kilobyte/compsize</a></li>
+            <li>Btrfs Scrub 文档：<a
+            href="https://btrfs.readthedocs.io/en/latest/btrfs-scrub.html">https://btrfs.readthedocs.io/en/latest/btrfs-scrub.html</a></li>
+            <li>Btrfs Send/Receive 协议：<a
+            href="https://btrfs.readthedocs.io/en/latest/btrfs-send.html">https://btrfs.readthedocs.io/en/latest/btrfs-send.html</a></li>
+            <li>Btrfs 挂载选项详解：<a
+            href="https://btrfs.readthedocs.io/en/latest/Administration.html">https://btrfs.readthedocs.io/en/latest/Administration.html</a></li>
+            <li>Btrfs 常见问题：<a
+            href="https://btrfs.wiki.kernel.org/index.php/FAQ">https://btrfs.wiki.kernel.org/index.php/FAQ</a></li>
+            <li>Josef Bacik, “Btrfs: The Linux B-tree Filesystem”, Linux
+            Storage, Filesystem, and Memory-Management Summit, 2023</li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../15-xfs-architecture/xfs-architecture.html">XFS
+            架构：大文件与高并发</a> <strong>下一篇</strong>: <a
+            href="../17-zfs-integrity/zfs-integrity.html">ZFS：数据完整性优先的存储栈</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-01 · storage</p>
+                    <h3><a href="/post/storage/23-snapshot-thin-provisioning/snapshot-thin-provisioning.html">【存储工程】存储快照与精简配置</a></h3>
+                    <p>存储系统有两个看似独立、实则紧密交织的能力：快照（Snapshot）和精简配置（Thin Provisioning）。快照解决的是&quot;时间维度&quot;的问题——在任意时刻冻结数据状态，用于备份、回滚或测试；精简配置解决的是&quot;空间维度&quot;的问题——让存储容量按需分配，避免预先占满物理磁盘。两者的交叉点在于写时复制（Copy-on-…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/05-encoding-compression/05-encoding-compression.html">【数据湖与开放表格式】列式编码与压缩</a></h3>
+                    <p>拆解 Parquet 的两层缩减：专用编码（dictionary / RLE / DELTA_BINARY_PACKED / BYTE_STREAM_SPLIT）降熵，再用 zstd/snappy/lz4/gzip 压字节。用 pyarrow 在同一列上实测不同编码+压缩组合的体积与读取耗时（3M 行，7 轮中位数），并与 ClickHouse CODEC 做同思想不同落地的对照。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/08-iceberg-metadata/08-iceberg-metadata.html">【数据湖与开放表格式】Iceberg 元数据树</a></h3>
+                    <p>拆解 Iceberg 的四层元数据：catalog 指针 → metadata.json → manifest list（snapshot）→ manifest file → data file。讲清 snapshot 与 manifest 里的分区数据和列级 stats（lower/upper bound、null/value count）如何让一次查询不 list 目录就收敛到文件集合，并给出表规范 V1/V2/V3 的版本边界。基于 pyiceberg 0.11.1 真实建表逐层 dump。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/16-time-travel-evolution/16-time-travel-evolution.html">【数据湖与开放表格式】时间旅行、Schema 与分区演进</a></h3>
+                    <p>讲清 Iceberg 的 snapshot 过期、回滚与按时间/快照读如何工作；schema evolution 为何按 field ID 而非位置来增删改名重排；以及演进对老数据文件与老 reader 的兼容边界与陷阱，附 PyIceberg 真实实验验证字段映射与时间旅行。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

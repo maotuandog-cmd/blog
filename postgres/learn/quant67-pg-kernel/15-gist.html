@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】GiST 索引：一套接口搞定几何、全文、数组——通用搜索树怎么把&quot;像什么&quot;变成索引查找 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL GiST
+索引的抽象算子接口（Consistent/Union/Penalty/PickSplit）、深度优先搜索与
+Consistent 过滤的组合逻辑、Penalty 引导插入路径与 PickSplit
+决定分裂策略的完整流程，以及 point_ops 的几何距离搜索和 tsvector_ops
+的全文搜索两种典型实现。读完你会理解为什么 GiST
+能用一个通用框架支持十几种数据类型，以及它什么时候比 B-Tree
+好、什么时候该用 GIN 替代。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, gist, index, consistent, penalty, picksplit, point-ops, tsvector-ops, full-text-search, geometric-index, generalized-search-tree, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/15-gist/15-gist.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】GiST 索引：一套接口搞定几何、全文、数组——通用搜索树怎么把&quot;像什么&quot;变成索引查找" />
+    <meta property="og:description" content="拆解 PostgreSQL GiST 索引的抽象算子接口（Consistent/Union/Penalty/PickSplit）、深度优先搜索与 Consistent 过滤的组合逻辑、Penalty 引导插入路径与 PickSplit 决定分裂策略的完整流程，以及 point_ops 的几何距离搜索和 tsvector_ops 的全文搜索两种典型实现。读完你会理解为什么 GiST 能用一个通用框架支持十几种数据类型，以及它什么时候比 B-Tree 好、什么时候该用 GIN 替代。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/15-gist/15-gist.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="gist" />
+    <meta property="article:tag" content="index" />
+    <meta property="article:tag" content="consistent" />
+    <meta property="article:tag" content="penalty" />
+    <meta property="article:tag" content="picksplit" />
+    <meta property="article:tag" content="point-ops" />
+    <meta property="article:tag" content="tsvector-ops" />
+    <meta property="article:tag" content="full-text-search" />
+    <meta property="article:tag" content="geometric-index" />
+    <meta property="article:tag" content="generalized-search-tree" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】GiST 索引：一套接口搞定几何、全文、数组——通用搜索树怎么把&quot;像什么&quot;变成索引查找" />
+    <meta name="twitter:description" content="拆解 PostgreSQL GiST 索引的抽象算子接口（Consistent/Union/Penalty/PickSplit）、深度优先搜索与 Consistent 过滤的组合逻辑、Penalty 引导插入路径与 PickSplit 决定分裂策略的完整流程，以及 point_ops 的几何距离搜索和 tsvector_ops 的全文搜索两种典型实现。读完你会理解为什么 GiST 能用一个通用框架支持十几种数据类型，以及它什么时候比 B-Tree 好、什么时候该用 GIN 替代。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】GiST 索引：一套接口搞定几何、全文、数组——通用搜索树怎么把\"像什么\"变成索引查找", "description": "拆解 PostgreSQL GiST 索引的抽象算子接口（Consistent/Union/Penalty/PickSplit）、深度优先搜索与 Consistent 过滤的组合逻辑、Penalty 引导插入路径与 PickSplit 决定分裂策略的完整流程，以及 point_ops 的几何距离搜索和 tsvector_ops 的全文搜索两种典型实现。读完你会理解为什么 GiST 能用一个通用框架支持十几种数据类型，以及它什么时候比 B-Tree 好、什么时候该用 GIN 替代。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/15-gist/15-gist.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "gist", "index", "consistent", "penalty", "picksplit", "point-ops", "tsvector-ops", "full-text-search", "geometric-index", "generalized-search-tree"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】GiST 索引：一套接口搞定几何、全文、数组——通用搜索树怎么把&quot;像什么&quot;变成索引查找</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#gist</span> <span>#index</span> <span>#consistent</span> <span>#penalty</span> <span>#picksplit</span> <span>#point-ops</span> <span>#tsvector-ops</span> <span>#full-text-search</span> <span>#geometric-index</span> <span>#generalized-search-tree</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/gist.html">#gist</a><a class="chip-link" href="/tags/index.html">#index</a><a class="chip-link" href="/tags/consistent.html">#consistent</a><a class="chip-link" href="/tags/penalty.html">#penalty</a><a class="chip-link" href="/tags/picksplit.html">#picksplit</a><a class="chip-link" href="/tags/point-ops.html">#point-ops</a><a class="chip-link" href="/tags/tsvector-ops.html">#tsvector-ops</a><a class="chip-link" href="/tags/full-text-search.html">#full-text-search</a><a class="chip-link" href="/tags/geometric-index.html">#geometric-index</a><a class="chip-link" href="/tags/generalized-search-tree.html">#generalized-search-tree</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#gist-索引一套接口搞定几何全文数组通用搜索树怎么把像什么变成索引查找"
+                id="toc-gist-索引一套接口搞定几何全文数组通用搜索树怎么把像什么变成索引查找">GiST
+                索引：一套接口搞定几何、全文、数组——通用搜索树怎么把”像什么”变成索引查找</a>
+                <ul>
+                <li><a href="#一gist-的设计动机与核心抽象"
+                id="toc-一gist-的设计动机与核心抽象">一、GiST
+                的设计动机与核心抽象</a>
+                <ul>
+                <li><a
+                href="#consistentgiststate-entry-query-strategy-recheck"
+                id="toc-consistentgiststate-entry-query-strategy-recheck">Consistent(giststate,
+                entry, query, strategy, recheck)</a></li>
+                <li><a href="#uniongiststate-entryvec-attrsz"
+                id="toc-uniongiststate-entryvec-attrsz">Union(giststate,
+                entryvec, attrsz)</a></li>
+                <li><a href="#penaltygiststate-origentry-newentry"
+                id="toc-penaltygiststate-origentry-newentry">Penalty(giststate,
+                origentry, newentry)</a></li>
+                <li><a
+                href="#picksplitgiststate-entryvec-left-right-delta"
+                id="toc-picksplitgiststate-entryvec-left-right-delta">PickSplit(giststate,
+                entryvec, left, right, delta)</a></li>
+                <li><a
+                href="#compressgiststate-entry-decompressgiststate-entry"
+                id="toc-compressgiststate-entry-decompressgiststate-entry">Compress(giststate,
+                entry) / Decompress(giststate, entry)</a></li>
+                <li><a href="#gist-页面布局" id="toc-gist-页面布局">GiST
+                页面布局</a></li>
+                <li><a href="#搜索流程"
+                id="toc-搜索流程">搜索流程</a></li>
+                <li><a href="#并发搜索的-rightlink-机制"
+                id="toc-并发搜索的-rightlink-机制">并发搜索的 rightlink
+                机制</a></li>
+                </ul></li>
+                <li><a href="#五point_ops几何索引的-gist-实现"
+                id="toc-五point_ops几何索引的-gist-实现">五、point_ops：几何索引的
+                GiST 实现</a>
+                <ul>
+                <li><a href="#compresspoint-box"
+                id="toc-compresspoint-box">Compress：point →
+                BOX</a></li>
+                <li><a href="#penaltymbr-面积增量"
+                id="toc-penaltymbr-面积增量">Penalty：MBR
+                面积增量</a></li>
+                </ul></li>
+                <li><a href="#六tsvector_ops全文搜索的-gist-实现"
+                id="toc-六tsvector_ops全文搜索的-gist-实现">六、tsvector_ops：全文搜索的
+                GiST 实现</a>
+                <ul>
+                <li><a href="#签名树原理"
+                id="toc-签名树原理">签名树原理</a></li>
+                <li><a href="#compress-decompress"
+                id="toc-compress-decompress">Compress /
+                Decompress</a></li>
+                </ul></li>
+                <li><a href="#七运维gist-vs-gin-的选择与常见坑"
+                id="toc-七运维gist-vs-gin-的选择与常见坑">七、运维：GiST
+                vs GIN 的选择与常见坑</a>
+                <ul>
+                <li><a href="#gist-vs-gin-对比"
+                id="toc-gist-vs-gin-对比">GiST vs GIN 对比</a></li>
+                <li><a href="#选择规则"
+                id="toc-选择规则">选择规则</a></li>
+                <li><a href="#索引膨胀与-vacuum"
+                id="toc-索引膨胀与-vacuum">索引膨胀与 VACUUM</a></li>
+                <li><a href="#knn-查询的性能陷阱"
+                id="toc-knn-查询的性能陷阱">KNN 查询的性能陷阱</a></li>
+                </ul></li>
+                <li><a href="#八关键要点"
+                id="toc-八关键要点">八、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#实验工具"
+                id="toc-实验工具">实验工具</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="gist-索引一套接口搞定几何全文数组通用搜索树怎么把像什么变成索引查找">GiST
+            索引：一套接口搞定几何、全文、数组——通用搜索树怎么把”像什么”变成索引查找</h1>
+            <p>假设你要在一个包含 100 万个地理坐标的表中查找距离
+            <code>(116.38, 39.90)</code> 最近的 10 个点。B-Tree
+            帮不了你——它只能做一维排序，没法回答”二维空间中谁离我最近”。全文搜索也类似——找包含
+            “database” AND “index”
+            的文档，不是找某个确切值，而是找满足布尔谓词的集合。</p>
+            <p>PG 的答案是 GiST（Generalized Search
+            Tree，通用搜索树）。它不定义具体的索引逻辑，而是定义一组抽象算子接口——Consistent、Union、Penalty、PickSplit——你只需按你的数据类型实现这几个函数，就能得到一个完整的平衡搜索树索引。<code>point_ops</code>
+            用这套接口做空间索引（R-Tree
+            风格），<code>tsvector_ops</code>
+            用同一套接口做全文搜索（签名树风格）。本文从这组接口出发，拆解搜索、插入、分裂的完整流程。</p>
+            <hr />
+            <h2 id="一gist-的设计动机与核心抽象">一、GiST
+            的设计动机与核心抽象</h2>
+            <p>B-Tree
+            的核心能力是<strong>一维全序比较</strong>：给定任意两个键，总能判定它们之间的大小关系。这个前提很多数据类型不满足：</p>
+            <ul>
+            <li><strong>几何类型</strong>：<code>(1,2)</code> 和
+            <code>(3,4)</code>
+            谁大谁小？没有天然的全序。查询”覆盖哪些点”或”谁离我最近”是空间包含或距离度量问题。</li>
+            <li><strong>全文搜索</strong>：<code>'database' &lt; 'index'</code>
+            有意义吗？查询
+            <code>to_tsquery('database &amp; index')</code>
+            是集合包含问题。</li>
+            <li><strong>范围类型</strong>：<code>[1,10)</code> 和
+            <code>[5,15)</code>
+            有部分序——可以说谁包含谁、谁和谁重叠，但不能说谁更大。</li>
+            </ul>
+            <p>GiST 把这些类型统一为一种抽象：<strong>每个 key 是一种
+            predicate（谓词），页面中存储 key 的 bounding
+            predicate（边界谓词），搜索时用 Consistent
+            判定查询谓词是否可能与页面内某个 key
+            的谓词成立。</strong></p>
+            <pre class="mermaid"><code>flowchart LR
+  A[&quot;B-Tree&lt;br/&gt;一维全序&lt;br/&gt;a &amp;lt; b → 左分支&lt;br/&gt;a &amp;ge; b → 右分支&quot;] --&gt; C[&quot;索引基础设施&lt;br/&gt;页面管理 / 并发控制 / WAL&quot;]
+  B[&quot;GiST&lt;br/&gt;N 维谓词&lt;br/&gt;Consistent(q, p) → true/false&lt;br/&gt;决定是否深入搜索&quot;] --&gt; C
+```text
+
+这意味着 GiST 不需要知道你的 key 长什么样——你实现了 Consistent、Union，以及 Penalty 或 PickSplit 之一，GiST 就能帮你构建和维护一棵平衡搜索树。
+
+PG 内置的 GiST opclass 覆盖了多种类型：
+
+| opclass | 数据类型 | 主要查询操作 |
+|---------|---------|------------|
+| `point_ops` | `point` | `&lt;-&gt;`（距离 KNN）、`&lt;@`（包含）、`&amp;&amp;`（重叠） |
+| `tsvector_ops` | `tsvector` | `@@`（全文匹配） |
+| `range_ops` | `anyrange` | `&amp;&amp;`（重叠）、`@&gt;`（包含）、`&lt;&lt;`（严格左） |
+| `inet_ops` | `inet` | `&lt;&lt;`（子网）、`&gt;&gt;`（超网）、`&amp;&amp;`（重叠） |
+| `box_ops` | `box` | `&amp;&amp;`（重叠）、`@&gt;`（包含） |
+| `circle_ops` | `circle` | `&amp;&amp;`（重叠）、`&lt;-&gt;`（距离） |
+| `poly_ops` | `polygon` | `&amp;&amp;`（重叠）、`@&gt;`（包含） |
+| `array_ops` | `_int4` | `&amp;&amp;`（重叠）、`@&gt;`（包含） |
+
+---
+
+## 二、GiST 的六个抽象算子接口
+
+这六个接口定义在 `src/include/access/gist.h` 的 `GISTSTATE` 结构体中，每个 opclass 注册时提供函数指针。
+
+```c
+// src/include/access/gist_private.h
+typedef struct GISTSTATE {
+    FmgrInfo consistentFn[INDEX_MAX_KEYS];  // Consistent 回调
+    FmgrInfo unionFn[INDEX_MAX_KEYS];       // Union 回调
+    FmgrInfo compressFn[INDEX_MAX_KEYS];    // Compress 回调
+    FmgrInfo decompressFn[INDEX_MAX_KEYS];  // Decompress 回调
+    FmgrInfo penaltyFn[INDEX_MAX_KEYS];     // Penalty 回调
+    FmgrInfo picksplitFn[INDEX_MAX_KEYS];   // PickSplit 回调
+    FmgrInfo equalFn[INDEX_MAX_KEYS];       // Same 回调
+} GISTSTATE;</code></pre>
+            <h3
+            id="consistentgiststate-entry-query-strategy-recheck">Consistent(giststate,
+            entry, query, strategy, recheck)</h3>
+            <p><strong>作用</strong>：判断页面/索引项的谓词
+            <code>entry-&gt;key</code> 是否”一致于”查询谓词
+            <code>query</code>。</p>
+            <p><strong>关键</strong>：<code>recheck</code> 是出参。如果
+            Consistent 不能精确判定，可以返回 <code>true</code> 但设
+            <code>*recheck = true</code>，告诉执行器”这只是候选，需要回表再检查”。这是
+            GiST
+            实现<strong>有损索引</strong>的基础——索引层做粗筛选，heap
+            层做精筛。全文搜索严重依赖这个机制。</p>
+            <p><strong>契约</strong>：Consistent 可以有假阳性（false
+            positive），但绝不能有假阴性（false
+            negative）。“宁滥勿缺”让签名树等概率性索引得以工作——加载一个可能匹配但实际不匹配的页面检查，比漏掉真正的匹配更安全。</p>
+            <h3 id="uniongiststate-entryvec-attrsz">Union(giststate,
+            entryvec, attrsz)</h3>
+            <p><strong>作用</strong>：把多个 key 合并成一个”超级
+            key”（bounding predicate）。这是 GiST
+            的向上归纳能力——叶节点的 key 是原始数据，内部节点的 key
+            是子节点 key 的 Union。</p>
+            <p><strong>point_ops
+            的例子</strong>：<code>Union([(1,2), (5,8), (3,4)])</code> →
+            一个包围所有三维点的最小矩形
+            <code>BOX(1,2),(5,8)</code>。</p>
+            <p><strong>tsvector_ops
+            的例子</strong>：<code>Union([{'a','b'}, {'b','c'}, {'d'}])</code>
+            → <code>{'a','b','c','d'}</code>，所有词元的并集。</p>
+            <p><strong>契约</strong>：Union 的结果必须覆盖所有输入
+            key——不能比输入 key 的集合更窄。</p>
+            <h3
+            id="penaltygiststate-origentry-newentry">Penalty(giststate,
+            origentry, newentry)</h3>
+            <p><strong>作用</strong>：把 <code>newentry</code> 插入到
+            <code>origentry</code> 所在的子树，会导致 origentry 的
+            bounding predicate 膨胀多少？</p>
+            <p>penalty 越小，说明 newentry 和该子树越”亲近”。Penalty 是
+            GiST 插入路径选择的核心——新 key 走下哪个子树能最小化
+            bounding predicate 的膨胀。</p>
+            <p><strong>point_ops 的例子</strong>：Penalty = 加入新点后
+            MBR 的面积增量。新点在 MBR 内部 → penalty = 0；新点在 MBR
+            外面很远 → penalty 很大。</p>
+            <h3
+            id="picksplitgiststate-entryvec-left-right-delta">PickSplit(giststate,
+            entryvec, left, right, delta)</h3>
+            <p><strong>作用</strong>：页面满了，把 <code>entryvec</code>
+            中约 <span class="math inline">\(2n+1\)</span>
+            个条目分成左右两组。目标：让左右两组的 bounding predicate
+            尽量紧凑且重叠小。</p>
+            <p>B-Tree
+            的分裂原则是”左右尽量平衡”（<code>_bt_findsplitloc()</code>
+            找两边大小最接近的分裂点），GiST 的 PickSplit
+            不以大小为平衡目标——它以查询效率为目标。分裂质量直接影响后续查询性能：bounding
+            predicate 太大 → Consistent 过滤效果差 → 扫描更多页面。</p>
+            <p><strong>point_ops
+            的例子</strong>：空间聚类——把点分成两个组，使组内聚拢、组间远离。point_ops
+            用基于 MBR 面积最小的贪心算法。</p>
+            <p><strong>tsvector_ops
+            的例子</strong>：基于签名位差异的分裂——让左右分区的签名尽量不重叠，减少后续搜索时的假阳性。</p>
+            <h3
+            id="compressgiststate-entry-decompressgiststate-entry">Compress(giststate,
+            entry) / Decompress(giststate, entry)</h3>
+            <p><strong>作用</strong>：Compress 把原始类型值转为 GiST
+            内部存储形式，Decompress
+            是其逆操作。只在存储格式不同于原始类型时需要。</p>
+            <p><strong>point_ops</strong>：Compress 把
+            <code>point(1,2)</code> 压缩为
+            <code>BOX(1,2),(1,2)</code>（退化为点的矩形），因为内部页面统一用
+            BOX 做 Union。</p>
+            <p><strong>tsvector_ops</strong>：Compress 把
+            <code>tsvector</code> 转为 <code>SignTSVector</code>（定长
+            bitmap 签名），减少存储开销和 Union 计算量。</p>
+            <p>这六个接口中，Consistent 和 Union 是必须实现的，Penalty
+            和 PickSplit
+            至少实现一个（否则无法维护平衡树），Compress/Decompress
+            可选。</p>
+            <h3 id="gist-页面布局">GiST 页面布局</h3>
+            <p>GiST 页面与 B-Tree 共享 <code>PageHeaderData</code> 和
+            <code>ItemIdData</code> 数组，但页面尾部用
+            <code>GISTPageOpaqueData</code> 替代
+            <code>BTPageOpaque</code>：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/gist.h</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> GISTPageOpaqueData <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    PageGistNSN    nsn<span class="op">;</span>              <span class="co">// GiST NSN（并发搜索用）</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    BlockNumber    rightlink<span class="op">;</span>        <span class="co">// 右兄弟指针</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    uint16         flags<span class="op">;</span>            <span class="co">// F_LEAF / F_DELETED / F_FOLLOW_RIGHT / F_TUPLES_DELETED</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    uint16         gist_page_id<span class="op">;</span>     <span class="co">// 魔数 0xFF81</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> GISTPageOpaqueData<span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>`rightlink` 是关键并发控制机制：当一个页面分裂时，原页面的 `rightlink` 指向新页面，并发搜索可以顺着 `rightlink` 找到被迁移的元组，不需要持锁等待分裂完成。</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 三、搜索：深度优先 + Consistent 过滤</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 入口：gistgettuple()</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>搜索入口是 `src<span class="op">/</span>backend<span class="op">/</span>access<span class="op">/</span>gist<span class="op">/</span>gistget<span class="op">.</span>c` 中的 `gistgettuple<span class="op">()</span>`。它为每次扫描（返回一条结果）调用 `gistnext<span class="op">()</span>`，后者通过栈驱动深度优先遍历。</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/gist/gistget.c</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="co">// gistgettuple() → gistnext() → gistScanPage() 核心路径</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>gistgettuple<span class="op">(</span>scan<span class="op">,</span> dir<span class="op">)</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>  → gistnext<span class="op">(</span>scan<span class="op">)</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    → gistScanPage<span class="op">(</span>scan<span class="op">,</span> <span class="op">...)</span>          <span class="co">// 扫描当前页面</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>      → gistindex_keytest<span class="op">(</span>pageitems<span class="op">,</span> query<span class="op">,</span> strategy<span class="op">,</span> recheck<span class="op">)</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        → <span class="cf">for</span> each item in page<span class="op">:</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>            FunctionCall2Coll<span class="op">(</span>consistent<span class="op">,</span> key<span class="op">,</span> query<span class="op">,</span> <span class="op">...)</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>consistent <span class="op">==</span> <span class="kw">true</span><span class="op">):</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>              <span class="cf">if</span> <span class="op">(</span>leaf page<span class="op">):</span> 返回 tuple 的 TID</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>              <span class="cf">else</span><span class="op">:</span>           把子页面的 block 压入搜索栈</span></code></pre></div>
+            <h3 id="搜索流程">搜索流程</h3>
+            <pre class="mermaid"><code>flowchart TD
+  A[&quot;从根页开始，压入搜索栈&quot;] --&gt; B{&quot;搜索栈为空？&quot;}
+  B --&gt;|是| G[&quot;返回 false（无更多匹配）&quot;]
+  B --&gt;|否| C[&quot;弹出栈顶页面&quot;]
+  C --&gt; D[&quot;对页面中每个 IndexTuple&lt;br/&gt;调用 Decompress → Consistent&quot;]
+  D --&gt; E{是叶页面？}
+  E --&gt;|是| F1[&quot;Consistent=true → 返回 TID&lt;br/&gt;检查 heap 可见性后返回给上层&quot;]
+  E --&gt;|否, 内部页面| F2[&quot;Consistent=true → 子页压栈&lt;br/&gt;Consistent=false → 跳过（剪枝）&quot;]
+  F1 --&gt; B
+  F2 --&gt; B
+```text
+
+关键点：Consistent 在叶子层和内部层都会被调用。在内部层，它决定是否深入子树；在叶子层，它决定是否返回该 TID。如果 Consistent 过于&quot;宽松&quot;（假阳性太多），会把大量无用页面加载进内存。
+
+### KNN 距离查询的优先队列
+
+对于 `ORDER BY pos &lt;-&gt; point &#39;(0,0)&#39; LIMIT 5` 这样的 KNN 查询，GiST 不使用简单的 DFS 栈，而是使用**优先队列**：
+
+```c
+// src/backend/access/gist/gistget.c, gistnext() 中 KNN 分支
+if (scan-&gt;numberOfOrderBys &gt; 0) {
+    // KNN 模式：对每个内部页面条目计算距离
+    // 优先搜索距离查询点最近的页面
+    // 使用 PairingHeap 作为优先队列，保证最早返回的结果就是最近的
+}</code></pre>
+            <p>这是<strong>增量式
+            KNN</strong>：不需要扫描全部数据再排序，而是一边搜索一边按距离产出结果。如果
+            LIMIT 5 的结果已经在优先探索的分支中找到了，GiST
+            可以直接返回，不需要访问远处的分支。</p>
+            <h3 id="并发搜索的-rightlink-机制">并发搜索的 rightlink
+            机制</h3>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// gistScanPage() 中简化逻辑</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 读完当前页面后，检查是否需要跟随 rightlink</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>GistFollowRight<span class="op">(</span>page<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    BlockNumber rightlink <span class="op">=</span> GistPageGetOpaque<span class="op">(</span>page<span class="op">)-&gt;</span>rightlink<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>rightlink <span class="op">!=</span> InvalidBlockNumber<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 页面被并发分裂了——把右兄弟也压栈继续搜索</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        stack <span class="op">=</span> gistPushItrRightLink<span class="op">(</span>stack<span class="op">,</span> rightlink<span class="op">,</span> so<span class="op">);</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 四、插入与页面分裂：Penalty → PickSplit 二阶段</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 插入路径</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>GiST 的插入入口是 `src<span class="op">/</span>backend<span class="op">/</span>access<span class="op">/</span>gist<span class="op">/</span>gist<span class="op">.</span>c` 中的 `gistdoinsert<span class="op">()</span>`：</span></code></pre></div>
+            <ol type="1">
+            <li>从根页面开始向下搜索</li>
+            <li>对内部页面的每个子页面、调用 Penalty(child_union_key,
+            new_key)</li>
+            <li>选择 Penalty 最小的子页面继续向下</li>
+            <li>到达叶页面后尝试放入</li>
+            <li>如果叶页面满 → 触发 gistSplit()</li>
+            </ol>
+            <pre class="text"><code>
+Penalty 选择逻辑在 `gistchoose()`（`src/backend/access/gist/gistutil.c`）中：
+
+```c
+// gistchoose() 简化逻辑
+OffsetNumber gistchoose(Relation r, Page p, IndexTuple it, ...) {
+    best_penalty = INFINITY;
+    for each item in page {
+        penalty = FunctionCall2(penalty_fn, item_union_key, it);
+        if (penalty &lt; best_penalty) {
+            best_penalty = penalty;
+            best_item = current_item;
+        }
+    }
+    return best_item;
+}</code></pre>
+            <p>如果有多个子页面的 penalty 相等（如 point_ops
+            中新点同时落在多个 MBR 内部，penalty 都是 0），则选择
+            <code>Union(child_entries + new_entry)</code>
+            后面积最小的那个。</p>
+            <pre class="mermaid"><code>sequenceDiagram
+    participant HEAP as Heap Insert
+    participant GIST as gistdoinsert()
+    participant WALK as 树下降
+    participant PAGE as gistplacetopage()
+    participant SPLIT as gistSplit()
+
+    HEAP-&gt;&gt;GIST: 插入 IndexTuple
+    GIST-&gt;&gt;WALK: 从根页开始
+    loop 下降
+        WALK-&gt;&gt;WALK: Penalty(new_entry, child.union)
+        WALK-&gt;&gt;WALK: 选 penalty 最小的 child
+    end
+    WALK-&gt;&gt;PAGE: 尝试放入叶页
+    alt 页面有空间
+        PAGE--&gt;&gt;GIST: 放入，完成
+    else 页面已满
+        PAGE-&gt;&gt;SPLIT: 调用 PickSplit
+        SPLIT-&gt;&gt;SPLIT: 种子选择 + 条目分配
+        SPLIT-&gt;&gt;SPLIT: 左右组分别计算 Union key
+        SPLIT-&gt;&gt;PAGE: 返回分裂结果
+        PAGE-&gt;&gt;PAGE: 更新父页，插入新 downlink
+        alt 父页也满
+            PAGE-&gt;&gt;SPLIT: 递归向上分裂
+        end
+    end
+```bash
+
+### PickSplit 算法
+
+通用 PickSplit 实现在 `src/backend/access/gist/gistsplit.c` 中：
+
+```c
+// genericPickSplit() 简化
+void genericPickSplit(GistEntryVector *entryvec, GIST_SPLITVEC *v, ...) {
+    // 1. 种子选择：互相之间 penalty 最大的两个条目作为左右组种子
+    find_seeds(entryvec, &amp;seed_left, &amp;seed_right, penalty_fn);
+
+    // 2. 贪心分配：每个剩余条目分别计算加入左/右组后的 penalty
+    for each remaining entry {
+        penalty_left  = Penalty(Union(左组), entry);
+        penalty_right = Penalty(Union(右组), entry);
+        分配到 penalty 较小的一组;
+        更新该组的 Union key;
+    }
+
+    // 3. 计算左右组的 Union key 写入父页面
+    v-&gt;spl_ldatum = Union(左组所有条目);
+    v-&gt;spl_rdatum = Union(右组所有条目);
+}</code></pre>
+            <p>不同 opclass 有不同的分裂策略：</p>
+            <ul>
+            <li><strong>point_ops（R-Tree
+            风格）</strong>：尝试多种角度和轴上的分割，选择总周长或总面积最小的方案。目标是最小化后续搜索时需要同时访问左右两边的概率。</li>
+            <li><strong>tsvector_ops（签名树）</strong>：计算左右分区的签名重叠度，选择重叠最小的方案，减少后续搜索时的假阳性。</li>
+            </ul>
+            <p>分裂完成后，父页面插入两个新条目（分别指向左右新页面）。如果父页面也满了，分裂向上递归，直到根页面——如果根页面也需要分裂，GiST
+            会创建一个新的根页面。</p>
+            <hr />
+            <h2
+            id="五point_ops几何索引的-gist-实现">五、point_ops：几何索引的
+            GiST 实现</h2>
+            <p><code>point_ops</code>（源码在
+            <code>src/backend/access/gist/gistproc.c</code>）是最直观的
+            GiST
+            实现，核心思想是用<strong>最小外包矩形（MBR）</strong>作为
+            bounding predicate。</p>
+            <h3 id="compresspoint-box">Compress：point → BOX</h3>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/gist/gistproc.c</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co">// gbt_point_compress() 简化</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>Datum gbt_point_compress<span class="op">(</span>PG_FUNCTION_ARGS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    GISTENTRY <span class="op">*</span>entry <span class="op">=</span> <span class="op">...;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>entry<span class="op">-&gt;</span>leafkey<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>        Point <span class="op">*</span>p <span class="op">=</span> DatumGetPointP<span class="op">(</span>entry<span class="op">-&gt;</span>key<span class="op">);</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>        BOX <span class="op">*</span>box <span class="op">=</span> palloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(</span>BOX<span class="op">));</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>        box<span class="op">-&gt;</span>high <span class="op">=</span> box<span class="op">-&gt;</span>low <span class="op">=</span> <span class="op">*</span>p<span class="op">;</span>   <span class="co">// 退化为点的矩形</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        PG_RETURN_POINTER<span class="op">(</span>box<span class="op">);</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 内部页面已经是 BOX，不需要转换</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    PG_RETURN_POINTER<span class="op">(</span>entry<span class="op">-&gt;</span>key<span class="op">);</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## Consistent：五类空间策略</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 策略号 <span class="op">|</span> 操作符 <span class="op">|</span> 含义 <span class="op">|</span> Consistent 判定逻辑 <span class="op">|</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="op">|--------|--------|------|--------------------|</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> <span class="dv">1</span> <span class="op">|</span> `<span class="op">&lt;&lt;</span>` <span class="op">|</span> 严格在左 <span class="op">|</span> entry 右边界 <span class="op">&lt;</span> query 左边界 <span class="op">|</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> <span class="dv">3</span> <span class="op">|</span> `<span class="op">&amp;&amp;</span>` <span class="op">|</span> 重叠 <span class="op">|</span> entry MBR 和 query 有交集 <span class="op">|</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> <span class="dv">17</span> <span class="op">|</span> `<span class="op">&lt;-&gt;</span>` <span class="op">|</span> KNN 距离 <span class="op">|</span> 计算 MBR 到查询点的最小距离 <span class="op">|</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> <span class="dv">24</span> <span class="op">|</span> `<span class="op">&lt;</span>@` <span class="op">|</span> 被包含 <span class="op">|</span> query 包含 entry <span class="op">|</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> <span class="op">---</span> <span class="op">|</span> `@<span class="op">&gt;</span>` <span class="op">|</span> 包含 <span class="op">|</span> entry 包含 query <span class="op">|</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="co">// gbt_point_consistent() 简化——策略 3（重叠 &amp;&amp;）</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="cf">case</span> RTOverlapStrategyNumber<span class="op">:</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> overlap2d<span class="op">(</span>entry_box<span class="op">,</span> query_box<span class="op">);</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 两个矩形有交集 → true</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="co">// 策略 17（KNN 距离 &lt;-&gt;）</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="cf">case</span> RTDistanceStrategyNumber<span class="op">:</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 查询点在 MBR 内部 → 距离 = 0</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 否则 → 查询点到 MBR 最近边的距离</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>    distance <span class="op">=</span> box_dist<span class="op">(</span>query_point<span class="op">,</span> entry_box<span class="op">);</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">break</span><span class="op">;</span></span></code></pre></div>
+            <h3 id="penaltymbr-面积增量">Penalty：MBR 面积增量</h3>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// point_ops 的 Penalty：新点加入后 MBR 的面积膨胀</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>Datum gbt_point_penalty<span class="op">(</span>PG_FUNCTION_ARGS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    BOX <span class="op">*</span>origbox <span class="op">=</span> DatumGetBoxP<span class="op">(</span>origentry<span class="op">-&gt;</span>key<span class="op">);</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    BOX <span class="op">*</span>newkey  <span class="op">=</span> DatumGetBoxP<span class="op">(</span>newentry<span class="op">-&gt;</span>key<span class="op">);</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 合并后的 MBR</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    BOX unionbox<span class="op">;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    unionbox<span class="op">.</span>high<span class="op">.</span>x <span class="op">=</span> Max<span class="op">(</span>origbox<span class="op">-&gt;</span>high<span class="op">.</span>x<span class="op">,</span> newkey<span class="op">-&gt;</span>high<span class="op">.</span>x<span class="op">);</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    unionbox<span class="op">.</span>low<span class="op">.</span>x  <span class="op">=</span> Min<span class="op">(</span>origbox<span class="op">-&gt;</span>low<span class="op">.</span>x<span class="op">,</span> newkey<span class="op">-&gt;</span>low<span class="op">.</span>x<span class="op">);</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... 同理处理 y 坐标</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    penalty <span class="op">=</span> size_box<span class="op">(&amp;</span>unionbox<span class="op">)</span> <span class="op">-</span> size_box<span class="op">(</span>origbox<span class="op">);</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    PG_RETURN_FLOAT4<span class="op">(</span>penalty<span class="op">);</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>新点落在 MBR 内部 → penalty <span class="op">=</span> <span class="dv">0</span>（不膨胀 bounding predicate）。这正是理想情况——新增数据不增加<span class="st">&quot;松散度&quot;</span>。</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 搜索示例</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 建 GiST 空间索引</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>CREATE INDEX idx_points_gist ON locations USING gist <span class="op">(</span>pos<span class="op">);</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 包围矩形搜索</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>SELECT <span class="op">*</span> FROM locations</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>WHERE pos <span class="op">&lt;</span>@ box <span class="ch">&#39;(</span><span class="er">(0,0),(100,100))</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> KNN 搜索：离目标最近的 <span class="dv">10</span> 个点</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>SELECT <span class="op">*</span> FROM locations</span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>ORDER BY pos <span class="op">&lt;-&gt;</span> point <span class="ch">&#39;(</span><span class="er">50, 50)</span><span class="ch">&#39;</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>LIMIT <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> 方向搜索</span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>SELECT <span class="op">*</span> FROM locations</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>WHERE pos <span class="op">&gt;&gt;</span> point <span class="ch">&#39;(</span><span class="er">10, 0)</span><span class="ch">&#39;</span><span class="op">;</span></span></code></pre></div>
+            <p>KNN 查询
+            <code>ORDER BY pos &lt;-&gt; point LIMIT 10</code>
+            的过程：</p>
+            <pre class="text"><code>根页（内部节点）:
+  ┌───────────────────────────────────────────────────┐
+  │ Entry 1: MBR((-50,-50),(50,50))  │ 距 (0,0)=0    │ ← 优先搜索
+  │ Entry 2: MBR((100,100),(200,200))│ 距 (0,0)=141  │ ← 后搜
+  │ Entry 3: MBR((-200,-200),(-100,-100))│ 距=141    │
+  └───────────────────────────────────────────────────┘
+
+优先搜索 Entry1 → 叶页 → 找到实际点，LIMIT 10 满了就停止，无需访问 Entry2/3</code></pre>
+            <hr />
+            <h2
+            id="六tsvector_ops全文搜索的-gist-实现">六、tsvector_ops：全文搜索的
+            GiST 实现</h2>
+            <p><code>tsvector_ops</code>（源码在
+            <code>src/backend/utils/adt/tsgistidx.c</code>）展示了 GiST
+            如何处理有损索引和布尔查询。</p>
+            <h3 id="签名树原理">签名树原理</h3>
+            <p>签名（signature）是一个固定长度的 bit 串（默认 124
+            字节，即 992
+            位）。每个词通过哈希被映射到签名的某些位。一个页面的签名是其所有子页面签名的按位或。</p>
+            <pre class="text"><code>tsvector: &#39;database:1 index:2 query:3&#39;
+  ↓ Compress
+SignTSVector: bitmap[hash(&#39;database&#39;)]=1, bitmap[hash(&#39;index&#39;)]=1, bitmap[hash(&#39;query&#39;)]=1</code></pre>
+            <p>核心运算：</p>
+            <pre class="text"><code>Union:    parent_sig = child1_sig | child2_sig | ...
+Consistent: query_sig &amp; page_sig == query_sig ?</code></pre>
+            <h3 id="compress-decompress">Compress / Decompress</h3>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/utils/adt/tsgistidx.c</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>Datum gtsvector_compress<span class="op">(</span>PG_FUNCTION_ARGS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    GISTENTRY <span class="op">*</span>entry <span class="op">=</span> <span class="op">...;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>entry<span class="op">-&gt;</span>leafkey<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>        TSVector val <span class="op">=</span> DatumGetTSVector<span class="op">(</span>entry<span class="op">-&gt;</span>key<span class="op">);</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>        SignTSVector <span class="op">*</span>sign <span class="op">=</span> makeSignTSVector<span class="op">(</span>val<span class="op">);</span>  <span class="co">// 转签名</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>        PG_RETURN_SIGNTSVECTOR<span class="op">(</span>sign<span class="op">);</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 内部页面已经是 SignTSVector</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>    PG_RETURN_POINTER<span class="op">(</span>entry<span class="op">-&gt;</span>key<span class="op">);</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## Consistent：签名匹配 + recheck</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="co">// gtsvector_consistent() 核心逻辑</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>Datum gtsvector_consistent<span class="op">(</span>PG_FUNCTION_ARGS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>    SignTSVector <span class="op">*</span>entry_sign <span class="op">=</span> <span class="op">...;</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>    QUERYTYPE <span class="op">*</span>query <span class="op">=</span> <span class="op">...;</span>   <span class="co">// tsquery: &#39;database &amp; index&#39;</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 签名匹配检查</span></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>entry 签名包含 query 中所有必须词元的 bit<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>recheck <span class="op">=</span> <span class="kw">true</span><span class="op">;</span>       <span class="co">// 签名匹配 ≠ 精确匹配！</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>        PG_RETURN_BOOL<span class="op">(</span><span class="kw">true</span><span class="op">);</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>        PG_RETURN_BOOL<span class="op">(</span><span class="kw">false</span><span class="op">);</span> <span class="co">// 签名不匹配 → 安全排除</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><strong>假阳性不可怕，假阴性才是问题。</strong>签名哈希冲突导致假阳性（不同词哈希到相同
+            bit）→ Consistent 返回 true 但实际不匹配 → recheck 在 heap
+            层纠正。假阴性不可能（bit 在这就说明有某个词被哈希到这位）→
+            Consistent 返回 false 一定是安全的。</p>
+            <pre class="mermaid"><code>sequenceDiagram
+    participant Q as tsquery&lt;br/&gt;&#39;database &amp; index&#39;
+    participant G as GiST Index
+    participant H as Heap
+
+    Q-&gt;&gt;G: 搜索
+    G-&gt;&gt;G: DFS 遍历内部页面
+    loop 每个内部页面的 entry
+        G-&gt;&gt;G: Consistent(entry_sign, query)
+        G-&gt;&gt;G: signature AND 位运算
+        alt 签名匹配
+            G-&gt;&gt;G: push 子页面（可能有假阳性）
+        else 签名不匹配
+            G-&gt;&gt;G: skip（安全剪枝）
+        end
+    end
+    G-&gt;&gt;H: 叶页签名匹配 → 返回 TID (recheck=true)
+    H-&gt;&gt;H: 用真实 tsvector 重新检查
+    H-&gt;&gt;Q: 精确结果（假阳性已过滤）
+```bash
+
+### PickSplit：签名重叠最小化
+
+```c
+// tsvector_ops 的 PickSplit 启发式（简化）
+// 1. 计算所有条目的 Union 签名
+// 2. 尝试将条目分配到左右分区
+// 3. 对候选方案计算左右签名位重叠度
+// 4. 选重叠最小的方案
+// 目标：让未来搜索时 Consistent 可以更早排除一个分支</code></pre>
+            <hr />
+            <h2 id="七运维gist-vs-gin-的选择与常见坑">七、运维：GiST vs
+            GIN 的选择与常见坑</h2>
+            <h3 id="gist-vs-gin-对比">GiST vs GIN 对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 35%" />
+            <col style="width: 35%" />
+            <col style="width: 29%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>GiST</th>
+            <th>GIN</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>基本结构</td>
+            <td>平衡树（节点存储”区域”概括）</td>
+            <td>倒排索引（词 → 文档列表）</td>
+            </tr>
+            <tr>
+            <td>写性能</td>
+            <td>较高（树下降 + 签名更新，代价稳定）</td>
+            <td>较低（更新 posting tree/list，pending list
+            需要后台合并）</td>
+            </tr>
+            <tr>
+            <td>读性能</td>
+            <td>中等（签名匹配 + recheck 开销）</td>
+            <td>高（直接定位到含词的文档，无假阳性）</td>
+            </tr>
+            <tr>
+            <td>存储开销</td>
+            <td>较小（签名固定长度）</td>
+            <td>较大（posting list 随文档数增长）</td>
+            </tr>
+            <tr>
+            <td>KNN 支持</td>
+            <td>原生支持（距离排序）</td>
+            <td>不支持</td>
+            </tr>
+            <tr>
+            <td>数据分布敏感度</td>
+            <td>对分布敏感（分裂质量影响查询）</td>
+            <td>对键基数敏感（高基数列开销大）</td>
+            </tr>
+            <tr>
+            <td>更新友好性</td>
+            <td>好（索引内 update = delete + insert）</td>
+            <td>差（频繁更新导致 pending list 膨胀）</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="选择规则">选择规则</h3>
+            <p><strong>选 GiST 的场景：</strong></p>
+            <ul>
+            <li>几何/空间数据（<code>point</code>、<code>box</code>、<code>polygon</code>、<code>circle</code>）——GIN
+            不支持这些类型</li>
+            <li>需要 KNN
+            距离排序（<code>ORDER BY pos &lt;-&gt; point</code>）</li>
+            <li>写入频繁且数据量大——签名树 GiST 的更新代价低于 GIN</li>
+            <li>范围类型（<code>int4range</code>、<code>tsrange</code>）——范围重叠和包含</li>
+            <li>网络地址类型（<code>inet</code>、<code>cidr</code>）——子网包含和层级搜索</li>
+            </ul>
+            <p><strong>选 GIN 的场景：</strong></p>
+            <ul>
+            <li>全文搜索的读密集型工作负载——GIN 倒排索引读性能更好</li>
+            <li>数组包含（<code>_int4</code>、<code>_text</code> 的
+            <code>@&gt;</code>、<code>&amp;&amp;</code>）——GIN 的
+            posting list 天然适合</li>
+            <li>JSONB
+            查询（<code>jsonb @&gt; '{"key":"value"}'</code>）——GIN
+            是官方推荐</li>
+            <li>三元组相似度（<code>pg_trgm</code>、<code>LIKE '%pattern%'</code>）</li>
+            <li>数据读多写少</li>
+            </ul>
+            <h3 id="索引膨胀与-vacuum">索引膨胀与 VACUUM</h3>
+            <p>GiST 索引也会膨胀——UPDATE 和 DELETE 产生的死 tuple
+            在页面中累积。但与 B-Tree 不同：</p>
+            <ul>
+            <li><strong>GiST 不支持 HOT update</strong>：每次 UPDATE
+            都会在索引中标记旧条目为 dead
+            并插入新条目。更新频繁的表，GiST 索引膨胀速度可能比 B-Tree
+            快。</li>
+            <li><strong>页面回收</strong>：GiST 的 VACUUM
+            可以回收完全空的页面，但不会做页面内的碎片整理——“大部分 dead
+            但还有一个 live tuple”的页面无法回收。</li>
+            </ul>
+            <p>排查：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 GiST 索引大小</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_size_pretty(pg_relation_size(<span class="st">&#39;idx_gist_geom&#39;</span>)) <span class="kw">AS</span> index_size;</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看膨胀（需要 pgstattuple 扩展）</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pgstattuple;</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pgstatindex(<span class="st">&#39;idx_gist_geom&#39;</span>);</span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 关注 dead_tuple_percent，&gt;20% 值得关注</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 检查 autovacuum 是否跟得上</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, n_dead_tup, n_live_tup,</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>       last_autovacuum, last_autoanalyze</span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables <span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;your_table&#39;</span>;</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>### fillfactor</span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>GiST 支持 `fillfactor`。降低 fillfactor 可以减少页面分裂的频率，但会增加索引初始大小：</span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_gist_points <span class="kw">ON</span> points <span class="kw">USING</span> gist (geom) <span class="kw">WITH</span> (fillfactor <span class="op">=</span> <span class="dv">70</span>);</span></code></pre></div>
+            <h3 id="knn-查询的性能陷阱">KNN 查询的性能陷阱</h3>
+            <p>GiST 的距离排序查询在以下情况可能很慢：</p>
+            <ol type="1">
+            <li><p><strong>Bounding predicate
+            过于松散</strong>：数据分布极度不均匀时，PickSplit
+            可能产生一个大的 MBR 覆盖大部分数据。结果：KNN
+            搜索需要扫描大量”看似很近”的页面。</p></li>
+            <li><p><strong>LIMIT
+            太小但数据量大</strong>：如果优先搜索的分支中没有足够的结果，需要回溯大量分支。</p></li>
+            </ol>
+            <p>验证方法：</p>
+            <p><code>sql EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM points ORDER BY geom &lt;-&gt; '(0,0)'::point LIMIT 10; -- 如果 "Buffers: shared hit=..." 数字很大，说明扫描了大量页面</code>text</p>
+            <hr />
+            <h2 id="八关键要点">八、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>GiST
+            是索引框架，不是一种索引用法</strong>——它将页面管理、并发控制、WAL
+            恢复与搜索/分裂的语义分离。Consistent、Union、Penalty、PickSplit
+            六个接口定义了 opclass 需要实现的所有行为。</p></li>
+            <li><p><strong>搜索是深度优先 + Consistent
+            过滤</strong>——<code>gistgettuple()</code>
+            从根页出发，对每个内部条目的 bounding predicate 调
+            Consistent。命中 → 深入子树；未命中 → 剪枝跳过。KNN
+            用优先队列替代栈，保证最近的结果最先产出。</p></li>
+            <li><p><strong>插入用 Penalty 选路径，分裂用 PickSplit
+            决定分区</strong>——Penalty 最小化 bounding predicate
+            膨胀，PickSplit 以查询效率为目标（不是平衡大小）。Point_ops
+            最小化 MBR 面积，tsvector_ops 最小化签名重叠。</p></li>
+            <li><p><strong>Consistent 的 recheck
+            是有损索引的基础</strong>——签名树等概率性索引通过 recheck
+            处理假阳性。契约：允许 false positive，禁止 false
+            negative。</p></li>
+            <li><p><strong>point_ops</strong>：MBR 做 bounding
+            predicate，Penalty 是面积增量，PickSplit 是贪心空间聚类。KNN
+            利用 MBR 距离做搜索优先级排序。</p></li>
+            <li><p><strong>tsvector_ops</strong>：签名（定长
+            bitmap）做有损压缩——Union 是位或，Consistent
+            是位与。假阳性通过 recheck 消除，假阴性不可能。</p></li>
+            <li><p><strong>GiST 偏写，GIN 偏读</strong>——GiST
+            的树结构使更新代价更稳定，GIN
+            的倒排索引读性能更高但写代价大。需要 KNN 距离排序时只能选
+            GiST。</p></li>
+            </ol>
+            <p>上一章：<a href="../14-btree/14-btree.html">B-Tree
+            索引</a> 下一章：<a href="../16-gin/16-gin.html">GIN
+            索引</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/access/gist/gist.c</code>：GiST
+            索引构建（<code>gistbuild()</code>）、插入（<code>gistinsert()</code>）、页面分裂（<code>gistSplit()</code>）</li>
+            <li><code>src/backend/access/gist/gistget.c</code>：GiST
+            搜索——<code>gistgettuple()</code>、<code>gistgetbitmap()</code>、<code>gistnext()</code>、<code>gistScanPage()</code></li>
+            <li><code>src/backend/access/gist/gistutil.c</code>：辅助函数——<code>gistchoose()</code>（Penalty
+            选择）、<code>gistMakeUnion*()</code></li>
+            <li><code>src/backend/access/gist/gistsplit.c</code>：通用
+            PickSplit 实现</li>
+            <li><code>src/backend/access/gist/gistproc.c</code>：point_ops/box_ops
+            的 GiST
+            算子（Consistent/Union/Penalty/PickSplit/Compress）</li>
+            <li><code>src/backend/utils/adt/tsgistidx.c</code>：tsvector_ops
+            的 GiST 算子——签名压缩、签名匹配 Consistent、签名
+            PickSplit</li>
+            <li><code>src/include/access/gist.h</code>：GISTPageOpaqueData、GISTENTRY
+            结构体定义</li>
+            <li><code>src/include/access/gist_private.h</code>：GISTSTATE、GISTSearchStack、GISTInsertState
+            内部结构</li>
+            <li><code>src/backend/access/gist/gistxlog.c</code>：GiST 的
+            WAL 记录与恢复</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 64: GiST Indexes —
+            GiST 接口规范与内置 opclass</li>
+            <li>PostgreSQL Documentation, Section 11.8: GiST and GIN
+            Index Types — 索引用法对比</li>
+            <li>PostgreSQL Documentation, Chapter 12: Full Text Search —
+            全文搜索与 GiST/GIN</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Hellerstein, J. M., Naughton, J. F., &amp; Pfeffer, A.
+            <em>Generalized Search Trees for Database Systems.</em> VLDB
+            1995. — GiST 的原始论文，定义了
+            Consistent/Union/Penalty/PickSplit 接口及正确性条件。</li>
+            <li>Guttman, A. <em>R-Trees: A Dynamic Index Structure for
+            Spatial Searching.</em> SIGMOD 1984. — R-Tree
+            基础，point_ops 的 PickSplit 参考来源。</li>
+            <li>Beckmann, N. et al. <em>The R</em>-Tree: An Efficient
+            and Robust Access Method for Points and Rectangles.* SIGMOD
+            1990. — point_ops 分裂启发式的参考。</li>
+            </ul>
+            <h3 id="实验工具">实验工具</h3>
+            <ul>
+            <li><code>pageinspect</code>
+            扩展：<code>gist_page_items()</code> 和
+            <code>gist_page_opaque_info()</code> 观察 GiST 页面内部</li>
+            <li><code>EXPLAIN (ANALYZE, BUFFERS)</code>：查看 GiST
+            索引扫描的 buffer 访问量</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/14-btree/14-btree.html">【PG 内核】B-Tree 索引：页面分裂、rightlink 与去重</a></h3>
+                    <p>拆解 PostgreSQL B-Tree 索引的内核实现：BTPageOpaque 页面布局（high key / rightlink 的工程意义）、_bt_doinsert() 插入路径与 _bt_split() 页面分裂的完整流程（分裂点选择不是简单的 50/50）、PG 12+ 去重（deduplicate_items）的触发条件与 posting list 压缩策略、B-Tree WAL 记录类型与恢复，以及用 bt_page_items() 和 bt_metap() 观察索引内部结构的实验方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/16-gin/16-gin.html">【PG 内核】GIN 索引：倒排索引的内部机制与 Fast Update</a></h3>
+                    <p>拆解 PostgreSQL GIN 索引的内部结构：entry tree、posting list、posting tree 三者各在什么条件下使用；Fast Update 的 pending list 设计与 gin_clean_pending_list 合并时机；gingetbitmap() 的 bitmap AND/OR 多关键词搜索合并流程；全文搜索 tsvector 与数组 _int4 的 GIN 实现；以及 GIN 与 GiST 在写性能、读性能、存储开销上的三角权衡和具体场景下的选择建议。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

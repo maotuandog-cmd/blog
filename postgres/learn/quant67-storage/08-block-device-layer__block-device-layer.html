@@ -1,0 +1,1826 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】块设备层：bio、request 与 I/O 调度器 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="block-layer, bio, blk-mq, io-scheduler, bfq, mq-deadline, kyber, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/08-block-device-layer/block-device-layer.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】块设备层：bio、request 与 I/O 调度器" />
+    <meta property="og:description" content="文件系统把&quot;写这个文件&quot;翻译成&quot;写这些逻辑块&quot;，但逻辑块怎么变成磁盘控制器能执行的命令？中间那一层就是块设备层（Block Layer）。它做的事不复杂——把上层的 I/O 请求收集、合并、排序，然后交给设备驱动——但做得好不好，直接决定了存储栈的吞吐和延迟。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/08-block-device-layer/block-device-layer.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="block-layer" />
+    <meta property="article:tag" content="bio" />
+    <meta property="article:tag" content="blk-mq" />
+    <meta property="article:tag" content="io-scheduler" />
+    <meta property="article:tag" content="bfq" />
+    <meta property="article:tag" content="mq-deadline" />
+    <meta property="article:tag" content="kyber" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】块设备层：bio、request 与 I/O 调度器" />
+    <meta name="twitter:description" content="文件系统把&quot;写这个文件&quot;翻译成&quot;写这些逻辑块&quot;，但逻辑块怎么变成磁盘控制器能执行的命令？中间那一层就是块设备层（Block Layer）。它做的事不复杂——把上层的 I/O 请求收集、合并、排序，然后交给设备驱动——但做得好不好，直接决定了存储栈的吞吐和延迟。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】块设备层：bio、request 与 I/O 调度器", "description": "文件系统把\"写这个文件\"翻译成\"写这些逻辑块\"，但逻辑块怎么变成磁盘控制器能执行的命令？中间那一层就是块设备层（Block Layer）。它做的事不复杂——把上层的 I/O 请求收集、合并、排序，然后交给设备驱动——但做得好不好，直接决定了存储栈的吞吐和延迟。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/08-block-device-layer/block-device-layer.html"}, "datePublished": "2025-08-17T00:00:00+00:00", "dateModified": "2026-04-15T10:43:36+00:00", "keywords": ["block-layer", "bio", "blk-mq", "io-scheduler", "bfq", "mq-deadline", "kyber"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】块设备层：bio、request 与 I/O 调度器</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-17</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#block-layer</span> <span>#bio</span> <span>#blk-mq</span> <span>#io-scheduler</span> <span>#bfq</span> <span>#mq-deadline</span> <span>#kyber</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/07-linux-io-stack/linux-io-stack.html">上一篇：【存储工程】Linux I/O 栈全景：从 write() 到磁盘扇区</a><a class="post-series-nav__link" href="/post/storage/09-page-cache/page-cache.html">下一篇：【存储工程】Page Cache 深度解析</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/block-layer.html">#block-layer</a><a class="chip-link" href="/tags/bio.html">#bio</a><a class="chip-link" href="/tags/blk-mq.html">#blk-mq</a><a class="chip-link" href="/tags/io-scheduler.html">#io-scheduler</a><a class="chip-link" href="/tags/bfq.html">#bfq</a><a class="chip-link" href="/tags/mq-deadline.html">#mq-deadline</a><a class="chip-link" href="/tags/kyber-401276.html">#kyber</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一块设备层在-io-栈中的位置"
+                id="toc-一块设备层在-io-栈中的位置">一、块设备层在 I/O
+                栈中的位置</a>
+                <ul>
+                <li><a href="#io-栈全景" id="toc-io-栈全景">1.1 I/O
+                栈全景</a></li>
+                <li><a href="#块设备层的核心职责"
+                id="toc-块设备层的核心职责">1.2
+                块设备层的核心职责</a></li>
+                <li><a href="#从单队列到多队列"
+                id="toc-从单队列到多队列">1.3 从单队列到多队列</a></li>
+                </ul></li>
+                <li><a href="#二bio-结构体详解"
+                id="toc-二bio-结构体详解">二、bio 结构体详解</a>
+                <ul>
+                <li><a href="#bio块-io-的基本单元"
+                id="toc-bio块-io-的基本单元">2.1 bio：块 I/O
+                的基本单元</a></li>
+                <li><a href="#struct-bio-关键字段"
+                id="toc-struct-bio-关键字段">2.2 struct bio
+                关键字段</a></li>
+                <li><a href="#bio_vec散列-聚集描述"
+                id="toc-bio_vec散列-聚集描述">2.3
+                bio_vec：散列-聚集描述</a></li>
+                <li><a href="#bvec_iter跟踪-io-进度"
+                id="toc-bvec_iter跟踪-io-进度">2.4 bvec_iter：跟踪 I/O
+                进度</a></li>
+                <li><a href="#bio-生命周期" id="toc-bio-生命周期">2.5
+                bio 生命周期</a></li>
+                <li><a href="#bio-的操作类型"
+                id="toc-bio-的操作类型">2.6 bio 的操作类型</a></li>
+                </ul></li>
+                <li><a href="#三request-与请求合并"
+                id="toc-三request-与请求合并">三、Request 与请求合并</a>
+                <ul>
+                <li><a href="#从-bio-到-request"
+                id="toc-从-bio-到-request">3.1 从 bio 到
+                request</a></li>
+                <li><a href="#合并策略" id="toc-合并策略">3.2
+                合并策略</a></li>
+                <li><a href="#合并的限制" id="toc-合并的限制">3.3
+                合并的限制</a></li>
+                <li><a href="#plugging-机制批量提交"
+                id="toc-plugging-机制批量提交">3.4 Plugging
+                机制：批量提交</a></li>
+                <li><a href="#合并对性能的影响"
+                id="toc-合并对性能的影响">3.5 合并对性能的影响</a></li>
+                </ul></li>
+                <li><a href="#四blk-mq-多队列架构"
+                id="toc-四blk-mq-多队列架构">四、blk-mq 多队列架构</a>
+                <ul>
+                <li><a href="#为什么需要多队列"
+                id="toc-为什么需要多队列">4.1 为什么需要多队列</a></li>
+                <li><a href="#blk-mq-架构详解"
+                id="toc-blk-mq-架构详解">4.2 blk-mq 架构详解</a></li>
+                <li><a href="#标签机制" id="toc-标签机制">4.3
+                标签机制</a></li>
+                <li><a href="#cpu-亲和性与-numa-感知"
+                id="toc-cpu-亲和性与-numa-感知">4.4 CPU 亲和性与 NUMA
+                感知</a></li>
+                <li><a href="#blk-mq-sysfs-接口"
+                id="toc-blk-mq-sysfs-接口">4.5 blk-mq sysfs
+                接口</a></li>
+                </ul></li>
+                <li><a href="#五io-调度器深度解析"
+                id="toc-五io-调度器深度解析">五、I/O 调度器深度解析</a>
+                <ul>
+                <li><a href="#mq-deadline" id="toc-mq-deadline">5.1
+                mq-deadline</a></li>
+                <li><a href="#bfqbudget-fair-queueing"
+                id="toc-bfqbudget-fair-queueing">5.2 BFQ（Budget Fair
+                Queueing）</a></li>
+                <li><a href="#kyber" id="toc-kyber">5.3 kyber</a></li>
+                <li><a href="#nonenoop" id="toc-nonenoop">5.4
+                none（noop）</a></li>
+                </ul></li>
+                <li><a href="#六io-调度器选择与切换"
+                id="toc-六io-调度器选择与切换">六、I/O
+                调度器选择与切换</a>
+                <ul>
+                <li><a href="#查看当前调度器"
+                id="toc-查看当前调度器">6.1 查看当前调度器</a></li>
+                <li><a href="#运行时切换" id="toc-运行时切换">6.2
+                运行时切换</a></li>
+                <li><a href="#内核启动参数" id="toc-内核启动参数">6.3
+                内核启动参数</a></li>
+                <li><a href="#udev-规则自动选择"
+                id="toc-udev-规则自动选择">6.4 udev
+                规则自动选择</a></li>
+                <li><a href="#调度器性能对比"
+                id="toc-调度器性能对比">6.5 调度器性能对比</a></li>
+                </ul></li>
+                <li><a href="#七blktrace-实战"
+                id="toc-七blktrace-实战">七、blktrace 实战</a>
+                <ul>
+                <li><a href="#blktrace-简介" id="toc-blktrace-简介">7.1
+                blktrace 简介</a></li>
+                <li><a href="#基本用法" id="toc-基本用法">7.2
+                基本用法</a></li>
+                <li><a href="#事件类型" id="toc-事件类型">7.3
+                事件类型</a></li>
+                <li><a href="#分析合并效率" id="toc-分析合并效率">7.4
+                分析合并效率</a></li>
+                <li><a href="#分析队列深度" id="toc-分析队列深度">7.5
+                分析队列深度</a></li>
+                <li><a href="#实战诊断顺序写性能下降"
+                id="toc-实战诊断顺序写性能下降">7.6
+                实战：诊断顺序写性能下降</a></li>
+                </ul></li>
+                <li><a href="#八io-优先级与-cgroup-控制"
+                id="toc-八io-优先级与-cgroup-控制">八、I/O 优先级与
+                cgroup 控制</a>
+                <ul>
+                <li><a href="#ionice进程级-io-优先级"
+                id="toc-ionice进程级-io-优先级">8.1 ionice：进程级 I/O
+                优先级</a></li>
+                <li><a href="#cgroup-v1blkio-控制器"
+                id="toc-cgroup-v1blkio-控制器">8.2 cgroup v1：blkio
+                控制器</a></li>
+                <li><a href="#cgroup-v2io-控制器"
+                id="toc-cgroup-v2io-控制器">8.3 cgroup v2：io
+                控制器</a></li>
+                <li><a href="#实战隔离数据库与批处理任务"
+                id="toc-实战隔离数据库与批处理任务">8.4
+                实战：隔离数据库与批处理任务</a></li>
+                </ul></li>
+                <li><a href="#九块设备层调优"
+                id="toc-九块设备层调优">九、块设备层调优</a>
+                <ul>
+                <li><a href="#队列深度nr_requests"
+                id="toc-队列深度nr_requests">9.1
+                队列深度：nr_requests</a></li>
+                <li><a href="#预读read_ahead_kb"
+                id="toc-预读read_ahead_kb">9.2
+                预读：read_ahead_kb</a></li>
+                <li><a href="#最大请求大小max_sectors_kb"
+                id="toc-最大请求大小max_sectors_kb">9.3
+                最大请求大小：max_sectors_kb</a></li>
+                <li><a href="#rotational-标志"
+                id="toc-rotational-标志">9.4 rotational 标志</a></li>
+                <li><a href="#不同设备类型的推荐配置"
+                id="toc-不同设备类型的推荐配置">9.5
+                不同设备类型的推荐配置</a></li>
+                <li><a href="#诊断高-await-问题"
+                id="toc-诊断高-await-问题">9.6 诊断高 await
+                问题</a></li>
+                </ul></li>
+                <li><a href="#参考文献" id="toc-参考文献">参考文献</a>
+                <ul>
+                <li><a href="#内核源码"
+                id="toc-内核源码">内核源码</a></li>
+                <li><a href="#内核文档"
+                id="toc-内核文档">内核文档</a></li>
+                <li><a href="#论文与演讲"
+                id="toc-论文与演讲">论文与演讲</a></li>
+                <li><a href="#工具文档"
+                id="toc-工具文档">工具文档</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>文件系统把”写这个文件”翻译成”写这些逻辑块”，但逻辑块怎么变成磁盘控制器能执行的命令？中间那一层就是块设备层（Block
+            Layer）。它做的事不复杂——把上层的 I/O
+            请求收集、合并、排序，然后交给设备驱动——但做得好不好，直接决定了存储栈的吞吐和延迟。</p>
+            <p>从 Linux 2.6 到
+            5.0，块设备层经历了一次架构级重写：从单队列（Single
+            Queue）到多队列（Multi-Queue，即
+            blk-mq）。这次重写的驱动力很简单：NVMe
+            设备可以同时处理几十万个 I/O
+            请求，而旧的单队列架构在一把大锁上排队，成了整个 I/O
+            栈最大的瓶颈。</p>
+            <p>本文从块设备层在 I/O 栈中的位置讲起，逐层拆解
+            <code>bio</code> 结构体、请求合并机制、blk-mq
+            多队列架构、四种 I/O 调度器的设计与参数调优，最后落到
+            <code>blktrace</code> 实战分析和 cgroup I/O
+            控制。所有源码引用基于 Linux 6.1 内核，命令示例在 Ubuntu
+            22.04（内核 5.15+）上验证。</p>
+            <hr />
+            <h2 id="一块设备层在-io-栈中的位置">一、块设备层在 I/O
+            栈中的位置</h2>
+            <h3 id="io-栈全景">1.1 I/O 栈全景</h3>
+            <p>一次 <code>write()</code>
+            系统调用从用户空间到磁盘扇区，大致经过以下层次：</p>
+            <pre class="text"><code>用户空间
+  └─ write() 系统调用
+       └─ VFS（Virtual File System，虚拟文件系统）
+            └─ 具体文件系统（ext4 / XFS / Btrfs）
+                 └─ Page Cache（页缓存）
+                      └─ 块设备层（Block Layer）    ← 本文聚焦
+                           └─ 设备驱动（Device Driver）
+                                └─ 硬件控制器（HBA / NVMe Controller）
+                                     └─ 存储介质（HDD / SSD）</code></pre>
+            <p>块设备层的上游是文件系统和页缓存，下游是设备驱动。它的输入是
+            <code>bio</code>
+            结构体——描述”从哪些内存页读写哪些磁盘扇区”；输出是格式化好的请求（<code>request</code>），交给驱动的派发函数。</p>
+            <h3 id="块设备层的核心职责">1.2 块设备层的核心职责</h3>
+            <p>块设备层做四件事：</p>
+            <ol type="1">
+            <li><strong>I/O 提交</strong>：接收上层的
+            <code>bio</code>，找到对应的块设备和请求队列。</li>
+            <li><strong>I/O 合并</strong>：把相邻的 <code>bio</code>
+            合并成更大的 <code>request</code>，减少驱动交互次数。</li>
+            <li><strong>I/O 调度</strong>：对 <code>request</code>
+            排序和优先级控制，平衡吞吐和延迟。</li>
+            <li><strong>I/O
+            完成</strong>：驱动完成请求后，触发回调通知上层。</li>
+            </ol>
+            <h3 id="从单队列到多队列">1.3 从单队列到多队列</h3>
+            <p>Linux 2.6
+            时代的块设备层用一个请求队列（<code>request_queue</code>）管理所有
+            I/O。这个队列由一把自旋锁（<code>queue_lock</code>）保护，所有
+            CPU 提交 I/O 都要争这把锁。在 HDD
+            时代问题不大——设备本身就慢，锁竞争不是瓶颈。但 NVMe
+            设备出现后，设备处理 I/O
+            的速度远超内核排队的速度，单队列成了性能天花板。</p>
+            <p>Jens Axboe 在 2013 年提出了 blk-mq（Block
+            Multi-Queue）架构。核心思路：</p>
+            <ul>
+            <li>每个 CPU 一个软件暂存队列（Software Staging
+            Queue），消除提交路径上的锁竞争。</li>
+            <li>一个或多个硬件派发队列（Hardware Dispatch
+            Queue），直接映射到设备的硬件队列。</li>
+            <li>用标签（Tag）追踪每个请求，取代旧的请求编号机制。</li>
+            </ul>
+            <p>从 Linux 5.0
+            开始，旧的单队列代码被彻底删除，所有块设备都走 blk-mq
+            路径。</p>
+            <pre class="text"><code>单队列时代（Linux 2.6 ~ 4.x）：
+
+  CPU 0 ──┐
+  CPU 1 ──┤
+  CPU 2 ──┼── request_queue（一把锁）──── 设备驱动
+  CPU 3 ──┘
+
+多队列时代（Linux 5.0+）：
+
+  CPU 0 ── ctx[0] ──┐                    ┌── hw queue 0 ── 设备驱动
+  CPU 1 ── ctx[1] ──┤── I/O 调度器  ────┤
+  CPU 2 ── ctx[2] ──┤                    └── hw queue 1 ── 设备驱动
+  CPU 3 ── ctx[3] ──┘</code></pre>
+            <p>这个架构变化影响了后续所有的 I/O
+            调度器设计——新调度器必须能在多队列环境下工作。</p>
+            <hr />
+            <h2 id="二bio-结构体详解">二、bio 结构体详解</h2>
+            <h3 id="bio块-io-的基本单元">2.1 bio：块 I/O 的基本单元</h3>
+            <p><code>bio</code>（Block I/O）是内核块设备层的基本 I/O
+            描述单元。每个 <code>bio</code>
+            描述一段连续的磁盘区域和对应的内存页。当文件系统需要读写磁盘时，它构造一个或多个
+            <code>bio</code>，提交给块设备层。</p>
+            <p><code>bio</code>
+            不等于一次磁盘操作。一个大的文件写入可能拆成多个
+            <code>bio</code>，而多个相邻的 <code>bio</code>
+            又可能被合并成一个 <code>request</code>。</p>
+            <h3 id="struct-bio-关键字段">2.2 struct bio 关键字段</h3>
+            <p>以下代码摘自 Linux
+            6.1，<code>include/linux/bio.h</code>，经删减仅保留核心字段：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Linux 6.1, include/linux/bio.h（删减版） */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> bio <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio             <span class="op">*</span>bi_next<span class="op">;</span>      <span class="co">/* 链表指针，用于请求队列 */</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> block_device    <span class="op">*</span>bi_bdev<span class="op">;</span>      <span class="co">/* 目标块设备 */</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>            bi_opf<span class="op">;</span>       <span class="co">/* 操作类型 + 标志位 */</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">short</span>          bi_vcnt<span class="op">;</span>      <span class="co">/* bio_vec 数组中的有效条目数 */</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">short</span>          bi_max_vecs<span class="op">;</span>  <span class="co">/* bio_vec 数组的最大容量 */</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    atomic_t                __bi_cnt<span class="op">;</span>     <span class="co">/* 引用计数 */</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bvec_iter        bi_iter<span class="op">;</span>      <span class="co">/* I/O 进度迭代器 */</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    bio_end_io_t           <span class="op">*</span>bi_end_io<span class="op">;</span>    <span class="co">/* I/O 完成回调 */</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span>                   <span class="op">*</span>bi_private<span class="op">;</span>   <span class="co">/* 回调的私有数据 */</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">short</span>          bi_write_hint<span class="op">;</span> <span class="co">/* 写入生命周期提示 */</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio_vec         <span class="op">*</span>bi_io_vec<span class="op">;</span>    <span class="co">/* 指向 bio_vec 数组 */</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>几个关键字段的含义：</p>
+            <ul>
+            <li><code>bi_bdev</code>：指向目标块设备，内核通过它找到对应的请求队列。</li>
+            <li><code>bi_opf</code>：操作类型（读、写、丢弃、刷新等）和标志位的组合。低位是操作码，高位是标志（如
+            <code>REQ_SYNC</code>、<code>REQ_META</code>）。</li>
+            <li><code>bi_io_vec</code>：指向一个 <code>bio_vec</code>
+            数组，描述这次 I/O 涉及的内存页。</li>
+            <li><code>bi_iter</code>：迭代器，跟踪当前 I/O
+            进度——已经处理到哪个扇区、哪个 <code>bio_vec</code>。</li>
+            <li><code>bi_end_io</code>：I/O
+            完成后的回调函数，负责通知上层（如页缓存的
+            <code>end_bio_bh_io_sync</code>）。</li>
+            </ul>
+            <h3 id="bio_vec散列-聚集描述">2.3
+            bio_vec：散列-聚集描述</h3>
+            <p><code>bio_vec</code>（Bio Vector）是 <code>bio</code>
+            的内存描述单元，每个 <code>bio_vec</code>
+            指向一个内存页的一个连续区间：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Linux 6.1, include/linux/bvec.h */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> bio_vec <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> page  <span class="op">*</span>bv_page<span class="op">;</span>    <span class="co">/* 内存页指针 */</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>  bv_len<span class="op">;</span>     <span class="co">/* 这段数据的长度（字节） */</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>  bv_offset<span class="op">;</span>  <span class="co">/* 在页内的起始偏移 */</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>这三个字段组合起来就是”页 + 偏移 +
+            长度”，描述了内存中一段连续的数据缓冲区。多个
+            <code>bio_vec</code>
+            组成散列-聚集（Scatter-Gather）列表，允许一次 I/O
+            操作涉及多个不连续的内存页。</p>
+            <p>例如，一个 16KB 的写入可能由 4 个 <code>bio_vec</code>
+            组成，每个指向一个 4KB 的页面：</p>
+            <pre class="text"><code>bio
+ └─ bi_io_vec[]
+      [0] page=0xffff8800, offset=0,    len=4096
+      [1] page=0xffff8810, offset=0,    len=4096
+      [2] page=0xffff8820, offset=0,    len=4096
+      [3] page=0xffff8830, offset=0,    len=4096
+
+总大小 = 4 × 4096 = 16384 字节（16KB）
+磁盘区域 = bi_iter.bi_sector 开始的连续 32 个扇区</code></pre>
+            <h3 id="bvec_iter跟踪-io-进度">2.4 bvec_iter：跟踪 I/O
+            进度</h3>
+            <p><code>bvec_iter</code>（Bio Vec Iterator）是 bio
+            内部的进度追踪器：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Linux 6.1, include/linux/bvec.h */</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> bvec_iter <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    sector_t         bi_sector<span class="op">;</span>   <span class="co">/* 当前 I/O 的起始扇区号 */</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>     bi_size<span class="op">;</span>     <span class="co">/* 剩余字节数 */</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>     bi_idx<span class="op">;</span>      <span class="co">/* 当前 bio_vec 索引 */</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>     bi_bvec_done<span class="op">;</span> <span class="co">/* 当前 bio_vec 已完成的字节数 */</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>为什么需要迭代器？因为一个 <code>bio</code>
+            可能被拆分（split）。当 <code>bio</code>
+            跨越了设备的最大请求大小时，块设备层会用
+            <code>bio_split()</code> 把它拆成两个
+            <code>bio</code>，共享同一个 <code>bio_vec</code>
+            数组，但各自有独立的
+            <code>bvec_iter</code>。这样拆分操作不需要复制内存页的指针。</p>
+            <h3 id="bio-生命周期">2.5 bio 生命周期</h3>
+            <p>一个 <code>bio</code> 从创建到释放，经历以下阶段：</p>
+            <pre class="text"><code>1. 分配：bio_alloc() 或 bio_alloc_bioset()
+     └─ 从 bio 内存池分配，避免在 I/O 路径上触发内存回收的死锁
+2. 填充：设置 bi_bdev、bi_opf，用 bio_add_page() 添加内存页
+     └─ bio_add_page() 检查是否超过设备的 max_segments 限制
+3. 提交：submit_bio()
+     └─ 进入块设备层的合并和调度流程
+4. 派发：被合并进 request，或单独作为 request 派发给驱动
+     └─ 驱动通过 DMA 把数据搬到磁盘（或从磁盘搬到内存）
+5. 完成：驱动调用 bio_endio()
+     └─ 触发 bi_end_io 回调
+6. 释放：bio_put() 递减引用计数，计数归零时释放</code></pre>
+            <h3 id="bio-的操作类型">2.6 bio 的操作类型</h3>
+            <p><code>bi_opf</code>
+            字段由操作码和标志位组合而成。常见的操作码定义在
+            <code>include/linux/blk_types.h</code>：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Linux 6.1, include/linux/blk_types.h（部分） */</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">enum</span> req_op <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    REQ_OP_READ     <span class="op">=</span> <span class="dv">0</span><span class="op">,</span>    <span class="co">/* 读操作 */</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    REQ_OP_WRITE    <span class="op">=</span> <span class="dv">1</span><span class="op">,</span>    <span class="co">/* 写操作 */</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    REQ_OP_FLUSH    <span class="op">=</span> <span class="dv">2</span><span class="op">,</span>    <span class="co">/* 刷新设备写缓存 */</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    REQ_OP_DISCARD  <span class="op">=</span> <span class="dv">3</span><span class="op">,</span>    <span class="co">/* 通知设备某些块不再使用（TRIM） */</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    REQ_OP_WRITE_ZEROES <span class="op">=</span> <span class="dv">9</span><span class="op">,</span> <span class="co">/* 将指定范围写零 */</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>标志位用于修饰操作的行为：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>标志</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>REQ_SYNC</code></td>
+            <td>同步 I/O，提交者希望尽快完成</td>
+            </tr>
+            <tr>
+            <td><code>REQ_META</code></td>
+            <td>元数据 I/O（如 inode、日志块）</td>
+            </tr>
+            <tr>
+            <td><code>REQ_PRIO</code></td>
+            <td>高优先级 I/O</td>
+            </tr>
+            <tr>
+            <td><code>REQ_FUA</code></td>
+            <td>强制写穿（Force Unit Access），跳过设备写缓存</td>
+            </tr>
+            <tr>
+            <td><code>REQ_PREFLUSH</code></td>
+            <td>先刷缓存再执行本次写入</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这些标志会影响 I/O
+            调度器的处理方式。例如，<code>REQ_SYNC</code> 的请求在
+            mq-deadline
+            调度器中会走读队列的逻辑（即使它是写操作），以获得更短的截止时间。</p>
+            <hr />
+            <h2 id="三request-与请求合并">三、Request 与请求合并</h2>
+            <h3 id="从-bio-到-request">3.1 从 bio 到 request</h3>
+            <p><code>bio</code> 进入块设备层后，第一步是尝试合并到已有的
+            <code>request</code> 中。如果无法合并，就创建一个新的
+            <code>request</code>。</p>
+            <p><code>request</code> 是块设备层面向驱动的 I/O 单元。一个
+            <code>request</code> 可以包含多个 <code>bio</code>，这些
+            <code>bio</code>
+            描述的磁盘区域必须连续。<code>request</code>
+            结构体的关键字段：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Linux 6.1, include/linux/blk-mq.h（删减版） */</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> request <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> request_queue   <span class="op">*</span>q<span class="op">;</span>           <span class="co">/* 所属请求队列 */</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_mq_ctx      <span class="op">*</span>mq_ctx<span class="op">;</span>     <span class="co">/* 所属的软件队列上下文 */</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_mq_hw_ctx   <span class="op">*</span>mq_hctx<span class="op">;</span>    <span class="co">/* 目标硬件队列 */</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>            cmd_flags<span class="op">;</span>   <span class="co">/* 操作类型和标志 */</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    sector_t                __sector<span class="op">;</span>    <span class="co">/* 起始扇区 */</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span>            __data_len<span class="op">;</span>  <span class="co">/* 数据总长度 */</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>                     tag<span class="op">;</span>         <span class="co">/* blk-mq 标签 */</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio             <span class="op">*</span>bio<span class="op">;</span>         <span class="co">/* 第一个 bio */</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> bio             <span class="op">*</span>biotail<span class="op">;</span>     <span class="co">/* 最后一个 bio */</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> list_head        queuelist<span class="op">;</span>   <span class="co">/* 队列链表节点 */</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p><code>bio</code> 和 <code>biotail</code> 指向
+            <code>bio</code> 链表的头尾。当多个 <code>bio</code>
+            被合并进同一个 <code>request</code> 时，它们通过
+            <code>bi_next</code> 串成链表。</p>
+            <h3 id="合并策略">3.2 合并策略</h3>
+            <p>块设备层支持三种合并模式：</p>
+            <p><strong>后向合并（Back Merge）</strong>：新
+            <code>bio</code> 的起始扇区紧跟在已有 <code>request</code>
+            的末尾扇区之后。这是最常见的合并类型——顺序写入天然产生后向合并。</p>
+            <pre class="text"><code>已有 request: 扇区 [100, 200)
+新 bio:       扇区 [200, 250)
+合并结果:     扇区 [100, 250)    ← 后向合并</code></pre>
+            <p><strong>前向合并（Front Merge）</strong>：新
+            <code>bio</code> 的末尾扇区紧接在已有 <code>request</code>
+            的起始扇区之前。相对少见，但文件系统的预读（Read-Ahead）有时会产生这种模式。</p>
+            <pre class="text"><code>已有 request: 扇区 [200, 300)
+新 bio:       扇区 [150, 200)
+合并结果:     扇区 [150, 300)    ← 前向合并</code></pre>
+            <p><strong>不合并（No Merge）</strong>：新 <code>bio</code>
+            和任何已有 <code>request</code>
+            都不相邻，或者超过了设备的最大请求大小（<code>max_sectors_kb</code>），创建新
+            <code>request</code>。</p>
+            <p>合并的查找过程使用每个请求队列维护的哈希表（<code>elevator_hash</code>），以扇区号为键，快速判断是否存在可合并的
+            <code>request</code>。</p>
+            <h3 id="合并的限制">3.3 合并的限制</h3>
+            <p>不是所有相邻的 <code>bio</code>
+            都能合并。以下情况会阻止合并：</p>
+            <ul>
+            <li>合并后的请求超过 <code>max_sectors_kb</code>（默认通常为
+            512KB 或 1280KB）。</li>
+            <li>合并后的散列-聚集段数超过
+            <code>max_segments</code>（每个请求最多包含多少个不连续内存段）。</li>
+            <li>两个 <code>bio</code>
+            的操作类型不同（如一个读一个写）。</li>
+            <li>设备或调度器禁用了合并（<code>nomerges</code>
+            标志）。</li>
+            </ul>
+            <p>可以通过 sysfs 查看和调整这些参数：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看最大请求大小</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/max_sectors_kb</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看最大散列-聚集段数</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/max_segments</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看合并策略（0=全部合并，1=不尝试合并，2=不尝试前向合并）</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/nomerges</span></code></pre></div>
+            <h3 id="plugging-机制批量提交">3.4 Plugging
+            机制：批量提交</h3>
+            <p>如果每个 <code>bio</code>
+            到达时都立即尝试合并和派发，效率很低——因为上层往往会在短时间内连续提交多个
+            <code>bio</code>。Plugging（插塞）机制解决这个问题：先把
+            <code>bio</code> 攒在每个 CPU
+            的本地列表中，等攒够了再一次性提交给调度器。</p>
+            <p>工作流程：</p>
+            <pre class="text"><code>1. 线程调用 blk_start_plug()，在当前线程的 task_struct 中分配 plug 列表
+2. 后续的 submit_bio() 不直接进入调度器，而是挂到 plug 列表
+3. 当以下任一条件满足时，触发 unplug：
+   - 线程调用 blk_finish_plug()
+   - plug 列表达到 BLK_MAX_REQUEST_COUNT（默认 32）
+   - 线程在 I/O 上等待（调用 io_schedule()）
+4. unplug 时，plug 列表中的 bio 被排序、合并、一次性提交给调度器</code></pre>
+            <p>这个机制对顺序 I/O 的效果非常明显。以 <code>dd</code>
+            写入为例：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 写入 1GB 数据（bs=4k），观察合并效果</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/mnt/test bs=4k count=262144 oflag=direct <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看合并统计</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/stat</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 字段含义（按顺序）：</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="co"># read_ios read_merges read_sectors read_ticks</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="co"># write_ios write_merges write_sectors write_ticks</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="co"># in_flight io_ticks time_in_queue</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="co"># discard_ios discard_merges discard_sectors discard_ticks</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="co"># flush_ios flush_ticks</span></span></code></pre></div>
+            <p><code>write_merges</code>
+            字段就是后向/前向合并的次数。如果顺序写入没有发生合并，说明
+            plug 列表没有正常工作，或者 <code>nomerges</code>
+            被设置了。</p>
+            <h3 id="合并对性能的影响">3.5 合并对性能的影响</h3>
+            <p>合并的好处很直观：减少驱动需要处理的请求数。一次 DMA 传输
+            256KB 比 64 次传输 4KB 高效得多——减少了中断次数、DMA
+            映射开销和驱动的请求处理开销。</p>
+            <p>但合并也有代价：</p>
+            <ul>
+            <li>增加了 I/O 的延迟——bio 要在 plug
+            列表中等待合并机会。</li>
+            <li>对于 NVMe
+            设备，合并的收益递减——设备本身有很深的内部队列，可以高效处理大量小请求。</li>
+            </ul>
+            <p>实际测试中的经验判断：HDD 场景下合并通常带来 2~5
+            倍的吞吐提升，NVMe 场景下合并的收益通常不到 10%。如果你的
+            NVMe 工作负载以小 I/O 为主，可以考虑禁用合并来降低延迟：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用合并（适用于低延迟 NVMe 场景）</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/nomerges</span></code></pre></div>
+            <hr />
+            <h2 id="四blk-mq-多队列架构">四、blk-mq 多队列架构</h2>
+            <h3 id="为什么需要多队列">4.1 为什么需要多队列</h3>
+            <p>单队列架构的瓶颈在 Linux 3.x 时代已经暴露：</p>
+            <ul>
+            <li><strong>锁竞争</strong>：所有 CPU 提交 I/O 都要获取
+            <code>request_queue-&gt;queue_lock</code>。在 32
+            核以上的服务器上，这把锁的争用会消耗大量 CPU 时间。</li>
+            <li><strong>缓存行抖动</strong>：多个 CPU
+            频繁修改同一个队列的元数据，导致缓存一致性协议（MESI）产生大量无效化消息。</li>
+            <li><strong>NUMA
+            不友好</strong>：请求队列通常分配在一个节点上，远端节点的
+            CPU 每次访问都要走内存互联。</li>
+            <li><strong>无法匹配硬件并行度</strong>：NVMe 设备有 64
+            个以上的硬件队列，但内核只用一个队列喂数据。</li>
+            </ul>
+            <p>在 IOPS 敏感的场景下（如数据库的随机 4KB
+            读写），单队列架构可能把 NVMe 设备的实际性能限制在其能力的
+            30% 以下。</p>
+            <h3 id="blk-mq-架构详解">4.2 blk-mq 架构详解</h3>
+            <p>blk-mq 的核心数据结构有三个：</p>
+            <p><strong>软件暂存队列（<code>blk_mq_ctx</code>）</strong>：每个
+            CPU 一个。<code>bio</code> 先进入本 CPU 的软件队列，不需要跨
+            CPU 加锁。</p>
+            <p><strong>硬件派发队列（<code>blk_mq_hw_ctx</code>）</strong>：映射到设备的硬件队列。一个设备可以有多个硬件派发队列。典型配置：NVMe
+            设备为每个 CPU 创建一个硬件队列；HDD/SATA SSD
+            通常只有一个硬件队列。</p>
+            <p><strong>标签集（<code>blk_mq_tag_set</code>）</strong>：为每个硬件队列管理请求标签。标签是一个整数，用于在请求完成时快速定位对应的
+            <code>request</code> 结构体。</p>
+            <p>数据流：</p>
+            <pre class="text"><code>submit_bio()
+  │
+  ├─ 获取当前 CPU 的 blk_mq_ctx
+  │
+  ├─ 尝试在 plug list 中合并
+  │    ├─ 成功 → 合并到已有 request
+  │    └─ 失败 → 分配新 request（获取 tag）
+  │
+  ├─ request 进入 I/O 调度器（如果有的话）
+  │    ├─ 调度器决定何时派发
+  │    └─ 可能重新排序请求
+  │
+  └─ 派发到 blk_mq_hw_ctx
+       │
+       └─ 调用驱动的 queue_rq() 函数
+            └─ 驱动把请求写入设备的提交队列（如 NVMe SQ）</code></pre>
+            <h3 id="标签机制">4.3 标签机制</h3>
+            <p>标签（Tag）是 blk-mq
+            的核心创新之一。每个正在处理的请求都分配一个唯一的整数标签，范围是
+            <code>[0, queue_depth)</code>。</p>
+            <p>标签的作用：</p>
+            <ul>
+            <li><strong>快速查找</strong>：设备完成一个 I/O
+            后，返回标签号。内核通过标签号直接索引到
+            <code>request</code> 结构体，不需要遍历队列。</li>
+            <li><strong>流控</strong>：标签的总数等于队列深度。当标签用完时，新请求会等待，自动实现了背压（Backpressure）。</li>
+            <li><strong>无锁分配</strong>：标签使用位图（<code>sbitmap</code>）管理，支持每
+            CPU 缓存，减少跨 CPU 竞争。</li>
+            </ul>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 NVMe 设备的队列深度（标签总数）</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/queue/nr_requests</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看硬件队列数量</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/block/nvme0n1/mq/</span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：0  1  2  3  4  5  6  7（8 个硬件队列）</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看每个硬件队列的状态</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/mq/0/nr_reserved_tags</span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/mq/0/nr_tags</span></code></pre></div>
+            <h3 id="cpu-亲和性与-numa-感知">4.4 CPU 亲和性与 NUMA
+            感知</h3>
+            <p>blk-mq 的队列映射通过 <code>blk_mq_map_queues()</code>
+            实现，支持三种映射策略：</p>
+            <ul>
+            <li><strong>默认映射</strong>：每个 CPU
+            映射到一个硬件队列。如果硬件队列数小于 CPU 数，多个 CPU
+            共享一个硬件队列。</li>
+            <li><strong>NUMA 感知映射</strong>：优先把同一 NUMA 节点的
+            CPU 映射到同一个硬件队列，减少跨节点内存访问。</li>
+            <li><strong>管理队列映射</strong>：为管理命令（如 NVMe admin
+            命令）分配专用队列。</li>
+            </ul>
+            <p>NVMe 驱动默认每个 CPU 分配一个 I/O
+            队列（如果设备支持足够多的队列）。这意味着每个 CPU
+            有自己独立的提交队列和完成队列，从提交到完成全程无锁。</p>
+            <p>查看 CPU 到队列的映射：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 CPU 亲和性</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> /sys/block/nvme0n1/mq/<span class="pp">*</span>/cpu_list<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">dirname</span> <span class="va">$i</span> <span class="kw">|</span> <span class="fu">xargs</span> basename<span class="va">)</span><span class="st">: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$i)</span><span class="st">&quot;</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 0: 0</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 1: 1</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 2: 2</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 3: 3</span></span></code></pre></div>
+            <h3 id="blk-mq-sysfs-接口">4.5 blk-mq sysfs 接口</h3>
+            <p>blk-mq 在 sysfs 中暴露了丰富的调试信息：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 队列级别参数</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">/sys/block/</span><span class="op">&lt;</span>dev<span class="op">&gt;</span>/queue/</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> nr_requests          <span class="co"># 队列深度</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> scheduler            <span class="co"># 当前 I/O 调度器</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> nomerges             <span class="co"># 合并策略</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> max_sectors_kb       <span class="co"># 单个请求最大大小</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> read_ahead_kb        <span class="co"># 预读大小</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> rotational           <span class="co"># 是否旋转设备（0=SSD，1=HDD）</span></span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> io_poll              <span class="co"># 是否启用轮询</span></span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a><span class="ex">└──</span> write_cache          <span class="co"># 写缓存状态</span></span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 多队列级别信息</span></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a><span class="ex">/sys/block/</span><span class="op">&lt;</span>dev<span class="op">&gt;</span>/mq/</span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> 0/</span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a><span class="ex">│</span>   ├── nr_tags          <span class="co"># 该队列的标签总数</span></span>
+<span id="cb19-16"><a href="#cb19-16" aria-hidden="true" tabindex="-1"></a><span class="ex">│</span>   ├── nr_reserved_tags <span class="co"># 预留标签数</span></span>
+<span id="cb19-17"><a href="#cb19-17" aria-hidden="true" tabindex="-1"></a><span class="ex">│</span>   ├── cpu_list         <span class="co"># 映射到该队列的 CPU 列表</span></span>
+<span id="cb19-18"><a href="#cb19-18" aria-hidden="true" tabindex="-1"></a><span class="ex">│</span>   └── dispatched       <span class="co"># 派发统计</span></span>
+<span id="cb19-19"><a href="#cb19-19" aria-hidden="true" tabindex="-1"></a><span class="ex">├──</span> 1/</span>
+<span id="cb19-20"><a href="#cb19-20" aria-hidden="true" tabindex="-1"></a><span class="ex">│</span>   └── ...</span>
+<span id="cb19-21"><a href="#cb19-21" aria-hidden="true" tabindex="-1"></a><span class="ex">└──</span> ...</span></code></pre></div>
+            <hr />
+            <h2 id="五io-调度器深度解析">五、I/O 调度器深度解析</h2>
+            <p>Linux 5.0+ 的 blk-mq 架构支持四种 I/O 调度器（I/O
+            Scheduler）：<code>mq-deadline</code>、<code>bfq</code>、<code>kyber</code>
+            和
+            <code>none</code>。调度器位于软件队列和硬件派发队列之间，决定请求的派发顺序。</p>
+            <p>不同调度器的设计目标不同：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>调度器</th>
+            <th>设计目标</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>mq-deadline</code></td>
+            <td>保证延迟上界</td>
+            <td>HDD、混合负载</td>
+            </tr>
+            <tr>
+            <td><code>bfq</code></td>
+            <td>公平带宽分配</td>
+            <td>桌面、cgroup 隔离</td>
+            </tr>
+            <tr>
+            <td><code>kyber</code></td>
+            <td>延迟目标驱动</td>
+            <td>NVMe、快速设备</td>
+            </tr>
+            <tr>
+            <td><code>none</code></td>
+            <td>最小开销</td>
+            <td>NVMe 内部调度</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="mq-deadline">5.1 mq-deadline</h3>
+            <p><code>mq-deadline</code> 是 <code>deadline</code>
+            调度器的多队列版本，代码位于
+            <code>block/mq-deadline.c</code>。它的核心思路：在优化吞吐的同时，保证每个请求在截止时间前被服务。</p>
+            <h4 id="数据结构">数据结构</h4>
+            <p><code>mq-deadline</code> 维护四个队列：</p>
+            <pre class="text"><code>读排序队列（rb_tree）    写排序队列（rb_tree）
+      ↕                        ↕
+读 FIFO 队列（list）     写 FIFO 队列（list）</code></pre>
+            <ul>
+            <li><strong>排序队列</strong>：按扇区号排序的红黑树。从排序队列派发请求可以减少磁头移动距离（对
+            HDD 有意义）。</li>
+            <li><strong>FIFO
+            队列</strong>：按到达时间排序的链表。当请求在 FIFO
+            队列中等待超过截止时间，调度器切换到 FIFO
+            模式派发，防止饿死。</li>
+            </ul>
+            <h4 id="关键参数">关键参数</h4>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 mq-deadline 参数</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/block/sda/queue/iosched/</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出：fifo_batch  front_merges  read_expire  write_expire  writes_starved</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 各参数含义和默认值：</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/read_expire</span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 500（毫秒）—— 读请求的截止时间</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/write_expire</span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 5000（毫秒）—— 写请求的截止时间</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/writes_starved</span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 2 —— 连续服务多少批读请求后，必须服务一批写请求</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/fifo_batch</span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 16 —— 从 FIFO 切换到排序模式前，连续派发多少个 FIFO 请求</span></span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/front_merges</span>
+<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 1 —— 是否允许前向合并（0=禁用，1=启用）</span></span></code></pre></div>
+            <h4 id="派发逻辑">派发逻辑</h4>
+            <p>调度器每次选择下一个要派发的请求时，按以下优先级决策：</p>
+            <ol type="1">
+            <li>检查读 FIFO 队列，是否有请求超过
+            <code>read_expire</code>（500ms）。如果有，立即派发——读延迟敏感。</li>
+            <li>检查写 FIFO 队列，是否有请求超过
+            <code>write_expire</code>（5000ms）。如果有，派发写请求。</li>
+            <li>如果没有超时请求，看 <code>writes_starved</code>
+            计数器。如果已经连续服务了 <code>writes_starved</code>
+            批读请求而没有服务写请求，切换到写队列。</li>
+            <li>从排序队列按扇区顺序派发，这样磁头做单向扫描，类似电梯算法（Elevator
+            Algorithm）。</li>
+            </ol>
+            <p>读优先的设计基于一个观察：读操作通常是同步的——应用程序在等读结果返回，而写操作通常是异步的——写入页缓存后应用程序就继续执行了。所以读延迟直接影响应用响应时间，写延迟的容忍度更高。</p>
+            <h4 id="适用场景">适用场景</h4>
+            <p><code>mq-deadline</code> 适合以下场景：</p>
+            <ul>
+            <li>HDD 设备：排序派发减少寻道时间，截止时间防止饿死。</li>
+            <li>混合读写负载：读优先策略保护交互式应用的响应时间。</li>
+            <li>数据库服务器：<code>read_expire</code>
+            保证读延迟上界。</li>
+            </ul>
+            <p>对于 NVMe 设备，<code>mq-deadline</code>
+            的排序逻辑没有意义（NVMe
+            没有磁头移动），但截止时间机制仍然有用——可以防止在高写入压力下读延迟飙升。</p>
+            <h3 id="bfqbudget-fair-queueing">5.2 BFQ（Budget Fair
+            Queueing）</h3>
+            <p>BFQ（预算公平排队）调度器的设计目标是公平带宽分配和低延迟保证，代码位于
+            <code>block/bfq-iosched.c</code>。它基于 WF²Q+（Worst-case
+            Fair Weighted Fair Queueing Plus）算法，为每个进程（或
+            cgroup）分配独立的 I/O 队列和预算。</p>
+            <h4 id="核心概念">核心概念</h4>
+            <p><strong>每进程队列</strong>：BFQ 为每个提交 I/O
+            的进程创建一个独立的内部队列（<code>bfq_queue</code>）。调度器在这些队列之间轮转服务。</p>
+            <p><strong>预算（Budget）</strong>：每个进程队列每次被服务时，获得一个预算——以扇区数衡量。进程队列可以持续派发请求，直到预算耗尽或没有更多请求。预算大小根据进程的
+            I/O 模式动态调整：顺序 I/O
+            获得更大预算（因为顺序访问效率高），随机 I/O
+            获得较小预算。</p>
+            <p><strong>权重（Weight）</strong>：每个进程队列有一个权重值（默认
+            100），权重越大，分配的带宽越多。权重可以通过 cgroup 的
+            <code>io.weight</code> 参数设置。</p>
+            <h4 id="低延迟启发式">低延迟启发式</h4>
+            <p>BFQ
+            有一套启发式机制来识别交互式应用（如文件浏览器、桌面应用）并给予低延迟优待：</p>
+            <ul>
+            <li>如果一个进程在短时间内只提交了少量 I/O（“短突发”），BFQ
+            判断它可能是交互式应用，给予更高的调度优先级。</li>
+            <li>如果一个进程长时间持续提交大量 I/O（“长流”），BFQ
+            判断它是后台任务，正常按权重分配。</li>
+            </ul>
+            <p>这个启发式在桌面场景下效果显著：即使后台在大量拷贝文件，文件管理器打开目录仍然很快。</p>
+            <h4 id="关键参数-1">关键参数</h4>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 BFQ 参数</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/block/sda/queue/iosched/</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 部分输出：</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="co"># back_seek_max        back_seek_penalty</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="co"># fifo_expire_async    fifo_expire_sync</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a><span class="co"># low_latency          max_budget</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="co"># slice_idle           slice_idle_us</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a><span class="co"># strict_guarantees    timeout_sync</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 关键参数含义：</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-12"><a href="#cb22-12" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/slice_idle</span>
+<span id="cb22-13"><a href="#cb22-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 8（毫秒）—— 进程队列空闲等待时间</span></span>
+<span id="cb22-14"><a href="#cb22-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 当一个进程队列暂时没有请求时，BFQ 等待这么久再切换到下一个队列</span></span>
+<span id="cb22-15"><a href="#cb22-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 目的：给顺序 I/O 一个机会继续提交后续请求</span></span>
+<span id="cb22-16"><a href="#cb22-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-17"><a href="#cb22-17" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/low_latency</span>
+<span id="cb22-18"><a href="#cb22-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 1 —— 是否启用低延迟启发式（0=禁用，1=启用）</span></span>
+<span id="cb22-19"><a href="#cb22-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-20"><a href="#cb22-20" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/strict_guarantees</span>
+<span id="cb22-21"><a href="#cb22-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 0 —— 是否严格保证权重比例</span></span>
+<span id="cb22-22"><a href="#cb22-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 设为 1 时，BFQ 会更严格地按权重分配带宽，但可能降低总吞吐</span></span>
+<span id="cb22-23"><a href="#cb22-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-24"><a href="#cb22-24" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/fifo_expire_sync</span>
+<span id="cb22-25"><a href="#cb22-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 125（毫秒）—— 同步请求（通常是读）的截止时间</span></span>
+<span id="cb22-26"><a href="#cb22-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-27"><a href="#cb22-27" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/iosched/fifo_expire_async</span>
+<span id="cb22-28"><a href="#cb22-28" aria-hidden="true" tabindex="-1"></a><span class="co"># 250（毫秒）—— 异步请求（通常是写）的截止时间</span></span></code></pre></div>
+            <h4 id="适用场景-1">适用场景</h4>
+            <p>BFQ 适合以下场景：</p>
+            <ul>
+            <li><strong>桌面系统</strong>：低延迟启发式保证交互式应用的响应速度。</li>
+            <li><strong>cgroup I/O
+            隔离</strong>：多租户环境中按权重分配带宽。</li>
+            <li><strong>混合负载</strong>：后台批量 I/O 不影响前台交互式
+            I/O。</li>
+            </ul>
+            <p>BFQ 的代价是 CPU 开销较高——每进程队列的管理和 WF²Q+
+            算法的虚拟时间计算都不便宜。在高 IOPS 场景（如 NVMe 随机 4KB
+            读写）下，BFQ 自身的 CPU 消耗可能成为瓶颈。</p>
+            <h3 id="kyber">5.3 kyber</h3>
+            <p>kyber 调度器采用延迟目标驱动的设计，代码位于
+            <code>block/kyber-iosched.c</code>。它不排序请求、不按进程分配队列，而是通过控制并发请求数来达成延迟目标。</p>
+            <h4 id="设计原理">设计原理</h4>
+            <p>kyber 把 I/O
+            分成两个优先级域（Domain）：读域和写域。每个域有独立的令牌（Token）池。调度器监控每个域的完成延迟，如果延迟超过目标值，就减少该域的令牌数（降低并发），反之增加令牌数。</p>
+            <pre class="text"><code>请求到达
+  │
+  ├─ 是读请求 → 申请读令牌
+  │    ├─ 有令牌 → 派发
+  │    └─ 无令牌 → 等待
+  │
+  └─ 是写请求 → 申请写令牌
+       ├─ 有令牌 → 派发
+       └─ 无令牌 → 等待
+
+令牌数量动态调整：
+  if 实际延迟 &gt; 目标延迟:
+      减少令牌数 → 降低并发 → 降低延迟
+  if 实际延迟 &lt; 目标延迟:
+      增加令牌数 → 提高并发 → 提高吞吐</code></pre>
+            <p>这种设计的直觉：对于快速设备，延迟升高通常意味着设备内部队列太满了。减少并发请求数，就能降低排队延迟。</p>
+            <h4 id="关键参数-2">关键参数</h4>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 kyber 参数</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/block/nvme0n1/queue/iosched/</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出：read_lat_nsec  write_lat_nsec</span></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/queue/iosched/read_lat_nsec</span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 2000000（纳秒）= 2ms —— 读延迟目标</span></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/queue/iosched/write_lat_nsec</span>
+<span id="cb24-9"><a href="#cb24-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 10000000（纳秒）= 10ms —— 写延迟目标</span></span></code></pre></div>
+            <p>参数很简单——只需要告诉调度器你期望的读写延迟目标，调度器自动调节并发来满足目标。</p>
+            <h4 id="适用场景-2">适用场景</h4>
+            <p>kyber 适合以下场景：</p>
+            <ul>
+            <li><strong>NVMe 设备</strong>：简单轻量，CPU
+            开销极低。</li>
+            <li><strong>延迟敏感的在线服务</strong>：自动调节并发，防止设备过载导致延迟飙升。</li>
+            <li><strong>快速存储设备</strong>：设备本身有内部调度，不需要内核再做排序。</li>
+            </ul>
+            <p>kyber 不适合
+            HDD——它不做排序，无法优化磁头移动；也不提供公平性保证——不区分进程，只看读写两个域。</p>
+            <h3 id="nonenoop">5.4 none（noop）</h3>
+            <p><code>none</code>
+            不是真正的调度器——它只是一个简单的先进先出（FIFO）队列，不排序、不合并、不做任何智能调度。</p>
+            <pre class="text"><code>请求到达 → 直接进入 FIFO 队列 → 按到达顺序派发给驱动</code></pre>
+            <p><code>none</code> 的使用场景：</p>
+            <ul>
+            <li><strong>NVMe
+            设备</strong>：设备控制器有自己的高级调度算法，内核再排序是多余的。</li>
+            <li><strong>虚拟化环境</strong>：虚拟磁盘背后是宿主机的 I/O
+            调度器，客户机不需要再调度。</li>
+            <li><strong>极致低延迟</strong>：减少内核路径上的 CPU
+            消耗。</li>
+            </ul>
+            <p>大多数 Linux 发行版对 NVMe 设备默认使用
+            <code>none</code>，对 HDD 默认使用
+            <code>mq-deadline</code>。</p>
+            <hr />
+            <h2 id="六io-调度器选择与切换">六、I/O 调度器选择与切换</h2>
+            <h3 id="查看当前调度器">6.1 查看当前调度器</h3>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看某个设备的当前调度器</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：[mq-deadline] kyber bfq none</span></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 方括号中的就是当前生效的调度器</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看所有块设备的调度器</span></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> dev <span class="kw">in</span> /sys/block/<span class="pp">*</span>/queue/scheduler<span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$(</span><span class="bu">echo</span> <span class="va">$dev</span> <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d</span>/ <span class="at">-f4</span><span class="va">)</span><span class="st">: </span><span class="va">$(</span><span class="fu">cat</span> <span class="va">$dev)</span><span class="st">&quot;</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+            <h3 id="运行时切换">6.2 运行时切换</h3>
+            <p>切换调度器不需要卸载文件系统或重启，直接写入 sysfs
+            即可：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 切换到 bfq</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> bfq <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 切换到 none</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> none <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 切换到 kyber</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> kyber <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 验证</span></span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/scheduler</span></code></pre></div>
+            <p>注意：切换调度器是立即生效的，但已经在旧调度器队列中的请求会先处理完毕。切换过程中可能有短暂的性能抖动。</p>
+            <h3 id="内核启动参数">6.3 内核启动参数</h3>
+            <p>通过内核命令行参数设置默认调度器：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 GRUB 配置中添加</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="va">GRUB_CMDLINE_LINUX</span><span class="op">=</span><span class="st">&quot;elevator=mq-deadline&quot;</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 更新 GRUB</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="ex">update-grub</span></span></code></pre></div>
+            <p>从 Linux 5.x 开始，<code>elevator</code> 参数只影响 HDD
+            等传统设备。NVMe 设备的默认调度器由内核自动选择（通常是
+            <code>none</code>）。</p>
+            <h3 id="udev-规则自动选择">6.4 udev 规则自动选择</h3>
+            <p>对于不同类型的设备使用不同调度器，udev
+            规则是最优雅的方案：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/udev/rules.d/60-io-scheduler.rules</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="co"># HDD：使用 mq-deadline</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="va">ACTION</span><span class="op">=</span>=<span class="st">&quot;add|change&quot;</span>, <span class="va">KERNEL</span><span class="op">=</span>=<span class="st">&quot;sd[a-z]&quot;</span>, <span class="ex">ATTR{queue/rotational}==</span><span class="st">&quot;1&quot;</span><span class="ex">,</span> <span class="dt">\</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a>    ATTR{queue/scheduler}=<span class="st">&quot;mq-deadline&quot;</span></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="co"># SATA/SAS SSD：使用 mq-deadline</span></span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a><span class="va">ACTION</span><span class="op">=</span>=<span class="st">&quot;add|change&quot;</span>, <span class="va">KERNEL</span><span class="op">=</span>=<span class="st">&quot;sd[a-z]&quot;</span>, <span class="ex">ATTR{queue/rotational}==</span><span class="st">&quot;0&quot;</span><span class="ex">,</span> <span class="dt">\</span></span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a>    ATTR{queue/scheduler}=<span class="st">&quot;mq-deadline&quot;</span></span>
+<span id="cb29-10"><a href="#cb29-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-11"><a href="#cb29-11" aria-hidden="true" tabindex="-1"></a><span class="co"># NVMe：使用 none</span></span>
+<span id="cb29-12"><a href="#cb29-12" aria-hidden="true" tabindex="-1"></a><span class="va">ACTION</span><span class="op">=</span>=<span class="st">&quot;add|change&quot;</span>, <span class="va">KERNEL</span><span class="op">=</span>=<span class="st">&quot;nvme[0-9]*&quot;</span>, <span class="ex">ATTR{queue/scheduler}=</span><span class="st">&quot;none&quot;</span></span></code></pre></div>
+            <h3 id="调度器性能对比">6.5 调度器性能对比</h3>
+            <p>以下是不同调度器在典型工作负载下的特征对比。这不是具体的
+            IOPS 数字（因为高度依赖硬件和负载），而是定性的对比：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>none</th>
+            <th>mq-deadline</th>
+            <th>bfq</th>
+            <th>kyber</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>HDD 顺序吞吐</td>
+            <td>差</td>
+            <td>好</td>
+            <td>好</td>
+            <td>差</td>
+            </tr>
+            <tr>
+            <td>HDD 随机 IOPS</td>
+            <td>差</td>
+            <td>中</td>
+            <td>中</td>
+            <td>差</td>
+            </tr>
+            <tr>
+            <td>NVMe 随机 IOPS</td>
+            <td>优</td>
+            <td>好</td>
+            <td>中</td>
+            <td>好</td>
+            </tr>
+            <tr>
+            <td>NVMe 延迟</td>
+            <td>优</td>
+            <td>好</td>
+            <td>中</td>
+            <td>优</td>
+            </tr>
+            <tr>
+            <td>读写公平性</td>
+            <td>无</td>
+            <td>中（读优先）</td>
+            <td>优</td>
+            <td>中</td>
+            </tr>
+            <tr>
+            <td>进程间公平性</td>
+            <td>无</td>
+            <td>无</td>
+            <td>优</td>
+            <td>无</td>
+            </tr>
+            <tr>
+            <td>CPU 开销</td>
+            <td>极低</td>
+            <td>低</td>
+            <td>高</td>
+            <td>低</td>
+            </tr>
+            <tr>
+            <td>cgroup 支持</td>
+            <td>无</td>
+            <td>无</td>
+            <td>优</td>
+            <td>无</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>选择建议的简化决策树：</p>
+            <pre class="text"><code>设备类型？
+├─ HDD → mq-deadline
+├─ SATA/SAS SSD
+│   ├─ 需要 cgroup 隔离？ → bfq
+│   └─ 不需要 → mq-deadline
+└─ NVMe
+    ├─ 需要延迟控制？ → kyber
+    ├─ 需要 cgroup 隔离？ → bfq
+    └─ 追求极致性能？ → none</code></pre>
+            <hr />
+            <h2 id="七blktrace-实战">七、blktrace 实战</h2>
+            <h3 id="blktrace-简介">7.1 blktrace 简介</h3>
+            <p><code>blktrace</code>（Block
+            Trace）是块设备层的跟踪工具，可以记录每个 I/O
+            请求在块设备层中的完整生命周期。它通过内核的 tracepoint
+            机制捕获事件，几乎没有性能开销（相比 <code>strace</code>
+            等工具）。</p>
+            <p>安装：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Debian/Ubuntu</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">apt-get</span> install blktrace</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co"># RHEL/CentOS</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="ex">yum</span> install blktrace</span></code></pre></div>
+            <h3 id="基本用法">7.2 基本用法</h3>
+            <p><code>blktrace</code> 采集数据，<code>blkparse</code>
+            解析数据，<code>btt</code> 做统计分析。</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 采集 sda 的跟踪数据，持续 10 秒</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">blktrace</span> <span class="at">-d</span> /dev/sda <span class="at">-w</span> 10 <span class="at">-o</span> trace</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 解析跟踪数据</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> trace <span class="at">-o</span> trace.txt</span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看输出（截取关键行）</span></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a><span class="fu">head</span> <span class="at">-30</span> trace.txt</span></code></pre></div>
+            <h3 id="事件类型">7.3 事件类型</h3>
+            <p><code>blkparse</code>
+            输出中的每一行代表一个事件。关键事件类型：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>事件代码</th>
+            <th>名称</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Q</td>
+            <td>Queue</td>
+            <td>bio 进入请求队列</td>
+            </tr>
+            <tr>
+            <td>G</td>
+            <td>Get Request</td>
+            <td>分配了新的 request 结构体</td>
+            </tr>
+            <tr>
+            <td>M</td>
+            <td>Merge</td>
+            <td>bio 被合并到已有的 request</td>
+            </tr>
+            <tr>
+            <td>I</td>
+            <td>Insert</td>
+            <td>request 被插入调度器队列</td>
+            </tr>
+            <tr>
+            <td>D</td>
+            <td>Dispatch</td>
+            <td>request 被派发给设备驱动</td>
+            </tr>
+            <tr>
+            <td>C</td>
+            <td>Complete</td>
+            <td>设备完成了这个请求</td>
+            </tr>
+            <tr>
+            <td>P</td>
+            <td>Plug</td>
+            <td>队列被塞住</td>
+            </tr>
+            <tr>
+            <td>U</td>
+            <td>Unplug</td>
+            <td>队列被拔塞</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>一个典型的 I/O 请求生命周期在 <code>blkparse</code>
+            输出中的体现：</p>
+            <pre class="text"><code>8,0    1        1     0.000000000  1234  Q   W 12345 + 8 [dd]
+8,0    1        2     0.000001200  1234  G   W 12345 + 8 [dd]
+8,0    1        3     0.000002400  1234  I   W 12345 + 8 [dd]
+8,0    1        4     0.000010000  1234  D   W 12345 + 8 [dd]
+8,0    1        5     0.001500000     0  C   W 12345 + 8 [0]</code></pre>
+            <p>解读：</p>
+            <ul>
+            <li>第 1 行：进程 1234（dd）提交了一个写请求，起始扇区
+            12345，长度 8 个扇区（4KB）。</li>
+            <li>第 2 行：分配了一个新的
+            request（说明没有发生合并）。</li>
+            <li>第 3 行：request 被插入调度器队列。</li>
+            <li>第 4 行：request 被派发给驱动。</li>
+            <li>第 5 行：设备完成了请求。总耗时 = 0.001500 - 0.000000 =
+            1.5ms。</li>
+            </ul>
+            <h3 id="分析合并效率">7.4 分析合并效率</h3>
+            <p>通过 <code>blkparse</code> 可以统计合并率：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 采集跟踪数据</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="ex">blktrace</span> <span class="at">-d</span> /dev/sda <span class="at">-w</span> 10 <span class="at">-o</span> merge_test</span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 统计各事件类型的数量</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> merge_test <span class="at">-q</span> <span class="at">-d</span> merge_test.bin</span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btt</span> <span class="at">-i</span> merge_test.bin <span class="at">-q</span> merge_stats.txt <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动统计合并率</span></span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> merge_test <span class="at">-f</span> <span class="st">&quot;%a\n&quot;</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="kw">|</span> <span class="fu">uniq</span> <span class="at">-c</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-rn</span></span>
+<span id="cb34-10"><a href="#cb34-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb34-11"><a href="#cb34-11" aria-hidden="true" tabindex="-1"></a><span class="co">#  52341 Q     ← 总提交的 bio 数</span></span>
+<span id="cb34-12"><a href="#cb34-12" aria-hidden="true" tabindex="-1"></a><span class="co">#  12045 G     ← 分配的新 request 数</span></span>
+<span id="cb34-13"><a href="#cb34-13" aria-hidden="true" tabindex="-1"></a><span class="co">#  40296 M     ← 合并的 bio 数</span></span>
+<span id="cb34-14"><a href="#cb34-14" aria-hidden="true" tabindex="-1"></a><span class="co">#   8123 D     ← 派发的 request 数</span></span>
+<span id="cb34-15"><a href="#cb34-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-16"><a href="#cb34-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 合并率 = M / Q = 40296 / 52341 ≈ 77%</span></span>
+<span id="cb34-17"><a href="#cb34-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 请求缩减率 = 1 - D/Q = 1 - 8123/52341 ≈ 84%</span></span></code></pre></div>
+            <p>77% 的合并率意味着大部分 I/O
+            是顺序或准顺序的。如果合并率接近 0%，说明 I/O 完全随机。</p>
+            <h3 id="分析队列深度">7.5 分析队列深度</h3>
+            <p>通过 <code>btt</code>
+            可以生成队列深度随时间变化的统计：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 采集数据</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="ex">blktrace</span> <span class="at">-d</span> /dev/sda <span class="at">-w</span> 30 <span class="at">-o</span> depth_test</span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 生成合并后的二进制文件</span></span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> depth_test <span class="at">-d</span> depth_test.bin</span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 用 btt 分析</span></span>
+<span id="cb35-8"><a href="#cb35-8" aria-hidden="true" tabindex="-1"></a><span class="ex">btt</span> <span class="at">-i</span> depth_test.bin</span>
+<span id="cb35-9"><a href="#cb35-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出包含：</span></span>
+<span id="cb35-10"><a href="#cb35-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Q2Q  —— 两次提交之间的时间间隔</span></span>
+<span id="cb35-11"><a href="#cb35-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Q2G  —— 从提交到分配 request 的时间</span></span>
+<span id="cb35-12"><a href="#cb35-12" aria-hidden="true" tabindex="-1"></a><span class="co"># G2I  —— 从分配 request 到插入调度器的时间</span></span>
+<span id="cb35-13"><a href="#cb35-13" aria-hidden="true" tabindex="-1"></a><span class="co"># I2D  —— 从插入调度器到派发给驱动的时间（调度器排队时间）</span></span>
+<span id="cb35-14"><a href="#cb35-14" aria-hidden="true" tabindex="-1"></a><span class="co"># D2C  —— 从派发到完成的时间（设备处理时间）</span></span>
+<span id="cb35-15"><a href="#cb35-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Q2C  —— 从提交到完成的总时间（端到端延迟）</span></span></code></pre></div>
+            <p>各时间段的含义对诊断问题很有帮助：</p>
+            <ul>
+            <li><code>Q2G</code>
+            大说明内存分配慢（可能是内存紧张）。</li>
+            <li><code>I2D</code> 大说明调度器队列长或调度延迟高。</li>
+            <li><code>D2C</code> 大说明设备本身慢。</li>
+            <li><code>Q2C</code> 是用户感知到的 I/O 延迟。</li>
+            </ul>
+            <h3 id="实战诊断顺序写性能下降">7.6
+            实战：诊断顺序写性能下降</h3>
+            <p>假设你发现顺序写入吞吐量从预期的 200 MB/s 下降到 80
+            MB/s，可以这样排查：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 开始跟踪</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="ex">blktrace</span> <span class="at">-d</span> /dev/sda <span class="at">-w</span> 10 <span class="at">-o</span> diag <span class="kw">&amp;</span></span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 跑写入测试</span></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/mnt/test bs=1M count=1024 oflag=direct <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span></span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 停止跟踪</span></span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a><span class="bu">kill</span> %1</span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 分析</span></span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> diag <span class="at">-d</span> diag.bin</span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a><span class="ex">btt</span> <span class="at">-i</span> diag.bin</span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 重点看：</span></span>
+<span id="cb36-15"><a href="#cb36-15" aria-hidden="true" tabindex="-1"></a><span class="co"># - 合并率：如果低于 50%，说明 I/O 被拆得太碎</span></span>
+<span id="cb36-16"><a href="#cb36-16" aria-hidden="true" tabindex="-1"></a><span class="co"># - I2D 时间：如果很高，说明调度器有瓶颈</span></span>
+<span id="cb36-17"><a href="#cb36-17" aria-hidden="true" tabindex="-1"></a><span class="co"># - D2C 时间：如果很高，说明设备慢（可能是 HDD 碎片、SSD 写放大）</span></span>
+<span id="cb36-18"><a href="#cb36-18" aria-hidden="true" tabindex="-1"></a><span class="co"># - max_sectors_kb：如果太小，请求被截断，吞吐下降</span></span></code></pre></div>
+            <hr />
+            <h2 id="八io-优先级与-cgroup-控制">八、I/O 优先级与 cgroup
+            控制</h2>
+            <h3 id="ionice进程级-io-优先级">8.1 ionice：进程级 I/O
+            优先级</h3>
+            <p><code>ionice</code> 命令设置进程的 I/O
+            调度类别和优先级。Linux 的 I/O 优先级分三个类别：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>类别</th>
+            <th>编号</th>
+            <th>含义</th>
+            <th>优先级范围</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>实时（Realtime）</td>
+            <td>1</td>
+            <td>最高优先级，总是优先服务</td>
+            <td>0-7（0 最高）</td>
+            </tr>
+            <tr>
+            <td>尽力而为（Best-effort）</td>
+            <td>2</td>
+            <td>默认类别，按优先级轮转</td>
+            <td>0-7（0 最高）</td>
+            </tr>
+            <tr>
+            <td>空闲（Idle）</td>
+            <td>3</td>
+            <td>最低优先级，只在无其他 I/O 时服务</td>
+            <td>无</td>
+            </tr>
+            </tbody>
+            </table>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看进程的 I/O 优先级</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ionice</span> <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span></span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 以空闲优先级运行备份任务</span></span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ionice</span> <span class="at">-c</span> 3 rsync <span class="at">-av</span> /data/ /backup/</span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 以尽力而为、优先级 7（最低）运行</span></span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ionice</span> <span class="at">-c</span> 2 <span class="at">-n</span> 7 tar czf backup.tar.gz /data/</span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 以实时优先级运行数据库（谨慎使用）</span></span>
+<span id="cb37-11"><a href="#cb37-11" aria-hidden="true" tabindex="-1"></a><span class="ex">ionice</span> <span class="at">-c</span> 1 <span class="at">-n</span> 0 mysqld</span></code></pre></div>
+            <p>注意：I/O 优先级只在使用 BFQ 或
+            CFQ（已废弃）调度器时生效。<code>mq-deadline</code>、<code>kyber</code>
+            和 <code>none</code> 不感知 I/O 优先级。</p>
+            <h3 id="cgroup-v1blkio-控制器">8.2 cgroup v1：blkio
+            控制器</h3>
+            <p>cgroup v1 的 <code>blkio</code> 控制器提供两种 I/O
+            限制方式：</p>
+            <p><strong>权重分配（<code>blkio.weight</code>）</strong>：按比例分配
+            I/O 带宽，仅在 BFQ 调度器下有效。</p>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置 cgroup 权重</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 100 <span class="op">&gt;</span> /sys/fs/cgroup/blkio/group_a/blkio.weight   <span class="co"># 默认权重</span></span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 500 <span class="op">&gt;</span> /sys/fs/cgroup/blkio/group_b/blkio.weight   <span class="co"># 5 倍带宽</span></span>
+<span id="cb38-4"><a href="#cb38-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb38-5"><a href="#cb38-5" aria-hidden="true" tabindex="-1"></a><span class="co"># group_b 大约获得 group_a 5 倍的 I/O 带宽</span></span></code></pre></div>
+            <p><strong>速率限制（<code>blkio.throttle</code>）</strong>：硬限制每秒读写字节数或
+            IOPS。</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 限制 sda 的读带宽为 10 MB/s</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;8:0 10485760&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/blkio/db_group/blkio.throttle.read_bps_device</span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 限制 sda 的写 IOPS 为 1000</span></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;8:0 1000&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/blkio/db_group/blkio.throttle.write_iops_device</span></code></pre></div>
+            <p>设备号 <code>8:0</code> 对应
+            <code>/dev/sda</code>，可以通过 <code>ls -l /dev/sda</code>
+            或 <code>cat /proc/partitions</code> 查看。</p>
+            <h3 id="cgroup-v2io-控制器">8.3 cgroup v2：io 控制器</h3>
+            <p>cgroup v2 统一了权重和限流接口，比 v1 更简洁：</p>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用 io 控制器</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;+io&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/cgroup.subtree_control</span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置权重（范围 1-10000，默认 100）</span></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;default 200&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/mygroup/io.weight</span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置带宽限制</span></span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 格式：MAJ:MIN rbps=&lt;bytes&gt; wbps=&lt;bytes&gt; riops=&lt;count&gt; wiops=&lt;count&gt;</span></span>
+<span id="cb40-9"><a href="#cb40-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;8:0 rbps=10485760 wbps=5242880 riops=max wiops=1000&quot;</span> <span class="dt">\</span></span>
+<span id="cb40-10"><a href="#cb40-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">&gt;</span> /sys/fs/cgroup/mygroup/io.max</span>
+<span id="cb40-11"><a href="#cb40-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-12"><a href="#cb40-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前 I/O 统计</span></span>
+<span id="cb40-13"><a href="#cb40-13" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/mygroup/io.stat</span>
+<span id="cb40-14"><a href="#cb40-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb40-15"><a href="#cb40-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 8:0 rbytes=1048576 wbytes=524288 rios=256 wios=128 dbytes=0 dios=0</span></span></code></pre></div>
+            <p>cgroup v2 的 <code>io.weight</code> 同样依赖 BFQ
+            调度器。如果使用 <code>mq-deadline</code> 或
+            <code>none</code>，只有
+            <code>io.max</code>（硬限制）生效。</p>
+            <h3 id="实战隔离数据库与批处理任务">8.4
+            实战：隔离数据库与批处理任务</h3>
+            <p>一个常见场景：同一台服务器上运行 MySQL
+            和每日备份任务。没有 I/O
+            隔离时，备份的大量顺序读写会严重干扰数据库的随机 I/O。</p>
+            <p>用 cgroup v2 + BFQ 实现隔离：</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 对 sda 启用 BFQ</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> bfq <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 创建 cgroup</span></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> /sys/fs/cgroup/db</span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> /sys/fs/cgroup/backup</span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 设置权重——数据库获得 5 倍于备份的带宽</span></span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;default 500&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/db/io.weight</span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;default 100&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/backup/io.weight</span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-12"><a href="#cb41-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 限制备份的绝对带宽（兜底保护）</span></span>
+<span id="cb41-13"><a href="#cb41-13" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;8:0 rbps=52428800 wbps=52428800&quot;</span> <span class="op">&gt;</span> /sys/fs/cgroup/backup/io.max</span>
+<span id="cb41-14"><a href="#cb41-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 读写各限制 50 MB/s</span></span>
+<span id="cb41-15"><a href="#cb41-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-16"><a href="#cb41-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. 把进程加入 cgroup</span></span>
+<span id="cb41-17"><a href="#cb41-17" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="op">&lt;</span>mysql_pid<span class="op">&gt;</span> <span class="op">&gt;</span> /sys/fs/cgroup/db/cgroup.procs</span>
+<span id="cb41-18"><a href="#cb41-18" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="op">&lt;</span>backup_pid<span class="op">&gt;</span> <span class="op">&gt;</span> /sys/fs/cgroup/backup/cgroup.procs</span>
+<span id="cb41-19"><a href="#cb41-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-20"><a href="#cb41-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 6. 验证</span></span>
+<span id="cb41-21"><a href="#cb41-21" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/db/io.stat</span>
+<span id="cb41-22"><a href="#cb41-22" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/backup/io.stat</span></code></pre></div>
+            <p>权重 + 硬限制的组合提供了双重保护：正常情况下按 5:1
+            分配带宽，即使备份突发也不会超过 50 MB/s。</p>
+            <hr />
+            <h2 id="九块设备层调优">九、块设备层调优</h2>
+            <h3 id="队列深度nr_requests">9.1 队列深度：nr_requests</h3>
+            <p><code>nr_requests</code>
+            控制每个硬件队列能同时处理的最大请求数：</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前值</span></span>
+<span id="cb42-2"><a href="#cb42-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/nr_requests</span>
+<span id="cb42-3"><a href="#cb42-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认值通常是 64（HDD）或 1023（NVMe）</span></span>
+<span id="cb42-4"><a href="#cb42-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb42-5"><a href="#cb42-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整</span></span>
+<span id="cb42-6"><a href="#cb42-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 128 <span class="op">&gt;</span> /sys/block/sda/queue/nr_requests</span></code></pre></div>
+            <p>调优原则：</p>
+            <ul>
+            <li><strong>增大
+            <code>nr_requests</code></strong>：允许更多请求排队，提高设备利用率和吞吐量，但增加延迟。适合吞吐优先的批处理场景。</li>
+            <li><strong>减小
+            <code>nr_requests</code></strong>：限制队列深度，降低排队延迟，但可能降低吞吐。适合延迟敏感的在线服务。</li>
+            </ul>
+            <p>一个经验判断：对于数据库服务器，NVMe 设备的
+            <code>nr_requests</code> 设为 64~256
+            通常是合理的范围——比默认值小，换取更稳定的延迟。</p>
+            <h3 id="预读read_ahead_kb">9.2 预读：read_ahead_kb</h3>
+            <p>预读（Read-Ahead）是内核在检测到顺序读模式时，提前读取后续数据到页缓存：</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前预读大小</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认 128KB</span></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 增大预读（适合大文件顺序读）</span></span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2048 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 减小预读（适合随机读为主的工作负载）</span></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 32 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span></code></pre></div>
+            <p>预读的效果取决于工作负载：</p>
+            <table>
+            <colgroup>
+            <col style="width: 38%" />
+            <col style="width: 38%" />
+            <col style="width: 23%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>工作负载</th>
+            <th>推荐预读</th>
+            <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>大文件顺序读（视频、备份）</td>
+            <td>1024~4096 KB</td>
+            <td>预读命中率高，减少 I/O 次数</td>
+            </tr>
+            <tr>
+            <td>数据库（随机读为主）</td>
+            <td>64~128 KB</td>
+            <td>预读浪费带宽，污染页缓存</td>
+            </tr>
+            <tr>
+            <td>小文件大量读取</td>
+            <td>32~64 KB</td>
+            <td>文件小于预读窗口时预读无意义</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="最大请求大小max_sectors_kb">9.3
+            最大请求大小：max_sectors_kb</h3>
+            <p><code>max_sectors_kb</code>
+            限制单个请求能包含的最大数据量：</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前值和硬件上限</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/max_sectors_kb</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/max_hw_sectors_kb</span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整（不能超过 max_hw_sectors_kb）</span></span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1280 <span class="op">&gt;</span> /sys/block/sda/queue/max_sectors_kb</span></code></pre></div>
+            <p>增大 <code>max_sectors_kb</code>
+            允许更大的请求，减少请求数量，对顺序 I/O
+            有利。但过大的请求可能增加单次 I/O
+            的延迟，影响其他等待中的请求。</p>
+            <h3 id="rotational-标志">9.4 rotational 标志</h3>
+            <p><code>rotational</code>
+            标志告诉内核这个设备是否有旋转介质：</p>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/rotational</span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 1 = HDD（旋转设备）</span></span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 0 = SSD/NVMe（非旋转设备）</span></span></code></pre></div>
+            <p>这个标志影响：</p>
+            <ul>
+            <li>I/O 调度器的默认选择。</li>
+            <li>文件系统的分配策略（如 ext4
+            对旋转设备倾向于分配连续块）。</li>
+            <li><code>fstrim</code> 和 TRIM 操作的自动触发。</li>
+            </ul>
+            <p>某些 SSD 可能被错误识别为旋转设备（特别是通过 USB 或 RAID
+            卡连接时）。手动修正：</p>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/block/sda/queue/rotational</span></code></pre></div>
+            <h3 id="不同设备类型的推荐配置">9.5
+            不同设备类型的推荐配置</h3>
+            <p>以下是面向不同设备类型的块设备层参数推荐。这些数值来自工程经验和社区实践，不是绝对最优值——实际调优应以实测为准。</p>
+            <p><strong>HDD（7200 RPM 企业级）</strong>：</p>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> mq-deadline <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 128 <span class="op">&gt;</span> /sys/block/sda/queue/nr_requests</span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 256 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1280 <span class="op">&gt;</span> /sys/block/sda/queue/max_sectors_kb</span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> /sys/block/sda/queue/rotational</span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/block/sda/queue/nomerges</span></code></pre></div>
+            <p><strong>SATA SSD</strong>：</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> mq-deadline <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 64 <span class="op">&gt;</span> /sys/block/sda/queue/nr_requests</span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 128 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 512 <span class="op">&gt;</span> /sys/block/sda/queue/max_sectors_kb</span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/block/sda/queue/rotational</span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/block/sda/queue/nomerges</span></code></pre></div>
+            <p><strong>NVMe SSD（通用服务器）</strong>：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> none <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 256 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/nr_requests</span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 128 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/read_ahead_kb</span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/rotational</span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/nomerges</span></code></pre></div>
+            <p><strong>NVMe SSD（延迟敏感型，如数据库）</strong>：</p>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> kyber <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 128 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/nr_requests</span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 64 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/read_ahead_kb</span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/rotational</span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置延迟目标</span></span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2000000 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/iosched/read_lat_nsec   <span class="co"># 2ms</span></span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 10000000 <span class="op">&gt;</span> /sys/block/nvme0n1/queue/iosched/write_lat_nsec  <span class="co"># 10ms</span></span></code></pre></div>
+            <h3 id="诊断高-await-问题">9.6 诊断高 await 问题</h3>
+            <p><code>iostat</code> 中的 <code>await</code>（平均 I/O
+            等待时间）升高是最常见的存储性能问题。诊断步骤：</p>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 确认问题</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注 await、r_await、w_await 列</span></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 正常值：HDD &lt; 20ms，SSD &lt; 5ms，NVMe &lt; 1ms</span></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 区分排队等待和设备处理时间</span></span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a><span class="co"># await = 排队时间 + 设备处理时间</span></span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a><span class="co"># svctm 已被 iostat 废弃（不准确），用 blktrace 替代</span></span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 用 blktrace 定位瓶颈</span></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a><span class="ex">blktrace</span> <span class="at">-d</span> /dev/sda <span class="at">-w</span> 10 <span class="at">-o</span> await_diag</span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a><span class="ex">blkparse</span> <span class="at">-i</span> await_diag <span class="at">-d</span> await_diag.bin</span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a><span class="ex">btt</span> <span class="at">-i</span> await_diag.bin</span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 看 btt 输出的各阶段耗时</span></span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Q2G 大 → 请求分配慢（内存压力或标签耗尽）</span></span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a><span class="co"># G2I 大 → 进入调度器慢（调度器锁竞争）</span></span>
+<span id="cb51-18"><a href="#cb51-18" aria-hidden="true" tabindex="-1"></a><span class="co"># I2D 大 → 调度器队列排队时间长</span></span>
+<span id="cb51-19"><a href="#cb51-19" aria-hidden="true" tabindex="-1"></a><span class="co">#   → 减小 nr_requests</span></span>
+<span id="cb51-20"><a href="#cb51-20" aria-hidden="true" tabindex="-1"></a><span class="co">#   → 检查调度器参数</span></span>
+<span id="cb51-21"><a href="#cb51-21" aria-hidden="true" tabindex="-1"></a><span class="co"># D2C 大 → 设备本身慢</span></span>
+<span id="cb51-22"><a href="#cb51-22" aria-hidden="true" tabindex="-1"></a><span class="co">#   → HDD：碎片化严重，考虑碎片整理</span></span>
+<span id="cb51-23"><a href="#cb51-23" aria-hidden="true" tabindex="-1"></a><span class="co">#   → SSD：写放大高，检查 TRIM 是否正常</span></span>
+<span id="cb51-24"><a href="#cb51-24" aria-hidden="true" tabindex="-1"></a><span class="co">#   → 检查设备固件、温度、健康状态</span></span>
+<span id="cb51-25"><a href="#cb51-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-26"><a href="#cb51-26" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. 检查队列深度是否过高</span></span>
+<span id="cb51-27"><a href="#cb51-27" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/nr_requests</span>
+<span id="cb51-28"><a href="#cb51-28" aria-hidden="true" tabindex="-1"></a><span class="co"># 如果队列深度很大且 await 高，减小它</span></span>
+<span id="cb51-29"><a href="#cb51-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-30"><a href="#cb51-30" aria-hidden="true" tabindex="-1"></a><span class="co"># 6. 检查是否有 I/O 优先级问题</span></span>
+<span id="cb51-31"><a href="#cb51-31" aria-hidden="true" tabindex="-1"></a><span class="ex">iotop</span> <span class="at">-oPa</span></span>
+<span id="cb51-32"><a href="#cb51-32" aria-hidden="true" tabindex="-1"></a><span class="co"># 找到占用 I/O 最多的进程</span></span></code></pre></div>
+            <hr />
+            <h2 id="参考文献">参考文献</h2>
+            <h3 id="内核源码">内核源码</h3>
+            <ol type="1">
+            <li>Linux
+            6.1，<code>block/blk-core.c</code>——块设备层核心代码，包含
+            <code>submit_bio()</code> 入口。</li>
+            <li>Linux 6.1，<code>block/blk-mq.c</code>——blk-mq
+            多队列架构实现。</li>
+            <li>Linux 6.1，<code>block/mq-deadline.c</code>——mq-deadline
+            调度器实现。</li>
+            <li>Linux 6.1，<code>block/bfq-iosched.c</code>——BFQ
+            调度器实现。</li>
+            <li>Linux 6.1，<code>block/kyber-iosched.c</code>——kyber
+            调度器实现。</li>
+            <li>Linux 6.1，<code>include/linux/bio.h</code>——bio
+            结构体定义。</li>
+            <li>Linux 6.1，<code>include/linux/blk-mq.h</code>——blk-mq
+            数据结构定义。</li>
+            </ol>
+            <h3 id="内核文档">内核文档</h3>
+            <ol start="8" type="1">
+            <li><code>Documentation/block/blk-mq.rst</code>——blk-mq
+            架构设计文档。</li>
+            <li><code>Documentation/block/bfq-iosched.rst</code>——BFQ
+            调度器官方文档。</li>
+            <li><code>Documentation/block/kyber-iosched.rst</code>——kyber
+            调度器文档。</li>
+            <li><code>Documentation/block/deadline-iosched.rst</code>——deadline
+            调度器文档。</li>
+            <li><code>Documentation/admin-guide/cgroup-v2.rst</code>——cgroup
+            v2 io 控制器文档。</li>
+            </ol>
+            <h3 id="论文与演讲">论文与演讲</h3>
+            <ol start="13" type="1">
+            <li>Axboe, Jens. “Linux Block IO: Present and Future.”
+            Ottawa Linux Symposium, 2004.</li>
+            <li>Axboe, Jens. “blk-mq: new multi-queue block IO queueing
+            mechanism.” Linux Plumbers Conference, 2013.</li>
+            <li>Valente, Paolo. “BFQ, Budget Fair Queueing.” Linux
+            Plumbers Conference, 2017.</li>
+            <li>Bjørling, Matias et al. “Linux Block IO: Introducing
+            Multi-Queue SSD Access on Multi-Core Systems.” SYSTOR,
+            2013.</li>
+            </ol>
+            <h3 id="工具文档">工具文档</h3>
+            <ol start="17" type="1">
+            <li><code>blktrace(8)</code> 手册页——blktrace
+            使用说明。</li>
+            <li><code>blkparse(1)</code> 手册页——blkparse
+            输出格式说明。</li>
+            <li><code>btt(1)</code> 手册页——btt 统计分析工具。</li>
+            <li><code>ionice(1)</code> 手册页——I/O 优先级设置。</li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../07-linux-io-stack/linux-io-stack.html">Linux I/O
+            栈全景：从 write() 到磁盘扇区</a> <strong>下一篇</strong>:
+            <a href="../09-page-cache/page-cache.html">Page Cache
+            深度解析</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-16 · storage</p>
+                    <h3><a href="/post/storage/07-linux-io-stack/linux-io-stack.html">【存储工程】Linux I/O 栈全景：从 write() 到磁盘扇区</a></h3>
+                    <p>当应用程序调用一次 write() 系统调用（System Call）时，数据并不会立刻落到磁盘扇区上。 它需要穿越内核中七个以上的软件层次，每一层都有独立的职责、数据结构和延迟开销。 理解这条完整路径，是进行存储性能调优和故障诊断的基础。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-07-15 · algorithms</p>
+                    <h3><a href="/post/algorithms/54-io-scheduling/io-scheduling.html">I/O 调度：CFQ → mq-deadline → BFQ → kyber</a></h3>
+                    <p>你把数据库从 HDD 迁移到了 NVMe SSD，IOPS 涨了 100 倍——然后你发现 I/O 调度器还在用 CFQ，它正在用复杂的算法把你的 NVMe 搞慢。NVMe 时代，最好的调度器可能是&#x27;不调度&#x27;。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · db / storage</p>
+                    <h3><a href="/post/db/index.html">数据库内核实验索引</a></h3>
+                    <p>汇总本站数据库内核文章：PostgreSQL / MySQL InnoDB / 列存引擎 / 数据湖与开放表格式 / 流式数据处理 / 分布式 OLAP 查询引擎，以及 LSM-Tree 从零实现实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/01-lakehouse-overview/01-lakehouse-overview.html">【数据湖与开放表格式】Lakehouse 全景：从 Hive 表到开放表格式</a></h3>
+                    <p>Hive 目录式分区表把『表』等同于『一组目录加 metastore 里的分区行』，于是没有原子提交、planning 要 LIST 目录、schema 与分区演进常要重写。本文用这三个硬伤切入，讲清 lakehouse 把表拆成『不可变数据文件 + 可变元数据指针 + catalog』三层后各自解决了什么，并给出全系列的分层地图。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

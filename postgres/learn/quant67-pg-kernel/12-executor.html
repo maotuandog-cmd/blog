@@ -1,0 +1,1358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】执行器与表达式求值：从计划树到行数据的一趟流水 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+执行器的火山模型（ExecInitNode→ExecProcNode→ExecEndNode）、Hash Join
+内存化实现、EEO 表达式求值的 opcode 编译与解释执行机制、TupleTableSlot
+的三种数据承载方式（virtual/heap/minimal）。附带查询 hang
+住的完整诊断路径：pg_stat_activity 的 wait_event + pg_blocking_pids()
+追踪锁等待链 + EXPLAIN ANALYZE 计划行数与实际行数差异定位。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, executor, volcano-model, expression-evaluation, hash-join, tupleslot, wait-event, pg-blocking-pids, explain-analyze, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/12-executor/12-executor.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】执行器与表达式求值：从计划树到行数据的一趟流水" />
+    <meta property="og:description" content="拆解 PostgreSQL 执行器的火山模型（ExecInitNode→ExecProcNode→ExecEndNode）、Hash Join 内存化实现、EEO 表达式求值的 opcode 编译与解释执行机制、TupleTableSlot 的三种数据承载方式（virtual/heap/minimal）。附带查询 hang 住的完整诊断路径：pg_stat_activity 的 wait_event + pg_blocking_pids() 追踪锁等待链 + EXPLAIN ANALYZE 计划行数与实际行数差异定位。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/12-executor/12-executor.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="executor" />
+    <meta property="article:tag" content="volcano-model" />
+    <meta property="article:tag" content="expression-evaluation" />
+    <meta property="article:tag" content="hash-join" />
+    <meta property="article:tag" content="tupleslot" />
+    <meta property="article:tag" content="wait-event" />
+    <meta property="article:tag" content="pg-blocking-pids" />
+    <meta property="article:tag" content="explain-analyze" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】执行器与表达式求值：从计划树到行数据的一趟流水" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 执行器的火山模型（ExecInitNode→ExecProcNode→ExecEndNode）、Hash Join 内存化实现、EEO 表达式求值的 opcode 编译与解释执行机制、TupleTableSlot 的三种数据承载方式（virtual/heap/minimal）。附带查询 hang 住的完整诊断路径：pg_stat_activity 的 wait_event + pg_blocking_pids() 追踪锁等待链 + EXPLAIN ANALYZE 计划行数与实际行数差异定位。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】执行器与表达式求值：从计划树到行数据的一趟流水", "description": "拆解 PostgreSQL 执行器的火山模型（ExecInitNode→ExecProcNode→ExecEndNode）、Hash Join 内存化实现、EEO 表达式求值的 opcode 编译与解释执行机制、TupleTableSlot 的三种数据承载方式（virtual/heap/minimal）。附带查询 hang 住的完整诊断路径：pg_stat_activity 的 wait_event + pg_blocking_pids() 追踪锁等待链 + EXPLAIN ANALYZE 计划行数与实际行数差异定位。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/12-executor/12-executor.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "executor", "volcano-model", "expression-evaluation", "hash-join", "tupleslot", "wait-event", "pg-blocking-pids", "explain-analyze"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】执行器与表达式求值：从计划树到行数据的一趟流水</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#executor</span> <span>#volcano-model</span> <span>#expression-evaluation</span> <span>#hash-join</span> <span>#tupleslot</span> <span>#wait-event</span> <span>#pg-blocking-pids</span> <span>#explain-analyze</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/executor.html">#executor</a><a class="chip-link" href="/tags/volcano-model.html">#volcano-model</a><a class="chip-link" href="/tags/expression-evaluation.html">#expression-evaluation</a><a class="chip-link" href="/tags/hash-join.html">#hash-join</a><a class="chip-link" href="/tags/tupleslot.html">#tupleslot</a><a class="chip-link" href="/tags/wait-event.html">#wait-event</a><a class="chip-link" href="/tags/pg-blocking-pids.html">#pg-blocking-pids</a><a class="chip-link" href="/tags/explain-analyze.html">#explain-analyze</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#执行器与表达式求值从计划树到行数据的一趟流水"
+                id="toc-执行器与表达式求值从计划树到行数据的一趟流水">执行器与表达式求值：从计划树到行数据的一趟流水</a>
+                <ul>
+                <li><a href="#一火山模型三条控制流"
+                id="toc-一火山模型三条控制流">一、火山模型：三条控制流</a>
+                <ul>
+                <li><a href="#入口函数" id="toc-入口函数">1.1
+                入口函数</a></li>
+                <li><a href="#execprocnode每次返回一行"
+                id="toc-execprocnode每次返回一行">1.3
+                ExecProcNode：每次返回一行</a></li>
+                </ul></li>
+                <li><a href="#二hash-join内存中的构建与探测"
+                id="toc-二hash-join内存中的构建与探测">二、Hash
+                Join：内存中的构建与探测</a>
+                <ul>
+                <li><a href="#两阶段流程" id="toc-两阶段流程">2.1
+                两阶段流程</a></li>
+                <li><a href="#hash-表的内存结构"
+                id="toc-hash-表的内存结构">2.2 Hash
+                表的内存结构</a></li>
+                <li><a href="#编译过程" id="toc-编译过程">3.3
+                编译过程</a></li>
+                <li><a href="#解释执行循环" id="toc-解释执行循环">3.4
+                解释执行循环</a></li>
+                <li><a href="#heap-slot完整的堆元组"
+                id="toc-heap-slot完整的堆元组">4.3 Heap
+                Slot：完整的堆元组</a></li>
+                <li><a href="#slot-操作接口" id="toc-slot-操作接口">4.5
+                Slot 操作接口</a></li>
+                </ul></li>
+                <li><a href="#六运维查询-hang-住不动时的诊断"
+                id="toc-六运维查询-hang-住不动时的诊断">六、运维：查询
+                hang 住不动时的诊断</a>
+                <ul>
+                <li><a href="#wait_event-是第一现场"
+                id="toc-wait_event-是第一现场">6.1 wait_event
+                是第一现场</a></li>
+                <li><a href="#explain-行数偏差诊断"
+                id="toc-explain-行数偏差诊断">6.3 EXPLAIN
+                行数偏差诊断</a></li>
+                <li><a href="#执行器层面的排查命令总结"
+                id="toc-执行器层面的排查命令总结">6.4
+                执行器层面的排查命令总结</a></li>
+                <li><a href="#观察-hash-join-的-batch-溢出"
+                id="toc-观察-hash-join-的-batch-溢出">7.2 观察 Hash Join
+                的 batch 溢出</a></li>
+                <li><a href="#观察-eeo-编译结果"
+                id="toc-观察-eeo-编译结果">7.3 观察 EEO
+                编译结果</a></li>
+                </ul></li>
+                <li><a href="#八关键要点"
+                id="toc-八关键要点">八、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#实验工具"
+                id="toc-实验工具">实验工具</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="执行器与表达式求值从计划树到行数据的一趟流水">执行器与表达式求值：从计划树到行数据的一趟流水</h1>
+            <p>你给 PG 发了一条 SQL，planner
+            给了一个计划——然后呢？执行器（Executor）负责把计划树变成实际的行数据。它按”火山模型”自上而下驱动算子树：父节点每次调用子节点的
+            <code>ExecProcNode()</code>
+            拉一行数据，处理完返回给更上层，最终回到客户端。这不是简单的
+            <code>for</code>
+            循环——每一步都涉及内存分配（TupleTableSlot）、表达式求值（<code>WHERE</code>
+            条件、<code>SELECT</code>
+            列表、聚合参数）、以及算子内部的复杂状态机（hash join
+            的构建/探测阶段切换）。</p>
+            <p>一条 SQL 执行到底要经过多少函数调用？本文从
+            <code>execMain.c</code> 的入口一路追到
+            <code>execExprInterp.c</code> 的 opcode 解释循环，再深入到
+            <code>nodeHashjoin.c</code> 的 hash
+            表构建与探测。最后讨论一个运维核心问题：查询 hang
+            住不动时，从哪里下手诊断。</p>
+            <hr />
+            <h2 id="一火山模型三条控制流">一、火山模型：三条控制流</h2>
+            <p>PG 执行器的设计遵循经典的
+            <strong>Volcano（迭代器）模型</strong>。每个算子（plan
+            node）对外暴露统一的接口：<code>ExecInitNode()</code>
+            初始化状态 → <code>ExecProcNode()</code> 每次调用返回一行 →
+            <code>ExecEndNode()</code> 清理资源。parent 算子不知道 child
+            是 SeqScan、IndexScan 还是 HashJoin——它只管调
+            <code>ExecProcNode()</code> 拉数据。</p>
+            <h3 id="入口函数">1.1 入口函数</h3>
+            <p>执行器的入口在
+            <code>src/backend/executor/execMain.c</code> 中：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execMain.c, ExecutorStart()</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ExecutorStart<span class="op">(</span>QueryDesc <span class="op">*</span>queryDesc<span class="op">,</span> <span class="dt">int</span> eflags<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 初始化执行状态（EState）</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 为计划树中每个节点调用 ExecInitNode()</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 为 expression tree 编译 opcode（EEO）</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    ExecInitPlan<span class="op">(</span>queryDesc<span class="op">,</span> estate<span class="op">,</span> eflags<span class="op">);</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">...</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execMain.c, ExecutorRun()</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ExecutorRun<span class="op">(</span>QueryDesc <span class="op">*</span>queryDesc<span class="op">,</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>                 ScanDirection direction<span class="op">,</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>                 uint64 count<span class="op">,</span> <span class="dt">bool</span> execute_once<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 循环调用 ExecProcNode(planstate-&gt;planTree) 直到：</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// - 返回 NULL（没数据了）</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// - 达到 count 条</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">// - execute_once 为 true（只跑一次，如 INSERT）</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execMain.c, ExecutorFinish()</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ExecutorFinish<span class="op">(</span>QueryDesc <span class="op">*</span>queryDesc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 执行收尾：触发器、WITH CHECK OPTION 校验等</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execMain.c, ExecutorEnd()</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ExecutorEnd<span class="op">(</span>QueryDesc <span class="op">*</span>queryDesc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 对每个节点调用 ExecEndNode() 释放资源</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    ExecEndPlan<span class="op">(</span>queryDesc<span class="op">-&gt;</span>planstate<span class="op">,</span> estate<span class="op">);</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>四个阶段的调用关系：</span></code></pre></div>
+            <p>ExecutorStart() // 初始化整棵树 → ExecInitPlan() // 遍历
+            plan tree，每个节点 ExecInitNode() → InitPlan() // 处理
+            InitPlan（子查询提前求值）</p>
+            <p>ExecutorRun() // 拉数据 → ExecutePlan() // while (true) {
+            slot = ExecProcNode(root); … }</p>
+            <p>ExecutorFinish() // 收尾（INSERT/UPDATE/DELETE 的 trigger
+            等）</p>
+            <p>ExecutorEnd() // 释放所有资源 → ExecEndPlan() //
+            遍历每个节点 ExecEndNode()</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">### 1.2 ExecInitNode：递归初始化计划树</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">`</span><span class="fu">ExecInitNode()</span><span class="kw">`</span> 根据节点类型（plan node 的 <span class="kw">`</span><span class="bu">type</span><span class="kw">`</span> 字段）分发到具体的 <span class="kw">`</span><span class="ex">ExecInit*</span><span class="kw">`</span> 函数：</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">c</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> src/backend/executor/execProcnode.c, ExecInitNode<span class="er">(</span><span class="kw">)</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="ex">PlanState</span> <span class="pp">*</span>ExecInitNode<span class="er">(</span><span class="ex">Plan</span> <span class="pp">*</span>node, EState <span class="pp">*</span>estate, int eflags<span class="kw">)</span> <span class="kw">{</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="ex">switch</span> <span class="er">(</span><span class="ex">nodeTag</span><span class="er">(</span><span class="ex">node</span><span class="kw">))</span> <span class="kw">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> T_SeqScan:</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>            return ExecInitSeqScan((SeqScan *) node, estate, eflags);</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>        case T_IndexScan:</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>            return ExecInitIndexScan((IndexScan *) node, estate, eflags);</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        case T_HashJoin:</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>            return ExecInitHashJoin((HashJoin *) node, estate, eflags);</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>        case T_NestLoop:</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>            return ExecInitNestLoop((NestLoop *) node, estate, eflags);</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>        case T_MergeJoin:</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>            return ExecInitMergeJoin((MergeJoin *) node, estate, eflags);</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>        case T_Hash:</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>            return ExecInitHash((Hash *) node, estate, eflags);</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>        case T_Agg:</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>            return ExecInitAgg((Agg *) node, estate, eflags);</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        case T_Sort:</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>            return ExecInitSort((Sort *) node, estate, eflags);</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>        // ... 还有几十种</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div>
+            <p>每个 <code>ExecInit*Node()</code> 函数做三件事：</p>
+            <ol type="1">
+            <li><strong>分配 <code>*State</code>
+            结构体</strong>：算子的运行时状态（如
+            <code>HashJoinState</code>），在
+            <code>estate-&gt;es_query_cxt</code> 的 memory context
+            中分配。</li>
+            <li><strong>递归初始化子节点</strong>：调用
+            <code>ExecInitNode(outerPlan(node), ...)</code> 和
+            <code>ExecInitNode(innerPlan(node), ...)</code>。</li>
+            <li><strong>编译表达式的
+            opcode</strong>：<code>ExecInitExpr()</code> 把
+            <code>WHERE</code> 条件、join qual、projection
+            列表从表达式树编译成 <code>ExprState</code>（EEO opcode
+            数组）。</li>
+            </ol>
+            <h3 id="execprocnode每次返回一行">1.3
+            ExecProcNode：每次返回一行</h3>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/executor/executor.h</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">inline</span> TupleTableSlot <span class="op">*</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>ExecProcNode<span class="op">(</span>PlanState <span class="op">*</span>node<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> node<span class="op">-&gt;</span>ExecProcNode<span class="op">(</span>node<span class="op">);</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>这是一个函数指针调用——每个算子注册自己的 `ExecProcNode` 实现。以 SeqScan 为例：</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/nodeSeqscan.c</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> TupleTableSlot <span class="op">*</span>SeqNext<span class="op">(</span>SeqScanState <span class="op">*</span>node<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    HeapScanDesc scandesc <span class="op">=</span> node<span class="op">-&gt;</span>ss<span class="op">.</span>ss_currentScanDesc<span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    EState <span class="op">*</span>estate <span class="op">=</span> node<span class="op">-&gt;</span>ss<span class="op">.</span>ps<span class="op">.</span>state<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    TupleTableSlot <span class="op">*</span>slot <span class="op">=</span> node<span class="op">-&gt;</span>ss<span class="op">.</span>ss_ScanTupleSlot<span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 从 heap 中读取下一个 tuple</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        HeapTuple tuple <span class="op">=</span> heap_getnext<span class="op">(</span>scandesc<span class="op">,</span> direction<span class="op">);</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>tuple <span class="op">==</span> NULL<span class="op">)</span> <span class="cf">return</span> NULL<span class="op">;</span>  <span class="co">// 没有更多行了</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 把 heap tuple 放入 slot</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        ExecStoreHeapTuple<span class="op">(</span>tuple<span class="op">,</span> slot<span class="op">,</span> <span class="kw">false</span><span class="op">);</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 应用 scan qual（filter 条件下推到 scan 层）</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>ExecQual<span class="op">(</span>node<span class="op">-&gt;</span>qual<span class="op">,</span> econtext<span class="op">))</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> slot<span class="op">;</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>关键模式：<strong>每次返回一行</strong>（pull-based）。如果当前行不满足
+            filter 条件（<code>ExecQual</code> 返回
+            false），循环继续读下一行。这与 MySQL
+            的迭代器模型一致，但与向量化引擎（一次返回一批行）不同。</p>
+            <hr />
+            <h2 id="二hash-join内存中的构建与探测">二、Hash
+            Join：内存中的构建与探测</h2>
+            <p>Hash Join 是 PG
+            执行器中逻辑最复杂的算子之一。它的实现位于
+            <code>src/backend/executor/nodeHashjoin.c</code> 和
+            <code>src/backend/executor/nodeHash.c</code>。Hash Join
+            本身不管理 hash 表——它依赖一个子节点
+            <code>Hash</code>（<code>T_Hash</code> 类型），由 Hash
+            节点负责构建 hash 表，Hash Join 节点只负责驱动探测。</p>
+            <h3 id="两阶段流程">2.1 两阶段流程</h3>
+            <pre class="mermaid"><code>sequenceDiagram
+  participant HJ as HashJoin
+  participant H as Hash (child)
+  participant Outer as Outer Plan
+  participant Inner as Inner Plan
+
+  Note over HJ: ExecInitHashJoin()
+  HJ-&gt;&gt;H: ExecInitNode(Hash)
+  HJ-&gt;&gt;Outer: ExecInitNode(OuterPlan)
+  Note over HJ: 构建阶段 (build phase)
+  HJ-&gt;&gt;H: ExecProcNode(Hash)
+  H-&gt;&gt;Inner: ExecProcNode() 循环拉完 inner 所有行
+  H-&gt;&gt;H: 构建 hash 表
+  Note over HJ: 探测阶段 (probe phase)
+  loop 每次拉一行 outer
+    HJ-&gt;&gt;Outer: ExecProcNode()
+    HJ-&gt;&gt;H: ExecHashGetBucketAndBatch() 查 hash 表
+    HJ-&gt;&gt;HJ: ExecQual() 检查 join qual
+    HJ--&gt;&gt;Client: 返回匹配行
+  end
+```text
+
+Hash Join 的状态机（`ExecHashJoin()`）：
+
+```c
+// src/backend/executor/nodeHashjoin.c, ExecHashJoin()
+TupleTableSlot *ExecHashJoin(PlanState *pstate) {
+    HashJoinState *node = castNode(HashJoinState, pstate);
+
+    for (;;) {
+        switch (node-&gt;hj_JoinState) {
+            case HJ_BUILD_HASHTABLE:
+                // 第一次调用：构建 hash 表
+                ExecHashTableCreate(...);
+                // 拉完 inner 所有行，插入 hash 表
+                for (;;) {
+                    TupleTableSlot *innerslot = ExecProcNode(innerPlan);
+                    if (TupIsNull(innerslot)) break;
+                    ExecHashTableInsert(hashstate-&gt;hashtable, innerslot);
+                }
+                node-&gt;hj_JoinState = HJ_NEED_NEW_OUTER;
+                // fall through
+
+            case HJ_NEED_NEW_OUTER:
+                // 从 outer 拉一行
+                node-&gt;hj_OuterTupleSlot = ExecProcNode(outerPlan);
+                if (TupIsNull(node-&gt;hj_OuterTupleSlot)) return NULL;  // 结束
+                node-&gt;hj_JoinState = HJ_SCAN_BUCKET;
+                // fall through
+
+            case HJ_SCAN_BUCKET:
+                // 在 hash 表中匹配
+                if (ExecScanHashBucket(node, node-&gt;hj_OuterTupleSlot)) {
+                    // 找到匹配：检查 join qual（hash key 相同不代表 WHERE 条件满足）
+                    if (ExecQual(node-&gt;js.joinqual, econtext))
+                        return ExecProject(node-&gt;js.ps.ps_ProjInfo);
+                } else {
+                    node-&gt;hj_JoinState = HJ_NEED_NEW_OUTER;  // 本行匹配完了
+                }
+                break;
+        }
+    }
+}</code></pre>
+            <h3 id="hash-表的内存结构">2.2 Hash 表的内存结构</h3>
+            <p>Hash 表实现在
+            <code>src/backend/executor/nodeHash.c</code>。核心数据结构：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/executor/hashjoin.h</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> HashJoinTableData <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>            nbuckets<span class="op">;</span>           <span class="co">// bucket 数量（2 的幂）</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>            log2_nbuckets<span class="op">;</span>      </span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>            nbatch<span class="op">;</span>             <span class="co">// batch 数量（hash join 溢出分区数）</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>            curbatch<span class="op">;</span>           <span class="co">// 当前处理的 batch</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// batched hash join 的内存管理</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> HashMemoryChunk <span class="op">*</span>chunks<span class="op">;</span>    <span class="co">// 链表分配的内存块</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// bucket 数组</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    HashJoinTuple  <span class="op">*</span>buckets<span class="op">;</span>           <span class="co">// buckets[0..nbuckets-1]，每个 bucket 是 tuple 链表</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// batch 文件（溢出到磁盘）</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    BufFile       <span class="op">**</span>innerBatchFile<span class="op">;</span>    <span class="co">// 每个 batch 的 inner 临时文件</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    BufFile       <span class="op">**</span>outerBatchFile<span class="op">;</span>    <span class="co">// 每个 batch 的 outer 临时文件</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 统计</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    Size           spaceUsed<span class="op">;</span>          <span class="co">// hash 表当前使用内存</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    Size           spaceAllowed<span class="op">;</span>       <span class="co">// 内存上限 = work_mem × hash_mem_multiplier  (PG 15+)</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>    Size           spacePeak<span class="op">;</span>          <span class="co">// 内存使用峰值</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> HashJoinTableData<span class="op">;</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>Hash Join 用 <span class="op">**</span>Grace Hash Join（hybrid hash join）<span class="op">**</span> 作为磁盘溢出策略：当 inner 表太大无法全部放入 `work_mem × hash_mem_multiplier` 时，PG 用两个 hash 函数——第一个 hash 分 batch，第二个 hash 分 bucket。当前 batch 在内存中，其他 batch 的 inner 行写入临时文件；outer 行也按 batch 分流到临时文件。每个 batch 完成后再加载下一个 batch。观察 `EXPLAIN ANALYZE` 中的 `Buckets<span class="op">:</span>`、`Batches<span class="op">:</span>`、`Memory Usage<span class="op">:</span>` 可以判断是否发生了磁盘溢出。</span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 2.3 Hash Join 的执行示例</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>EXPLAIN <span class="op">(</span>ANALYZE<span class="op">,</span> BUFFERS<span class="op">,</span> COSTS OFF<span class="op">)</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>SELECT <span class="op">*</span> FROM orders o JOIN customers c ON o<span class="op">.</span>customer_id <span class="op">=</span> c<span class="op">.</span>id<span class="op">;</span></span></code></pre></div>
+            <p>可能的输出（片段）：</p>
+            <pre class="text"><code>Hash Join (actual rows=10000 loops=1)
+  Hash Cond: (o.customer_id = c.id)
+  Buffers: shared hit=862 read=28
+  -&gt;  Seq Scan on orders o (actual rows=10000 loops=1)
+        Buffers: shared hit=442 read=8
+  -&gt;  Hash (actual rows=1000 loops=1)
+        Buckets: 1024  Batches: 1  Memory Usage: 44kB
+        Buffers: shared hit=6 read=16
+        -&gt;  Seq Scan on customers c (actual rows=1000 loops=1)
+              Buffers: shared hit=6 read=16
+```text
+
+`Batches: 1` 表示没有溢出。如果看到 `Batches: 8` 且 `Memory Usage` 接近 `work_mem`，说明发生了多趟溢出——性能会显著下降。
+
+---
+
+## 三、表达式求值：从 Tree 到 Opcode
+
+查询的 `WHERE` 条件、`SELECT` 列表、`ON CONFLICT` 子句、聚合参数——执行器每处理一行都要对它们求值。传统方式是递归遍历表达式树，每次求值都在 C 函数帧间跳转。这在小数据集上无所谓，但在每次调用 ExecProcNode 都要重新求值的场景下，函数调用开销会成为热点。
+
+PG 10 引入的 **EEO（Expression Evaluation）** 方案用编译技术解决这个问题：把表达式树编译成 opcode 数组，求值变成一个紧凑的 `while` 循环，在 switch-case 中按 opcode 跳转。
+
+### 3.1 表达式树的结构
+
+优化器输出的表达式是 `Expr` 树：
+
+```c
+// src/include/nodes/primnodes.h
+typedef struct OpExpr {
+    Expr        xpr;           // base Expr node
+    Oid         opno;          // 操作符 OID（pg_operator）
+    Oid         opfuncid;      // 对应的 C 函数 OID
+    Oid         opresulttype;  // 返回值类型
+    List       *args;          // 参数列表（Expr 节点链表）
+} OpExpr;</code></pre>
+            <p>但执行器不直接操作 <code>Expr</code> 树——它在
+            <code>ExecInitExpr()</code> 中将其编译成
+            <code>ExprState</code>：</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/executor/execExpr.h</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> ExprState <span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    NodeTag     tag<span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    Expr       <span class="op">*</span>expr<span class="op">;</span>                  <span class="co">// 原始表达式树（调试用）</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    ExprEvalStep <span class="op">*</span>steps<span class="op">;</span>               <span class="co">// 编译后的 opcode 数组</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         steps_len<span class="op">;</span>             <span class="co">// 数组长度</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         steps_alloc<span class="op">;</span>           <span class="co">// 已分配长度</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    Datum      <span class="op">*</span>results<span class="op">;</span>               <span class="co">// 中间结果数组</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         ressize<span class="op">;</span>               <span class="co">// 结果数组大小</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>        resnull<span class="op">;</span>               <span class="co">// 最终结果为 NULL</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    Datum       resvalue<span class="op">;</span>              <span class="co">// 最终结果值</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> MemoryContext <span class="op">*</span>eval_mcontext<span class="op">;</span>  <span class="co">// 求值用的 memory context</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ExprState<span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.2 Opcode 指令集</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>EEO 定义了约 <span class="dv">30</span> 种 opcode，每种对应一个表达式操作：</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/executor/execExpr.h</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">enum</span> ExprEvalOp <span class="op">{</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    EEOP_DONE<span class="op">,</span>                  <span class="co">// 结束标记</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 常量</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    EEOP_CONST<span class="op">,</span>                 <span class="co">// 把常量压入结果</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    EEOP_NULL_IF_NULL<span class="op">,</span>          <span class="co">// 一行中某列为 NULL 则整个表达式为 NULL</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 变量</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    EEOP_INNER_VAR<span class="op">,</span>             <span class="co">// 从 inner slot 读列值</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    EEOP_OUTER_VAR<span class="op">,</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    EEOP_SCAN_VAR<span class="op">,</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    EEOP_INNER_SYSVAR<span class="op">,</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>    EEOP_OUTER_SYSVAR<span class="op">,</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>    EEOP_SCAN_SYSVAR<span class="op">,</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 函数调用</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>    EEOP_FUNCEXPR<span class="op">,</span>              <span class="co">// 调用 C 函数（如 int4eq, texteq 等）</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    EEOP_FUNCEXPR_STRICT<span class="op">,</span>       <span class="co">// 带 STRICT 语义（任一参数 NULL 则结果为 NULL）</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 布尔运算</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>    EEOP_BOOL_AND_STEP_FIRST<span class="op">,</span>   <span class="co">// AND 短路求值</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>    EEOP_BOOL_AND_STEP_LAST<span class="op">,</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>    EEOP_BOOL_OR_STEP_FIRST<span class="op">,</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a>    EEOP_BOOL_OR_STEP_LAST<span class="op">,</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>    EEOP_BOOL_NOT_STEP<span class="op">,</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">// CASE</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a>    EEOP_CASE_TESTVAL<span class="op">,</span></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a>    EEOP_MAKE_READONLY_CASE_TESTVAL<span class="op">,</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a>    EEOP_CASE_WHEN<span class="op">,</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 跳转与条件</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a>    EEOP_JUMP<span class="op">,</span>                  <span class="co">// 无条件跳转</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a>    EEOP_JUMP_IF_NOT_TRUE<span class="op">,</span>      <span class="co">// 条件跳转（AND/OR 短路用）</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a>    EEOP_JUMP_IF_NULL<span class="op">,</span>          <span class="co">// 判定 NULL 后跳转</span></span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 数组、行类型、XML、JSON 等</span></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a>    EEOP_ARRAYEXPR<span class="op">,</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a>    EEOP_ARRAYCOERCE<span class="op">,</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a>    EEOP_ROWEXPR<span class="op">,</span></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a>    EEOP_ROWCOMPARE_STEP<span class="op">,</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 其他</span></span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a>    EEOP_ASSIGN_TMP<span class="op">,</span>            <span class="co">// 临时变量赋值</span></span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a>    EEOP_ASSIGN_TMP_MAKE_RO<span class="op">,</span></span>
+<span id="cb7-67"><a href="#cb7-67" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-68"><a href="#cb7-68" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 子查询</span></span>
+<span id="cb7-69"><a href="#cb7-69" aria-hidden="true" tabindex="-1"></a>    EEOP_PARAM_EXEC<span class="op">,</span></span>
+<span id="cb7-70"><a href="#cb7-70" aria-hidden="true" tabindex="-1"></a>    EEOP_PARAM_EXTERN<span class="op">,</span></span>
+<span id="cb7-71"><a href="#cb7-71" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-72"><a href="#cb7-72" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 哈希——用于 hash join / hash agg</span></span>
+<span id="cb7-73"><a href="#cb7-73" aria-hidden="true" tabindex="-1"></a>    EEOP_HASHED_SCALAR<span class="op">,</span>         <span class="co">// 对单列做 hash</span></span>
+<span id="cb7-74"><a href="#cb7-74" aria-hidden="true" tabindex="-1"></a>    EEOP_HASHED_SCALAR_NULLS<span class="op">,</span></span>
+<span id="cb7-75"><a href="#cb7-75" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-76"><a href="#cb7-76" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 聚合</span></span>
+<span id="cb7-77"><a href="#cb7-77" aria-hidden="true" tabindex="-1"></a>    EEOP_AGGREF<span class="op">,</span></span>
+<span id="cb7-78"><a href="#cb7-78" aria-hidden="true" tabindex="-1"></a>    EEOP_GROUPING_FUNC<span class="op">,</span></span>
+<span id="cb7-79"><a href="#cb7-79" aria-hidden="true" tabindex="-1"></a>    EEOP_WINDOW_FUNC<span class="op">,</span></span>
+<span id="cb7-80"><a href="#cb7-80" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb7-81"><a href="#cb7-81" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 子计划</span></span>
+<span id="cb7-82"><a href="#cb7-82" aria-hidden="true" tabindex="-1"></a>    EEOP_SUBPLAN<span class="op">,</span></span>
+<span id="cb7-83"><a href="#cb7-83" aria-hidden="true" tabindex="-1"></a>    EEOP_ALTERNATIVE_SUBPLAN<span class="op">,</span></span>
+<span id="cb7-84"><a href="#cb7-84" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ExprEvalOp<span class="op">;</span></span></code></pre></div>
+            <h3 id="编译过程">3.3 编译过程</h3>
+            <p><code>ExecInitExpr()</code> 在
+            <code>src/backend/executor/execExpr.c</code>
+            中实现。它是一个递归下降编译器，把表达式树转成 step
+            数组：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execExpr.c, ExecInitExprRec()</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 递归编译表达式树为 step 数组（简化）</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> ExecInitExprRec<span class="op">(</span>Expr <span class="op">*</span>node<span class="op">,</span> ExprState <span class="op">*</span>state<span class="op">,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>                            Datum <span class="op">*</span>scratch<span class="op">,</span> <span class="dt">int</span> <span class="op">*</span>scratch_idx<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>nodeTag<span class="op">(</span>node<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> T_Var<span class="op">:</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 列引用 → EEOP_INNER_VAR / EEOP_OUTER_VAR / EEOP_SCAN_VAR</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>            ExecPushVarStep<span class="op">(</span>state<span class="op">,</span> <span class="op">(</span>Var <span class="op">*)</span> node<span class="op">);</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> T_Const<span class="op">:</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 常量 → EEOP_CONST</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>            ExecPushConstStep<span class="op">(</span>state<span class="op">,</span> <span class="op">(</span>Const <span class="op">*)</span> node<span class="op">);</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> T_OpExpr<span class="op">:</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 二元操作符 → 先编译左子树 → EEOP_FUNCEXPR_STRICT</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>            ExecInitExprRec<span class="op">(</span>lfirst<span class="op">(</span>list_head<span class="op">(</span>op<span class="op">-&gt;</span>args<span class="op">)),</span> <span class="op">...);</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>            ExecInitExprRec<span class="op">(</span>lsecond<span class="op">(</span>list_head<span class="op">(</span>op<span class="op">-&gt;</span>args<span class="op">)),</span> <span class="op">...);</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>            ExecPushFuncExprStep<span class="op">(</span>state<span class="op">,</span> op<span class="op">-&gt;</span>opfuncid<span class="op">,</span> op<span class="op">-&gt;</span>opresulttype<span class="op">);</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> T_BoolExpr<span class="op">:</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>            <span class="co">// AND/OR → EEOP_BOOL_AND_STEP_FIRST 等</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 实现短路求值：AND 遇到 false 跳过剩余子表达式</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>            ExecPushBoolExprSteps<span class="op">(</span>state<span class="op">,</span> <span class="op">(</span>BoolExpr <span class="op">*)</span> node<span class="op">);</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> T_CaseExpr<span class="op">:</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>            <span class="co">// CASE WHEN ... THEN ... ELSE ...</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>            ExecPushCaseSteps<span class="op">(</span>state<span class="op">,</span> <span class="op">(</span>CaseExpr <span class="op">*)</span> node<span class="op">);</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... 更多类型</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>以 `x <span class="op">+</span> y <span class="op">&gt;</span> <span class="dv">10</span> AND z IS NOT NULL` 为例，编译后可能生成如下 opcode 序列：</span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> EEOP_OUTER_VAR          <span class="co">// 读 x 列值 → scratch[0]</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> EEOP_OUTER_VAR          <span class="co">// 读 y 列值 → scratch[1]</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> EEOP_FUNCEXPR_STRICT    <span class="co">// int4pl(scratch[0], scratch[1]) → scratch[2]</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> EEOP_CONST              <span class="co">// 常量 10 → scratch[3]</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a><span class="fl">5.</span> EEOP_FUNCEXPR_STRICT    <span class="co">// int4gt(scratch[2], scratch[3]) → result</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a><span class="fl">6.</span> EEOP_BOOL_AND_STEP_FIRST  <span class="co">// AND 左分支：如果 false，跳到步骤 9</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a><span class="fl">7.</span> EEOP_OUTER_VAR          <span class="co">// 读 z 列值 → scratch[0]</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a><span class="fl">8.</span> EEOP_BOOL_AND_STEP_LAST   <span class="co">// AND 右分支：返回 IS NOT NULL 结果</span></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a><span class="fl">9.</span> EEOP_DONE               <span class="co">// 结束</span></span></code></pre></div>
+            <h3 id="解释执行循环">3.4 解释执行循环</h3>
+            <p>编译后的 opcode 由 <code>ExecInterpExpr()</code>
+            执行：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/execExprInterp.c, ExecInterpExpr()</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 核心解释循环（简化）</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> pg_attribute_always_inline <span class="dt">void</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>ExecInterpExpr<span class="op">(</span>ExprState <span class="op">*</span>state<span class="op">,</span> ExprContext <span class="op">*</span>econtext<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>isnull<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    ExprEvalStep <span class="op">*</span>op <span class="op">=</span> state<span class="op">-&gt;</span>steps<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> nsteps <span class="op">=</span> state<span class="op">-&gt;</span>steps_len<span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    Datum <span class="op">*</span>results <span class="op">=</span> state<span class="op">-&gt;</span>results<span class="op">;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">switch</span> <span class="op">(</span>op<span class="op">-&gt;</span>opcode<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>            <span class="cf">case</span> EEOP_CONST<span class="op">:</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>op<span class="op">-&gt;</span>resvalue <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>constval<span class="op">.</span>value<span class="op">;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>op<span class="op">-&gt;</span>resnull  <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>constval<span class="op">.</span>isnull<span class="op">;</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>                op<span class="op">++;</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>            <span class="cf">case</span> EEOP_OUTER_VAR<span class="op">:</span> <span class="op">{</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>                <span class="dt">int</span> attnum <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>var<span class="op">.</span>attnum<span class="op">;</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>                SlotGetSomeAttrs<span class="op">(</span>econtext<span class="op">-&gt;</span>ecxt_outertuple<span class="op">,</span> attnum<span class="op">);</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>op<span class="op">-&gt;</span>resvalue <span class="op">=</span> econtext<span class="op">-&gt;</span>ecxt_outertuple<span class="op">-&gt;</span>tts_values<span class="op">[</span>attnum<span class="op">];</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>op<span class="op">-&gt;</span>resnull  <span class="op">=</span> econtext<span class="op">-&gt;</span>ecxt_outertuple<span class="op">-&gt;</span>tts_isnull<span class="op">[</span>attnum<span class="op">];</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>                op<span class="op">++;</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>            <span class="cf">case</span> EEOP_FUNCEXPR_STRICT<span class="op">:</span> <span class="op">{</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>                FunctionCallInfo fcinfo <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>func<span class="op">.</span>fcinfo_data<span class="op">;</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>                <span class="co">// ... 检查是否有 NULL 参数 ...</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a>                fcinfo<span class="op">-&gt;</span>isnull <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>op<span class="op">-&gt;</span>resvalue <span class="op">=</span> op<span class="op">-&gt;</span>d<span class="op">.</span>func<span class="op">.</span>fn_addr<span class="op">(</span>fcinfo<span class="op">);</span>  <span class="co">// 调用 C 函数</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>op<span class="op">-&gt;</span>resnull  <span class="op">=</span> fcinfo<span class="op">-&gt;</span>isnull<span class="op">;</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>                op<span class="op">++;</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a>            <span class="cf">case</span> EEOP_BOOL_AND_STEP_FIRST<span class="op">:</span></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(*</span>op<span class="op">-&gt;</span>resnull <span class="op">||</span> <span class="op">!</span>DatumGetBool<span class="op">(*</span>op<span class="op">-&gt;</span>resvalue<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a>                    <span class="co">// AND 短路：跳转到最后一个 AND step 之后</span></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a>                    op <span class="op">=</span> <span class="op">&amp;</span>state<span class="op">-&gt;</span>steps<span class="op">[</span>op<span class="op">-&gt;</span>d<span class="op">.</span>boolexpr<span class="op">.</span>jumpdone<span class="op">];</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a>                    op<span class="op">++;</span></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a>            <span class="cf">case</span> EEOP_JUMP<span class="op">:</span></span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a>                op <span class="op">=</span> <span class="op">&amp;</span>state<span class="op">-&gt;</span>steps<span class="op">[</span>op<span class="op">-&gt;</span>d<span class="op">.</span>jump<span class="op">.</span>jumpdone<span class="op">];</span></span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb9-48"><a href="#cb9-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-49"><a href="#cb9-49" aria-hidden="true" tabindex="-1"></a>            <span class="cf">case</span> EEOP_DONE<span class="op">:</span></span>
+<span id="cb9-50"><a href="#cb9-50" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>isnull<span class="op">)</span> <span class="op">*</span>isnull <span class="op">=</span> state<span class="op">-&gt;</span>resnull<span class="op">;</span></span>
+<span id="cb9-51"><a href="#cb9-51" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span><span class="op">;</span>  <span class="co">// 求值结束</span></span>
+<span id="cb9-52"><a href="#cb9-52" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-53"><a href="#cb9-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-54"><a href="#cb9-54" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-55"><a href="#cb9-55" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-56"><a href="#cb9-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-57"><a href="#cb9-57" aria-hidden="true" tabindex="-1"></a>`ExecInterpExpr<span class="op">()</span>` 被声明为 `always_inline` <span class="op">+</span> `static`——编译器会将它内联到调用点，消除函数调用开销。整个循环在一个大的 `switch` 中按 opcode 跳转，没有递归调用，没有表达式树的指针追踪。</span>
+<span id="cb9-58"><a href="#cb9-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-59"><a href="#cb9-59" aria-hidden="true" tabindex="-1"></a>执行 overhead 的比较：</span>
+<span id="cb9-60"><a href="#cb9-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-61"><a href="#cb9-61" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 方式 <span class="op">|</span> 每次求值的函数调用次数 <span class="op">|</span> L1i cache 行为 <span class="op">|</span></span>
+<span id="cb9-62"><a href="#cb9-62" aria-hidden="true" tabindex="-1"></a><span class="op">|------|----------------------|---------------|</span></span>
+<span id="cb9-63"><a href="#cb9-63" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 递归解释表达式树 <span class="op">|</span> 每个节点至少一次 `ExecEvalExpr<span class="op">()</span>` 调用 <span class="op">|</span> 函数调用导致指令 cache 跳跃 <span class="op">|</span></span>
+<span id="cb9-64"><a href="#cb9-64" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> EEO opcode 循环 <span class="op">|</span> 零次额外调用（在一次循环内） <span class="op">|</span> opcode 循环紧凑，指令 cache 友好 <span class="op">|</span></span>
+<span id="cb9-65"><a href="#cb9-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-66"><a href="#cb9-66" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.5 JIT 的区别</span></span>
+<span id="cb9-67"><a href="#cb9-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-68"><a href="#cb9-68" aria-hidden="true" tabindex="-1"></a>EEO 是<span class="op">**</span>解释执行<span class="op">**</span>opcode（switch<span class="op">-</span><span class="cf">case</span> 分发），而 JIT（第 <span class="dv">13</span> 章主题）是用 LLVM 把 opcode 序列编译成<span class="op">**</span>机器码<span class="op">**</span>——连 <span class="cf">switch</span><span class="op">-</span><span class="cf">case</span> 的分发开销都消除了。两者的关系是：EEO 编译出 opcode → JIT 再把 opcode 序列 JIT 成 native code。第 <span class="dv">13</span> 章会详细展开。</span>
+<span id="cb9-69"><a href="#cb9-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-70"><a href="#cb9-70" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb9-71"><a href="#cb9-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-72"><a href="#cb9-72" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 四、TupleTableSlot：行的三种承载方式</span></span>
+<span id="cb9-73"><a href="#cb9-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-74"><a href="#cb9-74" aria-hidden="true" tabindex="-1"></a>执行器中的每一行数据都封装在 `TupleTableSlot` 中。它不是简单的指针——它抽象了三种不同物理形态的 tuple 存储，让上层算子（Hash Join、Aggregate）不必关心下层传上来的是 heap tuple 还是虚拟 tuple。</span>
+<span id="cb9-75"><a href="#cb9-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-76"><a href="#cb9-76" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.1 三种 Slot 类型</span></span>
+<span id="cb9-77"><a href="#cb9-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-78"><a href="#cb9-78" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb9-79"><a href="#cb9-79" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/executor/tuptable.h</span></span>
+<span id="cb9-80"><a href="#cb9-80" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">enum</span> TupleTableSlotType <span class="op">{</span></span>
+<span id="cb9-81"><a href="#cb9-81" aria-hidden="true" tabindex="-1"></a>    T_TupleTableSlot_Virtual<span class="op">,</span>  <span class="co">// 虚拟 slot：数据在 tts_values[] / tts_isnull[] 数组中</span></span>
+<span id="cb9-82"><a href="#cb9-82" aria-hidden="true" tabindex="-1"></a>    T_TupleTableSlot_Minimal<span class="op">,</span>  <span class="co">// 最小化元组：只有列值，没有系统列（xmin/xmax 等）</span></span>
+<span id="cb9-83"><a href="#cb9-83" aria-hidden="true" tabindex="-1"></a>    T_TupleTableSlot_Heap<span class="op">,</span>     <span class="co">// 堆元组：完整的 HeapTupleData（含 xmin/xmax/ctid）</span></span>
+<span id="cb9-84"><a href="#cb9-84" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> TupleTableSlotType<span class="op">;</span></span></code></pre></div>
+            <p>核心结构：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/executor/tuptable.h</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> TupleTableSlot <span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    NodeTag         tag<span class="op">;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    uint16          tts_nvalid<span class="op">;</span>        <span class="co">// tts_values[] 中已填充的列数</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> TupleTableSlotOps <span class="op">*</span>tts_ops<span class="op">;</span>  <span class="co">// 虚函数表（根据实际 slot 类型不同）</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    TupleDesc       tts_tupleDescriptor<span class="op">;</span>  <span class="co">// 列描述（列名、类型、长度）</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    Datum          <span class="op">*</span>tts_values<span class="op">;</span>        <span class="co">// 列值数组（Datum 是 PG 的值容器类型）</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>           <span class="op">*</span>tts_isnull<span class="op">;</span>        <span class="co">// 列的 NULL 标志数组</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    MemoryContext   tts_mcxt<span class="op">;</span>          <span class="co">// 此 slot 的内存上下文</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    ItemPointerData tts_tid<span class="op">;</span>           <span class="co">// tuple 的物理位置 (block, offset)</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>             tts_tableOid<span class="op">;</span>      <span class="co">// 来源表的 OID</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>`tts_ops` 虚函数表是关键——不同类型的 slot 有不同的 `tts_ops`，实现了不同的 `slot_getallattrs<span class="op">()</span>`、`slot_getsomeattrs<span class="op">()</span>` 等操作。</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.2 Virtual Slot：最轻量</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>虚拟 slot 的数据直接存储在 `tts_values<span class="op">[]</span>` 和 `tts_isnull<span class="op">[]</span>` 数组中——没有对应的 heap tuple。表达式求值的结果、aggregate 的中间结果、函数扫描输出都使用 virtual slot。</span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="co">// 典型用法：表达式求值结果用 virtual slot 承载</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>TupleTableSlot <span class="op">*</span>slot <span class="op">=</span> ExecInitExtraTupleSlot<span class="op">(</span>estate<span class="op">,</span> tupdesc<span class="op">,</span> <span class="op">&amp;</span>TTSOpsVirtual<span class="op">);</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>slot<span class="op">-&gt;</span>tts_values<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> computed_value<span class="op">;</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>slot<span class="op">-&gt;</span>tts_isnull<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>ExecStoreVirtualTuple<span class="op">(</span>slot<span class="op">);</span>  <span class="co">// 标记为有效</span></span></code></pre></div>
+            <p>Virtual slot 不需要 <code>heap_form_tuple()</code> 或
+            <code>heap_deform_tuple()</code>——减少了一次数据拷贝和解构。</p>
+            <h3 id="heap-slot完整的堆元组">4.3 Heap
+            Slot：完整的堆元组</h3>
+            <p>Heap slot 包含一个完整的 <code>HeapTupleData</code>（含
+            header 的
+            <code>xmin</code>、<code>xmax</code>、<code>ctid</code>、<code>t_infomask</code>
+            等）。Seq Scan、Index Scan 从 buffer pool 读出来的行就是
+            heap slot。</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 从 buffer pool 读取到 heap slot</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>HeapTuple tuple <span class="op">=</span> heap_getnext<span class="op">(</span>scandesc<span class="op">,</span> ForwardScanDirection<span class="op">);</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>ExecStoreHeapTuple<span class="op">(</span>tuple<span class="op">,</span> slot<span class="op">,</span> <span class="kw">false</span><span class="op">);</span>  <span class="co">// false = 不拷贝，直接引用 buffer 页</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>`ExecStoreHeapTuple<span class="op">(</span>tuple<span class="op">,</span> slot<span class="op">,</span> <span class="kw">false</span><span class="op">)</span>` 不做数据拷贝——slot 的 `tts_values<span class="op">[]</span>` 指针直接指向 buffer 页内的数据。这意味着在 `ReleaseBuffer<span class="op">()</span>`（unpin）之前必须消费完 slot 内容，否则悬空指针。</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.4 Minimal Slot：用于 Hash 表</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>Hash Join 在构建 hash 表时，inner 行需要被存储到 hash 表的 tuple 链表中——但此时 PG 不需要系统列（xmin<span class="op">/</span>xmax）。Minimal slot 只保存用户列值，用于 hash 表存储和 hash join 匹配时的连接键抽取。</span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/executor/nodeHash.c</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="co">// hash join build 阶段：将 heap slot 转成 minimal tuple 存入 hash 表</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>ExecCopySlotMinimalTuple<span class="op">(</span>slot<span class="op">);</span>  <span class="co">// 提取用户列，丢掉系统列</span></span></code></pre></div>
+            <p>Minimal tuple 不包含 tuple header，大小比 heap tuple 小
+            23+ 字节。在 hash join 需要存储大量 inner
+            行时，这能节省可观的内存。</p>
+            <h3 id="slot-操作接口">4.5 Slot 操作接口</h3>
+            <p>算子通过统一的宏操作 slot，而不关心底层类型：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 从 slot 中取第 N 列的值</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>slot_getattr<span class="op">(</span>TupleTableSlot <span class="op">*</span>slot<span class="op">,</span> <span class="dt">int</span> attnum<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>isnull<span class="op">);</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 把所有列值填充到 tts_values[] / tts_isnull[]（惰性解构）</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>slot_getallattrs<span class="op">(</span>TupleTableSlot <span class="op">*</span>slot<span class="op">);</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 只填充一部分列（只填充需要的，惰性）</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>slot_getsomeattrs<span class="op">(</span>TupleTableSlot <span class="op">*</span>slot<span class="op">,</span> <span class="dt">int</span> attnum<span class="op">);</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="co">// 把 slot 内容物化成 heap tuple（如果是 virtual/minimal，需要构造 HeapTupleData）</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>ExecFetchSlotHeapTuple<span class="op">(</span>TupleTableSlot <span class="op">*</span>slot<span class="op">,</span> <span class="dt">bool</span> materialize<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>shouldFree<span class="op">);</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>惰性解构（lazy deforming）是性能优化：从 heap page 读出的 tuple 以紧凑格式存储（列值不是对齐的数组），不需要立即<span class="st">&quot;解构&quot;</span>成 `tts_values<span class="op">[]</span>` 数组。`slot_getattr<span class="op">()</span>` 在第一次访问某列时才解构，后续访问复用结果。</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 五、执行器与 Buffer Manager 的交互</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>执行器不直接读写磁盘——它通过 Buffer Manager 访问页面。以 Seq Scan 为例：</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/heap/heapam.c, heap_getnext()</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>HeapTuple heap_getnext<span class="op">(</span>TableScanDesc sscan<span class="op">,</span> ScanDirection direction<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>    HeapScanDesc scan <span class="op">=</span> <span class="op">(</span>HeapScanDesc<span class="op">)</span> sscan<span class="op">;</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 当前页面用完 → 读下一页</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>scan<span class="op">-&gt;</span>rs_inited <span class="op">&amp;&amp;</span> <span class="op">!</span>heap_page_is_all_visible<span class="op">(...))</span> <span class="op">{</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>            <span class="co">// ... 处理 VM 检查和 pin 操作 ...</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>        </span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a>        page <span class="op">=</span> BufferGetPage<span class="op">(</span>scan<span class="op">-&gt;</span>rs_cbuf<span class="op">);</span>  <span class="co">// 获取 pinned buffer 的页面指针</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a>        lineoff <span class="op">=</span> ItemPointerGetOffsetNumber<span class="op">(&amp;</span>scan<span class="op">-&gt;</span>rs_ctup<span class="op">.</span>t_self<span class="op">);</span></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>        </span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 扫描页面中的 ItemId 数组，找下一个有效 tuple</span></span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a>        lines <span class="op">=</span> PageGetMaxOffsetNumber<span class="op">(</span>page<span class="op">);</span></span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(;</span> lineoff <span class="op">&lt;=</span> lines<span class="op">;</span> lineoff<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a>            itemId <span class="op">=</span> PageGetItemId<span class="op">(</span>page<span class="op">,</span> lineoff<span class="op">);</span></span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(!</span>ItemIdIsNormal<span class="op">(</span>itemId<span class="op">))</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a>            </span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 设置返回 tuple 的位置</span></span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a>            scan<span class="op">-&gt;</span>rs_ctup<span class="op">.</span>t_self <span class="op">=</span> ItemPointer<span class="op">(</span>block<span class="op">,</span> lineoff<span class="op">);</span></span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a>            </span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a>            <span class="co">// heap_getnext 不拷贝数据——返回指针指向 buffer 页</span></span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a>            <span class="co">// buffer 的 pin 由执行器框架在释放 slot 时处理</span></span>
+<span id="cb12-47"><a href="#cb12-47" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="op">&amp;</span>scan<span class="op">-&gt;</span>rs_ctup<span class="op">;</span></span>
+<span id="cb12-48"><a href="#cb12-48" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-49"><a href="#cb12-49" aria-hidden="true" tabindex="-1"></a>        </span>
+<span id="cb12-50"><a href="#cb12-50" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 本页扫描完，unpin 旧页面，pin 新页面</span></span>
+<span id="cb12-51"><a href="#cb12-51" aria-hidden="true" tabindex="-1"></a>        scan<span class="op">-&gt;</span>rs_cblock<span class="op">++;</span>  <span class="co">// 下一页</span></span>
+<span id="cb12-52"><a href="#cb12-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-53"><a href="#cb12-53" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>这道出了 Seq Scan 的实际 IO
+            模式：不是把所有行读进内存再遍历，而是<strong>逐页 pin →
+            逐行扫描 → 逐页 unpin</strong>。每页可能包含几百行，一次
+            <code>ReadBuffer()</code> 带来的 IO
+            分摊到该页的每一行上。</p>
+            <hr />
+            <h2 id="六运维查询-hang-住不动时的诊断">六、运维：查询 hang
+            住不动时的诊断</h2>
+            <p>执行器本身不会”hang 住”——没有无限循环设计。查询 hang
+            住的根因通常在锁等待或 IO
+            等待。这个场景下，执行器正在某处等待——可能是等 Heavyweight
+            Lock（<code>LockAcquire()</code>）、等 LWLock（buffer 的
+            content lock）、等 Buffer Pin（<code>PinBuffer()</code>
+            等别人释放 pin）、等 IO（物理读）。</p>
+            <h3 id="wait_event-是第一现场">6.1 wait_event
+            是第一现场</h3>
+            <p>PG 9.6 开始在 <code>pg_stat_activity</code> 中暴露
+            <code>wait_event_type</code> 和
+            <code>wait_event</code>，它告诉你后端当前”卡在什么等待上”。查询
+            hang 住时，第一步永远是查这个：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, state, wait_event_type, wait_event, query_start, <span class="kw">LEFT</span>(<span class="kw">query</span>, <span class="dv">120</span>)</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">!=</span> <span class="st">&#39;idle&#39;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> query_start;</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>关键 `wait_event_type` 的解读：</span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>| wait_event_type | 典型 wait_event | 含义 | 下一步 |</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>|<span class="co">-----------------|----------------|------|--------|</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>| `Lock` | `relation` <span class="op">/</span> `transactionid` <span class="op">/</span> `tuple` | 等待 heavyweight lock（表锁<span class="op">/</span>行锁<span class="op">/</span>事务锁） | 查 `pg_locks` <span class="op">+</span> `pg_blocking_pids()` |</span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>| `LWLock` | `buffer_content` <span class="op">/</span> `WALWrite` <span class="op">/</span> `lock_manager` | 等待轻量级锁 | 看具体 LWLock 名称判断热点模块 |</span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>| `IO` | `DataFileRead` <span class="op">/</span> `WALRead` <span class="op">/</span> `WALWrite` | 等待物理 IO | 查 `pg_stat_io` <span class="op">/</span> `iostat` 确认磁盘是否有问题 |</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>| `BufferPin` | `BufferPin` | 其他 backend 持有一个 buffer 的 pin 太久 | 查谁持有了这个 buffer——通常意味着有人在 buffer 页数据上做了长时间操作 |</span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>| `Client` | `ClientRead` | 等待客户端发来下一条 SQL | 这不是 hang，是客户端没在发数据（idle <span class="kw">in</span> <span class="kw">transaction</span> 的典型表现） |</span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>| `Timeout` | `PgSleep` | `pg_sleep()` 等主动休眠 | 查 SQL 里是否有 `pg_sleep` |</span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>| `Activity` | `ArchiverMain` <span class="op">/</span> `AutoVacuumMain` 等 | 辅助进程的主循环等待 | 属于正常状态 |</span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>常见误诊：<span class="ot">&quot;查询 hang 住了，`wait_event=ClientRead`&quot;</span>——这不叫 PG hang 住，是客户端没有发下一条 SQL。如果一条连接 `state<span class="op">=</span><span class="st">&#39;idle in transaction&#39;</span>` 且 `wait_event<span class="op">=</span><span class="st">&#39;ClientRead&#39;</span>`，它是在等客户端提交<span class="op">/</span>回滚——但这期间它持有的锁不释放，其他查询会被阻塞在 `wait_event_type<span class="op">=</span><span class="st">&#39;Lock&#39;</span>`。</span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>### <span class="fl">6.2</span> 锁等待链追踪</span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>当一个查询 `wait_event_type<span class="op">=</span><span class="st">&#39;Lock&#39;</span>` 时，下一步是找到它在等谁的锁：</span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询所有未授予的锁及其阻塞者</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    blocked.pid              <span class="kw">AS</span> blocked_pid,</span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>    blocked.<span class="kw">query</span>            <span class="kw">AS</span> blocked_query,</span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    blocking.pid             <span class="kw">AS</span> blocking_pid,</span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>    blocking.<span class="kw">query</span>           <span class="kw">AS</span> blocking_query,</span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>    blocked.wait_event_type,</span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>    blocked.wait_event</span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity blocked</span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a><span class="kw">CROSS</span> <span class="kw">JOIN</span> LATERAL unnest(pg_blocking_pids(blocked.pid)) <span class="kw">AS</span> blocking_pid</span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity blocking <span class="kw">ON</span> blocking.pid <span class="op">=</span> blocking_pid</span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> blocked.state <span class="op">=</span> <span class="st">&#39;active&#39;</span>;</span></code></pre></div>
+            <p><code>pg_blocking_pids()</code> 返回<strong>直接阻塞当前
+            pid 的事务的 backend pid 列表</strong>。它的实现位于
+            <code>src/backend/utils/adt/lockfuncs.c</code>——遍历
+            <code>LockAcquire()</code>
+            的等待队列，找到所有前面持有冲突锁模式的 backend。</p>
+            <p>多级等待链（A 等 B，B 等 C）需要递归追踪：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> RECURSIVE lock_chain <span class="kw">AS</span> (</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 初始：找到等待锁的会话</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> pid, pg_blocking_pids(pid) <span class="kw">AS</span> blockers, <span class="dv">1</span> <span class="kw">AS</span> <span class="kw">level</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;Lock&#39;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 递归：查找阻塞者的阻塞者</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> a.pid, pg_blocking_pids(a.pid), lc.<span class="kw">level</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> pg_stat_activity a</span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">JOIN</span> lock_chain lc <span class="kw">ON</span> a.pid <span class="op">=</span> <span class="kw">ANY</span>(lc.blockers)</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> lc.<span class="kw">level</span> <span class="op">&lt;</span> <span class="dv">10</span>  <span class="co">-- 防止环</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> pid, blockers, <span class="kw">level</span> <span class="kw">FROM</span> lock_chain <span class="kw">ORDER</span> <span class="kw">BY</span> <span class="kw">level</span>;</span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a>同时需要看锁的类型：</span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a>    l.pid, l.<span class="kw">mode</span>, l.granted, l.locktype,</span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a>    l.relation:<span class="ch">:regclass</span> <span class="kw">AS</span> table_name</span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks l</span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity a <span class="kw">USING</span> (pid)</span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> l.pid <span class="op">=</span> <span class="kw">ANY</span>(pg_blocking_pids(<span class="op">&lt;</span>hang_pid<span class="op">&gt;</span>))</span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a>   <span class="kw">OR</span> l.pid <span class="op">=</span> <span class="op">&lt;</span>hang_pid<span class="op">&gt;</span>;</span></code></pre></div>
+            <p>关键判断： - 如果阻塞者的
+            <code>state='idle in transaction'</code> 且
+            <code>xact_start</code> 很久以前 →
+            这是一个长事务持锁。可以考虑
+            <code>pg_terminate_backend(pid)</code>
+            杀掉它（代价：它的事务回滚，未提交数据丢失）。 -
+            如果阻塞者的 <code>state='active'</code> 且自己也在等锁 →
+            形成了等待链，需要往上游追踪。 - 如果 <code>pg_locks</code>
+            显示阻塞者持有 <code>ExclusiveLock</code> 且自己卡在
+            <code>AccessExclusiveLock</code> → DDL
+            在等查询结束。查阻塞者 <code>state='active'</code> 的
+            <code>query</code> 看是什么查询跑太久。</p>
+            <h3 id="explain-行数偏差诊断">6.3 EXPLAIN 行数偏差诊断</h3>
+            <p><code>EXPLAIN ANALYZE</code> 输出中
+            <code>(actual rows=...)</code> 与 <code>(rows=...)</code>
+            的差异是最直接的性能诊断信息：</p>
+            <pre class="text"><code>Nested Loop  (cost=0.42..12345.67 rows=10 width=64)
+              (actual time=0.123..4523.456 rows=100000 loops=1)
+```text
+
+planner 估算 10 行，实际 100,000 行——偏差 10,000 倍。这会产生两种后果：
+
+1. **NestLoop 的内表被重复扫描远多于预期**：NestLoop 对外表每一行扫描一次内表。外表数量被低估 10,000 倍，内表就被多扫描 10,000 次。
+2. **上层算子在错误代价模型下做了错误决策**：如果 planner 知道这里是 100,000 行，可能选择 Hash Join 而非 NestLoop。
+
+行数偏差最常见的三个根因：
+
+**统计信息过时**：
+```sql
+-- 查表上次 ANALYZE 时间和 ESTIMATE 变化量
+SELECT schemaname, relname,
+       last_analyze, last_autoanalyze,
+       n_mod_since_analyze, n_live_tup
+FROM pg_stat_user_tables
+WHERE relname = &#39;your_table&#39;;</code></pre>
+            <p><code>n_mod_since_analyze</code> 很大 → 统计信息已经不准
+            → 手工 <code>ANALYZE your_table;</code></p>
+            <p><strong>多列相关未被统计</strong>：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果查询条件是 a &gt; 100 AND b &gt; 100，</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 而 a 和 b 存在相关性（大数据 a 往往对应大数据 b），</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 单列统计会严重低估过滤率。</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 解决方案：</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">STATISTICS</span> s1 <span class="kw">ON</span> a, b <span class="kw">FROM</span> your_table;</span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> your_table;</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>参数化查询的通用计划问题<span class="op">**</span>：</span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- PREPARE 后的参数化查询，PG 可能使用通用计划（generic plan）</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 固定使用一组代价估算，不考虑参数值的分布差异。</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>SHOW plan_cache_mode;  <span class="co">-- 检查是用 &#39;auto&#39; 还是 &#39;force_generic_plan&#39;</span></span></code></pre></div>
+            <p>如果应用使用 prepared
+            statement，且某些参数值的过滤率极端（如一个值匹配 1
+            行、另一个匹配 100
+            万行），<code>plan_cache_mode = 'force_custom_plan'</code>
+            或 <code>auto</code> 模式下 PG 会根据前 5
+            次执行判断是否切换到 custom plan。</p>
+            <h3 id="执行器层面的排查命令总结">6.4
+            执行器层面的排查命令总结</h3>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第一步：定位 hang 住的原因</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, state, wait_event_type, wait_event, <span class="kw">query</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pid <span class="op">=</span> <span class="op">&lt;</span>hang_pid<span class="op">&gt;</span>;</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第二步：如果是等锁，追踪锁等待链</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> unnest(pg_blocking_pids(<span class="op">&lt;</span>hang_pid<span class="op">&gt;</span>));</span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第三步：看锁的细节</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> locktype, <span class="kw">mode</span>, granted, relation:<span class="ch">:regclass</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks <span class="kw">WHERE</span> pid <span class="kw">IN</span> (<span class="op">&lt;</span>hang_pid<span class="op">&gt;</span>, <span class="op">&lt;</span>blocker_pid<span class="op">&gt;</span>);</span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第四步：如果 garented=false 且 mode=&#39;AccessExclusiveLock&#39;，</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查阻塞这条 DDL 的所有 backend</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, state, <span class="kw">query</span>, xact_start</span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pid <span class="op">=</span> <span class="kw">ANY</span>(pg_blocking_pids(<span class="op">&lt;</span>ddl_pid<span class="op">&gt;</span>));</span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第五步：如果没在等锁，而是在 IO 等待</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 EXPLAIN 输出定位哪个节点产生大量 IO</span></span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 再用 pg_stat_io 确认是不是磁盘瓶颈</span></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pg_stat_io <span class="kw">WHERE</span> backend_type <span class="op">=</span> <span class="st">&#39;client backend&#39;</span>;</span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a><span class="co">-- 补救措施（仅在确认安全时使用）</span></span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_cancel_backend(<span class="op">&lt;</span>pid<span class="op">&gt;</span>);       <span class="co">-- 取消查询（不 kill 连接）</span></span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_terminate_backend(<span class="op">&lt;</span>pid<span class="op">&gt;</span>);    <span class="co">-- 终止连接（回滚事务）</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>## 七、实验：观察执行器行为</span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>### <span class="fl">7.1</span> 用 GDB 追踪 ExecProcNode</span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a># <span class="fl">1.</span> 开一个 psql <span class="kw">session</span></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a>psql <span class="op">-</span>c <span class="ot">&quot;SELECT pg_backend_pid();&quot;</span></span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a># 假设输出 <span class="dv">12345</span></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a># <span class="fl">2.</span> 在另一个终端 attach</span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>gdb <span class="op">-</span>p <span class="dv">12345</span></span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a># <span class="fl">3.</span> 设置断点</span>
+<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>(gdb) <span class="kw">break</span> ExecProcNode</span>
+<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a>(gdb) <span class="kw">continue</span></span>
+<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a># <span class="fl">4.</span> 在 psql 中执行一条查询，GDB 会在每次 ExecProcNode 调用时停住</span>
+<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a># 通过 bt 看调用栈，追踪是哪一层算子在被调用</span>
+<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a>(gdb) bt</span>
+<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a># #<span class="dv">0</span>  ExecProcNode <span class="op">..</span>. </span>
+<span id="cb17-51"><a href="#cb17-51" aria-hidden="true" tabindex="-1"></a># #<span class="dv">1</span>  ExecNestLoop <span class="op">..</span>.</span>
+<span id="cb17-52"><a href="#cb17-52" aria-hidden="true" tabindex="-1"></a># #<span class="dv">2</span>  ExecProcNode <span class="op">..</span>.</span>
+<span id="cb17-53"><a href="#cb17-53" aria-hidden="true" tabindex="-1"></a># #<span class="dv">3</span>  ExecSort <span class="op">..</span>.</span>
+<span id="cb17-54"><a href="#cb17-54" aria-hidden="true" tabindex="-1"></a># <span class="op">..</span>.</span></code></pre></div>
+            <h3 id="观察-hash-join-的-batch-溢出">7.2 观察 Hash Join 的
+            batch 溢出</h3>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 先把 work_mem 调到极低，强制 hash join 溢出</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> work_mem <span class="op">=</span> <span class="st">&#39;64kB&#39;</span>;</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 制造一张大表</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t_big <span class="kw">AS</span> <span class="kw">SELECT</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) <span class="kw">AS</span> <span class="kw">id</span>, </span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>                              md5(<span class="kw">random</span>():<span class="ch">:text</span>) <span class="kw">AS</span> <span class="kw">data</span>;</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> t_small <span class="kw">AS</span> <span class="kw">SELECT</span> generate_series(<span class="dv">1</span>, <span class="dv">1000</span>) <span class="kw">AS</span> <span class="kw">id</span>;</span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> t_big; <span class="kw">ANALYZE</span> t_small;</span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 执行 hash join</span></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS)</span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> t_big b <span class="kw">JOIN</span> t_small s <span class="kw">ON</span> b.<span class="kw">id</span> <span class="op">=</span> s.<span class="kw">id</span>;</span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a>输出会显示 `Batches:` 远大于 <span class="dv">1</span>，`Memory <span class="kw">Usage</span>:` 接近 <span class="dv">64</span>kB，说明发生了磁盘溢出。`Buffers:` 的 `read` 计数会显著增加——因为每个 batch 都要从临时文件重读数据。</span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a>对比正常模式：</span>
+<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb18-21"><a href="#cb18-21" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> work_mem <span class="op">=</span> <span class="st">&#39;64MB&#39;</span>;</span>
+<span id="cb18-22"><a href="#cb18-22" aria-hidden="true" tabindex="-1"></a><span class="co">-- 同样查询，Batches: 1</span></span></code></pre></div>
+            <h3 id="观察-eeo-编译结果">7.3 观察 EEO 编译结果</h3>
+            <p>```sql – 开启 debug 输出（需要 PG 编译时带
+            –enable-debug） SET debug_print_expression = on;</p>
+            <p>SELECT x, y, x + y &gt; 10 AND z IS NOT NULL FROM test
+            WHERE id = 1; – 日志中会输出编译后的 step 序列 ```text</p>
+            <hr />
+            <h2 id="八关键要点">八、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>火山模型的核心是统一接口</strong>：<code>ExecInitNode()</code>
+            → <code>ExecProcNode()</code> → <code>ExecEndNode()</code>
+            三个函数覆盖所有算子。parent 不知道 child 的具体类型，只管调
+            <code>ExecProcNode()</code> 拉数据。</p></li>
+            <li><p><strong>Hash Join 用 Grace Hash Join
+            应对溢出</strong>：inner 行按 batch hash
+            分到多个分区，当前分区在内存，其余写临时文件。<code>EXPLAIN ANALYZE</code>
+            中 <code>Batches &gt; 1</code> 意味着溢出发生——每个额外的
+            batch 都需要一次额外的磁盘 IO。</p></li>
+            <li><p><strong>EEO
+            把表达式求值从递归改成了线性</strong>：表达式树在
+            <code>ExecInitExpr()</code> 中编译成 opcode
+            数组，<code>ExecInterpExpr()</code>
+            在一个紧凑的循环中分发执行。这是 PG 10
+            之后表达式求值不再成为瓶颈的基础。</p></li>
+            <li><p><strong>TupleTableSlot
+            有三种实现，按需选择</strong>：Virtual slot
+            最轻量（纯内存数组），Minimal slot 用于 hash 表，Heap slot
+            用于从 buffer pool
+            直接引用页面数据。惰性解构在真正需要时才解构列值。</p></li>
+            <li><p><strong>查询 hang 住时，<code>wait_event</code>
+            是第一个线索</strong>：<code>Lock</code> 表示锁等待（用
+            <code>pg_blocking_pids()</code> 追踪），<code>IO</code>
+            表示磁盘等待（查
+            <code>pg_stat_io</code>），<code>BufferPin</code> 表示有人在
+            buffer 页上耗太久，<code>ClientRead</code>
+            表示等客户端——这不是 PG 的问题。</p></li>
+            <li><p><strong>EXPLAIN
+            中计划行数与实际行数的偏差是最直接的性能诊断</strong>：偏差超过
+            100 倍意味着统计信息不准。NestLoop 的内表扫描次数被低估、或
+            Hash Join 本该被使用却错选
+            NestLoop——行数估算错误是一切糟糕计划的根因。</p></li>
+            </ol>
+            <p>下一章：<a href="../13-jit/13-jit.html">JIT 编译</a>——EEO
+            完成了从表达式树到 opcode 的编译，JIT 再进一步：把 opcode
+            序列编译成 LLVM native code，连 switch-case
+            的分发开销也消除。</p>
+            <p>上一章：<a
+            href="../11-join-paths/11-join-paths.html">查询规划器 — Join
+            顺序与路径生成</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/executor/execMain.c</code>：ExecutorStart(),
+            ExecutorRun(), ExecutorFinish(), ExecutorEnd()</li>
+            <li><code>src/backend/executor/execProcnode.c</code>：ExecInitNode(),
+            ExecProcNode(), ExecEndNode()</li>
+            <li><code>src/backend/executor/nodeHashjoin.c</code>：ExecHashJoin()
+            — Hash Join 的主循环与状态机</li>
+            <li><code>src/backend/executor/nodeHash.c</code>：ExecHashTableCreate(),
+            ExecHashTableInsert(), ExecHashGetBucketAndBatch()</li>
+            <li><code>src/backend/executor/nodeNestloop.c</code>：ExecNestLoop()
+            — NestLoop 实现</li>
+            <li><code>src/backend/executor/nodeSeqscan.c</code>：SeqNext()
+            — Seq Scan 的逐行读取</li>
+            <li><code>src/backend/executor/execExpr.c</code>：ExecInitExpr(),
+            ExecInitExprRec() — 表达式树到 opcode 的编译</li>
+            <li><code>src/backend/executor/execExprInterp.c</code>：ExecInterpExpr()
+            — EEO opcode 的解释执行循环</li>
+            <li><code>src/include/executor/execExpr.h</code>：ExprEvalOp
+            枚举定义、ExprEvalStep 结构体</li>
+            <li><code>src/include/executor/tuptable.h</code>：TupleTableSlot
+            结构体、TTSOps 虚函数表</li>
+            <li><code>src/include/executor/hashjoin.h</code>：HashJoinTableData
+            结构体</li>
+            <li><code>src/backend/access/heap/heapam.c</code>：heap_getnext()
+            — heap scan 实现</li>
+            <li><code>src/backend/utils/adt/lockfuncs.c</code>：pg_blocking_pids()
+            — 锁阻塞关系查询</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 51: Overview of
+            PostgreSQL Internals, Section 51.5 (Executor)</li>
+            <li>PostgreSQL Documentation, Chapter 28: Monitoring
+            Database Activity — <code>pg_stat_activity</code>,
+            <code>pg_locks</code></li>
+            <li>PostgreSQL Documentation, Section 14.4:
+            <code>EXPLAIN</code> — 执行计划输出解读</li>
+            <li>PostgreSQL Documentation, Section 19.4: Resource
+            Consumption — <code>work_mem</code>,
+            <code>hash_mem_multiplier</code></li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Graefe, G. <em>Volcano — An Extensible and Parallel
+            Query Evaluation System</em>. IEEE TKDE 1994. —
+            火山模型的原始论文。</li>
+            <li>Graefe, G. &amp; McKenna, W. J. <em>The Volcano
+            Optimizer Generator: Extensibility and Efficient
+            Search</em>. ICDE 1993. — Volcano 查询优化器框架。</li>
+            </ul>
+            <h3 id="实验工具">实验工具</h3>
+            <ul>
+            <li>GDB：断点追踪
+            <code>ExecProcNode()</code>、<code>ExecInterpExpr()</code>
+            调用栈</li>
+            <li><code>EXPLAIN (ANALYZE, BUFFERS, SETTINGS)</code>：观察实际行数、buffer
+            命中率、batch 溢出</li>
+            <li><code>pg_stat_activity</code> +
+            <code>pg_blocking_pids()</code> +
+            <code>pg_locks</code>：诊断查询 hang 住</li>
+            <li><code>debug_print_expression = on</code>：观察 EEO
+            opcode 编译结果</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/11-join-paths/11-join-paths.html">【PG 内核】查询规划器 — Join 顺序与路径生成：优化器如何选中 Nested Loop</a></h3>
+                    <p>拆解 PostgreSQL 查询优化器的路径生成：make_one_rel() 从基表访问到 Join 路径的完整流程、四种扫描路径 (SeqScan/IndexScan/IndexOnlyScan/BitmapScan) 的创建条件、三种 Join 方式 (NestLoop/HashJoin/MergeJoin) 的代价比较与选择逻辑、动态规划到 GEQO 遗传算法的切换条件 (geqo_threshold)、并行路径的生成机制。配 EXPLAIN (ANALYZE, BUFFERS) 输出与 planner 内部决策的逐项对照实验。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/13-jit/13-jit.html">【PG 内核】JIT 编译：为什么 PG 要把 WHERE 子句编译成机器码</a></h3>
+                    <p>拆解 PostgreSQL 的 LLVM JIT 编译机制：JIT 编译的触发决策流程（jit_above_cost 三级阈值）、LLVM 模块管理与惰性编译、表达式求值从 EEO opcode 到 LLVM IR 再到机器码的完整路径、Tuple 变形（deforming）的 JIT 加速原理，以及 JIT 在 OLAP 场景的实际加速效果、编译开销和适用边界。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/20-extensions-fdw/20-extensions-fdw.html">【PG 内核】扩展系统与 FDW：PG 的 hook 机制如何让扩展影响 Planner 决策</a></h3>
+                    <p>拆解 PostgreSQL 扩展系统的两种核心机制：全局 hook 机制全景（planner_hook、ExecutorStart_hook、ProcessUtility_hook 等覆盖七个子系统）和 FDW（Foreign Data Wrapper）的 FdwRoutine 回调接口。重点分析 postgres_fdw 的 pushdown 机制——哪些 WHERE/ORDER BY/LIMIT 能推到远端执行、哪些被留在本地——以及扩展如何通过 GetForeignRelSize→GetForeignPaths→GetForeignPlan 三个回调影响 planner 的代价估算和路径选择。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,2041 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】列式存储原理：为什么分析查询快 10 倍 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="columnar-storage, row-store, simd, vectorized, compression, pax, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/35-columnar-storage/columnar-storage.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】列式存储原理：为什么分析查询快 10 倍" />
+    <meta property="og:description" content="一条典型的分析查询只访问表中数百列里的三四列，行式存储却把整行数据从磁盘搬进内存，绝大多数字节在读入后立刻被丢弃。列式存储（Columnar Storage）把同一列的值连续存放，查询只需要读取涉及到的列，I/O 量可以降低一到两个数量级。但 I/O 减少只是故事的一半——列式布局还为压缩、向量化执行（Vectoriz…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/35-columnar-storage/columnar-storage.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="columnar-storage" />
+    <meta property="article:tag" content="row-store" />
+    <meta property="article:tag" content="simd" />
+    <meta property="article:tag" content="vectorized" />
+    <meta property="article:tag" content="compression" />
+    <meta property="article:tag" content="pax" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】列式存储原理：为什么分析查询快 10 倍" />
+    <meta name="twitter:description" content="一条典型的分析查询只访问表中数百列里的三四列，行式存储却把整行数据从磁盘搬进内存，绝大多数字节在读入后立刻被丢弃。列式存储（Columnar Storage）把同一列的值连续存放，查询只需要读取涉及到的列，I/O 量可以降低一到两个数量级。但 I/O 减少只是故事的一半——列式布局还为压缩、向量化执行（Vectoriz…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】列式存储原理：为什么分析查询快 10 倍", "description": "一条典型的分析查询只访问表中数百列里的三四列，行式存储却把整行数据从磁盘搬进内存，绝大多数字节在读入后立刻被丢弃。列式存储（Columnar Storage）把同一列的值连续存放，查询只需要读取涉及到的列，I/O 量可以降低一到两个数量级。但 I/O 减少只是故事的一半——列式布局还为压缩、向量化执行（Vectoriz…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/35-columnar-storage/columnar-storage.html"}, "datePublished": "2025-09-13T00:00:00+00:00", "dateModified": "2026-04-15T11:45:56+00:00", "keywords": ["columnar-storage", "row-store", "simd", "vectorized", "compression", "pax"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】列式存储原理：为什么分析查询快 10 倍</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-13</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#columnar-storage</span> <span>#row-store</span> <span>#simd</span> <span>#vectorized</span> <span>#compression</span> <span>#pax</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/34-embedded-engine-comparison/embedded-engine-comparison.html">上一篇：【存储工程】嵌入式存储引擎对比</a><a class="post-series-nav__link" href="/post/storage/36-parquet/parquet.html">下一篇：【存储工程】Parquet 文件格式深度解析</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/columnar-storage.html">#columnar-storage</a><a class="chip-link" href="/tags/row-store.html">#row-store</a><a class="chip-link" href="/tags/simd.html">#simd</a><a class="chip-link" href="/tags/vectorized.html">#vectorized</a><a class="chip-link" href="/tags/compression.html">#compression</a><a class="chip-link" href="/tags/pax.html">#pax</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一行式与列式的-io-差异"
+                id="toc-一行式与列式的-io-差异">一、行式与列式的 I/O
+                差异</a>
+                <ul>
+                <li><a href="#行式存储的数据布局"
+                id="toc-行式存储的数据布局">1.1
+                行式存储的数据布局</a></li>
+                <li><a href="#列式存储的数据布局"
+                id="toc-列式存储的数据布局">1.2
+                列式存储的数据布局</a></li>
+                <li><a href="#分析查询的-io-对比"
+                id="toc-分析查询的-io-对比">1.3 分析查询的 I/O
+                对比</a></li>
+                <li><a href="#io-差异的量化模型"
+                id="toc-io-差异的量化模型">1.4 I/O
+                差异的量化模型</a></li>
+                <li><a href="#磁盘顺序读取的优势"
+                id="toc-磁盘顺序读取的优势">1.5
+                磁盘顺序读取的优势</a></li>
+                <li><a href="#行式存储的优势场景"
+                id="toc-行式存储的优势场景">1.6
+                行式存储的优势场景</a></li>
+                </ul></li>
+                <li><a href="#二列式压缩优势"
+                id="toc-二列式压缩优势">二、列式压缩优势</a>
+                <ul>
+                <li><a href="#为什么列式数据更容易压缩"
+                id="toc-为什么列式数据更容易压缩">2.1
+                为什么列式数据更容易压缩</a></li>
+                <li><a href="#列式存储常用的编码技术"
+                id="toc-列式存储常用的编码技术">2.2
+                列式存储常用的编码技术</a></li>
+                <li><a href="#压缩率对比" id="toc-压缩率对比">2.3
+                压缩率对比</a></li>
+                <li><a href="#压缩对查询性能的影响"
+                id="toc-压缩对查询性能的影响">2.4
+                压缩对查询性能的影响</a></li>
+                </ul></li>
+                <li><a href="#三向量化执行simd"
+                id="toc-三向量化执行simd">三、向量化执行（SIMD）</a>
+                <ul>
+                <li><a href="#传统行式执行模型"
+                id="toc-传统行式执行模型">3.1 传统行式执行模型</a></li>
+                <li><a href="#向量化执行模型"
+                id="toc-向量化执行模型">3.2 向量化执行模型</a></li>
+                <li><a href="#simd-加速原理" id="toc-simd-加速原理">3.3
+                SIMD 加速原理</a></li>
+                <li><a href="#向量化过滤" id="toc-向量化过滤">3.4
+                向量化过滤</a></li>
+                <li><a href="#延迟物化late-materialization"
+                id="toc-延迟物化late-materialization">3.5 延迟物化（Late
+                Materialization）</a></li>
+                <li><a href="#向量化与编译执行的对比"
+                id="toc-向量化与编译执行的对比">3.6
+                向量化与编译执行的对比</a></li>
+                </ul></li>
+                <li><a href="#四列式写入挑战"
+                id="toc-四列式写入挑战">四、列式写入挑战</a>
+                <ul>
+                <li><a href="#行式写入-vs-列式写入"
+                id="toc-行式写入-vs-列式写入">4.1 行式写入 vs
+                列式写入</a></li>
+                <li><a href="#批量写入与-delta-store"
+                id="toc-批量写入与-delta-store">4.2 批量写入与 Delta
+                Store</a></li>
+                <li><a href="#lsm-tree-与列式存储的结合"
+                id="toc-lsm-tree-与列式存储的结合">4.3 LSM-Tree
+                与列式存储的结合</a></li>
+                <li><a href="#更新和删除的挑战"
+                id="toc-更新和删除的挑战">4.4 更新和删除的挑战</a></li>
+                <li><a href="#事务支持" id="toc-事务支持">4.5
+                事务支持</a></li>
+                </ul></li>
+                <li><a href="#五pax-混合布局"
+                id="toc-五pax-混合布局">五、PAX 混合布局</a>
+                <ul>
+                <li><a href="#行式和列式的两难"
+                id="toc-行式和列式的两难">5.1 行式和列式的两难</a></li>
+                <li><a href="#pax-布局的结构"
+                id="toc-pax-布局的结构">5.2 PAX 布局的结构</a></li>
+                <li><a href="#pax-布局的优势"
+                id="toc-pax-布局的优势">5.3 PAX 布局的优势</a></li>
+                <li><a href="#apache-parquet-的行组设计"
+                id="toc-apache-parquet-的行组设计">5.4 Apache Parquet
+                的行组设计</a></li>
+                <li><a href="#行组大小的选择"
+                id="toc-行组大小的选择">5.5 行组大小的选择</a></li>
+                </ul></li>
+                <li><a href="#六列式存储在数据库中的实现"
+                id="toc-六列式存储在数据库中的实现">六、列式存储在数据库中的实现</a>
+                <ul>
+                <li><a href="#clickhouse" id="toc-clickhouse">6.1
+                ClickHouse</a></li>
+                <li><a href="#duckdb" id="toc-duckdb">6.2
+                DuckDB</a></li>
+                <li><a href="#amazon-redshift"
+                id="toc-amazon-redshift">6.3 Amazon Redshift</a></li>
+                </ul></li>
+                <li><a href="#七行列混合htaptidb-tiflash"
+                id="toc-七行列混合htaptidb-tiflash">七、行列混合（HTAP：TiDB
+                TiFlash）</a>
+                <ul>
+                <li><a href="#htap-的需求背景"
+                id="toc-htap-的需求背景">7.1 HTAP 的需求背景</a></li>
+                <li><a href="#tidb-的行列混合架构"
+                id="toc-tidb-的行列混合架构">7.2 TiDB
+                的行列混合架构</a></li>
+                <li><a href="#tiflash-的数据同步机制"
+                id="toc-tiflash-的数据同步机制">7.3 TiFlash
+                的数据同步机制</a></li>
+                <li><a href="#tiflash-的-delta-tree-存储引擎"
+                id="toc-tiflash-的-delta-tree-存储引擎">7.4 TiFlash 的
+                Delta-Tree 存储引擎</a></li>
+                <li><a href="#查询路由与优化器协同"
+                id="toc-查询路由与优化器协同">7.5
+                查询路由与优化器协同</a></li>
+                <li><a href="#其他-htap-方案"
+                id="toc-其他-htap-方案">7.6 其他 HTAP 方案</a></li>
+                </ul></li>
+                <li><a href="#八列式存储性能实测"
+                id="toc-八列式存储性能实测">八、列式存储性能实测</a>
+                <ul>
+                <li><a href="#测试方法论" id="toc-测试方法论">8.1
+                测试方法论</a></li>
+                <li><a href="#测试环境" id="toc-测试环境">8.2
+                测试环境</a></li>
+                <li><a href="#tpc-h-基准测试"
+                id="toc-tpc-h-基准测试">8.3 TPC-H 基准测试</a></li>
+                <li><a href="#行式存储的反例"
+                id="toc-行式存储的反例">8.4 行式存储的反例</a></li>
+                <li><a href="#clickbench-的实测数据"
+                id="toc-clickbench-的实测数据">8.5 ClickBench
+                的实测数据</a></li>
+                </ul></li>
+                <li><a href="#九何时选择列式存储"
+                id="toc-九何时选择列式存储">九、何时选择列式存储</a>
+                <ul>
+                <li><a href="#列式存储的最佳场景"
+                id="toc-列式存储的最佳场景">9.1
+                列式存储的最佳场景</a></li>
+                <li><a href="#行式存储仍然更好的场景"
+                id="toc-行式存储仍然更好的场景">9.2
+                行式存储仍然更好的场景</a></li>
+                <li><a href="#选型决策树" id="toc-选型决策树">9.3
+                选型决策树</a></li>
+                <li><a href="#迁移到列式存储的注意事项"
+                id="toc-迁移到列式存储的注意事项">9.4
+                迁移到列式存储的注意事项</a></li>
+                <li><a href="#列式存储的未来趋势"
+                id="toc-列式存储的未来趋势">9.5
+                列式存储的未来趋势</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>一条典型的分析查询只访问表中数百列里的三四列，行式存储却把整行数据从磁盘搬进内存，绝大多数字节在读入后立刻被丢弃。列式存储（Columnar
+            Storage）把同一列的值连续存放，查询只需要读取涉及到的列，I/O
+            量可以降低一到两个数量级。但 I/O
+            减少只是故事的一半——列式布局还为压缩、向量化执行（Vectorized
+            Execution）和延迟物化（Late
+            Materialization）创造了条件，这些因素叠加在一起，才使得分析查询在列式存储上跑出数倍乃至数十倍的加速。</p>
+            <p>本文从最底层的 I/O
+            模型讲起，逐层拆解列式存储的压缩优势、向量化执行原理、写入挑战、混合布局方案，再到
+            ClickHouse、DuckDB、Redshift 的工程实现和 TiDB TiFlash
+            的行列混合架构，最后给出性能实测数据和选型建议。</p>
+            <hr />
+            <h2 id="一行式与列式的-io-差异">一、行式与列式的 I/O
+            差异</h2>
+            <h3 id="行式存储的数据布局">1.1 行式存储的数据布局</h3>
+            <p>行式存储（Row
+            Store）把一行记录的所有列连续存放在同一个磁盘页中。以一张包含
+            <code>id</code>、<code>name</code>、<code>age</code>、<code>city</code>、<code>salary</code>
+            五列的员工表为例，行式布局在磁盘上的排列方式如下：</p>
+            <pre class="text"><code>┌─── 磁盘页 0 ──────────────────────────────────────────────┐
+│ Row 0: [id=1, name=&quot;张三&quot;, age=28, city=&quot;北京&quot;, salary=15000] │
+│ Row 1: [id=2, name=&quot;李四&quot;, age=35, city=&quot;上海&quot;, salary=22000] │
+│ Row 2: [id=3, name=&quot;王五&quot;, age=31, city=&quot;深圳&quot;, salary=18000] │
+│ Row 3: [id=4, name=&quot;赵六&quot;, age=42, city=&quot;杭州&quot;, salary=25000] │
+└───────────────────────────────────────────────────────────┘
+┌─── 磁盘页 1 ──────────────────────────────────────────────┐
+│ Row 4: [id=5, name=&quot;钱七&quot;, age=26, city=&quot;成都&quot;, salary=13000] │
+│ Row 5: [id=6, name=&quot;孙八&quot;, age=38, city=&quot;广州&quot;, salary=20000] │
+│ ...                                                       │
+└───────────────────────────────────────────────────────────┘</code></pre>
+            <p>假设每行占 200 字节，一个 8KB 的磁盘页可以存放约 40
+            行。如果表有 1 亿行，需要约 250 万个磁盘页，总数据量约
+            20GB。</p>
+            <h3 id="列式存储的数据布局">1.2 列式存储的数据布局</h3>
+            <p>列式存储（Column
+            Store）把同一列的所有值连续存放。同样的员工表，列式布局在磁盘上的排列方式完全不同：</p>
+            <pre class="text"><code>┌─── id 列 ──────────────────────────────────────────────────┐
+│ [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ...]                      │
+└────────────────────────────────────────────────────────────┘
+┌─── name 列 ────────────────────────────────────────────────┐
+│ [&quot;张三&quot;, &quot;李四&quot;, &quot;王五&quot;, &quot;赵六&quot;, &quot;钱七&quot;, &quot;孙八&quot;, ...]         │
+└────────────────────────────────────────────────────────────┘
+┌─── age 列 ─────────────────────────────────────────────────┐
+│ [28, 35, 31, 42, 26, 38, ...]                              │
+└────────────────────────────────────────────────────────────┘
+┌─── city 列 ────────────────────────────────────────────────┐
+│ [&quot;北京&quot;, &quot;上海&quot;, &quot;深圳&quot;, &quot;杭州&quot;, &quot;成都&quot;, &quot;广州&quot;, ...]         │
+└────────────────────────────────────────────────────────────┘
+┌─── salary 列 ──────────────────────────────────────────────┐
+│ [15000, 22000, 18000, 25000, 13000, 20000, ...]            │
+└────────────────────────────────────────────────────────────┘</code></pre>
+            <p>每列独立存储，<code>age</code> 列只包含 4 字节整数，1
+            亿行的 <code>age</code> 列总共约 400MB；<code>salary</code>
+            列也是 4 字节整数，约 400MB。</p>
+            <h3 id="分析查询的-io-对比">1.3 分析查询的 I/O 对比</h3>
+            <p>考虑一个典型的分析查询：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 统计各城市的平均薪资</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> city, <span class="fu">AVG</span>(salary)</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> employees</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> city;</span></code></pre></div>
+            <p>这条查询只涉及 <code>city</code> 和 <code>salary</code>
+            两列，我们来对比两种存储布局的 I/O 开销。</p>
+            <p><strong>行式存储的 I/O 路径：</strong></p>
+            <pre class="text"><code>需要读取：全部 250 万个磁盘页（约 20GB）
+实际使用：每行 200 字节中的约 30 字节（city + salary）
+I/O 利用率：30 / 200 = 15%
+浪费的 I/O：85%</code></pre>
+            <p>行式存储必须把整行读入内存，即使查询只需要两列。每个磁盘页中，85%
+            的字节是
+            <code>id</code>、<code>name</code>、<code>age</code>
+            等不需要的列，这些字节被读入后立刻丢弃。</p>
+            <p><strong>列式存储的 I/O 路径：</strong></p>
+            <pre class="text"><code>需要读取：city 列 + salary 列
+city 列大小：约 1.2GB（假设平均每个城市名 12 字节）
+salary 列大小：约 400MB
+总 I/O：约 1.6GB
+I/O 利用率：接近 100%</code></pre>
+            <p>列式存储只读取 <code>city</code> 和 <code>salary</code>
+            两列的数据，完全不碰
+            <code>id</code>、<code>name</code>、<code>age</code> 列。I/O
+            量从 20GB 降到 1.6GB，减少了约 12 倍。</p>
+            <h3 id="io-差异的量化模型">1.4 I/O 差异的量化模型</h3>
+            <p>用一个简单的数学模型来量化两种布局的 I/O 差异。假设表有
+            <span class="math inline">\(N\)</span> 行、<span
+            class="math inline">\(C\)</span> 列，每列平均宽度为 <span
+            class="math inline">\(W\)</span> 字节，查询涉及 <span
+            class="math inline">\(Q\)</span> 列（<span
+            class="math inline">\(Q \leq C\)</span>）：</p>
+            <pre class="text"><code>行式存储 I/O = N × C × W （读取全部数据）
+列式存储 I/O = N × Q × W （只读取涉及的列）
+
+I/O 加速比 = C / Q</code></pre>
+            <p>当表有 100 列、查询涉及 5 列时，列式存储的 I/O
+            量是行式存储的 5/100 = 5%，加速比为 20
+            倍。实际场景中，分析型数据仓库的表通常有几十到几百列，而单条查询通常只涉及
+            3-10 列，这正是列式存储的最佳场景。</p>
+            <h3 id="磁盘顺序读取的优势">1.5 磁盘顺序读取的优势</h3>
+            <p>列式存储还有一个被低估的 I/O
+            优势：同一列的数据在磁盘上是连续的，读取一列的全部值是纯粹的顺序
+            I/O（Sequential I/O）。</p>
+            <pre class="text"><code>行式存储读取 salary 列：
+  Page 0 → 跳过 id/name/age → 读 salary → 跳过 city
+  Page 1 → 跳过 id/name/age → 读 salary → 跳过 city
+  ...
+  每个页内都有随机偏移
+
+列式存储读取 salary 列：
+  salary 文件 → 顺序读取连续的 4 字节整数块
+  完全顺序 I/O，无跳跃</code></pre>
+            <p>对于 HDD（Hard Disk Drive），顺序读取的吞吐量可以达到
+            150-200 MB/s，而随机读取只有 1-2
+            MB/s，差距达到两个数量级。即使在 SSD（Solid State
+            Drive）上，顺序读取的吞吐量也显著高于随机读取——NVMe SSD
+            顺序读取可以达到 3-7 GB/s，而 4KB
+            随机读取在高队列深度下通常在 1-2 GB/s。</p>
+            <h3 id="行式存储的优势场景">1.6 行式存储的优势场景</h3>
+            <p>列式存储在分析查询上的优势不代表它在所有场景下都更好。行式存储在以下场景下仍然占优：</p>
+            <p><strong>点查询（Point Query）和 OLTP（Online Transaction
+            Processing）负载：</strong></p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 按主键查一行，需要全部列</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> employees <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">42</span>;</span></code></pre></div>
+            <p>行式存储只需要一次 I/O
+            就能读取整行数据。列式存储需要分别从每一列的文件中读取对应位置的值，涉及
+            <span class="math inline">\(C\)</span> 次
+            I/O，反而更慢。</p>
+            <p><strong>高频小范围写入：</strong></p>
+            <p>行式存储插入一行只需要追加到一个位置。列式存储插入一行需要分别写入
+            <span class="math inline">\(C\)</span>
+            个列文件，写放大（Write Amplification）显著。</p>
+            <p>I/O 模型的总结如下表：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>行式存储（Row Store）</th>
+            <th>列式存储（Column Store）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>全表扫描、少量列</td>
+            <td>读取大量无关数据</td>
+            <td>只读涉及的列，I/O 大幅减少</td>
+            </tr>
+            <tr>
+            <td>点查询、全部列</td>
+            <td>一次 I/O 读整行</td>
+            <td>需要 C 次 I/O 拼装整行</td>
+            </tr>
+            <tr>
+            <td>顺序 I/O</td>
+            <td>页内混合多列，局部性一般</td>
+            <td>同列连续存放，顺序 I/O</td>
+            </tr>
+            <tr>
+            <td>写入</td>
+            <td>追加一行到一个位置</td>
+            <td>追加一行需要写 C 个列文件</td>
+            </tr>
+            <tr>
+            <td>典型负载</td>
+            <td>OLTP</td>
+            <td>OLAP</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="二列式压缩优势">二、列式压缩优势</h2>
+            <h3 id="为什么列式数据更容易压缩">2.1
+            为什么列式数据更容易压缩</h3>
+            <p>列式存储的压缩率通常比行式存储高 5-10
+            倍，这不是偶然的。同一列的值具有三个对压缩友好的特性：</p>
+            <ol type="1">
+            <li><strong>类型一致性</strong>：同一列的所有值类型相同——全是
+            <code>INT32</code>、全是 <code>VARCHAR</code>、全是
+            <code>TIMESTAMP</code>。通用压缩算法（如
+            LZ4、Zstd）在处理类型一致的数据时效率更高。</li>
+            <li><strong>值域集中</strong>：同一列的值通常来自相同的值域。例如
+            <code>age</code> 列的值集中在 18-65，<code>status</code>
+            列可能只有
+            <code>active</code>、<code>inactive</code>、<code>pending</code>
+            三个值。值域越集中，熵（Entropy）越低，可压缩性越强。</li>
+            <li><strong>局部有序性</strong>：如果数据按时间插入，时间戳列天然有序；如果有主键排序，相关列也呈现局部有序。有序数据的压缩效果远好于随机数据。</li>
+            </ol>
+            <p>行式存储中，一个页内混合了不同类型的列——<code>INT</code>、<code>VARCHAR</code>、<code>FLOAT</code>、<code>DATE</code>
+            交替排列，数据的统计特性不一致，压缩算法很难找到有效的模式。</p>
+            <h3 id="列式存储常用的编码技术">2.2
+            列式存储常用的编码技术</h3>
+            <p>列式存储不只依赖通用压缩算法，还大量使用针对特定数据模式的编码（Encoding）技术。这些编码技术在压缩的同时，可以直接在压缩数据上执行查询，避免解压开销。</p>
+            <h4 id="游程编码run-length-encoding-rle">2.2.1
+            游程编码（Run-Length Encoding, RLE）</h4>
+            <p>游程编码（Run-Length
+            Encoding）适用于排序后连续重复值较多的列。编码方式是把连续的相同值替换为
+            <code>(值, 重复次数)</code> 对：</p>
+            <pre class="text"><code>原始数据（city 列，按 city 排序后）：
+[&quot;北京&quot;, &quot;北京&quot;, &quot;北京&quot;, &quot;北京&quot;, &quot;上海&quot;, &quot;上海&quot;, &quot;上海&quot;, &quot;深圳&quot;, &quot;深圳&quot;]
+
+RLE 编码后：
+[(&quot;北京&quot;, 4), (&quot;上海&quot;, 3), (&quot;深圳&quot;, 2)]</code></pre>
+            <p>9 个字符串被压缩为 3 个元组，压缩率约 3:1。如果
+            <code>city</code> 列有 1 亿行但只有 300 个不同城市，且数据按
+            <code>city</code> 排序，RLE 可以把 1.2GB 的数据压缩到几十
+            KB。</p>
+            <p>RLE 的另一个优势是可以直接在编码数据上执行聚合操作。例如
+            <code>COUNT(*) GROUP BY city</code>：</p>
+            <pre class="text"><code>直接读取 RLE 编码：
+  &quot;北京&quot; → count = 4
+  &quot;上海&quot; → count = 3
+  &quot;深圳&quot; → count = 2
+不需要逐行扫描</code></pre>
+            <h4 id="字典编码dictionary-encoding">2.2.2
+            字典编码（Dictionary Encoding）</h4>
+            <p>字典编码（Dictionary
+            Encoding）适用于基数（Cardinality）较低的列——即不同值的数量远小于总行数。编码方式是建立一个字典，把每个值映射到一个整数编码，然后用整数编码替代原始值：</p>
+            <pre class="text"><code>原始数据（city 列）：
+[&quot;北京&quot;, &quot;上海&quot;, &quot;深圳&quot;, &quot;杭州&quot;, &quot;北京&quot;, &quot;上海&quot;, &quot;成都&quot;, &quot;北京&quot;, &quot;广州&quot;]
+
+字典：
+  0 → &quot;北京&quot;
+  1 → &quot;上海&quot;
+  2 → &quot;深圳&quot;
+  3 → &quot;杭州&quot;
+  4 → &quot;成都&quot;
+  5 → &quot;广州&quot;
+
+编码后的数据：
+[0, 1, 2, 3, 0, 1, 4, 0, 5]</code></pre>
+            <p>原来每个城市名占 6-12 字节（UTF-8
+            编码的中文），现在每个值只需要 1 字节（如果不同值不超过 256
+            个）甚至更少。字典本身只需要存一份，占用极小的空间。</p>
+            <p>字典编码可以和 RLE 组合使用：先做字典编码，再对整数序列做
+            RLE，进一步提高压缩率。</p>
+            <h4 id="位图编码bitmap-encoding">2.2.3 位图编码（Bitmap
+            Encoding）</h4>
+            <p>位图编码（Bitmap
+            Encoding）为每个不同值建立一个位图（Bitmap），位图中的每一位对应一行，如果该行的值等于这个值则为
+            1，否则为 0：</p>
+            <pre class="text"><code>原始数据（status 列）：
+[&quot;active&quot;, &quot;inactive&quot;, &quot;active&quot;, &quot;pending&quot;, &quot;active&quot;, &quot;inactive&quot;, &quot;active&quot;, &quot;active&quot;]
+
+位图：
+  active:   [1, 0, 1, 0, 1, 0, 1, 1]
+  inactive: [0, 1, 0, 0, 0, 1, 0, 0]
+  pending:  [0, 0, 0, 1, 0, 0, 0, 0]</code></pre>
+            <p>过滤条件 <code>WHERE status = 'active'</code> 只需要读取
+            <code>active</code> 的位图，用位运算（Bitwise
+            Operation）快速定位符合条件的行。位图天然支持 AND、OR、NOT
+            等逻辑运算，多个过滤条件可以通过位图的交集、并集来计算。</p>
+            <p>对于基数较高的列（例如
+            <code>user_id</code>），每个值的位图都非常稀疏（几乎全是
+            0），此时需要使用压缩位图（如 Roaring
+            Bitmap）来避免空间浪费。</p>
+            <h4 id="差分编码delta-encoding">2.2.4 差分编码（Delta
+            Encoding）</h4>
+            <p>差分编码（Delta
+            Encoding）适用于有序或近似有序的数值列，特别是时间戳列。编码方式是存储第一个值和后续值与前一个值的差值：</p>
+            <pre class="text"><code>原始数据（timestamp 列，毫秒级时间戳）：
+[1694563200000, 1694563201000, 1694563201500, 1694563202000, 1694563205000]
+
+Delta 编码后：
+基础值: 1694563200000
+差值序列: [0, 1000, 500, 500, 3000]</code></pre>
+            <p>原始值需要 8 字节（INT64），差值通常只需要 1-2
+            字节。对于毫秒级时间戳，差值通常在几百到几千的范围内，可以进一步用变长整数编码（Variable-Length
+            Integer Encoding）或帧参考（Frame of Reference,
+            FOR）压缩。</p>
+            <h4 id="帧参考编码frame-of-reference-for">2.2.5
+            帧参考编码（Frame of Reference, FOR）</h4>
+            <p>帧参考编码（Frame of
+            Reference）把一组值减去它们的最小值，得到一组较小的非负整数，然后用尽可能少的位数来存储这些整数：</p>
+            <pre class="text"><code>原始数据（age 列）：
+[28, 35, 31, 42, 26, 38, 29, 33]
+
+最小值: 26
+偏移后: [2, 9, 5, 16, 0, 12, 3, 7]
+最大偏移值: 16，需要 5 位
+
+FOR 编码：每个值用 5 位存储
+存储空间: 8 × 5 = 40 位 = 5 字节
+原始空间: 8 × 4 = 32 字节
+压缩率: 约 6.4:1</code></pre>
+            <p>FOR 编码的关键优势在于解码速度极快——批量位解包（Bit
+            Unpacking）可以利用 SIMD（Single Instruction, Multiple
+            Data）指令并行处理，每个时钟周期解码多个值。</p>
+            <h3 id="压缩率对比">2.3 压缩率对比</h3>
+            <p>以下是一组典型的压缩率对比数据，基于 TPC-H 的
+            <code>lineitem</code> 表（约 6 亿行，16 列）：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>编码方式</th>
+            <th>适用列类型</th>
+            <th>典型压缩率</th>
+            <th>可否在压缩态查询</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>游程编码（RLE）</td>
+            <td>排序后重复值多的列</td>
+            <td>10:1 - 1000:1</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td>字典编码（Dictionary）</td>
+            <td>低基数列</td>
+            <td>3:1 - 20:1</td>
+            <td>是</td>
+            </tr>
+            <tr>
+            <td>位图编码（Bitmap）</td>
+            <td>低基数列</td>
+            <td>2:1 - 10:1</td>
+            <td>是（位运算）</td>
+            </tr>
+            <tr>
+            <td>差分编码（Delta）</td>
+            <td>有序数值列、时间戳</td>
+            <td>4:1 - 20:1</td>
+            <td>部分支持</td>
+            </tr>
+            <tr>
+            <td>帧参考（FOR）</td>
+            <td>值域集中的整数列</td>
+            <td>3:1 - 8:1</td>
+            <td>是（SIMD 解码）</td>
+            </tr>
+            <tr>
+            <td>LZ4 通用压缩</td>
+            <td>任意列</td>
+            <td>2:1 - 4:1</td>
+            <td>否</td>
+            </tr>
+            <tr>
+            <td>Zstd 通用压缩</td>
+            <td>任意列</td>
+            <td>3:1 - 8:1</td>
+            <td>否</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>列式存储通常采用分层压缩策略（Layered
+            Compression）：先用轻量级编码（字典、RLE、Delta、FOR），再用通用压缩算法（LZ4
+            或
+            Zstd）做最后一层压缩。这种方式可以在压缩率和解码速度之间取得平衡。</p>
+            <h3 id="压缩对查询性能的影响">2.4 压缩对查询性能的影响</h3>
+            <p>压缩不只是节省磁盘空间。在现代硬件上，内存带宽和磁盘 I/O
+            往往是分析查询的瓶颈，而 CPU
+            能力相对过剩。压缩通过减少数据量，实际上加速了查询：</p>
+            <pre class="text"><code>未压缩：
+  磁盘读取 10GB → 内存传输 10GB → CPU 处理
+  总时间 ≈ 磁盘 I/O 时间（瓶颈）
+
+压缩后（5:1 压缩率）：
+  磁盘读取 2GB → 解压到 10GB → CPU 处理
+  总时间 ≈ 磁盘 I/O 时间（大幅减少）+ 解压时间（CPU 密集，通常很快）</code></pre>
+            <p>LZ4 的解压速度可以达到 4-5 GB/s，Zstd 也能达到 1-2
+            GB/s，远超磁盘或网络的传输速度。压缩后的数据在磁盘和内存之间传输更快，解压的
+            CPU 开销可以被 I/O 节省所覆盖。</p>
+            <p>我认为，压缩率是列式存储相对于行式存储最被低估的优势。很多人只关注”只读需要的列”带来的
+            I/O
+            减少，却忽略了列式布局本身让压缩率提高了数倍——两个因素叠加，实际的
+            I/O 减少量往往比简单的列选择模型预测的大得多。</p>
+            <hr />
+            <h2 id="三向量化执行simd">三、向量化执行（SIMD）</h2>
+            <h3 id="传统行式执行模型">3.1 传统行式执行模型</h3>
+            <p>传统数据库采用火山模型（Volcano
+            Model）执行查询。每个算子（Operator）实现一个
+            <code>next()</code>
+            接口，每次调用返回一行数据。查询执行树从根节点开始，逐层调用
+            <code>next()</code>，一行一行地处理数据：</p>
+            <pre class="text"><code>         ┌──────────┐
+         │  输出     │
+         └────┬─────┘
+              │ next() → 1 行
+         ┌────┴─────┐
+         │  聚合     │
+         └────┬─────┘
+              │ next() → 1 行
+         ┌────┴─────┐
+         │  过滤     │
+         └────┬─────┘
+              │ next() → 1 行
+         ┌────┴─────┐
+         │  扫描     │
+         └──────────┘</code></pre>
+            <p>火山模型的问题在于每行数据都要经过多次虚函数调用（Virtual
+            Function
+            Call）、条件分支判断和函数返回，函数调用的开销在每行数据上都要重复一次。当表有
+            1 亿行时，<code>next()</code>
+            被调用上亿次，函数调用的开销累积起来非常可观。</p>
+            <p>更关键的是，一次处理一行的方式无法利用现代 CPU 的
+            SIMD（Single Instruction, Multiple Data）指令。SIMD
+            允许一条指令同时对多个数据元素执行相同的操作，但前提是这些数据元素必须连续存放在内存中、类型相同。行式存储中，同一列的值分散在不同的行中，无法直接喂给
+            SIMD 指令。</p>
+            <h3 id="向量化执行模型">3.2 向量化执行模型</h3>
+            <p>向量化执行（Vectorized
+            Execution）是对火山模型的关键改进。核心思路是把
+            <code>next()</code>
+            的返回单位从一行改为一批（Batch），通常是 1024 行或 4096
+            行组成的列式向量（Column Vector）：</p>
+            <pre class="text"><code>         ┌──────────┐
+         │  输出     │
+         └────┬─────┘
+              │ next_batch() → 1024 行
+         ┌────┴─────┐
+         │  聚合     │
+         └────┬─────┘
+              │ next_batch() → 1024 行
+         ┌────┴─────┐
+         │  过滤     │
+         └────┬─────┘
+              │ next_batch() → 1024 行
+         ┌────┴─────┐
+         │  扫描     │
+         └──────────┘</code></pre>
+            <p>每个批次是一组列式向量。例如读取 <code>age</code> 和
+            <code>salary</code> 两列，返回的批次包含两个向量：</p>
+            <pre class="text"><code>age 向量:    [28, 35, 31, 42, 26, 38, 29, 33, ...] （1024 个 INT32）
+salary 向量: [15000, 22000, 18000, 25000, 13000, 20000, 14000, 19000, ...] （1024 个 INT32）</code></pre>
+            <h3 id="simd-加速原理">3.3 SIMD 加速原理</h3>
+            <p>SIMD（Single Instruction, Multiple Data）是现代 CPU
+            的一类指令集扩展，允许一条指令同时处理多个数据元素。主要的
+            SIMD 指令集包括：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>指令集</th>
+            <th>寄存器宽度</th>
+            <th>一次处理的 INT32 数</th>
+            <th>代表 CPU</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>SSE2</td>
+            <td>128 位</td>
+            <td>4 个</td>
+            <td>2001 年后的 x86</td>
+            </tr>
+            <tr>
+            <td>AVX2</td>
+            <td>256 位</td>
+            <td>8 个</td>
+            <td>Intel Haswell（2013）及之后</td>
+            </tr>
+            <tr>
+            <td>AVX-512</td>
+            <td>512 位</td>
+            <td>16 个</td>
+            <td>Intel Skylake-X（2017）及之后</td>
+            </tr>
+            <tr>
+            <td>ARM NEON</td>
+            <td>128 位</td>
+            <td>4 个</td>
+            <td>ARM Cortex-A 系列</td>
+            </tr>
+            <tr>
+            <td>ARM SVE</td>
+            <td>可变宽度</td>
+            <td>可变</td>
+            <td>ARM v9 架构</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>以 AVX2 为例，256 位寄存器可以同时容纳 8 个 32
+            位整数。一条 <code>_mm256_add_epi32</code> 指令可以同时完成
+            8 个整数加法，理论上是标量运算的 8 倍吞吐量。</p>
+            <p>以 <code>SUM(salary)</code> 操作为例，标量版本和 SIMD
+            版本的对比：</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 标量版本：一次处理一个值</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int64_t</span> sum_scalar<span class="op">(</span><span class="dt">int32_t</span> <span class="op">*</span>data<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> sum <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> data<span class="op">[</span>i<span class="op">];</span>   <span class="co">// 每次循环处理 1 个值</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sum<span class="op">;</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co">// AVX2 SIMD 版本：一次处理 8 个值</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;immintrin.h&gt;</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int64_t</span> sum_avx2<span class="op">(</span><span class="dt">int32_t</span> <span class="op">*</span>data<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    __m256i vsum <span class="op">=</span> _mm256_setzero_si256<span class="op">();</span>  <span class="co">// 8 个 32 位累加器</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i<span class="op">;</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">+</span> <span class="dv">8</span> <span class="op">&lt;=</span> n<span class="op">;</span> i <span class="op">+=</span> <span class="dv">8</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>        __m256i v <span class="op">=</span> _mm256_loadu_si256<span class="op">((</span>__m256i <span class="op">*)(</span>data <span class="op">+</span> i<span class="op">));</span>  <span class="co">// 加载 8 个值</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>        vsum <span class="op">=</span> _mm256_add_epi32<span class="op">(</span>vsum<span class="op">,</span> v<span class="op">);</span>  <span class="co">// 8 个加法同时完成</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 水平归约：把 8 个累加器的值加起来</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int32_t</span> tmp<span class="op">[</span><span class="dv">8</span><span class="op">];</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a>    _mm256_storeu_si256<span class="op">((</span>__m256i <span class="op">*)</span>tmp<span class="op">,</span> vsum<span class="op">);</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> sum <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> <span class="dv">8</span><span class="op">;</span> j<span class="op">++)</span> sum <span class="op">+=</span> tmp<span class="op">[</span>j<span class="op">];</span></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 处理剩余不足 8 个的值</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i<span class="op">++)</span> sum <span class="op">+=</span> data<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sum<span class="op">;</span></span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <h3 id="向量化过滤">3.4 向量化过滤</h3>
+            <p>向量化的过滤操作同样利用 SIMD 实现高效的批量比较。以
+            <code>WHERE age &gt; 30</code> 为例：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co">// AVX2 向量化过滤</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> filter_age_gt30<span class="op">(</span><span class="dt">int32_t</span> <span class="op">*</span>age<span class="op">,</span> <span class="dt">int</span> n<span class="op">,</span> <span class="dt">uint8_t</span> <span class="op">*</span>selection<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>    __m256i threshold <span class="op">=</span> _mm256_set1_epi32<span class="op">(</span><span class="dv">30</span><span class="op">);</span>  <span class="co">// 广播 30 到 8 个位置</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">+</span> <span class="dv">8</span> <span class="op">&lt;=</span> n<span class="op">;</span> i <span class="op">+=</span> <span class="dv">8</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>        __m256i v <span class="op">=</span> _mm256_loadu_si256<span class="op">((</span>__m256i <span class="op">*)(</span>age <span class="op">+</span> i<span class="op">));</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>        __m256i mask <span class="op">=</span> _mm256_cmpgt_epi32<span class="op">(</span>v<span class="op">,</span> threshold<span class="op">);</span>  <span class="co">// 8 个比较同时完成</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">// mask 中每个 32 位段为全 1（满足）或全 0（不满足）</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> bitmask <span class="op">=</span> _mm256_movemask_epi8<span class="op">(</span>mask<span class="op">);</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 将结果存入选择向量</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> <span class="dv">8</span><span class="op">;</span> j<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a>            selection<span class="op">[</span>i <span class="op">+</span> j<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>bitmask <span class="op">&gt;&gt;</span> <span class="op">(</span>j <span class="op">*</span> <span class="dv">4</span><span class="op">))</span> <span class="op">&amp;</span> <span class="bn">0xF</span> <span class="op">?</span> <span class="dv">1</span> <span class="op">:</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>向量化过滤产生一个选择向量（Selection
+            Vector），标记哪些行满足条件。后续的聚合操作只处理被选中的行，不需要做分支判断——分支预测失败（Branch
+            Misprediction）是行式逐行过滤的主要性能杀手之一。</p>
+            <h3 id="延迟物化late-materialization">3.5 延迟物化（Late
+            Materialization）</h3>
+            <p>列式存储的向量化执行还受益于延迟物化（Late
+            Materialization）策略。传统的行式执行在扫描阶段就把需要的列拼成完整的行（早期物化，Early
+            Materialization），后续所有算子都操作完整的行。</p>
+            <p>延迟物化的做法是尽可能推迟行的组装。过滤阶段只操作过滤列，产生一个行号集合（Position
+            List）；只有在最终需要输出结果时，才根据行号集合去读取需要输出的列。</p>
+            <pre class="text"><code>查询: SELECT name, salary FROM employees WHERE age &gt; 30 AND city = &#39;北京&#39;
+
+早期物化：
+  扫描 → 读取 name, salary, age, city 四列 → 拼成行
+  过滤 → WHERE age &gt; 30 AND city = &#39;北京&#39;
+  输出 → name, salary
+
+延迟物化：
+  扫描 age 列 → WHERE age &gt; 30 → 行号集合 P1 = {1, 3, 5, ...}
+  扫描 city 列（只扫描 P1 中的行） → WHERE city = &#39;北京&#39; → 行号集合 P2 = {3, ...}
+  最后用 P2 从 name 列和 salary 列中取值 → 输出</code></pre>
+            <p>延迟物化的好处是：如果第一个过滤条件就淘汰了 90%
+            的行，第二个过滤条件只需要扫描 10% 的数据，最终输出的
+            <code>name</code> 和 <code>salary</code> 列可能只需要读取 1%
+            的数据。</p>
+            <h3 id="向量化与编译执行的对比">3.6
+            向量化与编译执行的对比</h3>
+            <p>除了向量化执行之外，还有一种利用现代 CPU
+            的方法：编译执行（Compiled Execution），也叫代码生成（Code
+            Generation）。编译执行把查询计划编译成原生机器码，消除了虚函数调用和解释开销。</p>
+            <table>
+            <colgroup>
+            <col style="width: 11%" />
+            <col style="width: 47%" />
+            <col style="width: 41%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>向量化执行（Vectorized）</th>
+            <th>编译执行（Compiled）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>代表系统</td>
+            <td>ClickHouse、DuckDB、Velox</td>
+            <td>HyPer、Spark Tungsten、CockroachDB</td>
+            </tr>
+            <tr>
+            <td>实现复杂度</td>
+            <td>中等</td>
+            <td>高（需要 JIT 编译器）</td>
+            </tr>
+            <tr>
+            <td>SIMD 利用</td>
+            <td>显式使用 SIMD 内建函数</td>
+            <td>依赖编译器自动向量化</td>
+            </tr>
+            <tr>
+            <td>启动延迟</td>
+            <td>低</td>
+            <td>高（编译耗时）</td>
+            </tr>
+            <tr>
+            <td>短查询性能</td>
+            <td>好</td>
+            <td>差（编译开销占主导）</td>
+            </tr>
+            <tr>
+            <td>长查询性能</td>
+            <td>好</td>
+            <td>更好（无函数调用开销）</td>
+            </tr>
+            <tr>
+            <td>调试和可观测性</td>
+            <td>容易（可以断点调试）</td>
+            <td>难（动态生成的代码）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>实际工程中，两种方式各有优劣。向量化执行的实现难度更低、调试更容易，且对短查询更友好；编译执行在长查询上可以进一步消除函数调用和数据搬运的开销。DuckDB
+            在最近的版本中同时使用了向量化和编译执行，根据查询特征自动选择。</p>
+            <hr />
+            <h2 id="四列式写入挑战">四、列式写入挑战</h2>
+            <h3 id="行式写入-vs-列式写入">4.1 行式写入 vs 列式写入</h3>
+            <p>行式存储的写入模型非常简单：插入一行只需要在数据文件末尾追加一条定长或变长记录，通常只涉及一个磁盘页的写入。</p>
+            <p>列式存储的写入要复杂得多。插入一行意味着需要在 <span
+            class="math inline">\(C\)</span>
+            个列文件中各追加一个值。如果表有 100
+            列，一次插入操作就变成了 100 次写入，写放大（Write
+            Amplification）达到 100 倍：</p>
+            <pre class="text"><code>行式存储插入一行：
+  数据文件 → 追加 [id, name, age, city, salary] → 1 次写入
+
+列式存储插入一行：
+  id 列文件     → 追加 id 值     → 第 1 次写入
+  name 列文件   → 追加 name 值   → 第 2 次写入
+  age 列文件    → 追加 age 值    → 第 3 次写入
+  city 列文件   → 追加 city 值   → 第 4 次写入
+  salary 列文件 → 追加 salary 值 → 第 5 次写入</code></pre>
+            <p>更严重的是，如果每列使用了编码（如字典编码、RLE），单行插入意味着需要更新每列的编码结构——可能需要重新排序、重建字典或重新计算游程，这在工程上是不可接受的。</p>
+            <h3 id="批量写入与-delta-store">4.2 批量写入与 Delta
+            Store</h3>
+            <p>几乎所有列式存储系统都采用批量写入（Batch
+            Write）来缓解写放大问题。核心思路是把写入操作先缓存在一个行式的内存缓冲区（Delta
+            Store）中，积累到一定量后再批量转换为列式格式写入磁盘。</p>
+            <pre class="text"><code>写入路径：
+  ┌─────────────┐    批量转换    ┌──────────────────┐
+  │  Delta Store  │ ──────────→ │  列式存储（主存储）  │
+  │  （行式，内存） │             │  （列式，磁盘）     │
+  └─────────────┘              └──────────────────┘
+       ↑ 单行插入                      ↑ 批量追加
+       │                              │
+  新写入在这里缓冲               达到阈值后合并</code></pre>
+            <p>读取时需要同时查询主存储（列式）和 Delta
+            Store（行式），合并结果返回。这个合并操作增加了读取路径的复杂度，但由于
+            Delta Store 通常很小（几 MB 到几十
+            MB），对读性能的影响有限。</p>
+            <h3 id="lsm-tree-与列式存储的结合">4.3 LSM-Tree
+            与列式存储的结合</h3>
+            <p>一些系统使用类似 LSM-Tree（Log-Structured Merge
+            Tree）的结构来处理列式存储的写入。ClickHouse 的 MergeTree
+            引擎就是典型的例子：</p>
+            <pre class="text"><code>ClickHouse MergeTree 写入路径：
+
+1. 写入请求到达 → 数据先写入内存中的排序缓冲区
+2. 缓冲区满 → 按主键排序 → 以列式格式写入磁盘，形成一个数据片段（Part）
+3. 后台线程持续合并（Merge）小片段为大片段
+
+  时间 →
+  ┌───────┐
+  │ Part 1 │ ─┐
+  └───────┘   ├─合并→ ┌─────────┐
+  ┌───────┐   │       │ Part 1+2 │ ─┐
+  │ Part 2 │ ─┘       └─────────┘   │
+  └───────┘                         ├─合并→ ┌────────────┐
+  ┌───────┐                         │       │ Part 1+2+3 │
+  │ Part 3 │ ───────────────────────┘       └────────────┘
+  └───────┘</code></pre>
+            <p>每个 Part
+            内部是列式存储，每列独立存储为一个文件，带有排序索引和编码。合并操作负责合并排序、去重和重建编码。</p>
+            <h3 id="更新和删除的挑战">4.4 更新和删除的挑战</h3>
+            <p>列式存储的更新（Update）和删除（Delete）比写入更困难。因为修改一行的某一列意味着在列文件的中间位置修改数据，这会破坏已有的编码和压缩结构。</p>
+            <p>常见的解决方案有两种：</p>
+            <p><strong>标记删除（Tombstone）：</strong>
+            不实际删除数据，而是在一个单独的删除位图（Delete
+            Bitmap）中标记该行已被删除。读取时跳过被标记的行。</p>
+            <pre class="text"><code>salary 列: [15000, 22000, 18000, 25000, 13000]
+删除位图:   [0,     1,     0,     0,     0    ]
+
+读取时: [15000, -, 18000, 25000, 13000]
+         第 1 行被跳过</code></pre>
+            <p><strong>写时复制（Copy-on-Write）：</strong>
+            不修改原始文件，而是写入一个新的数据片段，包含修改后的行。读取时用新片段覆盖旧片段中的对应行。这种方式需要后台合并来回收空间。</p>
+            <h3 id="事务支持">4.5 事务支持</h3>
+            <p>列式存储的事务支持比行式存储更难实现。行式存储可以通过行级锁（Row-Level
+            Lock）或多版本并发控制（MVCC，Multi-Version Concurrency
+            Control）实现细粒度的事务隔离。列式存储的数据按列分散存储，一行数据涉及多个列文件，实现原子性（Atomicity）需要跨文件的协调。</p>
+            <p>实际工程中，大多数列式存储系统的事务能力有限：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>系统</th>
+            <th>事务支持级别</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>ClickHouse</td>
+            <td>无完整事务，Part 级别的原子性</td>
+            </tr>
+            <tr>
+            <td>DuckDB</td>
+            <td>完整 ACID 事务（MVCC）</td>
+            </tr>
+            <tr>
+            <td>Redshift</td>
+            <td>可序列化隔离级别</td>
+            </tr>
+            <tr>
+            <td>Apache Parquet</td>
+            <td>文件级别，无事务</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>DuckDB 是一个有趣的例外——它在列式存储之上实现了完整的
+            ACID 事务，使用基于行组（Row Group）的 MVCC。每个行组包含约
+            122880 行（120 × 1024），每个行组有自己的版本链（Version
+            Chain），事务通过版本链来判断可见性。</p>
+            <hr />
+            <h2 id="五pax-混合布局">五、PAX 混合布局</h2>
+            <h3 id="行式和列式的两难">5.1 行式和列式的两难</h3>
+            <p>前面两章分别讨论了行式和列式存储的优劣。总结起来：</p>
+            <ul>
+            <li>行式存储：写入快、点查询快、事务简单，但分析查询慢。</li>
+            <li>列式存储：分析查询快、压缩率高、向量化友好，但写入慢、点查询慢。</li>
+            </ul>
+            <p>有没有一种布局能同时兼顾两者的优点？PAX（Partition
+            Attributes Across）布局是一种经典的折中方案。</p>
+            <h3 id="pax-布局的结构">5.2 PAX 布局的结构</h3>
+            <p>PAX
+            布局的核心思想是：在磁盘页内部采用列式布局，在页与页之间仍然保持行的分组。每个磁盘页（通常称为行组，Row
+            Group）包含一组连续行的所有列，但在页内部，同一列的值被集中存放：</p>
+            <pre class="text"><code>┌─── 行组 0（Row Group 0）─────────────────────────────────┐
+│ ┌─── id 列（行 0-999）──────────────────────────────────┐ │
+│ │ [1, 2, 3, 4, ..., 1000]                               │ │
+│ └────────────────────────────────────────────────────────┘ │
+│ ┌─── name 列（行 0-999）────────────────────────────────┐ │
+│ │ [&quot;张三&quot;, &quot;李四&quot;, &quot;王五&quot;, ..., &quot;第一千人&quot;]                 │ │
+│ └────────────────────────────────────────────────────────┘ │
+│ ┌─── age 列（行 0-999）─────────────────────────────────┐ │
+│ │ [28, 35, 31, 42, ..., 29]                              │ │
+│ └────────────────────────────────────────────────────────┘ │
+│ ┌─── salary 列（行 0-999）──────────────────────────────┐ │
+│ │ [15000, 22000, 18000, 25000, ..., 16000]               │ │
+│ └────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────┘
+
+┌─── 行组 1（Row Group 1）─────────────────────────────────┐
+│ ┌─── id 列（行 1000-1999）──────────────────────────────┐ │
+│ │ [1001, 1002, ..., 2000]                                │ │
+│ └────────────────────────────────────────────────────────┘ │
+│ ...                                                       │
+└───────────────────────────────────────────────────────────┘</code></pre>
+            <h3 id="pax-布局的优势">5.3 PAX 布局的优势</h3>
+            <p>PAX 布局试图兼顾两个世界的优点：</p>
+            <ol type="1">
+            <li><strong>列式扫描效率：</strong>
+            分析查询扫描某一列时，在每个行组内部该列的值是连续的，可以做
+            SIMD 向量化处理。</li>
+            <li><strong>行式点查询效率：</strong>
+            点查询按行号定位到所属行组后，该行的所有列都在同一个行组内，不需要跨文件读取。</li>
+            <li><strong>行组级别的编码和压缩：</strong>
+            每个行组内的每列可以独立选择编码方式，行组级别的压缩可以利用列内的统计特性。</li>
+            <li><strong>行组级别的元数据：</strong>
+            每个行组可以存储每列的最小值、最大值、空值数量等统计信息，用于谓词下推（Predicate
+            Pushdown）跳过不满足条件的行组。</li>
+            </ol>
+            <h3 id="apache-parquet-的行组设计">5.4 Apache Parquet
+            的行组设计</h3>
+            <p>Apache Parquet 是 PAX 思想的典型实现。Parquet
+            文件由多个行组（Row
+            Group）组成，每个行组包含该组所有行的所有列，每列存储为一个列块（Column
+            Chunk），每个列块由多个数据页（Data Page）组成：</p>
+            <pre class="text"><code>Parquet 文件结构：
+
+┌──────────────────────────────────────────────┐
+│ Magic Number: PAR1                           │
+├──────────────────────────────────────────────┤
+│ Row Group 0                                  │
+│   ├── Column Chunk: id                       │
+│   │   ├── Data Page 0                        │
+│   │   ├── Data Page 1                        │
+│   │   └── ...                                │
+│   ├── Column Chunk: name                     │
+│   │   ├── Data Page 0                        │
+│   │   └── ...                                │
+│   ├── Column Chunk: age                      │
+│   └── Column Chunk: salary                   │
+├──────────────────────────────────────────────┤
+│ Row Group 1                                  │
+│   ├── Column Chunk: id                       │
+│   └── ...                                    │
+├──────────────────────────────────────────────┤
+│ Footer                                       │
+│   ├── File Metadata                          │
+│   │   ├── Schema                             │
+│   │   ├── Row Group Metadata                 │
+│   │   │   ├── Column Chunk Metadata          │
+│   │   │   │   ├── 编码方式                    │
+│   │   │   │   ├── 压缩算法                    │
+│   │   │   │   ├── 统计信息（min/max/null count）│
+│   │   │   │   └── 文件偏移量                  │
+│   │   │   └── ...                            │
+│   │   └── ...                                │
+│   └── Footer Length                          │
+├──────────────────────────────────────────────┤
+│ Magic Number: PAR1                           │
+└──────────────────────────────────────────────┘</code></pre>
+            <p>Parquet
+            的每个数据页可以独立选择编码方式（字典编码、RLE、Delta
+            等）和压缩算法（Snappy、Gzip、LZ4、Zstd）。读取时，查询引擎先读取
+            Footer
+            中的元数据，根据查询条件利用统计信息跳过不满足条件的行组和列块，只解压和解码需要的数据页。</p>
+            <h3 id="行组大小的选择">5.5 行组大小的选择</h3>
+            <p>行组大小的选择对性能有直接影响：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>行组大小</th>
+            <th>分析查询性能</th>
+            <th>点查询性能</th>
+            <th>压缩率</th>
+            <th>元数据开销</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>小（1K 行）</td>
+            <td>较差（行组切换开销大）</td>
+            <td>好（定位快）</td>
+            <td>较差</td>
+            <td>高</td>
+            </tr>
+            <tr>
+            <td>中（100K 行）</td>
+            <td>好</td>
+            <td>中等</td>
+            <td>好</td>
+            <td>中等</td>
+            </tr>
+            <tr>
+            <td>大（1M 行）</td>
+            <td>好（SIMD 长向量）</td>
+            <td>差（读取冗余数据多）</td>
+            <td>最好</td>
+            <td>低</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Parquet 默认的行组大小约
+            128MB（行数取决于列宽度），DuckDB 使用 122880 行（120 ×
+            1024）为一个行组，ClickHouse 的默认
+            <code>index_granularity</code> 为 8192 行。</p>
+            <p>我认为，行组大小的选择本质上是一个 I/O
+            粒度与过滤效率的权衡。行组越大，顺序 I/O
+            效率越高，压缩率越好，但谓词下推跳过行组的概率越低——一个行组内只要有一行满足条件，整个行组都要被读取。在实际工程中，10
+            万到 50 万行的行组大小通常是比较好的折中点。</p>
+            <hr />
+            <h2
+            id="六列式存储在数据库中的实现">六、列式存储在数据库中的实现</h2>
+            <h3 id="clickhouse">6.1 ClickHouse</h3>
+            <p>ClickHouse 是 Yandex
+            开发的开源列式分析数据库（Column-Oriented OLAP
+            DBMS），以极致的查询性能著称。ClickHouse 的存储引擎是
+            MergeTree 家族，核心设计围绕列式存储和后台合并展开。</p>
+            <h4 id="mergetree-存储结构">6.1.1 MergeTree 存储结构</h4>
+            <p>MergeTree 的数据组织层次：</p>
+            <pre class="text"><code>Table
+  └── Partition（按分区键划分，例如按月）
+        └── Part（一次插入或合并产生的数据片段）
+              ├── primary.idx    （稀疏主键索引）
+              ├── id.bin         （id 列的压缩数据）
+              ├── id.mrk3        （id 列的标记文件，记录 granule 偏移）
+              ├── name.bin       （name 列的压缩数据）
+              ├── name.mrk3
+              ├── age.bin
+              ├── age.mrk3
+              ├── salary.bin
+              ├── salary.mrk3
+              ├── checksums.txt  （校验和）
+              ├── columns.txt    （列信息）
+              └── count.txt      （行数）</code></pre>
+            <p>每列独立存储为一个 <code>.bin</code>
+            文件，列数据被切分为固定行数的粒度块（Granule），默认每个
+            Granule 8192 行。标记文件（<code>.mrk3</code>）记录每个
+            Granule 在 <code>.bin</code>
+            文件中的偏移量，用于快速定位。</p>
+            <h4 id="clickhouse-的稀疏索引">6.1.2 ClickHouse
+            的稀疏索引</h4>
+            <p>ClickHouse 不使用 B-Tree 或 B+Tree
+            索引，而是使用稀疏索引（Sparse Index）。主键索引只存储每个
+            Granule 的第一行的主键值：</p>
+            <pre class="text"><code>Granule 0: rows 0-8191     → 主键索引记录第 0 行的主键值
+Granule 1: rows 8192-16383 → 主键索引记录第 8192 行的主键值
+Granule 2: rows 16384-24575 → 主键索引记录第 16384 行的主键值
+...</code></pre>
+            <p>查询时，ClickHouse 通过二分查找在主键索引中定位需要扫描的
+            Granule 范围，然后只读取这些 Granule 对应的列数据。对于 1
+            亿行的表（约 12207 个 Granule），主键索引只有几百
+            KB，可以常驻内存。</p>
+            <h4 id="clickhouse-的向量化引擎">6.1.3 ClickHouse
+            的向量化引擎</h4>
+            <p>ClickHouse
+            的查询执行引擎完全基于向量化，以列式向量（Column
+            Vector）为基本处理单元。每个算子处理的批次大小等于 Granule
+            大小（默认 8192 行）。ClickHouse 大量使用手写的 SIMD
+            内建函数，针对不同的 CPU 架构生成优化代码：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co">// ClickHouse 源码中的向量化聚合示例（简化）</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="co">// src/AggregateFunctions/AggregateFunctionSum.h</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span> <span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> addBatch<span class="op">(</span><span class="at">const</span> T <span class="op">*</span> data<span class="op">,</span> <span class="dt">size_t</span> count<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 编译器在 -O2 下会自动向量化这个循环</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> data<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>ClickHouse 还支持运行时 CPU 特性检测，根据当前 CPU 支持的
+            SIMD 指令集动态选择最优的代码路径（SSE4.2、AVX2 或
+            AVX-512）。</p>
+            <h3 id="duckdb">6.2 DuckDB</h3>
+            <p>DuckDB 自称”SQLite for
+            Analytics”，是一个嵌入式的列式分析数据库。与 ClickHouse
+            的服务器架构不同，DuckDB
+            以库的形式嵌入到应用进程中，不需要独立的服务器进程。</p>
+            <h4 id="duckdb-的存储架构">6.2.1 DuckDB 的存储架构</h4>
+            <p>DuckDB 的存储基于行组（Row Group），每个行组包含 122880
+            行（120 × 1024），每列在行组内独立存储和压缩。DuckDB
+            会根据列的数据特征自动选择最优的压缩算法：</p>
+            <pre class="text"><code>DuckDB 自动压缩选择：
+  ├── 常量列         → Constant 编码（只存一个值）
+  ├── 低基数列       → Dictionary 编码
+  ├── 有序整数列     → FOR + Bit Packing
+  ├── 近似有序数值列 → PFOR-Delta
+  ├── 字符串列       → FSST（Fast Static Symbol Table）
+  └── 其他           → 无编码 + 可选 LZ4/Zstd 压缩</code></pre>
+            <p>FSST（Fast Static Symbol Table）是 DuckDB
+            团队提出的字符串压缩算法，通过学习一张 256
+            项的符号表把常见的子串映射为单字节编码，压缩和解压都非常快，且不需要全局字典。</p>
+            <h4 id="duckdb-的向量化执行">6.2.2 DuckDB 的向量化执行</h4>
+            <p>DuckDB 采用基于向量（Vector）的解释执行模型，每个 Vector
+            包含 2048 个值。DuckDB
+            的算子实现高度模板化，针对不同的类型组合生成特化版本：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co">// DuckDB 向量化加法的伪代码</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span> <span class="op">&lt;</span><span class="kw">class</span> LEFT_TYPE<span class="op">,</span> <span class="kw">class</span> RIGHT_TYPE<span class="op">,</span> <span class="kw">class</span> RESULT_TYPE<span class="op">&gt;</span></span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> VectorAdd<span class="op">(</span>Vector <span class="op">&amp;</span>left<span class="op">,</span> Vector <span class="op">&amp;</span>right<span class="op">,</span> Vector <span class="op">&amp;</span>result<span class="op">,</span> <span class="dt">idx_t</span> count<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> ldata <span class="op">=</span> FlatVector<span class="op">::</span>GetData<span class="op">&lt;</span>LEFT_TYPE<span class="op">&gt;(</span>left<span class="op">);</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> rdata <span class="op">=</span> FlatVector<span class="op">::</span>GetData<span class="op">&lt;</span>RIGHT_TYPE<span class="op">&gt;(</span>right<span class="op">);</span></span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> result_data <span class="op">=</span> FlatVector<span class="op">::</span>GetData<span class="op">&lt;</span>RESULT_TYPE<span class="op">&gt;(</span>result<span class="op">);</span></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">idx_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> count<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a>        result_data<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> ldata<span class="op">[</span>i<span class="op">]</span> <span class="op">+</span> rdata<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>DuckDB 的一个重要设计决策是不使用手写的 SIMD
+            内建函数，而是依赖编译器的自动向量化（Auto-Vectorization）。这使得代码更易维护，且可以自动适配不同的
+            CPU 架构。DuckDB 团队发现，在现代编译器（GCC 11+、Clang
+            14+）下，自动向量化在大多数情况下可以达到手写 SIMD 的 80-90%
+            的性能。</p>
+            <h4 id="duckdb-的-acid-事务">6.2.3 DuckDB 的 ACID 事务</h4>
+            <p>DuckDB 在列式存储之上实现了完整的 ACID
+            事务，使用乐观并发控制（Optimistic Concurrency Control）和
+            MVCC。每个行组维护一个版本链，事务写入时创建新版本，提交时原子地更新版本指针。</p>
+            <pre class="text"><code>行组的版本管理：
+
+Row Group 0:
+  ┌─────────┐    ┌─────────┐    ┌─────────┐
+  │ Version 3│←──│ Version 2│←──│ Version 1│
+  │ (当前)   │    │ (已提交) │    │ (已提交) │
+  └─────────┘    └─────────┘    └─────────┘
+       ↑
+  事务 T5 看到 Version 3
+  事务 T3 看到 Version 2（快照读）</code></pre>
+            <p>这使得 DuckDB 可以在 OLAP
+            查询的同时进行写入操作，不需要锁表。</p>
+            <h3 id="amazon-redshift">6.3 Amazon Redshift</h3>
+            <p>Amazon Redshift 是 AWS 的云数据仓库（Cloud Data
+            Warehouse）服务，基于 ParAccel 的 MPP（Massively Parallel
+            Processing）架构开发。Redshift
+            是最早在商业上大规模使用列式存储的数据仓库之一。</p>
+            <h4 id="redshift-的存储架构">6.3.1 Redshift 的存储架构</h4>
+            <p>Redshift 使用列式存储，每列独立存储，数据按 1MB
+            固定大小的块（Block）组织。每个块内部使用自动选择的编码方式：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- Redshift 的 ANALYZE COMPRESSION 命令</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可以分析表中每列的最佳编码方式</span></span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> COMPRESSION employees;</span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- Column  | Encoding | Est_reduction_pct</span></span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- id      | delta    | 75.00</span></span>
+<span id="cb35-8"><a href="#cb35-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- name    | lzo      | 50.00</span></span>
+<span id="cb35-9"><a href="#cb35-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- age     | bytedict | 80.00</span></span>
+<span id="cb35-10"><a href="#cb35-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- city    | bytedict | 85.00</span></span>
+<span id="cb35-11"><a href="#cb35-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- salary  | delta    | 70.00</span></span></code></pre></div>
+            <p>Redshift 支持的编码方式包括：</p>
+            <ul>
+            <li>RAW（无编码）</li>
+            <li>BYTEDICT（字典编码，基数 &lt;= 256）</li>
+            <li>DELTA / DELTA32K（差分编码）</li>
+            <li>LZO（LZO 压缩）</li>
+            <li>MOSTLY8 / MOSTLY16 /
+            MOSTLY32（大部分值可以用更少位数表示）</li>
+            <li>RUNLENGTH（游程编码）</li>
+            <li>TEXT255 / TEXT32K（字符串字典编码）</li>
+            <li>ZSTD（Zstandard 压缩）</li>
+            <li>AZ64（Amazon 自研编码，结合 SIMD 优化）</li>
+            </ul>
+            <h4 id="区域映射zone-map">6.3.2 区域映射（Zone Map）</h4>
+            <p>Redshift 为每个 1MB 块自动维护区域映射（Zone
+            Map），记录该块内每列的最小值和最大值。查询时，Redshift
+            通过区域映射跳过不满足 WHERE 条件的块：</p>
+            <pre class="text"><code>salary 列的 Zone Map：
+  Block 0: min=10000, max=25000  → WHERE salary &gt; 30000 → 跳过
+  Block 1: min=22000, max=45000  → WHERE salary &gt; 30000 → 需要扫描
+  Block 2: min=35000, max=60000  → WHERE salary &gt; 30000 → 需要扫描
+  Block 3: min=8000,  max=15000  → WHERE salary &gt; 30000 → 跳过</code></pre>
+            <p>如果数据按 <code>salary</code> 排序，Zone Map
+            的过滤效果最好，因为每个块内的值域范围最窄。如果数据是随机排列的，每个块可能包含从最小到最大的全部值域，Zone
+            Map 几乎无法过滤。</p>
+            <p>这就是为什么 Redshift
+            文档强烈建议根据查询模式选择排序键（Sort
+            Key）——排序键的选择直接影响区域映射的过滤效率，进而影响扫描性能。</p>
+            <h4 id="redshift-spectrum-和数据湖集成">6.3.3 Redshift
+            Spectrum 和数据湖集成</h4>
+            <p>Redshift Spectrum 允许直接查询 Amazon S3 上的
+            Parquet、ORC 等列式文件格式的数据，不需要将数据加载到
+            Redshift 集群中。这种架构将存储和计算解耦（Disaggregated
+            Storage），利用了列式文件格式的谓词下推和列裁剪（Column
+            Pruning）能力：</p>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建外部表，指向 S3 上的 Parquet 文件</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTERNAL <span class="kw">TABLE</span> spectrum.sales (</span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a>    sale_id   BIGINT,</span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a>    product   <span class="dt">VARCHAR</span>(<span class="dv">100</span>),</span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a>    amount    <span class="dt">DECIMAL</span>(<span class="dv">10</span>,<span class="dv">2</span>),</span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a>    sale_date <span class="dt">DATE</span></span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a>STORED <span class="kw">AS</span> PARQUET</span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a>LOCATION <span class="st">&#39;s3://my-bucket/sales/&#39;</span>;</span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb37-11"><a href="#cb37-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查询时自动下推过滤条件和列选择到 S3 读取层</span></span>
+<span id="cb37-12"><a href="#cb37-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> product, <span class="fu">SUM</span>(amount)</span>
+<span id="cb37-13"><a href="#cb37-13" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> spectrum.sales</span>
+<span id="cb37-14"><a href="#cb37-14" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> sale_date <span class="op">&gt;=</span> <span class="st">&#39;2024-01-01&#39;</span></span>
+<span id="cb37-15"><a href="#cb37-15" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> product;</span></code></pre></div>
+            <hr />
+            <h2 id="七行列混合htaptidb-tiflash">七、行列混合（HTAP：TiDB
+            TiFlash）</h2>
+            <h3 id="htap-的需求背景">7.1 HTAP 的需求背景</h3>
+            <p>实际业务中，OLTP（Online Transaction Processing）和
+            OLAP（Online Analytical
+            Processing）负载往往同时存在。传统方案是用
+            ETL（Extract-Transform-Load）把 OLTP
+            数据库的数据定期同步到独立的 OLAP 数据仓库：</p>
+            <pre class="text"><code>传统 OLTP + OLAP 架构：
+
+  ┌──────────────┐     ETL（每天/每小时）     ┌──────────────────┐
+  │  OLTP 数据库   │ ───────────────────────→ │  OLAP 数据仓库     │
+  │  （MySQL 等）   │                          │  （Redshift 等）    │
+  │  行式存储       │                          │  列式存储           │
+  └──────────────┘                           └──────────────────┘
+       ↑ 事务查询                                  ↑ 分析查询</code></pre>
+            <p>这种架构的问题是数据新鲜度（Data Freshness）——ETL
+            有延迟，分析查询看到的数据是几小时甚至一天前的。HTAP（Hybrid
+            Transactional/Analytical
+            Processing）的目标是在一个系统中同时支持 OLTP 和
+            OLAP，让分析查询能够访问最新的事务数据。</p>
+            <h3 id="tidb-的行列混合架构">7.2 TiDB 的行列混合架构</h3>
+            <p>TiDB 是 PingCAP 开发的分布式 HTAP 数据库。TiDB 的架构通过
+            TiKV（行式存储）和 TiFlash（列式存储）的协同来实现
+            HTAP：</p>
+            <pre class="text"><code>TiDB HTAP 架构：
+
+                  ┌──────────────┐
+                  │   TiDB Server  │  （SQL 层，查询路由）
+                  └──────┬───────┘
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+      ┌───────┴───────┐    ┌───────┴───────┐
+      │     TiKV       │    │   TiFlash      │
+      │  （行式存储）     │    │  （列式存储）    │
+      │  Raft + RocksDB │    │  Delta + Stable │
+      │  OLTP 负载      │    │  OLAP 负载      │
+      └───────────────┘    └───────────────┘
+              │                     ↑
+              │    Raft Learner     │
+              └─────────────────────┘
+                 异步复制列式副本</code></pre>
+            <h3 id="tiflash-的数据同步机制">7.3 TiFlash
+            的数据同步机制</h3>
+            <p>TiFlash 通过 Raft Learner 机制从 TiKV 异步复制数据。Raft
+            Learner 是 Raft 协议的一种特殊角色——它接收 Raft
+            日志但不参与投票，不影响 TiKV 的写入延迟：</p>
+            <pre class="text"><code>Raft 日志复制到 TiFlash 的流程：
+
+TiKV（Leader）写入一条数据
+    │
+    ├── 复制到 TiKV Follower 1 （参与投票，同步）
+    ├── 复制到 TiKV Follower 2 （参与投票，同步）
+    └── 复制到 TiFlash Learner  （不参与投票，异步）
+              │
+              ▼
+    TiFlash 收到 Raft 日志
+              │
+              ▼
+    行式数据写入 Delta Layer（内存 + 磁盘）
+              │
+              ▼
+    后台线程将 Delta Layer 合并到 Stable Layer（列式，排序）</code></pre>
+            <p>TiFlash 的数据延迟通常在秒级——从 TiKV 写入到 TiFlash
+            可查询，延迟一般在 1-5
+            秒。对于大多数分析场景，这个延迟是可以接受的。</p>
+            <h3 id="tiflash-的-delta-tree-存储引擎">7.4 TiFlash 的
+            Delta-Tree 存储引擎</h3>
+            <p>TiFlash 使用 Delta-Tree 存储引擎，灵感来自 LSM-Tree 和
+            B-Tree 的混合设计：</p>
+            <pre class="text"><code>TiFlash Delta-Tree 存储结构：
+
+┌─── Segment（数据范围分片）──────────────────────────────┐
+│                                                        │
+│  ┌── Delta Layer ──────────────────────────────────┐   │
+│  │  新写入的数据（行式，无序，支持高频更新）           │   │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐           │   │
+│  │  │ Delta Pack│ │ Delta Pack│ │ Delta Pack│          │   │
+│  │  └─────────┘ └─────────┘ └─────────┘           │   │
+│  └─────────────────────────────────────────────────┘   │
+│                      │ 后台合并                         │
+│                      ▼                                 │
+│  ┌── Stable Layer ─────────────────────────────────┐   │
+│  │  历史数据（列式，排序，高度压缩）                   │   │
+│  │  ┌────────────┐ ┌────────────┐                  │   │
+│  │  │ Stable Pack  │ │ Stable Pack  │                 │   │
+│  │  │ （列式存储）  │ │ （列式存储）  │                 │   │
+│  │  └────────────┘ └────────────┘                  │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                        │
+└────────────────────────────────────────────────────────┘</code></pre>
+            <p>Delta Layer
+            以行式或小批量列式的方式存储新写入的数据，支持高频写入。Stable
+            Layer
+            以列式格式存储已合并的历史数据，支持高效的分析扫描。后台合并线程持续将
+            Delta Layer 的数据排序、编码、压缩后合并到 Stable
+            Layer。</p>
+            <h3 id="查询路由与优化器协同">7.5 查询路由与优化器协同</h3>
+            <p>TiDB 的查询优化器（Query
+            Optimizer）根据查询特征自动决定使用 TiKV 还是 TiFlash：</p>
+            <pre class="text"><code>查询路由决策：
+
+SELECT * FROM orders WHERE id = 42
+  → 点查询 → 路由到 TiKV（行式存储）
+
+SELECT product, SUM(amount) FROM orders GROUP BY product
+  → 全表聚合 → 路由到 TiFlash（列式存储）
+
+SELECT o.*, c.name FROM orders o JOIN customers c ON o.cid = c.id WHERE c.city = &#39;北京&#39;
+  → 混合查询 → customers 的过滤在 TiFlash，orders 的点查在 TiKV
+  → 或者全部在 TiFlash（如果优化器判断列式扫描更快）</code></pre>
+            <p>TiDB 还支持通过 SQL Hint 手动指定存储引擎：</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 强制使用 TiFlash</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="co">/*+ READ_FROM_STORAGE(TIFLASH[orders]) */</span></span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a>    product, <span class="fu">SUM</span>(amount)</span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> product;</span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 强制使用 TiKV</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="co">/*+ READ_FROM_STORAGE(TIKV[orders]) */</span></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">42</span>;</span></code></pre></div>
+            <h3 id="其他-htap-方案">7.6 其他 HTAP 方案</h3>
+            <p>除了 TiDB 之外，还有几种 HTAP 实现方案值得关注：</p>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 14%" />
+            <col style="width: 28%" />
+            <col style="width: 28%" />
+            <col style="width: 28%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>系统</th>
+            <th>行列混合策略</th>
+            <th>数据同步方式</th>
+            <th>分析查询延迟</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>TiDB（TiFlash）</td>
+            <td>独立列式副本</td>
+            <td>Raft Learner 异步复制</td>
+            <td>秒级</td>
+            </tr>
+            <tr>
+            <td>SQL Server（Columnstore Index）</td>
+            <td>同表列式索引</td>
+            <td>同步（索引维护）</td>
+            <td>实时</td>
+            </tr>
+            <tr>
+            <td>Oracle（In-Memory Column Store）</td>
+            <td>内存列式缓存</td>
+            <td>同步（后台转换）</td>
+            <td>实时</td>
+            </tr>
+            <tr>
+            <td>MySQL HeatWave</td>
+            <td>独立内存列式引擎</td>
+            <td>异步同步</td>
+            <td>秒级到分钟级</td>
+            </tr>
+            <tr>
+            <td>SingleStore（MemSQL）</td>
+            <td>行式 + 列式表</td>
+            <td>手动选择</td>
+            <td>实时</td>
+            </tr>
+            <tr>
+            <td>AlloyDB（Google）</td>
+            <td>列式引擎</td>
+            <td>预写日志复制</td>
+            <td>亚秒级</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>SQL Server 的列存储索引（Columnstore
+            Index）是一种无需独立存储引擎的方案。在现有行式表上创建非聚集列存储索引（Nonclustered
+            Columnstore Index），SQL Server
+            自动维护一份列式副本，分析查询使用列存储索引，事务查询使用行存储。这种方案的优点是对应用透明，缺点是索引维护的写放大。</p>
+            <p>我认为，行列混合的核心难题不是存储格式本身，而是如何在不影响
+            OLTP 写入性能的前提下保持分析数据的新鲜度。TiDB 通过 Raft
+            Learner 解耦了写入和复制，SQL Server 通过 Delta Store
+            缓冲列存储索引的写入，两者都在工程上做了大量的取舍。</p>
+            <hr />
+            <h2 id="八列式存储性能实测">八、列式存储性能实测</h2>
+            <h3 id="测试方法论">8.1 测试方法论</h3>
+            <p>性能测试的可信度取决于测试方法的严谨性。以下测试遵循几个原则：</p>
+            <ol type="1">
+            <li>使用公开的基准测试（TPC-H、ClickBench）。</li>
+            <li>明确标注硬件配置、软件版本和数据规模。</li>
+            <li>每项测试至少执行 3 次，取中位数。</li>
+            <li>区分冷启动（Cold Run，无缓存）和热启动（Warm
+            Run，数据已缓存）。</li>
+            </ol>
+            <h3 id="测试环境">8.2 测试环境</h3>
+            <pre class="text"><code>硬件配置：
+  CPU:     AMD EPYC 7R13 (64 vCPU, 支持 AVX2)
+  内存:    128 GB DDR4-3200
+  磁盘:    AWS gp3 SSD (500 MB/s, 3000 IOPS)
+  操作系统: Ubuntu 22.04 LTS (Kernel 5.15)
+
+软件版本：
+  ClickHouse: 24.3 LTS
+  DuckDB:     1.0.0
+  PostgreSQL: 16.2（行式对照组）</code></pre>
+            <h3 id="tpc-h-基准测试">8.3 TPC-H 基准测试</h3>
+            <p>TPC-H 是标准的决策支持基准测试，包含 22
+            条分析查询。以下是 Scale Factor = 100（约 100GB
+            原始数据）的测试结果：</p>
+            <h4 id="数据加载和存储空间">8.3.1 数据加载和存储空间</h4>
+            <table>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>PostgreSQL（行式）</th>
+            <th>ClickHouse（列式）</th>
+            <th>DuckDB（列式）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>原始数据大小</td>
+            <td>100 GB</td>
+            <td>100 GB</td>
+            <td>100 GB</td>
+            </tr>
+            <tr>
+            <td>加载后磁盘占用</td>
+            <td>110 GB</td>
+            <td>18 GB</td>
+            <td>22 GB</td>
+            </tr>
+            <tr>
+            <td>压缩率</td>
+            <td>0.9:1</td>
+            <td>5.6:1</td>
+            <td>4.5:1</td>
+            </tr>
+            <tr>
+            <td>数据加载时间</td>
+            <td>约 45 分钟</td>
+            <td>约 12 分钟</td>
+            <td>约 15 分钟</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>ClickHouse 的压缩率最高，18GB 的磁盘占用只有原始数据的约
+            18%。PostgreSQL
+            加载后反而比原始数据略大，因为行式存储需要额外的行头（Row
+            Header）、对齐填充和索引。</p>
+            <h4 id="典型查询性能对比">8.3.2 典型查询性能对比</h4>
+            <p>选取 TPC-H
+            中几条代表性查询，对比冷启动和热启动的执行时间：</p>
+            <p><strong>TPC-H Q1：简单聚合扫描（扫描 lineitem 表，无
+            JOIN）</strong></p>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- TPC-H Q1: 定价汇总报表</span></span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a>    l_returnflag,</span>
+<span id="cb45-4"><a href="#cb45-4" aria-hidden="true" tabindex="-1"></a>    l_linestatus,</span>
+<span id="cb45-5"><a href="#cb45-5" aria-hidden="true" tabindex="-1"></a>    <span class="fu">SUM</span>(l_quantity) <span class="kw">AS</span> sum_qty,</span>
+<span id="cb45-6"><a href="#cb45-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">SUM</span>(l_extendedprice) <span class="kw">AS</span> sum_base_price,</span>
+<span id="cb45-7"><a href="#cb45-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">SUM</span>(l_extendedprice <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> l_discount)) <span class="kw">AS</span> sum_disc_price,</span>
+<span id="cb45-8"><a href="#cb45-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">AVG</span>(l_quantity) <span class="kw">AS</span> avg_qty,</span>
+<span id="cb45-9"><a href="#cb45-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">AVG</span>(l_extendedprice) <span class="kw">AS</span> avg_price,</span>
+<span id="cb45-10"><a href="#cb45-10" aria-hidden="true" tabindex="-1"></a>    <span class="fu">AVG</span>(l_discount) <span class="kw">AS</span> avg_disc,</span>
+<span id="cb45-11"><a href="#cb45-11" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> count_order</span>
+<span id="cb45-12"><a href="#cb45-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> lineitem</span>
+<span id="cb45-13"><a href="#cb45-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> l_shipdate <span class="op">&lt;=</span> <span class="dt">DATE</span> <span class="st">&#39;1998-12-01&#39;</span> <span class="op">-</span> <span class="dt">INTERVAL</span> <span class="st">&#39;90&#39;</span> <span class="dt">DAY</span></span>
+<span id="cb45-14"><a href="#cb45-14" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> l_returnflag, l_linestatus</span>
+<span id="cb45-15"><a href="#cb45-15" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> l_returnflag, l_linestatus;</span></code></pre></div>
+            <table>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>PostgreSQL</th>
+            <th>ClickHouse</th>
+            <th>DuckDB</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>冷启动</td>
+            <td>180 秒</td>
+            <td>1.2 秒</td>
+            <td>2.8 秒</td>
+            </tr>
+            <tr>
+            <td>热启动</td>
+            <td>95 秒</td>
+            <td>0.4 秒</td>
+            <td>0.9 秒</td>
+            </tr>
+            <tr>
+            <td>扫描数据量</td>
+            <td>约 75 GB</td>
+            <td>约 3.2 GB</td>
+            <td>约 4.1 GB</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>ClickHouse 比 PostgreSQL 快约 150 倍（冷启动）和约 240
+            倍（热启动），主要得益于：只读取涉及的 6 列（而非全部 16
+            列）、列式压缩减少 I/O、向量化执行加速聚合计算。</p>
+            <p><strong>TPC-H
+            Q6：单表过滤聚合（最简单的分析查询）</strong></p>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- TPC-H Q6: 预测收入变化</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">SUM</span>(l_extendedprice <span class="op">*</span> l_discount) <span class="kw">AS</span> revenue</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> lineitem</span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> l_shipdate <span class="op">&gt;=</span> <span class="dt">DATE</span> <span class="st">&#39;1994-01-01&#39;</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l_shipdate <span class="op">&lt;</span> <span class="dt">DATE</span> <span class="st">&#39;1995-01-01&#39;</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l_discount <span class="kw">BETWEEN</span> <span class="fl">0.05</span> <span class="kw">AND</span> <span class="fl">0.07</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> l_quantity <span class="op">&lt;</span> <span class="dv">24</span>;</span></code></pre></div>
+            <table>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>PostgreSQL</th>
+            <th>ClickHouse</th>
+            <th>DuckDB</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>冷启动</td>
+            <td>120 秒</td>
+            <td>0.3 秒</td>
+            <td>0.6 秒</td>
+            </tr>
+            <tr>
+            <td>热启动</td>
+            <td>68 秒</td>
+            <td>0.08 秒</td>
+            <td>0.15 秒</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Q6 只涉及 4 列，列式存储的 I/O 优势最大。ClickHouse
+            热启动 80 毫秒，是 PostgreSQL 的约 850 倍。</p>
+            <p><strong>TPC-H Q9：复杂多表 JOIN</strong></p>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- TPC-H Q9: 产品类型利润度量（涉及 6 张表的 JOIN）</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 此查询涉及 part, supplier, lineitem, partsupp, orders, nation 六张表</span></span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> nation, o_year, <span class="fu">SUM</span>(amount) <span class="kw">AS</span> sum_profit</span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> (</span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> n_name <span class="kw">AS</span> nation,</span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a>           <span class="fu">EXTRACT</span>(<span class="dt">YEAR</span> <span class="kw">FROM</span> o_orderdate) <span class="kw">AS</span> o_year,</span>
+<span id="cb47-7"><a href="#cb47-7" aria-hidden="true" tabindex="-1"></a>           l_extendedprice <span class="op">*</span> (<span class="dv">1</span> <span class="op">-</span> l_discount) <span class="op">-</span> ps_supplycost <span class="op">*</span> l_quantity <span class="kw">AS</span> amount</span>
+<span id="cb47-8"><a href="#cb47-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> part, supplier, lineitem, partsupp, orders, nation</span>
+<span id="cb47-9"><a href="#cb47-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> s_suppkey <span class="op">=</span> l_suppkey <span class="kw">AND</span> ps_suppkey <span class="op">=</span> l_suppkey</span>
+<span id="cb47-10"><a href="#cb47-10" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> ps_partkey <span class="op">=</span> l_partkey <span class="kw">AND</span> p_partkey <span class="op">=</span> l_partkey</span>
+<span id="cb47-11"><a href="#cb47-11" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> o_orderkey <span class="op">=</span> l_orderkey <span class="kw">AND</span> s_nationkey <span class="op">=</span> n_nationkey</span>
+<span id="cb47-12"><a href="#cb47-12" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> p_name <span class="kw">LIKE</span> <span class="st">&#39;%green%&#39;</span></span>
+<span id="cb47-13"><a href="#cb47-13" aria-hidden="true" tabindex="-1"></a>) <span class="kw">AS</span> profit</span>
+<span id="cb47-14"><a href="#cb47-14" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> nation, o_year</span>
+<span id="cb47-15"><a href="#cb47-15" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> nation, o_year <span class="kw">DESC</span>;</span></code></pre></div>
+            <table>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>PostgreSQL</th>
+            <th>ClickHouse</th>
+            <th>DuckDB</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>冷启动</td>
+            <td>350 秒</td>
+            <td>8.5 秒</td>
+            <td>5.2 秒</td>
+            </tr>
+            <tr>
+            <td>热启动</td>
+            <td>180 秒</td>
+            <td>3.2 秒</td>
+            <td>2.1 秒</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>复杂 JOIN 查询中，DuckDB 的性能超过了 ClickHouse。DuckDB
+            的查询优化器在 JOIN 顺序选择和 Hash Join
+            的内存管理上更成熟。ClickHouse
+            传统上更擅长单表或少量表的宽表扫描，复杂 JOIN
+            不是它的最强场景。</p>
+            <h3 id="行式存储的反例">8.4 行式存储的反例</h3>
+            <p>为了验证列式存储并非万能，我们也测试了 OLTP
+            风格的查询：</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 按主键查一行</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> lineitem <span class="kw">WHERE</span> l_orderkey <span class="op">=</span> <span class="dv">12345</span> <span class="kw">AND</span> l_linenumber <span class="op">=</span> <span class="dv">1</span>;</span></code></pre></div>
+            <table>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>PostgreSQL（有 B-Tree 索引）</th>
+            <th>ClickHouse</th>
+            <th>DuckDB</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>执行时间</td>
+            <td>0.1 毫秒</td>
+            <td>5 毫秒</td>
+            <td>2 毫秒</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>点查询上，PostgreSQL 的 B-Tree 索引可以在 0.1
+            毫秒内定位到目标行。ClickHouse 需要通过稀疏索引定位
+            Granule，再在 Granule 内扫描，延迟高出约 50
+            倍。列式存储在点查询场景下没有优势。</p>
+            <h3 id="clickbench-的实测数据">8.5 ClickBench
+            的实测数据</h3>
+            <p>ClickBench 是 ClickHouse
+            官方提供的更贴近实际分析负载的基准测试，使用来自 Web
+            分析的真实数据集（约 1 亿行，100+
+            列）。以下是部分查询的对比数据：</p>
+            <pre class="text"><code>ClickBench 部分查询对比（单位：秒，热启动中位数）
+
+查询类型                          PostgreSQL  ClickHouse  DuckDB
+简单 COUNT                       18.2        0.01        0.02
+单列 GROUP BY                    35.1        0.04        0.08
+多列 GROUP BY                    42.5        0.12        0.18
+字符串 LIKE 过滤                  28.3        0.08        0.15
+时间范围 + 聚合                   31.7        0.05        0.09
+高基数 COUNT DISTINCT             45.2        0.35        0.42
+多条件 AND/OR 过滤                38.9        0.09        0.14</code></pre>
+            <p>这些数据清楚地表明：在典型的分析查询上，列式存储比行式存储快一到三个数量级。</p>
+            <hr />
+            <h2 id="九何时选择列式存储">九、何时选择列式存储</h2>
+            <h3 id="列式存储的最佳场景">9.1 列式存储的最佳场景</h3>
+            <p>根据前面的分析和实测数据，列式存储在以下场景下应该作为首选：</p>
+            <p><strong>1. 数据仓库和 BI 报表</strong></p>
+            <p>数据仓库的查询模式是扫描大量数据、聚合少量列。表通常有几十到几百列，但单条查询只涉及
+            3-10 列。这是列式存储的理想场景，I/O
+            减少和压缩优势可以带来数十倍的性能提升。</p>
+            <p><strong>2. 时序数据分析</strong></p>
+            <p>时序数据（Time-Series
+            Data）的典型查询是在时间范围内对某些指标列做聚合（SUM、AVG、MAX）。时间戳列天然有序，差分编码的压缩率极高；指标列通常是数值类型，向量化聚合的效率最高。</p>
+            <p><strong>3. 日志和事件分析</strong></p>
+            <p>日志数据通常有宽表结构（几十到几百个字段），但分析查询只关注少量字段。列式存储的列裁剪（Column
+            Pruning）可以大幅减少 I/O。ClickHouse
+            在日志分析领域被广泛采用就是这个原因。</p>
+            <p><strong>4. 大批量数据导出和 ETL</strong></p>
+            <p>数据湖（Data Lake）场景中，Parquet 和 ORC
+            格式的列式文件已经成为事实标准。列式文件格式的高压缩率节省存储成本，列裁剪和谓词下推减少计算成本。</p>
+            <h3 id="行式存储仍然更好的场景">9.2
+            行式存储仍然更好的场景</h3>
+            <p><strong>1. OLTP 事务处理</strong></p>
+            <p>高并发的短事务（每秒数千到数万个事务）需要快速的单行读写。行式存储的
+            B-Tree 索引支持 O(log n)
+            的点查询，行级锁支持细粒度并发控制。列式存储在这些方面没有优势。</p>
+            <p><strong>2. 窄表、全列查询</strong></p>
+            <p>如果表只有 3-5 列，且查询经常需要所有列，行式和列式的 I/O
+            差异很小。此时列式存储的写入劣势和实现复杂度反而是负担。</p>
+            <p><strong>3. 频繁的单行更新和删除</strong></p>
+            <p>如果业务逻辑需要高频地更新单行数据（如修改用户状态、更新库存），行式存储的原地更新（In-Place
+            Update）远比列式存储的标记删除和后台合并高效。</p>
+            <p><strong>4. 对事务一致性要求极高的场景</strong></p>
+            <p>银行核心系统、订单系统等需要强一致性和完整 ACID
+            事务的场景，行式存储（如 PostgreSQL、MySQL
+            InnoDB）的事务模型更成熟。</p>
+            <h3 id="选型决策树">9.3 选型决策树</h3>
+            <pre class="text"><code>你的负载是什么类型？
+│
+├─ 主要是 OLTP（短事务、点查询、高并发写入）
+│   → 行式存储（PostgreSQL / MySQL）
+│
+├─ 主要是 OLAP（聚合查询、全表扫描、批量加载）
+│   → 列式存储
+│   │
+│   ├─ 需要独立部署的分析数据库？
+│   │   ├─ 数据量 &lt; 100GB，单机即可 → DuckDB
+│   │   ├─ 数据量 100GB-10TB → ClickHouse（单节点或小集群）
+│   │   └─ 数据量 &gt; 10TB → ClickHouse 集群 / Redshift / BigQuery
+│   │
+│   └─ 数据存在数据湖（S3/HDFS）中？
+│       → Parquet 格式 + 查询引擎（Spark / Trino / DuckDB）
+│
+├─ OLTP 和 OLAP 混合（HTAP）
+│   ├─ 可以接受秒级数据延迟 → TiDB + TiFlash
+│   ├─ 需要实时分析 → SQL Server + Columnstore Index
+│   └─ 在现有 PostgreSQL 上加分析能力 → Citus / TimescaleDB
+│
+└─ 嵌入式场景（嵌入到应用进程中）
+    ├─ 需要分析能力 → DuckDB
+    └─ 需要事务能力 → SQLite / LMDB</code></pre>
+            <h3 id="迁移到列式存储的注意事项">9.4
+            迁移到列式存储的注意事项</h3>
+            <p>从行式存储迁移到列式存储时，需要注意以下几点：</p>
+            <p><strong>1. 数据建模的变化</strong></p>
+            <p>行式存储通常采用范式化（Normalized）设计，通过 JOIN
+            关联多张表。列式存储更适合宽表（Wide
+            Table）设计——把需要一起查询的数据预先 JOIN
+            好，存储在一张宽表中。ClickHouse 等系统的 JOIN
+            性能不如行式数据库，宽表设计可以避免昂贵的 JOIN 操作。</p>
+            <p><strong>2. 写入模式的调整</strong></p>
+            <p>行式存储可以一行一行地写入。列式存储必须批量写入——单行插入的性能很差，应该积累到至少几千行再一次性写入。ClickHouse
+            官方建议每次插入至少 1000 行，最好是 10000-100000 行。</p>
+            <p><strong>3. 索引策略的差异</strong></p>
+            <p>行式存储依赖 B-Tree 索引加速查询。列式存储通常不使用
+            B-Tree，而是依赖稀疏索引、Zone Map 和布隆过滤器（Bloom
+            Filter）等轻量级索引。迁移后，需要重新设计索引策略。</p>
+            <p><strong>4. 排序键的选择</strong></p>
+            <p>列式存储的排序键（Sort Key / Primary Key / ORDER
+            BY）对查询性能有巨大影响。排序键决定了数据的物理存储顺序，直接影响压缩率和谓词下推的效果。选择排序键时应该优先考虑最频繁的查询过滤条件。</p>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- ClickHouse 排序键示例</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a>    event_date <span class="dt">Date</span>,</span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a>    user_id    UInt64,</span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a>    event_type String,</span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a>    payload    String</span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a>ENGINE <span class="op">=</span> MergeTree()</span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> (event_date, user_id, event_type);</span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 按时间 → 用户 → 事件类型排序</span></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- WHERE event_date = &#39;2024-01-15&#39; 可以利用排序键快速过滤</span></span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- WHERE user_id = 12345 需要扫描更多 Granule（不是排序键前缀）</span></span></code></pre></div>
+            <h3 id="列式存储的未来趋势">9.5 列式存储的未来趋势</h3>
+            <p>列式存储技术仍在快速演进，几个值得关注的方向：</p>
+            <p><strong>1. 存算分离（Disaggregated Storage and
+            Compute）</strong></p>
+            <p>Snowflake、Databricks、BigQuery
+            等云数据仓库都采用了存算分离架构：数据以 Parquet
+            等列式格式存储在对象存储（如
+            S3）中，计算节点按需启动。这种架构的弹性和成本优势使得列式存储从专用硬件走向了通用云基础设施。</p>
+            <p><strong>2. 向量化与硬件加速的深化</strong></p>
+            <p>随着 AVX-512、ARM SVE 等更宽的 SIMD 指令集的普及，以及
+            GPU 和 FPGA 在数据库加速中的探索（如 RAPIDS
+            cuDF），列式存储的向量化执行还有进一步提速的空间。</p>
+            <p><strong>3. 自适应布局</strong></p>
+            <p>一些研究和系统开始探索自适应存储布局（Adaptive
+            Layout）——根据查询负载自动在行式和列式之间切换，或者自动选择最优的行组大小和编码方式。CockroachDB
+            在 2024 年引入的列式执行引擎就是沿着这个方向的工程实践。</p>
+            <p><strong>4. 列式存储与数据湖的融合</strong></p>
+            <p>Apache Iceberg、Delta Lake、Apache Hudi 等表格式（Table
+            Format）在 Parquet
+            等列式文件格式之上构建了事务支持、模式演化（Schema
+            Evolution）和时间旅行（Time
+            Travel）等能力，模糊了数据仓库和数据湖的边界。</p>
+            <hr />
+            <p>本文从 I/O
+            模型出发，系统地拆解了列式存储在分析查询上快一到两个数量级的核心原因：列裁剪减少无关
+            I/O，专用编码提高压缩率进一步减少 I/O，连续内存布局释放 SIMD
+            向量化潜力，延迟物化减少中间数据量。同时也明确了列式存储的代价——写入放大、更新困难、事务复杂度高——以及
+            PAX 混合布局和 HTAP
+            架构如何在这些约束下寻找平衡。选型的关键不在于哪种布局”更好”，而在于负载特征与存储布局的匹配程度。</p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/05-encoding-compression/05-encoding-compression.html">【数据湖与开放表格式】列式编码与压缩</a></h3>
+                    <p>拆解 Parquet 的两层缩减：专用编码（dictionary / RLE / DELTA_BINARY_PACKED / BYTE_STREAM_SPLIT）降熵，再用 zstd/snappy/lz4/gzip 压字节。用 pyarrow 在同一列上实测不同编码+压缩组合的体积与读取耗时（3M 行，7 轮中位数），并与 ClickHouse CODEC 做同思想不同落地的对照。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / storage</p>
+                    <h3><a href="/post/db/columnar-engine/03-compression-encoding/03-compression-encoding.html">【列存引擎内核】压缩与编码</a></h3>
+                    <p>ClickHouse 列压缩：LZ4、ZSTD、Delta、DoubleDelta、Gorilla 时序编码与列类型关系；CODEC 链顺序、LowCardinality 与 PG TOAST 对照。压缩比须本机实测，本文不编造倍数。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / storage</p>
+                    <h3><a href="/post/db/columnar-engine/04-vectorized-execution/04-vectorized-execution.html">【列存引擎内核】向量化执行引擎</a></h3>
+                    <p>ClickHouse Block 列向量 batch、IProcessor Pipeline 与 filter/project/aggregate 向量实现；对照 PostgreSQL 火山模型 ExecProcNode。源码入口 src/Processors、src/Columns。24.x LTS。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / storage</p>
+                    <h3><a href="/post/db/columnar-engine/index.html">【列存引擎内核】ClickHouse 与 DuckDB 源码级拆解</a></h3>
+                    <p>主选 ClickHouse 拆解 MergeTree 存储格式、向量化执行与分布式协调；DuckDB 作为嵌入式 OLAP 对照。覆盖列存文件布局、merge 机制、跳数索引与生产故障模式，面向数据平台工程师与从 PG/MySQL 转 OLAP 的 DBA。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,1300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="不是工具箱罗列，而是一条按顺序推进的调查链：从
+pg_stat_statements 定位可疑 queryid，到 EXPLAIN (ANALYZE, BUFFERS)
+解剖执行计划，到 pg_stat_activity + wait_event 诊断等待类型，到 pg_locks
++ pg_blocking_pids() 追踪锁等待树，最后用 OS
+层工具（iostat/perf/bpftrace）确认物理瓶颈。覆盖三个特殊场景：计划缓存的快慢切换、CPU
+100% 无慢查询的 LWLock 自旋根因、命中率 99% 但 IO 打满的统计骗局。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, performance, pg_stat_statements, explain, wait_event, pg_locks, perf, bpftrace, plan_cache_mode, lwlock, shared_buffers, pg_wait_sampling, pg_stat_kcache, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/23-perf-investigation/23-perf-investigation.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链" />
+    <meta property="og:description" content="不是工具箱罗列，而是一条按顺序推进的调查链：从 pg_stat_statements 定位可疑 queryid，到 EXPLAIN (ANALYZE, BUFFERS) 解剖执行计划，到 pg_stat_activity + wait_event 诊断等待类型，到 pg_locks + pg_blocking_pids() 追踪锁等待树，最后用 OS 层工具（iostat/perf/bpftrace）确认物理瓶颈。覆盖三个特殊场景：计划缓存的快慢切换、CPU 100% 无慢查询的 LWLock 自旋根因、命中率 99% 但 IO 打满的统计骗局。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/23-perf-investigation/23-perf-investigation.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="performance" />
+    <meta property="article:tag" content="pg_stat_statements" />
+    <meta property="article:tag" content="explain" />
+    <meta property="article:tag" content="wait_event" />
+    <meta property="article:tag" content="pg_locks" />
+    <meta property="article:tag" content="perf" />
+    <meta property="article:tag" content="bpftrace" />
+    <meta property="article:tag" content="plan_cache_mode" />
+    <meta property="article:tag" content="lwlock" />
+    <meta property="article:tag" content="shared_buffers" />
+    <meta property="article:tag" content="pg_wait_sampling" />
+    <meta property="article:tag" content="pg_stat_kcache" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链" />
+    <meta name="twitter:description" content="不是工具箱罗列，而是一条按顺序推进的调查链：从 pg_stat_statements 定位可疑 queryid，到 EXPLAIN (ANALYZE, BUFFERS) 解剖执行计划，到 pg_stat_activity + wait_event 诊断等待类型，到 pg_locks + pg_blocking_pids() 追踪锁等待树，最后用 OS 层工具（iostat/perf/bpftrace）确认物理瓶颈。覆盖三个特殊场景：计划缓存的快慢切换、CPU 100% 无慢查询的 LWLock 自旋根因、命中率 99% 但 IO 打满的统计骗局。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链", "description": "不是工具箱罗列，而是一条按顺序推进的调查链：从 pg_stat_statements 定位可疑 queryid，到 EXPLAIN (ANALYZE, BUFFERS) 解剖执行计划，到 pg_stat_activity + wait_event 诊断等待类型，到 pg_locks + pg_blocking_pids() 追踪锁等待树，最后用 OS 层工具（iostat/perf/bpftrace）确认物理瓶颈。覆盖三个特殊场景：计划缓存的快慢切换、CPU 100% 无慢查询的 LWLock 自旋根因、命中率 99% 但 IO 打满的统计骗局。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/23-perf-investigation/23-perf-investigation.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "performance", "pg_stat_statements", "explain", "wait_event", "pg_locks", "perf", "bpftrace", "plan_cache_mode", "lwlock", "shared_buffers", "pg_wait_sampling", "pg_stat_kcache"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#performance</span> <span>#pg_stat_statements</span> <span>#explain</span> <span>#wait_event</span> <span>#pg_locks</span> <span>#perf</span> <span>#bpftrace</span> <span>#plan_cache_mode</span> <span>#lwlock</span> <span>#shared_buffers</span> <span>#pg_wait_sampling</span> <span>#pg_stat_kcache</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/performance-476ee0.html">#performance</a><a class="chip-link" href="/tags/pg_stat_statements.html">#pg_stat_statements</a><a class="chip-link" href="/tags/explain.html">#explain</a><a class="chip-link" href="/tags/wait_event.html">#wait_event</a><a class="chip-link" href="/tags/pg_locks.html">#pg_locks</a><a class="chip-link" href="/tags/perf.html">#perf</a><a class="chip-link" href="/tags/bpftrace.html">#bpftrace</a><a class="chip-link" href="/tags/plan_cache_mode.html">#plan_cache_mode</a><a class="chip-link" href="/tags/lwlock.html">#lwlock</a><a class="chip-link" href="/tags/shared_buffers.html">#shared_buffers</a><a class="chip-link" href="/tags/pg_wait_sampling.html">#pg_wait_sampling</a><a class="chip-link" href="/tags/pg_stat_kcache.html">#pg_stat_kcache</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#性能异常调查方法论从现象到内核根因的五层调查链"
+                id="toc-性能异常调查方法论从现象到内核根因的五层调查链">性能异常调查方法论：从现象到内核根因的五层调查链</a>
+                <ul>
+                <li><a href="#一调查链全景"
+                id="toc-一调查链全景">一、调查链全景</a>
+                <ul>
+                <li><a href="#pg_stat_statements-的边界"
+                id="toc-pg_stat_statements-的边界">pg_stat_statements
+                的边界</a></li>
+                </ul></li>
+                <li><a
+                href="#三第二层explain-analyze-buffers-settings-解剖执行计划"
+                id="toc-三第二层explain-analyze-buffers-settings-解剖执行计划">三、第二层：EXPLAIN
+                (ANALYZE, BUFFERS, SETTINGS) 解剖执行计划</a>
+                <ul>
+                <li><a href="#三个关键选项"
+                id="toc-三个关键选项">三个关键选项</a></li>
+                </ul></li>
+                <li><a
+                href="#四第三层pg_stat_activity-wait_event-诊断等待类型"
+                id="toc-四第三层pg_stat_activity-wait_event-诊断等待类型">四、第三层：pg_stat_activity
+                + wait_event 诊断等待类型</a>
+                <ul>
+                <li><a href="#查询当前等待状态"
+                id="toc-查询当前等待状态">查询当前等待状态</a></li>
+                <li><a href="#最常见的误判clientread"
+                id="toc-最常见的误判clientread">最常见的误判：ClientRead</a></li>
+                </ul></li>
+                <li><a
+                href="#五第四层pg_locks-pg_blocking_pids-追踪锁等待链"
+                id="toc-五第四层pg_locks-pg_blocking_pids-追踪锁等待链">五、第四层：pg_locks
+                + pg_blocking_pids() 追踪锁等待链</a>
+                <ul>
+                <li><a href="#单层锁查询"
+                id="toc-单层锁查询">单层锁查询</a></li>
+                </ul></li>
+                <li><a href="#六第五层os-层确认物理瓶颈"
+                id="toc-六第五层os-层确认物理瓶颈">六、第五层：OS
+                层确认物理瓶颈</a>
+                <ul>
+                <li><a href="#iostat-确认磁盘"
+                id="toc-iostat-确认磁盘">iostat 确认磁盘</a></li>
+                <li><a href="#perf-追踪-cpu-调用栈"
+                id="toc-perf-追踪-cpu-调用栈">perf 追踪 CPU
+                调用栈</a></li>
+                <li><a href="#bpftrace-追踪内核调用栈"
+                id="toc-bpftrace-追踪内核调用栈">bpftrace
+                追踪内核调用栈</a></li>
+                </ul></li>
+                <li><a
+                href="#七特殊场景一有时快有时慢-计划缓存与-genericcustom-plan"
+                id="toc-七特殊场景一有时快有时慢-计划缓存与-genericcustom-plan">七、特殊场景一：有时快有时慢
+                —— 计划缓存与 generic/custom plan</a>
+                <ul>
+                <li><a href="#现象" id="toc-现象">现象</a></li>
+                <li><a href="#根因generic-plan-与-custom-plan-的切换"
+                id="toc-根因generic-plan-与-custom-plan-的切换">根因：generic
+                plan 与 custom plan 的切换</a></li>
+                <li><a href="#解决方案顺序"
+                id="toc-解决方案顺序">解决方案顺序</a></li>
+                </ul></li>
+                <li><a
+                href="#八特殊场景二cpu-100-但没慢查询-lwlock-自旋与隐藏开销"
+                id="toc-八特殊场景二cpu-100-但没慢查询-lwlock-自旋与隐藏开销">八、特殊场景二：CPU
+                100% 但没慢查询 —— LWLock 自旋与隐藏开销</a>
+                <ul>
+                <li><a href="#现象-1" id="toc-现象-1">现象</a></li>
+                <li><a href="#根因一lwlock-自旋"
+                id="toc-根因一lwlock-自旋">根因一：LWLock 自旋</a></li>
+                </ul></li>
+                <li><a href="#九特殊场景三io-打满但命中率-99-命中率骗局"
+                id="toc-九特殊场景三io-打满但命中率-99-命中率骗局">九、特殊场景三：IO
+                打满但命中率 99% —— 命中率骗局</a>
+                <ul>
+                <li><a href="#现象-2" id="toc-现象-2">现象</a></li>
+                <li><a href="#为什么命中率会撒谎"
+                id="toc-为什么命中率会撒谎">为什么命中率会撒谎</a></li>
+                <li><a href="#验证pg_statio_user_tables-定位-io-源头"
+                id="toc-验证pg_statio_user_tables-定位-io-源头">验证：pg_statio_user_tables
+                定位 I/O 源头</a></li>
+                <li><a href="#解决方案方向"
+                id="toc-解决方案方向">解决方案方向</a></li>
+                </ul></li>
+                <li><a
+                href="#十工具链集成pg_stat_statements-pg_wait_sampling-pg_stat_kcache"
+                id="toc-十工具链集成pg_stat_statements-pg_wait_sampling-pg_stat_kcache">十、工具链集成：pg_stat_statements
+                + pg_wait_sampling + pg_stat_kcache</a>
+                <ul>
+                <li><a href="#pg_wait_sampling"
+                id="toc-pg_wait_sampling">pg_wait_sampling</a></li>
+                <li><a href="#三者的组合使用场景"
+                id="toc-三者的组合使用场景">三者的组合使用场景</a></li>
+                </ul></li>
+                <li><a href="#十一调查清单总结"
+                id="toc-十一调查清单总结">十一、调查清单总结</a></li>
+                <li><a href="#十二关键要点"
+                id="toc-十二关键要点">十二、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#扩展文档"
+                id="toc-扩展文档">扩展文档</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="性能异常调查方法论从现象到内核根因的五层调查链">性能异常调查方法论：从现象到内核根因的五层调查链</h1>
+            <p>一个慢查询摆在面前，新手的第一反应是
+            <code>EXPLAIN</code>，然后盯着 <code>cost</code> 和
+            <code>rows</code>
+            猜问题。但生产环境的性能异常很少孤立存在——同样的 SQL
+            有时快有时慢？CPU 满载但 <code>pg_stat_statements</code>
+            里没有慢查询？<code>shared_buffers</code> 命中率 99% 但磁盘
+            IO 快被打穿？</p>
+            <p>这些问题不是一条命令能回答的。本文定义一条五层调查链，每一层聚焦一个具体问题，层与层之间有明确的”什么时候往下一层走”的决策条件。它不是工具清单，而是从现象推到内核根因的排查路径。</p>
+            <hr />
+            <h2 id="一调查链全景">一、调查链全景</h2>
+            <p>五层调查链的推进逻辑：从应用层可见的 SQL
+            统计开始，逐步往下钻到 PG 内部执行细节、等待事件、锁关系和
+            OS 物理资源。</p>
+            <pre class="mermaid"><code>flowchart TD
+  L1[&quot;第一层：pg_stat_statements&lt;br/&gt;哪个查询是瓶颈？&quot;]
+  L2[&quot;第二层：EXPLAIN (ANALYZE, BUFFERS, SETTINGS)&lt;br/&gt;执行计划哪里出了问题？&quot;]
+  L3[&quot;第三层：pg_stat_activity + wait_event&lt;br/&gt;查询在等什么？&quot;]
+  L4[&quot;第四层：pg_locks + pg_blocking_pids()&lt;br/&gt;谁在锁谁？&quot;]
+  L5[&quot;第五层：OS 层工具&lt;br/&gt;物理瓶颈是什么？&quot;]
+
+  L1 --&gt;|&quot;定位高耗时/高频率 queryid&quot;| L2
+  L2 --&gt;|&quot;计划行数 vs 实际行数差异大&lt;br/&gt;或 buffer 访问异常&quot;| L3
+  L3 --&gt;|&quot;wait_event_type=Lock 或 LWLock&quot;| L4
+  L3 --&gt;|&quot;wait_event_type=IO&lt;br/&gt;或没有明显等待但 query 慢&quot;| L5
+  L4 --&gt;|&quot;锁等待链已定位&lt;br/&gt;需确认根因&quot;| L5
+```text
+
+每层的决策条件：
+
+- **第一层**：总是第一步。从全局统计中定位哪个 `queryid` 是瓶颈，避免随机抓取。
+- **第二层**：对定位到的 queryid 做单条解剖。如果估算行数和实际行数差异超过一个数量级，或者 `Buffers: read` 占比异常高，进入第三层。
+- **第三层**：查询慢但第二层看不出明显计划错误时，看它在等什么。`Lock` 和 `LWLock` 进入第四层；`IO` 进入第五层；`ClientRead` 说明不是 PG 的问题。
+- **第四层**：确认锁等待链的根节点——谁持锁、等谁释放。
+- **第五层**：当以上四层都用尽（计划正确、没有明显等待、没有锁竞争），问题在物理层面——磁盘带宽耗尽、CPU 自旋、内核调用栈。
+
+---
+
+## 二、第一层：pg_stat_statements 定位可疑查询
+
+### 核心思路
+
+不要从&quot;哪个查询慢&quot;开始，要从&quot;哪个查询消耗的总时间最多&quot;开始。一个执行 100000 次每次 1ms 的查询，总消耗远大于一个执行 1 次每次 1000ms 的查询。
+
+```sql
+-- 按总耗时排序，定位 top-N
+SELECT queryid,
+       calls,
+       round(mean_exec_time::numeric, 2) AS mean_ms,
+       round(stddev_exec_time::numeric, 2) AS stddev_ms,
+       round(total_exec_time::numeric, 2) AS total_ms,
+       round((total_exec_time / sum(total_exec_time) OVER ()) * 100, 1) AS pct,
+       left(query, 200) AS query_snippet
+FROM pg_stat_statements
+WHERE query NOT LIKE &#39;%pg_stat_statements%&#39;
+ORDER BY total_exec_time DESC
+LIMIT 10;</code></pre>
+            <p>输出解读：</p>
+            <pre class="text"><code> queryid  | calls  | mean_ms | stddev_ms | total_ms  | pct  | query_snippet
+----------+--------+---------+-----------+-----------+------+---------------
+ 12345678 |  50000 |   45.20 |    210.30 | 2260000.00| 62.3 | SELECT ... FROM orders JOIN ...
+ 23456789 | 200000 |    1.80 |      1.50 |  360000.00|  9.9 | SELECT ... FROM products WHERE id = $1
+```text
+
+这里有一个关键判断：`queryid=12345678` 的 `stddev_ms`（210.30）远大于 `mean_ms`（45.20），说明这个查询**偶尔非常慢**——执行的 50000 次中，大部分较快，但少数几次消耗了大量时间。如果 `stddev_ms` 接近 `mean_ms`，说明这个查询**一直慢**。
+
+### 区分&quot;一直慢&quot;和&quot;偶尔慢&quot;
+
+| 特征 | mean_ms 和 stddev_ms 的关系 | 调查方向 |
+|------|---------------------------|----------|
+| 一直慢 | `stddev_ms` 接近 `mean_ms`（变异系数 &lt; 0.5） | 计划问题、索引缺失、统计信息不准 → 进入第二层 |
+| 偶尔慢 | `stddev_ms` 远大于 `mean_ms`（变异系数 &gt; 1.5） | 锁等待、计划缓存切换、checkpoint IO 风暴 → 进入第三层 |
+| 频率爆发 | `calls` 突然飙升 | 应用端变更、缓存到期、连接池参数变化 → 检查应用和连接池 |
+
+这里引入的变异系数（Coefficient of Variation）定义为 $CV = \sigma / \mu$，即 `stddev_exec_time / mean_exec_time`。CV &lt; 0.5 说明波动在合理的随机噪声范围内；CV &gt; 1.5 说明存在系统性的间歇性因素。
+
+### 配合查询频率判断
+
+高频低耗查询（如上例中 `queryid=23456789`，200000 次调用，每次 1.8ms）的优化方向不是让单次更快，而是减少调用次数——检查应用层是否有 N+1 查询、是否缺缓存层、是否可以用批量查询替代循环。
+
+```sql
+-- 按调用频率排序
+SELECT queryid, calls,
+       round(mean_exec_time::numeric, 2) AS mean_ms,
+       round(total_exec_time::numeric, 2) AS total_ms
+FROM pg_stat_statements
+ORDER BY calls DESC
+LIMIT 10;</code></pre>
+            <p>如果某个查询的 <code>calls</code>
+            在时间窗口内异常高，说明它处于一个循环路径中——这通常是应用代码层面的问题，不是
+            PG 内核能解决的。</p>
+            <h3 id="pg_stat_statements-的边界">pg_stat_statements
+            的边界</h3>
+            <p><code>pg_stat_statements</code> 基于
+            <code>queryid</code>（查询文本标准化后的
+            hash）聚合。它不区分同一 SQL
+            的不同参数值——<code>SELECT * FROM t WHERE id = 1</code> 和
+            <code>SELECT * FROM t WHERE id = 999999</code>
+            会被聚合到同一条记录。如果参数值分布极端（比如一个 id 匹配
+            10000 行，另一个匹配 1 行），聚合后
+            <code>mean_exec_time</code> 和 <code>stddev_exec_time</code>
+            就会反映出这个偏差。这时候需要进入第二层，用具体参数值做
+            <code>EXPLAIN ANALYZE</code> 对比。</p>
+            <p>另一个边界：<code>pg_stat_statements</code> 只保留
+            <code>pg_stat_statements.max</code> 条记录（默认
+            5000），超出后最旧的记录被淘汰。在查询量很大的系统上，低频但昂贵的查询可能被淘汰出统计窗口。这时候需要配合
+            <code>log_min_duration_statement</code>
+            做日志侧的慢查询捕获。</p>
+            <hr />
+            <h2
+            id="三第二层explain-analyze-buffers-settings-解剖执行计划">三、第二层：EXPLAIN
+            (ANALYZE, BUFFERS, SETTINGS) 解剖执行计划</h2>
+            <p>定位到可疑的 queryid 后，用完整的
+            <code>EXPLAIN (ANALYZE, BUFFERS, SETTINGS)</code>
+            获取精确的执行信息。</p>
+            <h3 id="三个关键选项">三个关键选项</h3>
+            <table>
+            <colgroup>
+            <col style="width: 35%" />
+            <col style="width: 64%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>选项</th>
+            <th>提供的信息</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>ANALYZE</code></td>
+            <td>实际执行并收集时间、行数、循环次数
+            <code>(actual time=... rows=... loops=...)</code></td>
+            </tr>
+            <tr>
+            <td><code>BUFFERS</code></td>
+            <td>每个算子的 buffer 访问：<code>shared hit</code>（命中
+            shared_buffers）、<code>shared read</code>（从磁盘读）、<code>local</code>（临时表）、<code>temp read/write</code>（写到临时文件）</td>
+            </tr>
+            <tr>
+            <td><code>SETTINGS</code></td>
+            <td>影响该查询优化决策的 GUC
+            参数值（<code>work_mem</code>、<code>random_page_cost</code>、<code>enable_seqscan</code>
+            等）的输出快照</td>
+            </tr>
+            </tbody>
+            </table>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS, SETTINGS, TIMING, FORMAT TEXT)</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">..</span>.</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>`TIMING<span class="op">=</span>on`（默认）会测量每个算子的实际耗时，但引入微小开销——对极高频查询（<span class="op">&gt;</span><span class="dv">10000</span> QPS）可关闭。</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>### 计划行数与实际行数的差异</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>这是规划器估算错误的直接证据：</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="kw">Hash</span> <span class="kw">Join</span>  (<span class="kw">cost</span><span class="op">=..</span>. <span class="kw">rows</span><span class="op">=</span><span class="dv">1000</span> width<span class="op">=..</span>.) (actual <span class="dt">time</span><span class="op">=..</span>. <span class="kw">rows</span><span class="op">=</span><span class="dv">896000</span> loops<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">Hash</span> Cond: (<span class="op">..</span>.)</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>  <span class="op">-&gt;</span>  Seq <span class="kw">Scan</span> <span class="kw">on</span> orders  (<span class="kw">cost</span><span class="op">=..</span>. <span class="kw">rows</span><span class="op">=</span><span class="dv">50000</span> width<span class="op">=..</span>.)</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        (actual <span class="dt">time</span><span class="op">=..</span>. <span class="kw">rows</span><span class="op">=</span><span class="dv">896000</span> loops<span class="op">=</span><span class="dv">1</span>)</span></code></pre></div>
+            <p>规划器估计 <code>orders</code> 表返回 50000
+            行，实际返回了 896000 行——差了 17 倍。这意味着：</p>
+            <ol type="1">
+            <li>统计信息过期——<code>ANALYZE</code> 没跟上表的增长。</li>
+            <li>统计信息精度不够——大表上
+            <code>default_statistics_target</code>（默认
+            100）的采样比例不足以捕捉真实分布。</li>
+            <li>多列相关性未被捕获——单独看两列的分布都正常，但它们的组合有强相关性。需要用
+            <code>CREATE STATISTICS</code> 创建扩展统计。</li>
+            </ol>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 检查统计信息的更新时间</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> schemaname, relname, last_analyze, n_mod_since_analyze</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;orders&#39;</span>;</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>如果 `n_mod_since_analyze`（自上次 <span class="kw">ANALYZE</span> 以来修改的行数）远大于 `n_live_tup`，统计信息已严重过期。</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>### Buffers 输出解读</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="kw">Sort</span>  (<span class="kw">cost</span><span class="op">=..</span>. <span class="kw">rows</span><span class="op">=..</span>.) (actual <span class="dt">time</span><span class="op">=..</span>. <span class="kw">rows</span><span class="op">=..</span>. loops<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">Sort</span> <span class="kw">Key</span>: <span class="op">..</span>.</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>  <span class="kw">Sort</span> <span class="kw">Method</span>: external <span class="kw">merge</span>  Disk: <span class="dv">15360</span>kB</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>  Buffers: <span class="kw">shared</span> hit<span class="op">=</span><span class="dv">128</span> <span class="kw">read</span><span class="op">=</span><span class="dv">32160</span>, temp <span class="kw">read</span><span class="op">=</span><span class="dv">1920</span> written<span class="op">=</span><span class="dv">1920</span></span></code></pre></div>
+            <p>关键信号：</p>
+            <ul>
+            <li><code>Sort Method: external merge Disk: 15360kB</code>：排序结果大于
+            <code>work_mem</code>，溢写到磁盘。15360kB 的临时文件读写在
+            NVMe 上可能几十毫秒，在 HDD 上可能几百毫秒。</li>
+            <li><code>shared read=32160</code>：这个算子从磁盘读了 32160
+            个 8KB 页面（约 251MB）。如果 <code>shared_buffers</code>
+            里没有这些页面，每次执行都得重新读。</li>
+            <li><code>shared hit=128</code>：只有 128 个页面在
+            shared_buffers 中找到，其余都是从磁盘读的。</li>
+            </ul>
+            <p>对比一个 Buffer 友好的查询：</p>
+            <pre class="text"><code>Seq Scan on t  (cost=... rows=...) (actual time=... rows=... loops=1)
+  Buffers: shared hit=8432 read=16
+```text
+
+`shared hit=8432`、`shared read=16`——绝大多数页面在 `shared_buffers` 中，磁盘读取很少。但如果这个 t 是一个 200GB 的大表而 `shared_buffers` 只有 8GB，那么每次全表扫描都会把 buffer pool 冲一遍（这会在第五层展开讨论）。
+
+### 实际行数与 Buffer 访问的关联
+
+当 `actual rows` 比 `estimated rows` 大得多时，`shared read` 也往往异常高——因为规划器以为返回行数很少选择了 NestLoop + IndexScan，实际大量行触发了大量随机 I/O：
+
+```text
+Nested Loop  (cost=... rows=10 width=...) (actual time=... rows=500000 loops=1)
+  Buffers: shared hit=120 read=490200</code></pre>
+            <p><code>rows=10</code> 是估算，<code>rows=500000</code>
+            是实际。NestLoop 的 Inner 端被调用了 500000 次而不是 10
+            次——每次都可能触发一次随机 I/O，这就是
+            <code>read=490200</code> 的来源。如果把 NestLoop 换成
+            HashJoin（规划器本来应该选的，如果它知道实际行数），I/O 会从
+            490200 次随机读变成一次顺序扫描。</p>
+            <hr />
+            <h2
+            id="四第三层pg_stat_activity-wait_event-诊断等待类型">四、第三层：pg_stat_activity
+            + wait_event 诊断等待类型</h2>
+            <p>如果 <code>EXPLAIN</code>
+            显示执行计划合理（估算行数接近实际、buffer
+            访问正常），但查询仍然慢，问题在”等”——查询在执行，但在等某个资源。</p>
+            <h3 id="查询当前等待状态">查询当前等待状态</h3>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, state, wait_event_type, wait_event,</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>       <span class="kw">left</span>(<span class="kw">query</span>, <span class="dv">150</span>) <span class="kw">AS</span> query_snippet,</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> query_start <span class="kw">AS</span> duration</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;active&#39;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> pid <span class="op">&lt;&gt;</span> pg_backend_pid()</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> query_start;</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>`wait_event_type` 和 `wait_event` 的组合精确描述了查询在等什么：</span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>### wait_event 对照表</span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>| wait_event_type | 常见 wait_event | 含义 |</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>|<span class="co">-----------------|-----------------|------|</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>| `Lock` | `relation` | 等表级锁（ALTER TABLE、DROP TABLE、LOCK TABLE）——查询被一个持有 `AccessExclusiveLock` 的会话阻塞 |</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>| `Lock` | `transactionid` | 等事务完成——查询在等另一个事务 <span class="kw">COMMIT</span> 或 ROLLBACK，因为需要看到它的结果 |</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>| `Lock` | `tuple` | 等元组锁——两个事务同时想更新同一行，第二个在等第一个提交或回滚 |</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>| `LWLock` | `WALWrite` | 等 WAL 写入——WAL Writer 在刷盘，Backend 在等 WAL <span class="kw">flush</span> 完成才能继续 |</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>| `LWLock` | `BufferMapping` | 等 Buffer 映射表的分区锁——大量并发访问 buffer pool 的同一个分区 |</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>| `LWLock` | `lock_manager` | 等锁管理器的内部锁——高并发下 <span class="kw">Lock</span> <span class="kw">hash</span> <span class="kw">table</span> 的分区争用 |</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>| `LWLock` | `ProcArrayLock` | 等 PGPROC 数组的锁——快照构建的争用（大量连接<span class="op">+</span>短事务的典型瓶颈） |</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>| `IO` | `DataFileRead` | 等数据文件读取——磁盘 I<span class="op">/</span>O |</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>| `IO` | `WALRead` | 等 WAL 文件读取——standby 端恢复 WAL 时的读取等待 |</span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>| `IO` | `DataFileWrite` | 等数据文件写入——Backend 在写临时文件或做 buffer 替换时触发 |</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>| `BufferPin` | `BufferPin` | 等 Buffer Pin——另一个 Backend 持有一个 buffer page 的 pin 未释放 |</span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>| `Client` | `ClientRead` | 等客户端发送下一条 SQL——<span class="op">**</span>这不是 PG 的问题<span class="op">**</span>，是客户端在<span class="ot">&quot;想&quot;</span>（应用处理结果、网络延迟、或客户端忘了发请求） |</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>| `Activity` | `LogicalLauncherMain` 等 | PG 内部辅助进程的常规等待 |</span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>### 按等待类型快速分类</span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 统计每种 wait_event 的数量</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> wait_event_type, wait_event, <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> sessions</span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;active&#39;</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> wait_event_type <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">3</span> <span class="kw">DESC</span>;</span></code></pre></div>
+            <p>大量 <code>Lock/relation</code> 说明有 DDL
+            在阻塞查询；大量 <code>IO/DataFileRead</code>
+            说明磁盘不够快或 buffer 不够大；大量
+            <code>LWLock/WALWrite</code> 说明写入负载压力大。</p>
+            <h3
+            id="最常见的误判clientread">最常见的误判：ClientRead</h3>
+            <p><code>wait_event_type=Client, wait_event=ClientRead</code>
+            表示 PG 已经处理完上一条
+            SQL，正在等客户端发下一条。如果大量连接处于这个状态，问题不在
+            PG——在应用端连接池配置、网络延迟，或者最危险的情况是
+            <code>idle in transaction</code>：连接持有锁和事务资源，但什么也不做。</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 找出 idle in transaction 超过 5 分钟的连接</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, usename, datname,</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>       state, wait_event,</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> xact_start <span class="kw">AS</span> xact_age,</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>       <span class="kw">left</span>(<span class="kw">query</span>, <span class="dv">150</span>) <span class="kw">AS</span> last_query</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;idle in transaction&#39;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> now() <span class="op">-</span> xact_start <span class="op">&gt;</span> <span class="dt">interval</span> <span class="st">&#39;5 minutes&#39;</span>;</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>`idle <span class="kw">in</span> transaction` 的危害不只在当前——它持有的事务快照阻止 VACUUM 回收自事务开始后产生的 dead tuple，连锁导致表膨胀。排查这个问题时，同时需要检查它持有的锁（第四层会展开）。</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>### pg_wait_sampling 扩展：采样而不是快照</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>`pg_stat_activity` 是瞬时快照——你看到的是查询瞬间的状态，而不是它在过去一分钟里的等待分布。`pg_wait_sampling` 扩展通过定期采样（默认 <span class="dv">10</span>ms）记录每个进程的等待事件，能捕捉到短暂的等待尖峰：</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- pg_wait_sampling 的 profile 视图：采样到的等待事件分布</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> event_type, event, <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> samples</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_wait_sampling_profile</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pid <span class="op">=</span> <span class="dv">12345</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">3</span> <span class="kw">DESC</span>;</span></code></pre></div>
+            <p>如果一个 Backend 在 <code>IO/DataFileRead</code>
+            上有大量采样但在 <code>pg_stat_activity</code>
+            中碰巧不是，<code>pg_wait_sampling</code> 会在 profile
+            中捕获到。</p>
+            <hr />
+            <h2
+            id="五第四层pg_locks-pg_blocking_pids-追踪锁等待链">五、第四层：pg_locks
+            + pg_blocking_pids() 追踪锁等待链</h2>
+            <p>当第三层显示 <code>wait_event_type=Lock</code>
+            时，需要追踪”谁在锁谁”。</p>
+            <h3 id="单层锁查询">单层锁查询</h3>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> blocked.pid <span class="kw">AS</span> blocked_pid,</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>       blocked.usename <span class="kw">AS</span> blocked_user,</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>       blocked.<span class="kw">query</span> <span class="kw">AS</span> blocked_query,</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>       blocking.pid <span class="kw">AS</span> blocking_pid,</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>       blocking.usename <span class="kw">AS</span> blocking_user,</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>       blocking.<span class="kw">query</span> <span class="kw">AS</span> blocking_query,</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>       blocked.wait_event_type,</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>       blocked.wait_event</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity blocked</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity blocking</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ON</span> blocking.pid <span class="op">=</span> <span class="kw">ANY</span>(pg_blocking_pids(blocked.pid))</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> blocked.pid <span class="op">&lt;&gt;</span> pg_backend_pid();</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>`pg_blocking_pids()` 返回阻塞指定 pid 的所有会话的 pid 数组。但孤立的一层查询无法展示多级锁等待链——A 等 B，B 等 C，C 等 D。</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>### 递归 CTE 追踪锁等待树</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> RECURSIVE lock_tree <span class="kw">AS</span> (</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 基础：所有等待锁的会话</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> blocking.pid <span class="kw">AS</span> blocked_by,</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>           blocked.pid <span class="kw">AS</span> waiting_pid,</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>           blocked.wait_event,</span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>           <span class="dv">1</span> <span class="kw">AS</span> <span class="fu">depth</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> pg_stat_activity blocked</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">JOIN</span> pg_stat_activity blocking</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>      <span class="kw">ON</span> blocking.pid <span class="op">=</span> <span class="kw">ANY</span>(pg_blocking_pids(blocked.pid))</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> blocked.pid <span class="op">&lt;&gt;</span> pg_backend_pid()</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">UNION</span> <span class="kw">ALL</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 递归：如果 blocking 会话自己也在等</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> blocking2.pid <span class="kw">AS</span> blocked_by,</span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>           lt.waiting_pid,</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>           blocked2.wait_event,</span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>           lt.<span class="fu">depth</span> <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> lock_tree lt</span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    <span class="kw">JOIN</span> pg_stat_activity blocked2</span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>      <span class="kw">ON</span> blocked2.pid <span class="op">=</span> lt.blocked_by</span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>    <span class="kw">JOIN</span> pg_stat_activity blocking2</span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>      <span class="kw">ON</span> blocking2.pid <span class="op">=</span> <span class="kw">ANY</span>(pg_blocking_pids(blocked2.pid))</span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> lt.<span class="fu">depth</span> <span class="op">&lt;</span> <span class="dv">20</span>  <span class="co">-- 防止无限递归</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> blocked_by, waiting_pid, wait_event, <span class="fu">depth</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> lock_tree</span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="fu">depth</span>, blocked_by;</span></code></pre></div>
+            <p>输出解读：</p>
+            <pre class="text"><code> blocked_by | waiting_pid | wait_event  | depth
+------------+-------------+-------------+-------
+      10345 |       10789 | relation    |     1
+      10789 |       10812 | transactionid |     1
+      10021 |       10345 | tuple       |     1
+```text
+
+这里 `pid=10812` 等 `pid=10789` 的事务锁，`pid=10789` 等 `pid=10345` 的表级锁，`pid=10345` 等 `pid=10021` 的元组锁。锁等待链的根节点是 `pid=10021`——终止它或者等它 COMMIT，才能解开整棵树。
+
+### 查看持有的锁详情
+
+```sql
+SELECT l.pid, l.locktype, l.mode, l.granted,
+       l.relation::regclass AS relation,
+       a.state, a.query
+FROM pg_locks l
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.pid IN (10021, 10345, 10789, 10812)
+  AND NOT l.granted
+ORDER BY l.pid;</code></pre>
+            <p><code>locktype=relation, mode=AccessExclusiveLock, granted=true</code>
+            且 <code>state=idle in transaction</code>——这个会话在某条
+            DDL 或 <code>LOCK TABLE</code> 之后忘了
+            COMMIT，阻塞了所有后续
+            DML。这是生产环境中锁等待的最常见根因。</p>
+            <hr />
+            <h2 id="六第五层os-层确认物理瓶颈">六、第五层：OS
+            层确认物理瓶颈</h2>
+            <p>当前四层都没有发现明显异常时，瓶颈在 OS
+            层面——磁盘带宽、CPU 调度、内核调用栈。这些是 PG
+            内核无法通过自己的统计暴露出来的。</p>
+            <h3 id="iostat-确认磁盘">iostat 确认磁盘</h3>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># -x 扩展统计，-m 以 MB/s 为单位，1 秒采样</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xm</span> 1</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="ex">关注列：</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">|</span> <span class="ex">列</span> <span class="kw">|</span> <span class="ex">含义</span> <span class="kw">|</span> <span class="ex">危险阈值</span> <span class="kw">|</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="kw">|</span><span class="ex">-----</span><span class="kw">|</span><span class="ex">------</span><span class="kw">|</span><span class="ex">---------</span><span class="kw">|</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="kw">|</span> <span class="kw">`</span>r/s<span class="kw">`</span> <span class="ex">/</span> <span class="kw">`</span>w/s<span class="kw">`</span> <span class="kw">|</span> <span class="ex">每秒读/写请求数</span> <span class="kw">|</span> <span class="ex">随机</span> I/O 时 <span class="op">&gt;</span> 磁盘 IOPS 上限 <span class="kw">|</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="kw">|</span> <span class="kw">`</span>rMB/s<span class="kw">`</span> <span class="ex">/</span> <span class="kw">`</span>wMB/s<span class="kw">`</span> <span class="kw">|</span> <span class="ex">每秒读/写带宽</span> <span class="kw">|</span> <span class="op">&gt;</span> 磁盘顺序带宽的 <span class="ex">80%</span> <span class="kw">|</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="kw">|</span> <span class="kw">`</span>await<span class="kw">`</span> <span class="kw">|</span> <span class="ex">每个</span> I/O 请求的平均等待时间（ms） <span class="kw">|</span> <span class="ex">SSD</span> <span class="op">&gt;</span> 10ms，HDD <span class="op">&gt;</span> 50ms <span class="kw">|</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="kw">|</span> <span class="kw">`</span>r_await<span class="kw">`</span> <span class="ex">/</span> <span class="kw">`</span>w_await<span class="kw">`</span> <span class="kw">|</span> <span class="ex">分别的读写等待时间</span> <span class="kw">|</span> <span class="ex">同上</span> <span class="kw">|</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="kw">|</span> <span class="kw">`</span>%util<span class="kw">`</span> <span class="kw">|</span> <span class="ex">设备繁忙时间占比</span> <span class="kw">|</span> <span class="ex">持续</span> <span class="op">&gt;</span> 90% 意味着 I/O 成为瓶颈 <span class="kw">|</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="ex">如果</span> <span class="kw">`</span>%util<span class="kw">`</span> <span class="ex">接近</span> 100% 且 <span class="kw">`</span>await<span class="kw">`</span> <span class="ex">高，说明磁盘是瓶颈。但要注意：</span><span class="kw">`</span>%util<span class="kw">`</span> <span class="ex">对于</span> NVMe（支持多队列并行）不完全准确——NVMe 可能 <span class="kw">`</span>%util<span class="kw">`</span> <span class="ex">100%</span> 但仍有并行处理能力。更可靠的指标是 <span class="kw">`</span>r_await<span class="kw">`</span> <span class="ex">和</span> <span class="kw">`</span>w_await<span class="kw">`</span><span class="ex">。</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="co">### iotop 定位 I/O 大户</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 需要 root 权限</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="ex">iotop</span> <span class="at">-o</span> <span class="at">-b</span> <span class="at">-n</span> 1</span></code></pre></div>
+            <p>这会按当前 I/O 使用量排列进程。如果发现某个 Postgres
+            Backend 的 <code>DISK READ</code> 或 <code>DISK WRITE</code>
+            异常高，记下它的 PID，回到 <code>pg_stat_activity</code>
+            看它在执行什么查询。</p>
+            <h3 id="perf-追踪-cpu-调用栈">perf 追踪 CPU 调用栈</h3>
+            <p>当 CPU
+            使用率高但没有明显的慢查询（第二层和第三层都找不到）时，用
+            <code>perf</code> 看 CPU 到底花在哪：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 采样所有 CPU 10 秒，按函数聚合调用栈</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> record <span class="at">-g</span> <span class="at">-p</span> <span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-f</span> <span class="st">&quot;postgres: user&quot;</span><span class="va">)</span> <span class="at">--</span> sleep 10</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> report <span class="at">--stdio</span> <span class="at">--sort</span><span class="op">=</span>overhead,symbol</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">输出示例：</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>text</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="ex">Overhead</span>  Symbol</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>  <span class="ex">12.30%</span>  s_lock</span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>   <span class="ex">5.20%</span>  hash_search_with_hash_value</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>   <span class="ex">4.80%</span>  LWLockAcquire</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>   <span class="ex">3.10%</span>  AllocSetAlloc</span></code></pre></div>
+            <p>如果
+            <code>s_lock</code>（spinlock）在栈顶，说明正在自旋等待一个短临界区——这通常是
+            LWLock 争用的下游表现。<code>LWLockAcquire</code>
+            占比高直接说明 LWLock
+            争用严重。两个场景会在第七节和第八节展开。</p>
+            <h3 id="bpftrace-追踪内核调用栈">bpftrace
+            追踪内核调用栈</h3>
+            <p>当 I/O 等待高时，用 <code>bpftrace</code> 追踪 PG
+            进程在哪些内核函数上阻塞：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 追踪 postgres 进程的 I/O 阻塞调用栈</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:blk_mq_make_request /comm == &quot;postgres&quot;/ {</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="st">    @io_pid[pid] = count();</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 追踪 fsync 调用（确认是否由 checkpoint/WAL 导致 IO 尖峰）</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="st">kprobe:__x64_sys_fsync /comm == &quot;postgres&quot;/ {</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="st">    printf(&quot;pid=%d tid=%d\n&quot;, pid, tid);</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="st">    print(ustack);</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span></span></code></pre></div>
+            <p>如果大量 <code>fsync</code> 来自
+            <code>checkpointer</code>
+            进程（<code>postgres: checkpointer</code>），说明 checkpoint
+            正在刷脏页——IO 尖峰的根因在第 4 章解释的 checkpoint
+            流程中（<code>checkpoint_completion_target</code>
+            的摊平策略和 <code>max_wal_size</code> 的触发边界）。</p>
+            <hr />
+            <h2
+            id="七特殊场景一有时快有时慢-计划缓存与-genericcustom-plan">七、特殊场景一：有时快有时慢
+            —— 计划缓存与 generic/custom plan</h2>
+            <h3 id="现象">现象</h3>
+            <p>同一个
+            <code>queryid</code>，<code>stddev_exec_time</code> 是
+            <code>mean_exec_time</code> 的 3
+            倍以上。<code>EXPLAIN</code>
+            给出的计划看起来很好——但在慢的时候 PG
+            实际用了另一个计划。</p>
+            <h3
+            id="根因generic-plan-与-custom-plan-的切换">根因：generic
+            plan 与 custom plan 的切换</h3>
+            <p>PG 对 prepared statement 使用两种计划：</p>
+            <ul>
+            <li><strong>Custom
+            plan</strong>：每次执行时根据具体参数值做规划。参数化查询的第一到第四次（默认五次前）都使用
+            custom plan。</li>
+            <li><strong>Generic
+            plan</strong>：对参数值做平均化假设，生成一个对所有参数值都”不太差”的计划，缓存后重复使用。第五次执行时，如果
+            generic plan 的代价不比 custom plan 高太多，PG 会选择
+            generic plan 并缓存它。</li>
+            </ul>
+            <p>问题出在”参数值分布极端倾斜”的场景：90% 的查询用
+            <code>status = 'active'</code> 返回 1000 行，10% 用
+            <code>status = 'pending'</code> 返回 1000000 行。Generic
+            plan 假设平均返回行数，如果 planner 选择了 NestLoop（适合
+            1000 行的），那 10% 的 “pending”
+            查询就会跑出灾难性的性能。</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前 plan_cache_mode 设置</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>SHOW plan_cache_mode;</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可选值：auto（默认）、force_custom_plan、force_generic_plan</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>### 诊断方法：auto_explain 捕获慢查询的实际计划</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>```conf</span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a># postgresql.conf</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>shared_preload_libraries <span class="op">=</span> <span class="st">&#39;auto_explain&#39;</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>auto_explain.log_min_duration <span class="op">=</span> <span class="st">&#39;2s&#39;</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>auto_explain.log_analyze <span class="op">=</span> <span class="kw">on</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>auto_explain.log_buffers <span class="op">=</span> <span class="kw">on</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>auto_explain.log_timing <span class="op">=</span> <span class="kw">on</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>auto_explain.log_nested_statements <span class="op">=</span> <span class="kw">on</span></span></code></pre></div>
+            <p><code>auto_explain.log_analyze=on</code>
+            会在查询超过阈值时把 <code>EXPLAIN (ANALYZE, BUFFERS)</code>
+            的输出写入 PG 日志。对比同一 <code>queryid</code>
+            的快慢两次日志：</p>
+            <ul>
+            <li>快的那次：<code>Nested Loop</code>，<code>actual rows=1020</code></li>
+            <li>慢的那次：<code>Nested Loop</code>，<code>actual rows=986000</code>——但
+            planner 以为只有 1000 行</li>
+            </ul>
+            <p>这就是 generic plan 对倾斜数据的选择偏差。</p>
+            <h3 id="解决方案顺序">解决方案顺序</h3>
+            <ol type="1">
+            <li>如果参数倾斜严重，<code>SET plan_cache_mode = force_custom_plan</code>
+            让每次都用实参规划。代价是每次调用
+            planner，对极高频查询（&gt;10000 QPS）的 planner CPU
+            开销不可忽略。</li>
+            <li>如果倾斜在特定参数，用扩展统计（<code>CREATE STATISTICS</code>）让
+            planner 知道列之间的相关性，使 generic plan
+            也能做出合理选择。</li>
+            <li>如果计划不稳定但 <code>force_custom_plan</code> 的 CPU
+            开销不可接受，考虑 PG 17+ 的
+            <code>plan_cache_mode = auto</code> 配合
+            <code>CUSTOM_PLAN_THRESHOLD</code> 调大 custom plan
+            的使用次数。</li>
+            </ol>
+            <hr />
+            <h2
+            id="八特殊场景二cpu-100-但没慢查询-lwlock-自旋与隐藏开销">八、特殊场景二：CPU
+            100% 但没慢查询 —— LWLock 自旋与隐藏开销</h2>
+            <h3 id="现象-1">现象</h3>
+            <p><code>top</code> 显示 PG 进程的 CPU 使用率接近 100%，但
+            <code>pg_stat_statements</code> 中单个查询的
+            <code>mean_exec_time</code> 都很低（&lt;5ms），只是
+            <code>calls</code> 很高。<code>pg_stat_activity</code>
+            中大量会话的 <code>wait_event_type=LWLock</code>。</p>
+            <h3 id="根因一lwlock-自旋">根因一：LWLock 自旋</h3>
+            <p>LWLock 使用自旋（spin）+
+            等待的混合策略：先自旋一定次数（默认
+            <code>SPIN_DELAY</code>），如果还获取不到锁，才通过
+            <code>semop()</code>
+            进入内核等待。在高并发短查询场景下，大量 Backend
+            可能在同一个 LWLock 上自旋，导致 CPU 满载但查询本身不慢——CPU
+            花在了等锁而不是执行上。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 用 perf 确认</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> top <span class="at">-p</span> <span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-f</span> <span class="st">&quot;postgres:&quot;</span><span class="va">)</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="ex">如果</span> <span class="kw">`</span>LWLockAcquire<span class="kw">`</span><span class="ex">（或内部的自旋函数）出现在栈顶，说明</span> LWLock 争用是 CPU 的主要消耗。</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="ex">PG</span> 14 之前的 snapshot scalability 问题就是典型：<span class="kw">`</span>GetSnapshotData<span class="er">(</span><span class="kw">)`</span> <span class="ex">需要</span> <span class="kw">`</span>ProcArrayLock<span class="kw">`</span> <span class="ex">的共享锁，1000</span> 个并发连接意味着每次获取快照都要竞争这个锁。PG 14 将 <span class="kw">`</span>xid<span class="kw">`</span><span class="ex">/</span><span class="kw">`</span>xmin<span class="kw">`</span> <span class="ex">的更新改为</span> per-backend 原子操作，大幅减少了持锁路径。</span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="ex">PG</span> 17 中 LWLock 的实现使用了 <span class="kw">`</span>LWLockWaitListLock<span class="kw">`</span> <span class="ex">优化——等待者不再自旋在同一个锁上，而是自旋在</span> per-lock 的等待列表锁上，减少了 cache line 的 ping-pong。</span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="co">### 根因二：Extended Statistics 构建</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="ex">如果在</span> <span class="kw">`</span>perf top<span class="kw">`</span> <span class="ex">中看到大量的</span> <span class="kw">`</span>statext_mcv_serialize<span class="kw">`</span> <span class="ex">或</span> <span class="kw">`</span>mcv_list_build<span class="kw">`</span><span class="ex">，说明</span> <span class="kw">`</span>CREATE STATISTICS<span class="kw">`</span> <span class="ex">的扩展统计构建在消耗</span> CPU。扩展统计的 MCV（Most Common Values）列表在 <span class="kw">`</span>ANALYZE<span class="kw">`</span> <span class="ex">时计算，对于多列组合的大表，构建组合</span> MCV 的 CPU 开销可能非常大。</span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a><span class="ex">这通常发生在配置了</span> <span class="kw">`</span>CREATE STATISTICS ON a, b, c FROM t<span class="kw">`</span> <span class="ex">但三列的基数都很高时——MCV</span> 的组合数可能是指数级的。</span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a><span class="co">### 根因三：表达式索引维护</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a><span class="ex">表达式索引（如</span> <span class="kw">`</span>CREATE INDEX ON t <span class="er">(</span><span class="kw">(</span><span class="ex">lower</span><span class="er">(</span><span class="ex">name</span><span class="kw">)))`</span><span class="ex">）在每次</span> INSERT/UPDATE 时都要计算表达式值。如果表达式计算本身很重（如复杂的字符串处理或 JSON 操作），高频率的写入会导致 CPU 被表达式计算消耗。</span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>sql</span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a><span class="ex">--</span> 检查表达式索引及其在 pg_stat_user_indexes 中的扫描次数</span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> indexrelid::regclass, idx_scan, idx_tup_read, idx_tup_fetch</span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a><span class="ex">FROM</span> pg_stat_user_indexes</span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a><span class="ex">WHERE</span> indexrelid::regclass::text LIKE <span class="st">&#39;%expr%&#39;</span><span class="kw">;</span></span></code></pre></div>
+            <p><code>idx_scan=0</code> 但
+            <code>pg_stat_user_tables.n_tup_ins</code>
+            很大——这个索引从没被查询用上，但一直在消耗维护
+            CPU。这种情况考虑删除该索引或用生成列替代表达式索引（PG 12+
+            支持
+            <code>GENERATED ALWAYS AS ... STORED</code>，表达式只算一次）。</p>
+            <hr />
+            <h2
+            id="九特殊场景三io-打满但命中率-99-命中率骗局">九、特殊场景三：IO
+            打满但命中率 99% —— 命中率骗局</h2>
+            <h3 id="现象-2">现象</h3>
+            <p><code>pg_stat_bgwriter</code> 或 Prometheus 的
+            <code>shared_buffers</code>
+            命中率（<code>buffers_alloc / (buffers_alloc + buffers_backend_fsync + ...)</code>
+            的变形）显示 99%+ 的命中率，但磁盘 <code>iostat</code> 显示
+            <code>%util</code> 接近 100%，<code>await</code> 很高。</p>
+            <h3 id="为什么命中率会撒谎">为什么命中率会撒谎</h3>
+            <p>命中率（buffer hit ratio）说的是<strong>当 Backend
+            请求一个页面时，有多少比例在 shared_buffers
+            中找到</strong>。这个指标的陷阱在于：它把所有请求同等看待，但一个频繁访问的”热”页面的命中量可以淹没大量不频繁的”冷”页面的未命中。</p>
+            <p>设想一个场景：有一个 200GB 的 <code>logs</code>
+            表，每天做一次全表顺序扫描用于报表。另外有一批 100MB
+            的”热”表（用户表、配置表、状态表）被频繁查询。<code>shared_buffers = 8GB</code>。热表的页面全在
+            shared_buffers 中，每次命中。报表的 seqscan 每次都要把 200GB
+            扫描一遍——这些页面走 <code>shared_buffers</code> 的 clock
+            sweep 路径，用完就淘汰。但热表每秒产生数万次命中，报表的
+            seqscan
+            只产生几千次未命中。分子（<code>hit</code>）远大于分母（<code>hit+read</code>）——命中率
+            99%。但磁盘的 I/O 带宽被 seqscan 占满。</p>
+            <h3
+            id="验证pg_statio_user_tables-定位-io-源头">验证：pg_statio_user_tables
+            定位 I/O 源头</h3>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relid:<span class="ch">:regclass</span> <span class="kw">AS</span> table_name,</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>       heap_blks_read, heap_blks_hit,</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>       <span class="fu">round</span>(heap_blks_hit <span class="op">*</span> <span class="fl">100.0</span> <span class="op">/</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>             <span class="fu">NULLIF</span>(heap_blks_hit <span class="op">+</span> heap_blks_read, <span class="dv">0</span>), <span class="dv">1</span>) <span class="kw">AS</span> hit_pct,</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>       idx_blks_read, idx_blks_hit</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_statio_user_tables</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> heap_blks_read <span class="kw">DESC</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">10</span>;</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>输出：</span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a> table_name | heap_blks_read | heap_blks_hit | hit_pct | idx_blks_read | idx_blks_hit</span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a><span class="co">------------+----------------+---------------+---------+---------------+--------------</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a> logs       |      <span class="dv">12000000</span>  |      <span class="dv">8000000</span>  |    <span class="fl">40.0</span> |             <span class="dv">0</span> |            <span class="dv">0</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a> orders     |         <span class="dv">300000</span> |     <span class="dv">12000000</span>  |    <span class="fl">97.6</span> |         <span class="dv">15000</span> |     <span class="dv">20000000</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a> users      |           <span class="dv">1200</span> |      <span class="dv">5000000</span>  |    <span class="fl">99.9</span> |           <span class="dv">100</span> |      <span class="dv">3000000</span></span></code></pre></div>
+            <p><code>logs</code> 表的 <code>hit_pct=40.0%</code>——它的
+            buffer 命中率很低，而且
+            <code>heap_blks_read=12000000</code>（约 93GB）是绝对的 I/O
+            大户。<code>orders</code> 和 <code>users</code>
+            的命中率都超过 97%，但由于它们的页面数远少于
+            <code>logs</code>，它们对整体命中率的贡献被稀释了。</p>
+            <h3 id="解决方案方向">解决方案方向</h3>
+            <ol type="1">
+            <li>如果是报表类的 seqscan 导致 IO
+            打满，<code>BAS_BULKREAD</code> buffer access strategy 会让
+            PG 使用”小圈”替换——seqscan 读取的页面在 clock sweep
+            中替换一个小的 buffer ring（默认 256KB），不会污染整个
+            buffer pool。但 200GB 的表仍需 200GB 的磁盘读取。</li>
+            <li>如果表中有一个”总是递增”的索引字段（如
+            <code>created_at</code>），考虑用 BRIN 索引替代 B-Tree——BRIN
+            用范围摘要而不是逐行索引，对顺序访问的大表 I/O
+            压力小得多。</li>
+            <li>如果是频繁的 <code>SELECT COUNT(*)</code>
+            或类似的聚合导致 seqscan，考虑用物化视图或定期快照。</li>
+            <li>如果 <code>shared_buffers</code> 足够大（&gt; 16GB）但
+            seqscan 仍然打满 IO，增配 <code>shared_buffers</code>
+            的真正收益是减少重复 seqscan
+            的磁盘读取——前提是同一份数据被多次扫描，且 buffer pool
+            足够容纳它。</li>
+            </ol>
+            <hr />
+            <h2
+            id="十工具链集成pg_stat_statements-pg_wait_sampling-pg_stat_kcache">十、工具链集成：pg_stat_statements
+            + pg_wait_sampling + pg_stat_kcache</h2>
+            <p>三个扩展组合使用，覆盖了查询统计、等待事件采样和 OS
+            层资源消耗三个维度：</p>
+            <h3 id="pg_wait_sampling">pg_wait_sampling</h3>
+            <p><code>pg_wait_sampling</code> 以固定频率（默认
+            10ms）采样每个 Backend
+            的等待事件并写入共享内存中的环形缓冲区，支持两种查询模式：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 当前所有进程的等待事件</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, event_type, event, <span class="kw">query</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_wait_sampling_current;</span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 历史采样 profile（累计统计）</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, event_type, event, <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> samples</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_wait_sampling_profile</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> <span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> <span class="dv">4</span> <span class="kw">DESC</span>;</span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>与 `pg_stat_activity` 的瞬时快照不同，`pg_wait_sampling_profile` 是累计视图——一个查询在 <span class="dv">60</span> 秒执行期间如果只有 <span class="dv">2</span> 秒阻塞在 `IO<span class="op">/</span>DataFileRead`，瞬时快照 <span class="dv">90</span>% 抓不到，但 <span class="kw">profile</span> 会准确反映这 <span class="dv">2</span> 秒的占比。</span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>### pg_stat_kcache</span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a>`pg_stat_kcache` 是 `pg_stat_statements` 的扩展，为每个 queryid 增加操作系统层的统计维度：</span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `reads` <span class="op">/</span> `writes`：该查询触发的 OS 层 <span class="kw">read</span><span class="op">/</span><span class="kw">write</span> 系统调用次数</span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `read_bytes` <span class="op">/</span> `write_bytes`：读取<span class="op">/</span>写入的字节总数</span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `user_time` <span class="op">/</span> `system_time`：用户态和内核态的 CPU 时间</span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `minflts` <span class="op">/</span> `majflts`：minor page fault（内存不足触发 page fault）和 major page fault（磁盘 I<span class="op">/</span>O 触发的 page fault）</span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a>这些指标直接把 queryid 和 OS 层的物理资源消耗关联起来：</span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pss.queryid,</span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>       pss.calls,</span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a>       <span class="fu">round</span>(pss.mean_exec_time:<span class="ch">:numeric</span>, <span class="dv">2</span>) <span class="kw">AS</span> mean_ms,</span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a>       kc.read_bytes <span class="op">/</span> <span class="fu">NULLIF</span>(kc.calls, <span class="dv">0</span>) <span class="kw">AS</span> avg_read_bytes_per_call,</span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a>       kc.system_time <span class="op">/</span> <span class="fu">NULLIF</span>(kc.calls, <span class="dv">0</span>) <span class="kw">AS</span> avg_system_time_per_call</span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_statements pss</span>
+<span id="cb16-32"><a href="#cb16-32" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_kcache kc <span class="kw">ON</span> pss.queryid <span class="op">=</span> kc.queryid</span>
+<span id="cb16-33"><a href="#cb16-33" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> kc.read_bytes <span class="kw">DESC</span></span>
+<span id="cb16-34"><a href="#cb16-34" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre></div>
+            <p>如果一个查询的 <code>system_time</code>
+            占比异常高（<code>system_time &gt;&gt; user_time</code>），说明它把大量时间花在内核调用上——通常是
+            <code>read()</code> / <code>write()</code> 系统调用。结合
+            <code>avg_read_bytes_per_call</code> 可以判断是 I/O
+            密集型查询。如果大量 <code>majflts</code>（major page
+            fault），说明 <code>shared_buffers</code> 不足或 OS page
+            cache 不够，查询在读磁盘。</p>
+            <h3 id="三者的组合使用场景">三者的组合使用场景</h3>
+            <p>```mermaid flowchart TD PSS[“pg_stat_statements<br/>哪个
+            queryid 耗 CPU/时间最多？”] KC[“pg_stat_kcache<br/>该
+            queryid 的 OS 层读写量、<br/>系统调用时间比？”]
+            WS[“pg_wait_sampling<br/>该 Backend
+            在采样窗口内<br/>等待事件分布？”]
+            ACT[“pg_stat_activity<br/>当前瞬间该
+            Backend<br/>在等什么？”]</p>
+            <p>PSS –&gt;|“定位 queryid 和 pid”| KC PSS –&gt;|“定位
+            queryid 和 pid”| WS WS –&gt;|“怀疑当前正在等时”| ACT KC
+            –&gt;|“read_bytes 很大但<br/>wait_event 不是 IO？”| ACT
+            ```text</p>
+            <p>典型调查路径：</p>
+            <ol type="1">
+            <li><code>pg_stat_statements</code> 定位
+            <code>queryid</code> 和对应的
+            <code>userid</code>/<code>dbid</code>。</li>
+            <li><code>pg_stat_kcache</code> 看该 queryid 的
+            <code>read_bytes</code>、<code>system_time</code>
+            比例——确认真的是 I/O 问题还是 CPU 问题。</li>
+            <li><code>pg_wait_sampling_profile</code> 看该 queryid 对应
+            Backend 的等待事件历史分布——是
+            <code>IO/DataFileRead</code>、<code>LWLock</code>、还是
+            <code>Lock</code>。</li>
+            <li>如果需要实时确认，<code>pg_stat_activity</code>
+            看当前瞬间的 <code>wait_event</code>。</li>
+            </ol>
+            <hr />
+            <h2 id="十一调查清单总结">十一、调查清单总结</h2>
+            <table>
+            <colgroup>
+            <col style="width: 6%" />
+            <col style="width: 27%" />
+            <col style="width: 16%" />
+            <col style="width: 20%" />
+            <col style="width: 17%" />
+            <col style="width: 11%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>现象</th>
+            <th>第一层 pg_stat_statements</th>
+            <th>第二层 EXPLAIN</th>
+            <th>第三层 wait_event</th>
+            <th>第四层 pg_locks</th>
+            <th>第五层 OS</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>查询一直慢</td>
+            <td><code>stddev_ms</code> ~
+            <code>mean_ms</code>，<code>total_exec_time</code> 高</td>
+            <td><code>rows estimated</code> vs <code>actual</code>
+            差异大</td>
+            <td>无等待或 <code>IO/DataFileRead</code></td>
+            <td>不适用</td>
+            <td><code>iostat</code> 确认磁盘</td>
+            </tr>
+            <tr>
+            <td>偶发性慢</td>
+            <td><code>stddev_ms</code> &gt;&gt; <code>mean_ms</code>，CV
+            &gt; 1.5</td>
+            <td>同一 queryid 快慢两次计划不同</td>
+            <td><code>Lock/transactionid</code> 或
+            <code>LWLock</code></td>
+            <td><code>pg_blocking_pids()</code> 追踪</td>
+            <td><code>perf</code> 看 LWLock 自旋</td>
+            </tr>
+            <tr>
+            <td>CPU 高但无慢查询</td>
+            <td><code>calls</code> 极高，<code>mean_exec_time</code>
+            低</td>
+            <td>多个短查询各有不同计划</td>
+            <td>大量 <code>LWLock</code> 等待</td>
+            <td>通常不适用</td>
+            <td><code>perf top</code> 看 <code>s_lock</code> /
+            <code>LWLockAcquire</code></td>
+            </tr>
+            <tr>
+            <td>IO 高但命中率 99%</td>
+            <td>有 seqscan 查询，<code>mean_exec_time</code> 中等</td>
+            <td><code>shared read</code> 大</td>
+            <td><code>IO/DataFileRead</code></td>
+            <td>不适用</td>
+            <td><code>pg_statio_user_tables</code> 找 I/O 大户</td>
+            </tr>
+            <tr>
+            <td>连接堆积</td>
+            <td><code>state=idle in transaction</code> 多</td>
+            <td>不适用</td>
+            <td><code>ClientRead</code> 或
+            <code>Lock/relation</code></td>
+            <td>递归 CTE 找根节点</td>
+            <td>不适用</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>五层调查链的核心原则：<strong>每一层给出一个明确的判断，告诉你问题在本层还是需要往下走</strong>。不要跳过层级——先看全局统计，再看单条计划，再看等待原因，再看锁关系，最后才上
+            OS 工具。跳层排查的典型错误是在还没确定是 CPU 还是 I/O
+            问题的时候就去调 <code>shared_buffers</code> 大小。</p>
+            <hr />
+            <h2 id="十二关键要点">十二、关键要点</h2>
+            <ol type="1">
+            <li><strong>五层调查链按顺序走</strong>——<code>pg_stat_statements</code>
+            定位 query → <code>EXPLAIN (ANALYZE, BUFFERS)</code>
+            看计划偏差 → <code>wait_event</code> 看等什么 →
+            <code>pg_locks</code> 追锁链 → OS 工具确认硬件/内核栈。</li>
+            <li><strong><code>stddev_exec_time</code>
+            区分”一直慢”和”偶尔慢”</strong>——CV
+            高说明计划或锁竞争不稳定，需要配合 <code>auto_explain</code>
+            抓慢实例。</li>
+            <li><strong>命中率 99%
+            可能是假象</strong>——聚合命中率掩盖大表 seqscan 和 buffer
+            churn；必须分表看 <code>pg_statio_user_tables</code>。</li>
+            <li><strong>CPU 100% 无慢查询时查 LWLock
+            自旋和短查询风暴</strong>——<code>perf top</code> 看
+            <code>LWLockAcquire</code> /
+            <code>s_lock</code>，<code>pg_stat_statements</code> 看
+            <code>calls</code> 极高的轻量查询。</li>
+            <li><strong>扩展工具组合使用</strong>——<code>pg_wait_sampling</code>
+            补历史等待分布，<code>pg_stat_kcache</code> 把 queryid
+            关联到 OS 层 read/write 字节。</li>
+            </ol>
+            <p>上一章：<a
+            href="../22-classic-failures/22-classic-failures.html">经典故障模式与排查手册</a>
+            下一章：<a
+            href="../24-recovery-corruption/24-recovery-corruption.html">数据恢复与损坏应对</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/utils/adt/pgstatfuncs.c</code>：<code>pg_stat_statements</code>、<code>pg_stat_activity</code>
+            等统计视图的 C 端实现</li>
+            <li><code>src/backend/storage/lmgr/lwlock.c</code>：<code>LWLockAcquire()</code>、<code>LWLockRelease()</code>、spinlock
+            等待循环</li>
+            <li><code>src/backend/storage/lmgr/lock.c</code>：<code>LockAcquire()</code>、<code>LockRelease()</code>、heavyweight
+            lock 管理</li>
+            <li><code>src/backend/storage/lmgr/deadlock.c</code>：<code>DeadLockCheck()</code>
+            死锁检测算法</li>
+            <li><code>src/backend/storage/buffer/bufmgr.c</code>：<code>ReadBuffer()</code>、Buffer
+            Access Strategy（<code>BAS_BULKREAD</code>）</li>
+            <li><code>src/backend/utils/cache/plancache.c</code>：plan
+            cache 逻辑、generic vs custom plan 选择</li>
+            <li><code>src/backend/postmaster/autovacuum.c</code>：autovacuum
+            launcher 的触发逻辑</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 27: Monitoring
+            Database
+            Activity（<code>pg_stat_activity</code>、<code>pg_locks</code>、<code>pg_stat_statements</code>）</li>
+            <li>PostgreSQL Documentation, Chapter 14.4: Populating a
+            Database（ANALYZE 和统计信息）</li>
+            <li>PostgreSQL Documentation, Chapter 19: Server
+            Configuration（<code>plan_cache_mode</code>、<code>shared_buffers</code>、<code>work_mem</code>）</li>
+            <li>PostgreSQL Documentation, Chapter 61: Index Access
+            Methods（BRIN 索引的场景定位）</li>
+            </ul>
+            <h3 id="扩展文档">扩展文档</h3>
+            <ul>
+            <li><code>pg_stat_statements</code>：PostgreSQL contrib
+            模块，查询统计聚合</li>
+            <li><code>pg_wait_sampling</code>：PostgresPro
+            开源扩展，等待事件采样（GitHub:
+            postgrespro/pg_wait_sampling）</li>
+            <li><code>pg_stat_kcache</code>：Dalibo 开源扩展，OS
+            层资源统计关联到 queryid（GitHub:
+            dalibo/pg_stat_kcache）</li>
+            <li><code>auto_explain</code>：PostgreSQL contrib
+            模块，自动记录慢查询的执行计划</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/06-lock-manager/06-lock-manager.html">【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系</a></h3>
+                    <p>拆解 PostgreSQL 锁管理器的完整架构：SpinLock 自旋锁的硬件原语与使用边界、LWLock 从 PG 9.4 前到 PG 16 LWLockWaitListLock 的三代演进、Heavyweight Lock 的 LockAcquire() 完整路径和锁表结构、死锁检测 DeadLockCheck() 的等待图 DFS 算法、行级锁 FOR UPDATE/FOR SHARE/FOR KEY SHARE 的 t_infomask 实现，以及用 pg_locks 和 pg_blocking_pids() 追踪生产锁等待链的诊断方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/10-statistics-cost/10-statistics-cost.html">【PG 内核】查询规划器 — 统计信息与代价模型：优化器为什么选错了索引</a></h3>
+                    <p>拆解 PostgreSQL 查询优化器的决策基础：pg_statistic 中 MCV/histogram/correlation 的存储结构、ANALYZE 的采样流程与精度边界、clauselist_selectivity 如何逐层估算选择率、seq_page_cost 等代价常量的物理意义与调优依据、CREATE STATISTICS 解决多列相关性问题、以及统计信息漂移的诊断 SQL 与排查路径。读完你能回答：优化器为什么选 Seq Scan 而不是你建的索引，以及怎么定位根因。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

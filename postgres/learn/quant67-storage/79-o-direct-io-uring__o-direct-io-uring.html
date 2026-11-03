@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】O_DIRECT 与 io_uring：固定缓冲区、register_buffers 与工程选型 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 O_DIRECT 对齐约束与 io_uring
+固定缓冲区（IORING_REGISTER_BUFFERS）如何叠加；对比 buffered/Direct I/O
+的 io_uring 实测 IOPS，给出数据库与块设备场景选型。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="o-direct, io-uring, liburing, direct-io, register-buffers, fixed-buffers, database-io, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢 · 系统与基础设施" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/79-o-direct-io-uring/o-direct-io-uring.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】O_DIRECT 与 io_uring：固定缓冲区、register_buffers 与工程选型" />
+    <meta property="og:description" content="拆解 O_DIRECT 对齐约束与 io_uring 固定缓冲区（IORING_REGISTER_BUFFERS）如何叠加；对比 buffered/Direct I/O 的 io_uring 实测 IOPS，给出数据库与块设备场景选型。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/79-o-direct-io-uring/o-direct-io-uring.html" />
+    <meta property="og:site_name" content="土法炼钢 · 系统与基础设施" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="o-direct" />
+    <meta property="article:tag" content="io-uring" />
+    <meta property="article:tag" content="liburing" />
+    <meta property="article:tag" content="direct-io" />
+    <meta property="article:tag" content="register-buffers" />
+    <meta property="article:tag" content="fixed-buffers" />
+    <meta property="article:tag" content="database-io" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】O_DIRECT 与 io_uring：固定缓冲区、register_buffers 与工程选型" />
+    <meta name="twitter:description" content="拆解 O_DIRECT 对齐约束与 io_uring 固定缓冲区（IORING_REGISTER_BUFFERS）如何叠加；对比 buffered/Direct I/O 的 io_uring 实测 IOPS，给出数据库与块设备场景选型。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】O_DIRECT 与 io_uring：固定缓冲区、register_buffers 与工程选型", "description": "拆解 O_DIRECT 对齐约束与 io_uring 固定缓冲区（IORING_REGISTER_BUFFERS）如何叠加；对比 buffered/Direct I/O 的 io_uring 实测 IOPS，给出数据库与块设备场景选型。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/79-o-direct-io-uring/o-direct-io-uring.html"}, "datePublished": "2026-06-12T00:00:00+00:00", "dateModified": "2026-08-13T15:00:59+00:00", "keywords": ["o-direct", "io-uring", "liburing", "direct-io", "register-buffers", "fixed-buffers", "database-io"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢 ·
+系统与基础设施</a></p>
+            <h1 class="title">【存储工程】O_DIRECT 与 io_uring：固定缓冲区、register_buffers 与工程选型</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-12</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#o-direct</span> <span>#io-uring</span> <span>#liburing</span> <span>#direct-io</span> <span>#register-buffers</span> <span>#fixed-buffers</span> <span>#database-io</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/o-direct.html">#o-direct</a><a class="chip-link" href="/tags/io-uring.html">#io-uring</a><a class="chip-link" href="/tags/liburing.html">#liburing</a><a class="chip-link" href="/tags/direct-io.html">#direct-io</a><a class="chip-link" href="/tags/register-buffers.html">#register-buffers</a><a class="chip-link" href="/tags/fixed-buffers.html">#fixed-buffers</a><a class="chip-link" href="/tags/database-io.html">#database-io</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/78-storage-incident-postmortems/storage-incident-postmortems.html">上一篇：【存储工程】存储事故复盘：经典生产故障的根因与教训</a></div></section>
+
+                <section class="post-downloads">
+    <h2>源码下载</h2>
+    <p>本文相关源码已整理，共 2 个文件。</p>
+    <p><a class="post-download-link" href="/post/storage/79-o-direct-io-uring/downloads/o-direct-io-uring/index.html">打开下载目录 →</a></p>
+</section>
+<div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一为什么要把两者放在一起"
+                id="toc-一为什么要把两者放在一起">一、为什么要把两者放在一起</a></li>
+                <li><a href="#二决策边界何时组合"
+                id="toc-二决策边界何时组合">二、决策边界（何时组合）</a></li>
+                <li><a href="#三o_direct-硬约束复习"
+                id="toc-三o_direct-硬约束复习">三、O_DIRECT
+                硬约束（复习）</a></li>
+                <li><a
+                href="#四io_uring-固定缓冲区io_uring_register_buffers"
+                id="toc-四io_uring-固定缓冲区io_uring_register_buffers">四、io_uring
+                固定缓冲区：<code>io_uring_register_buffers</code></a>
+                <ul>
+                <li><a href="#作用" id="toc-作用">4.1 作用</a></li>
+                <li><a href="#与-o_direct-叠加时的注意点"
+                id="toc-与-o_direct-叠加时的注意点">4.2 与
+                <code>O_DIRECT</code> 叠加时的注意点</a></li>
+                <li><a href="#provided-buffers进阶"
+                id="toc-provided-buffers进阶">4.3 Provided
+                Buffers（进阶）</a></li>
+                </ul></li>
+                <li><a href="#五实测三种-io_uring-写路径10k-4kb"
+                id="toc-五实测三种-io_uring-写路径10k-4kb">五、实测：三种
+                io_uring 写路径（10k × 4KB）</a></li>
+                <li><a href="#六与-epoll-同步-read-的选型"
+                id="toc-六与-epoll-同步-read-的选型">六、与 epoll / 同步
+                read 的选型</a></li>
+                <li><a href="#七工程检查清单"
+                id="toc-七工程检查清单">七、工程检查清单</a></li>
+                <li><a href="#八与系列文章的衔接"
+                id="toc-八与系列文章的衔接">八、与系列文章的衔接</a></li>
+                <li><a href="#九开放问题"
+                id="toc-九开放问题">九、开放问题</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#规范-手册" id="toc-规范-手册">规范 /
+                手册</a></li>
+                <li><a href="#源码" id="toc-源码">源码</a></li>
+                <li><a href="#论文-设计文档" id="toc-论文-设计文档">论文
+                / 设计文档</a></li>
+                <li><a href="#实验-本站" id="toc-实验-本站">实验 /
+                本站</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <blockquote>
+            <p><strong>与 #10 的分工</strong></p>
+            <table>
+            <colgroup>
+            <col style="width: 50%" />
+            <col style="width: 50%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>文章</th>
+            <th>分工</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><a href="../10-direct-io/direct-io.html">#10 Direct
+            I/O</a></td>
+            <td><strong><code>O_DIRECT</code>
+            语义与坑</strong>：对齐、双重缓冲、何时绕过 Page
+            Cache、文件系统差异</td>
+            </tr>
+            <tr>
+            <td><strong>本文（#79）</strong></td>
+            <td><strong>组合路径</strong>：在已决定 direct 的前提下，用
+            io_uring 批量提交；<code>register_buffers</code> / 本机
+            benchmark</td>
+            </tr>
+            <tr>
+            <td><a href="../../io_uring/index.html">io_uring 系列</a> ·
+            <a
+            href="../../os/57-io-uring-deep/io-uring-deep.html">内核内部</a></td>
+            <td>SQ/CQ 机制与 opcode</td>
+            </tr>
+            <tr>
+            <td><a
+            href="../../linux/iouring-production/iouring-production.html">io_uring
+            生产翻车实录</a></td>
+            <td>版本矩阵、SQPOLL、容器 Seccomp——<strong>上线 io_uring
+            前必读</strong></td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>决策顺序</strong>：先按 #10 判断是否绕过 Page
+            Cache → 再决定是否用 io_uring 降 syscall →
+            最后在<strong>目标内核</strong>上实测
+            <code>register_buffers</code> + <code>O_DIRECT</code>（本文
+            WSL2 6.6 上曾 EFAULT，不可外推）。</p>
+            </blockquote>
+            <p>数据库和块存储引擎常同时遇到两件事：<strong>用
+            <code>O_DIRECT</code> 绕过 Page Cache
+            避免双重缓冲</strong>（见 <a
+            href="../10-direct-io/direct-io.html">#10</a>），以及
+            <strong>用 io_uring 降低 syscall 开销</strong>（见 <a
+            href="../../os/57-io-uring-deep/io-uring-deep.html">io_uring
+            内核内部</a>）。两者可以组合，但对齐、<code>posix_memalign</code>、<code>io_uring_register_buffers</code>
+            和 <code>IOSQE_FIXED_FILE</code>
+            各有一层约束。本文把组合路径、<strong>标注环境</strong>的实测与选型边界写清楚。</p>
+            <blockquote>
+            <p><strong>测试环境说明</strong> 下文 benchmark 在 Linux
+            6.6.87（WSL2）、liburing 2.14、ext4
+            文件系统、<code>/tmp</code> 上实测。块设备裸盘与 NVMe
+            上的绝对 IOPS
+            会更高；结论侧重<strong>路径差异与约束</strong>，不跨环境比绝对数值。</p>
+            </blockquote>
+            <hr />
+            <h2
+            id="一为什么要把两者放在一起">一、为什么要把两者放在一起</h2>
+            <pre class="mermaid"><code>flowchart LR
+    APP[应用 Buffer Pool]
+    UR[io_uring SQ/CQ]
+    VFS[VFS + 文件系统]
+    PC[Page Cache]
+    DISK[块设备]
+    APP --&gt;|O_DIRECT 路径| UR --&gt; VFS --&gt; DISK
+    APP --&gt;|缓冲 I/O| UR --&gt; VFS --&gt; PC --&gt; DISK</code></pre>
+            <table>
+            <colgroup>
+            <col style="width: 23%" />
+            <col style="width: 38%" />
+            <col style="width: 38%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>路径</th>
+            <th>数据副本</th>
+            <th>典型用户</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>缓冲 I/O + Page Cache</td>
+            <td>用户缓冲 + 页缓存</td>
+            <td>通用文件、小文件</td>
+            </tr>
+            <tr>
+            <td><code>O_DIRECT</code></td>
+            <td>仅用户缓冲（对齐后直写块层）</td>
+            <td>InnoDB 数据文件、Ceph OSD、自定义引擎</td>
+            </tr>
+            <tr>
+            <td><code>O_DIRECT</code> + io_uring</td>
+            <td>同上 + 批量提交减少 syscall</td>
+            <td>高 IOPS 数据库、NVMe 压测工具</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>O_DIRECT</code>
+            解决<strong>缓存语义</strong>；io_uring
+            解决<strong>提交效率</strong>。互不替代。是否绕过 Page Cache
+            的判据见 <a href="../10-direct-io/direct-io.html">#10
+            文首决策边界</a>。</p>
+            <hr />
+            <h2 id="二决策边界何时组合">二、决策边界（何时组合）</h2>
+            <table>
+            <colgroup>
+            <col style="width: 33%" />
+            <col style="width: 33%" />
+            <col style="width: 33%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>问题</th>
+            <th>倾向</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>应用是否自管缓存？</td>
+            <td>是 → 考虑 <code>O_DIRECT</code></td>
+            <td>InnoDB Buffer Pool、RocksDB block cache 等（#10）</td>
+            </tr>
+            <tr>
+            <td>瓶颈在 memcpy / 双缓存还是 syscall？</td>
+            <td>前者 → direct；后者 → io_uring</td>
+            <td>两者可叠加，但须分别验证</td>
+            </tr>
+            <tr>
+            <td>工作负载</td>
+            <td>随机 4K/16K 页、高 QD</td>
+            <td>常见数据库页路径；顺序大扫描未必需要 io_uring</td>
+            </tr>
+            <tr>
+            <td>文件系统</td>
+            <td>ext4/XFS 本地块设备</td>
+            <td>NFS/FUSE 对 direct 支持参差，先测通再组合</td>
+            </tr>
+            <tr>
+            <td>生产内核</td>
+            <td>对照 <a
+            href="../../linux/iouring-production/iouring-production.html">iouring-production</a>
+            版本矩阵</td>
+            <td><code>register_buffers</code> 泄漏、CQE overflow 等与
+            5.10/5.15 边界相关</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>谱系（简）</strong>：POSIX AIO/libaio（真异步块
+            I/O，接口残缺）→ epoll（就绪通知，仍同步 read/write）→
+            io_uring（完成通知，可与 <code>O_DIRECT</code>
+            叠加）。性能不是单调递增，低并发下 epoll 延迟可能更优（见 <a
+            href="../../io_uring/07-epoll-vs-iouring-efficiency.html">07
+            epoll vs io_uring</a>）。</p>
+            <hr />
+            <h2 id="三o_direct-硬约束复习">三、O_DIRECT
+            硬约束（复习）</h2>
+            <p>来自 <a
+            href="../10-direct-io/direct-io.html">#10</a>，组合 io_uring
+            前必须满足：</p>
+            <ol type="1">
+            <li><strong>缓冲区地址、长度、文件偏移</strong>
+            均按逻辑块大小对齐（ext4 常见 4 KB）。</li>
+            <li>使用 <code>posix_memalign(4096, size)</code> 或
+            <code>mmap</code> 对齐映射，不要用普通
+            <code>malloc</code>。</li>
+            <li>文件系统与块层需支持 direct
+            I/O；部分网络文件系统不支持或行为怪异。</li>
+            <li><code>O_DIRECT</code> 与 <code>mmap</code>
+            同一文件混用会踩坑；<code>sendfile</code> 等页缓存路径与
+            direct fd 不兼容。</li>
+            </ol>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>buf<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>posix_memalign<span class="op">(&amp;</span>buf<span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span>path<span class="op">,</span> O_RDWR <span class="op">|</span> O_CREAT <span class="op">|</span> O_TRUNC <span class="op">|</span> O_DIRECT<span class="op">,</span> <span class="bn">0644</span><span class="op">);</span></span></code></pre></div>
+            <hr />
+            <h2
+            id="四io_uring-固定缓冲区io_uring_register_buffers">四、io_uring
+            固定缓冲区：<code>io_uring_register_buffers</code></h2>
+            <h3 id="作用">4.1 作用</h3>
+            <p>每次 <code>read</code>/<code>write</code> 传统路径需要
+            pin 用户页。<code>io_uring_register_buffers()</code>
+            预先注册一组 <code>iovec</code>，内核长期持有映射，后续 SQE
+            可通过 <strong>buf_index</strong> 引用，减少 per-I/O
+            页表开销。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> io_uring ring<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>io_uring_queue_init<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="op">&amp;</span>ring<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> iovec iov <span class="op">=</span> <span class="op">{</span> <span class="op">.</span>iov_base <span class="op">=</span> aligned_buf<span class="op">,</span> <span class="op">.</span>iov_len <span class="op">=</span> <span class="dv">4096</span> <span class="op">};</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>io_uring_register_buffers<span class="op">(&amp;</span>ring<span class="op">,</span> <span class="op">&amp;</span>iov<span class="op">,</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> io_uring_sqe <span class="op">*</span>sqe <span class="op">=</span> io_uring_get_sqe<span class="op">(&amp;</span>ring<span class="op">);</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>io_uring_prep_write<span class="op">(</span>sqe<span class="op">,</span> fd<span class="op">,</span> NULL<span class="op">,</span> <span class="dv">4096</span><span class="op">,</span> offset<span class="op">);</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>sqe<span class="op">-&gt;</span>buf_index <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>   <span class="co">/* 使用注册缓冲区槽位 0 */</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>io_uring_submit<span class="op">(&amp;</span>ring<span class="op">);</span></span></code></pre></div>
+            <p>与 <code>IORING_REGISTER_FILES</code>（固定 fd
+            槽位）独立：前者优化<strong>缓冲区 pin</strong>，后者优化
+            <strong>fd 查找</strong>。</p>
+            <h3 id="与-o_direct-叠加时的注意点">4.2 与
+            <code>O_DIRECT</code> 叠加时的注意点</h3>
+            <ul>
+            <li>注册缓冲区本身必须是 <strong>O_DIRECT
+            合法的对齐内存</strong>。</li>
+            <li>部分内核版本对 <code>register_buffers</code> +
+            <code>O_DIRECT</code> + <code>NULL</code>
+            用户地址组合的行为曾有 bug；升级内核后应回归测试。</li>
+            <li>本文环境实测：<code>O_DIRECT</code> + 普通
+            <code>io_uring_prep_write(sqe, fd, buf, ...)</code>
+            <strong>成功</strong>；<code>register_buffers</code> +
+            <code>buf_index</code> 路径返回
+            <strong>-EFAULT（14）</strong>——说明该组合在当前 WSL2 6.6
+            栈上未走通，<strong>生产启用前必须在目标内核上验证</strong>。</li>
+            </ul>
+            <h3 id="provided-buffers进阶">4.3 Provided
+            Buffers（进阶）</h3>
+            <p><code>IOSQE_BUFFER_SELECT</code> +
+            <code>io_uring_setup_buf_ring</code> 是更新的缓冲池模型（见
+            <a href="../../io_uring/05-advanced-features.html">io_uring
+            高级特性</a>），适合网络收包；块设备 Direct I/O
+            场景更常见仍是 <strong>register_buffers</strong>
+            或每请求显式缓冲区。</p>
+            <hr />
+            <h2 id="五实测三种-io_uring-写路径10k-4kb">五、实测：三种
+            io_uring 写路径（10k × 4KB）</h2>
+            <p>测试程序对同一 ext4 文件顺序写 10000 次 4 KB（约 40
+            MB），对比：</p>
+            <ol type="1">
+            <li>缓冲 I/O + io_uring（无 <code>O_DIRECT</code>）</li>
+            <li><code>O_DIRECT</code> + io_uring（对齐缓冲，无
+            register）</li>
+            <li><code>O_DIRECT</code> +
+            <code>register_buffers</code>（本文环境失败）</li>
+            </ol>
+            <pre class="text"><code>buffered io_uring write:     0.284 s, ~35242 IOPS
+O_DIRECT io_uring write:     0.271 s, ~36840 IOPS
+O_DIRECT + register_buffers: EFAULT（未成功完成）</code></pre>
+            <p>解读（限于本环境）：</p>
+            <ul>
+            <li>40 MB 规模下，缓冲与 Direct 的 IOPS
+            接近——瓶颈尚未到设备上限，差异主要体现在<strong>是否污染
+            Page Cache</strong>。</li>
+            <li><code>register_buffers</code>
+            失败说明：<strong>不能假设注册缓冲在所有 Direct
+            组合下开箱即用</strong>，需单独测通再上线。</li>
+            </ul>
+            <p>完整复现可参考 liburing 示例 <code>examples/reg-wr</code>
+            与 <code>man io_uring_register_buffers</code>。</p>
+            <hr />
+            <h2 id="六与-epoll-同步-read-的选型">六、与 epoll / 同步
+            read 的选型</h2>
+            <table>
+            <colgroup>
+            <col style="width: 25%" />
+            <col style="width: 50%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>场景</th>
+            <th>更常见选择</th>
+            <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>数据库 16KB 页随机读写</td>
+            <td><code>O_DIRECT</code> + 同步或 libaio/io_uring</td>
+            <td>缓存语义由 Buffer Pool 掌控</td>
+            </tr>
+            <tr>
+            <td>高并发网络 + 小包</td>
+            <td>epoll 或 io_uring（常非 Direct）</td>
+            <td>延迟与连接管理优先</td>
+            </tr>
+            <tr>
+            <td>块设备裸盘压测</td>
+            <td><code>O_DIRECT</code> +
+            io_uring/libaio，<code>direct=1</code></td>
+            <td>见 <a
+            href="../64-storage-benchmarking/storage-benchmarking.md">#64
+            基准方法论</a></td>
+            </tr>
+            <tr>
+            <td>大量空闲连接</td>
+            <td>epoll 可能更省（见 <a
+            href="../../io_uring/07-epoll-vs-iouring-efficiency.html">io_uring
+            vs epoll</a>）</td>
+            <td>io_uring 每连接状态成本</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>io_uring 不是 epoll 的完全替代；<code>O_DIRECT</code>
+            也不是所有存储栈的默认。组合用于：<strong>已决定绕过页缓存，且需要批量异步提交</strong>。</p>
+            <hr />
+            <h2 id="七工程检查清单">七、工程检查清单</h2>
+            <pre class="text"><code>□ 缓冲区 4K（或设备块大小）对齐
+□ open 带 O_DIRECT；ftruncate 预分配避免 ENOSPC 中途失败
+□ 文件系统 block size 与 I/O 大小兼容
+□ io_uring register_buffers 在目标内核实测通过
+□ 监控 iowait 与 Buffer Pool 命中率，确认没有「双缓存」
+□ 与 fsync/fsync 策略一致（见 #12 数据完整性）</code></pre>
+            <hr />
+            <h2 id="八与系列文章的衔接">八、与系列文章的衔接</h2>
+            <ul>
+            <li>页缓存路径：<a
+            href="../09-page-cache/page-cache.html">Page Cache</a>、<a
+            href="../07-linux-io-stack/linux-io-stack.html">Linux I/O
+            栈</a></li>
+            <li>io_uring 机制：<a
+            href="../../os/57-io-uring-deep/io-uring-deep.html">内核内部</a>、<a
+            href="../11-linux-async-io/linux-async-io.html">异步 I/O
+            综述</a>、<a href="../../io_uring/index.html">io_uring
+            系列索引</a></li>
+            <li>生产坑：<a
+            href="../../linux/iouring-production/iouring-production.html">io_uring
+            翻车实录</a></li>
+            <li>liburing API：<a
+            href="../../io_uring/03-liburing-api.html">03 liburing
+            API</a>、<a
+            href="../../io_uring/08-golang-integration.html">Golang
+            集成</a></li>
+            </ul>
+            <hr />
+            <h2 id="九开放问题">九、开放问题</h2>
+            <ol type="1">
+            <li><strong><code>io_uring_register_buffers</code> +
+            <code>O_DIRECT</code> 的内核组合行为未完全文档化。</strong>
+            本文 WSL2 6.6.87 上 <code>buf_index</code> 路径
+            EFAULT，而显式用户指针可成功——说明必须按<strong>目标内核+FS</strong>回归，不能假设
+            register 一定降 pin 开销。</li>
+            <li><strong>SQPOLL / IOPOLL 与 direct 写的一致性。</strong>
+            轮询模式降低 syscall，但 idle CPU 与容器 Seccomp 限制见 <a
+            href="../../linux/iouring-production/iouring-production.html">iouring-production</a>；与数据库
+            fsync 策略叠加时的延迟尖刺仍缺统一 benchmark 口径。</li>
+            </ol>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="规范-手册">规范 / 手册</h3>
+            <ul>
+            <li>Linux
+            <code>man 2 open</code>（<code>O_DIRECT</code>）、<code>man io_uring_register_buffers</code>、<code>man io_uring_prep_read/write</code></li>
+            </ul>
+            <h3 id="源码">源码</h3>
+            <ul>
+            <li>Linux
+            内核：<code>fs/direct-io.c</code>、<code>io_uring/opdef.c</code></li>
+            </ul>
+            <h3 id="论文-设计文档">论文 / 设计文档</h3>
+            <ul>
+            <li>J. Axboe, <em>Efficient IO with io_uring</em> — <a
+            href="https://kernel.dk/io_uring.pdf"
+            class="uri">https://kernel.dk/io_uring.pdf</a></li>
+            </ul>
+            <h3 id="实验-本站">实验 / 本站</h3>
+            <ul>
+            <li>复现：<code>examples/storage/79-o-direct-io-uring/</code>（<code>make &amp;&amp; make run</code>）</li>
+            <li><a href="../10-direct-io/direct-io.html">#10 Direct
+            I/O</a>、<a
+            href="../64-storage-benchmarking/storage-benchmarking.html">#64
+            存储基准测试</a>、<a
+            href="../../linux/iouring-production/iouring-production.html">io_uring
+            生产翻车实录</a></li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../78-storage-incident-postmortems/storage-incident-postmortems.html">存储事故复盘</a>
+            <strong>相关</strong>: <a
+            href="../../os/57-io-uring-deep/io-uring-deep.html">io_uring
+            内核内部</a> · <a
+            href="../10-direct-io/direct-io.html">Direct I/O 详解</a> ·
+            <a href="../11-linux-async-io/linux-async-io.html">Linux
+            异步 I/O</a> · <a
+            href="../../linux/iouring-production/iouring-production.html">io_uring
+            生产翻车实录</a> · <a href="../../spdk/index.html">SPDK /
+            用户态存储栈</a>（绕过内核块层的另一条路径）</p>
+        <section class="post-recommendations"><h2>读完这篇，下一步读什么</h2><p>优先读同系列或同问题的下一篇，把单篇消费变成主题集群。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-19 · storage</p>
+                    <h3><a href="/post/storage/10-direct-io/direct-io.html">【存储工程】Direct I/O 与 O_DIRECT：绕过缓存的得与失</a></h3>
+                    <p>O_DIRECT 什么时候该用：双重缓冲、对齐约束、文件系统坑，以及与 io_uring 组合路径的边界。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-20 · storage</p>
+                    <h3><a href="/post/storage/11-linux-async-io/linux-async-io.html">【存储工程】Linux 异步 I/O：从 POSIX AIO 到 io_uring</a></h3>
+                    <p>在高吞吐存储系统中，同步 I/O 是性能的天花板。本文系统梳理 Linux 下三代异步 I/O 方案——POSIX AIO、Linux Native AIO（libaio）和 io_uring——的设计原理、编程接口、性能特征与工程实践，帮助你在实际项目中做出正确的技术选型。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-12 · storage</p>
+                    <h3><a href="/post/storage/03-nvme-protocol/nvme-protocol.html">【存储工程】NVMe 协议与存储接口演进</a></h3>
+                    <p>存储接口（Storage Interface）是连接主机与存储介质的桥梁，其协议设计直接决定了数据访问的延迟、吞吐量和并发能力。从早期的并行接口到现代的非易失性内存快捷通道（Non-Volatile Memory Express，NVMe），存储协议经历了数十年的演进。本文将系统梳理存储接口的发展历程，深入剖析 NVM…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

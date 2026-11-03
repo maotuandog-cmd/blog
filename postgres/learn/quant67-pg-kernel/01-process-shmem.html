@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的
+fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores()
+的共享内存初始化流程、PGPROC/ProcArray/PGXACT
+等关键共享内存结构的内存布局，以及 Background Worker
+的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及
+max_connections 为什么不能随便调大。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, postmaster, shared-memory, backend-process, pgproc, lwlock, background-worker, fork, ipc, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend" />
+    <meta property="og:description" content="拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="postmaster" />
+    <meta property="article:tag" content="shared-memory" />
+    <meta property="article:tag" content="backend-process" />
+    <meta property="article:tag" content="pgproc" />
+    <meta property="article:tag" content="lwlock" />
+    <meta property="article:tag" content="background-worker" />
+    <meta property="article:tag" content="fork" />
+    <meta property="article:tag" content="ipc" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend", "description": "拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "postmaster", "shared-memory", "backend-process", "pgproc", "lwlock", "background-worker", "fork", "ipc"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#postmaster</span> <span>#shared-memory</span> <span>#backend-process</span> <span>#pgproc</span> <span>#lwlock</span> <span>#background-worker</span> <span>#fork</span> <span>#ipc</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/postmaster.html">#postmaster</a><a class="chip-link" href="/tags/shared-memory.html">#shared-memory</a><a class="chip-link" href="/tags/backend-process.html">#backend-process</a><a class="chip-link" href="/tags/pgproc.html">#pgproc</a><a class="chip-link" href="/tags/lwlock.html">#lwlock</a><a class="chip-link" href="/tags/background-worker.html">#background-worker</a><a class="chip-link" href="/tags/fork.html">#fork</a><a class="chip-link" href="/tags/ipc.html">#ipc</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#进程模型与共享内存postmaster-如何管理-100-个-backend"
+                id="toc-进程模型与共享内存postmaster-如何管理-100-个-backend">进程模型与共享内存：Postmaster
+                如何管理 100 个 Backend</a>
+                <ul>
+                <li><a href="#一pg-的进程全景"
+                id="toc-一pg-的进程全景">一、PG 的进程全景</a>
+                <ul>
+                <li><a href="#进程类型速览"
+                id="toc-进程类型速览">进程类型速览</a></li>
+                <li><a href="#进程树结构"
+                id="toc-进程树结构">进程树结构</a></li>
+                <li><a href="#serverloopaccept-和-fork"
+                id="toc-serverloopaccept-和-fork">ServerLoop：accept 和
+                fork</a></li>
+                <li><a href="#initpostgres最关键的三件事"
+                id="toc-initpostgres最关键的三件事">InitPostgres：最关键的三件事</a></li>
+                </ul></li>
+                <li><a
+                href="#四共享内存初始化createsharedmemoryandsemaphores"
+                id="toc-四共享内存初始化createsharedmemoryandsemaphores">四、共享内存初始化：CreateSharedMemoryAndSemaphores</a>
+                <ul>
+                <li><a href="#调用时序"
+                id="toc-调用时序">调用时序</a></li>
+                </ul></li>
+                <li><a href="#五关键共享内存结构"
+                id="toc-五关键共享内存结构">五、关键共享内存结构</a>
+                <ul>
+                <li><a href="#pgproc-与-procarray"
+                id="toc-pgproc-与-procarray">PGPROC 与
+                ProcArray</a></li>
+                <li><a href="#lwlock-数组" id="toc-lwlock-数组">LWLock
+                数组</a></li>
+                <li><a href="#worker-的限制"
+                id="toc-worker-的限制">Worker 的限制</a></li>
+                </ul></li>
+                <li><a href="#七为什么是进程而不是线程"
+                id="toc-七为什么是进程而不是线程">七、为什么是进程而不是线程</a></li>
+                <li><a href="#八实验观察-pg-的进程树和共享内存"
+                id="toc-八实验观察-pg-的进程树和共享内存">八、实验：观察
+                PG 的进程树和共享内存</a>
+                <ul>
+                <li><a href="#进程树" id="toc-进程树">进程树</a></li>
+                <li><a href="#用-gdb-观察-pgproc"
+                id="toc-用-gdb-观察-pgproc">用 GDB 观察 PGPROC</a></li>
+                </ul></li>
+                <li><a href="#九关键要点"
+                id="toc-九关键要点">九、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="进程模型与共享内存postmaster-如何管理-100-个-backend">进程模型与共享内存：Postmaster
+            如何管理 100 个 Backend</h1>
+            <p>如果你用 <code>ps aux | grep postgres</code> 看过 PG
+            的进程列表，大概率被一堆叫 <code>postgres</code>
+            的进程吓到过。每个客户端连接都是一个独立的 OS 进程——这和
+            MySQL（线程模型）、MongoDB（线程模型）、Redis（单线程）都不一样。</p>
+            <p>多进程意味着 <code>fork()</code>
+            的代价、共享内存的复杂协调、信号驱动的父子通信。但 PG
+            的进程模型不是”老派设计”——它把 OS
+            的进程隔离和信号机制变成了故障隔离和资源管理的工程优势。</p>
+            <p>本文从源码路径拆解 PG 的进程骨架：Postmaster
+            如何孵化和管理子进程、共享内存里塞了哪些关键数据结构、Backend
+            从 <code>fork()</code> 到退出的完整生命周期。读完你就能对着
+            <code>ps</code> 输出判断每个进程在干什么、为什么
+            <code>max_connections</code> 设太高比你想的更危险。</p>
+            <hr />
+            <h2 id="一pg-的进程全景">一、PG 的进程全景</h2>
+            <h3 id="进程类型速览">进程类型速览</h3>
+            <table>
+            <colgroup>
+            <col style="width: 34%" />
+            <col style="width: 42%" />
+            <col style="width: 23%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>进程类型</th>
+            <th>进程名示例</th>
+            <th>职责</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>Postmaster</td>
+            <td><code>postgres: postmaster</code></td>
+            <td>进程树根节点，监听新连接、fork Backend、处理子进程
+            crash</td>
+            </tr>
+            <tr>
+            <td>Backend</td>
+            <td><code>postgres: user db 10.0.0.1(54321) SELECT</code></td>
+            <td>处理一条客户端连接的所有 SQL</td>
+            </tr>
+            <tr>
+            <td>Background Writer</td>
+            <td><code>postgres: background writer</code></td>
+            <td>定期将 shared_buffers 脏页写入磁盘</td>
+            </tr>
+            <tr>
+            <td>WAL Writer</td>
+            <td><code>postgres: walwriter</code></td>
+            <td>将 WAL buffer 刷到 WAL 文件</td>
+            </tr>
+            <tr>
+            <td>Checkpointer</td>
+            <td><code>postgres: checkpointer</code></td>
+            <td>执行 checkpoint</td>
+            </tr>
+            <tr>
+            <td>Autovacuum Launcher</td>
+            <td><code>postgres: autovacuum launcher</code></td>
+            <td>监控需要 VACUUM 的表，fork Autovacuum Worker</td>
+            </tr>
+            <tr>
+            <td>Autovacuum Worker</td>
+            <td><code>postgres: autovacuum worker db</code></td>
+            <td>执行具体的 VACUUM / ANALYZE 操作</td>
+            </tr>
+            <tr>
+            <td>WAL Sender</td>
+            <td><code>postgres: walsender user</code></td>
+            <td>把 WAL 发送给 standby（流复制）</td>
+            </tr>
+            <tr>
+            <td>WAL Receiver</td>
+            <td><code>postgres: walreceiver</code></td>
+            <td>standby 上接收 WAL</td>
+            </tr>
+            <tr>
+            <td>Logical Replication Worker</td>
+            <td><code>postgres: logical replication worker</code></td>
+            <td>逻辑复制的 apply worker</td>
+            </tr>
+            <tr>
+            <td>Background Worker</td>
+            <td><code>postgres: bgworker: name</code></td>
+            <td>用户注册的自定义后台进程（如
+            <code>pg_cron</code>、<code>pg_stat_statements</code> 的
+            hash 表清理）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这是 PG
+            的多进程设计哲学：<strong>每种职责一个独立进程</strong>，进程之间通过共享内存和信号通信。一个
+            Backend crash 不会影响其他连接，因为 OS
+            保证了进程的地址空间隔离。</p>
+            <h3 id="进程树结构">进程树结构</h3>
+            <pre class="mermaid"><code>flowchart TD
+  PM[&quot;postmaster&lt;br/&gt;(PID=pid1)&quot;] --&gt; BG[&quot;background writer&quot;]
+  PM --&gt; WA[&quot;walwriter&quot;]
+  PM --&gt; CK[&quot;checkpointer&quot;]
+  PM --&gt; AL[&quot;autovacuum launcher&quot;]
+  PM --&gt; BE1[&quot;backend 1&lt;br/&gt;(client connection)&quot;]
+  PM --&gt; BE2[&quot;backend 2&lt;br/&gt;(client connection)&quot;]
+  PM --&gt; BE3[&quot;backend N&lt;br/&gt;(client connection)&quot;]
+  PM --&gt; WS[&quot;walsender(s)&quot;]
+  AL --&gt; AV1[&quot;autovacuum worker 1&quot;]
+  AL --&gt; AV2[&quot;autovacuum worker 2&quot;]
+```text
+
+Autovacuum Launcher 是唯一会自己 fork 子进程的辅助进程（fork Autovacuum Worker）；其他所有进程都由 Postmaster 直接创建。
+
+---
+
+## 二、Postmaster：进程树的根
+
+### 入口路径
+
+Postmaster 的启动入口在 `src/backend/postmaster/postmaster.c` 的 `PostmasterMain()` 函数。调用链：
+</code></pre>
+            <p>main() // src/backend/main/main.c → PostmasterMain(argc,
+            argv) // src/backend/postmaster/postmaster.c →
+            InitializeGUCOptions() → set up signal handlers // SIGHUP,
+            SIGTERM, SIGINT, SIGQUIT, SIGCHLD →
+            StreamServerPort(AF_UNSPEC) // 对每个 listen_addresses 创建
+            socket → ServerLoop() // 主循环：accept → fork backend</p>
+            <pre class="text"><code>
+关键信号处理：
+
+| 信号 | 处理方式 | 效果 |
+|------|---------|------|
+| `SIGTERM` | `pmdie = SIGTERM` → 等待所有子进程退出 → shutdown | 智能关闭（smart shutdown），等所有连接自然断开 |
+| `SIGINT` | `pmdie = SIGINT` → 回滚在线事务 → 断开连接 → shutdown | 快速关闭（fast shutdown） |
+| `SIGQUIT` | `pmdie = SIGQUIT` → 立即 SIGKILL 所有子进程 → 退出 | 立即关闭（immediate shutdown），crash recovery 在下次启动时执行 |
+| `SIGHUP` | `ProcessConfigFile()` → 所有 Backend 重新加载配置 | reload 配置文件，不重启 |
+| `SIGCHLD` | 子进程退出通知 | 回收子进程、决定是否 restart |
+
+```c
+// src/backend/postmaster/postmaster.c, PostmasterMain()
+// 信号处理器注册（简化）
+pqsignal(SIGHUP,  SIGHUP_handler);    // reload config
+pqsignal(SIGTERM, pmdie);             // smart shutdown
+pqsignal(SIGINT,  pmdie);             // fast shutdown
+pqsignal(SIGQUIT, pmdie);             // immediate shutdown
+pqsignal(SIGCHLD, reaper);            // child process cleanup</code></pre>
+            <p><code>SIGCHLD</code> 的处理器 <code>reaper()</code> 是
+            Postmaster 最关键的函数之一——当 Backend crash 时，Postmaster
+            通过 <code>waitpid()</code> 回收子进程状态，并决定是否
+            restart <code>restart_after_crash=on</code>
+            的所有子进程。</p>
+            <h3 id="serverloopaccept-和-fork">ServerLoop：accept 和
+            fork</h3>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/postmaster/postmaster.c, ServerLoop()</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 主循环（简化伪代码）</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. select() 等待新连接或子进程信号</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    selres <span class="op">=</span> WaitEventSetWait<span class="op">(</span>pm_wait_set<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 如果是新连接</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>socket ready<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>        port <span class="op">=</span> ConnCreate<span class="op">(</span>AF_UNSPEC<span class="op">);</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>        port<span class="op">-&gt;</span>sock <span class="op">=</span> accept<span class="op">(</span>listen_socket<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 3. fork Backend 进程</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>        pid <span class="op">=</span> fork_process<span class="op">();</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>pid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 子进程：不再需要 Postmaster 的资源</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>            ClosePostmasterPorts<span class="op">(</span><span class="kw">false</span><span class="op">);</span>   <span class="co">// 关闭监听 socket</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>            InitPostmasterChild<span class="op">();</span>         <span class="co">// 注册到 PMChildFlags</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>            BackendMain<span class="op">(</span>port<span class="op">);</span>             <span class="co">// → 进入 Backend 主循环（永不返回）</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 父进程：记录子进程信息，回到 select() 等下一个事件</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        BackendStartup<span class="op">(</span>port<span class="op">);</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 如果是 SIGCHLD，reaper() 已经在信号处理器中回收了子进程</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>注意 `fork_process<span class="op">()</span>` 是一个对 `fork<span class="op">()</span>` 的包装——在 fork 之前它先获取 `postmaster_lock` 以保证 fork 的原子性，防止多个 Postmaster 子进程同时 fork 引发竞态。</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 三、Backend 进程：从 fork 到查询执行</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 生命周期全景</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>sequenceDiagram</span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>  participant Client</span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>  participant PM as Postmaster</span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>  participant Backend</span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>  Client<span class="op">-&gt;&gt;</span>PM<span class="op">:</span> TCP connect</span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>  PM<span class="op">-&gt;&gt;</span>PM<span class="op">:</span> ServerLoop accept<span class="op">()</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>  PM<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> fork<span class="op">()</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>  Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> ClosePostmasterPorts<span class="op">()</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>  Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> InitPostmasterChild<span class="op">()</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>  Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> InitProcess<span class="op">()</span> — 绑定到 PGPROC slot</span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>  Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> InitPostgres<span class="op">()</span> — 加载 catalog cache<span class="op">,</span> 设置搜索路径</span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>  Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> PostgresMain<span class="op">()</span> 主循环</span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>  loop 每一条 SQL</span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>    Client<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> SQL query</span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>    Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> exec_simple_query<span class="op">()</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>    Backend<span class="op">-&gt;&gt;</span>Client<span class="op">:</span> result</span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>  end</span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>  Client<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> disconnect</span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>  Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> ProcKill<span class="op">()</span> — 释放 PGPROC<span class="op">,</span> 释放锁</span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>  Backend<span class="op">-&gt;&gt;</span>Backend<span class="op">:</span> exit<span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>  PM<span class="op">-&gt;&gt;</span>PM<span class="op">:</span> SIGCHLD → reaper<span class="op">()</span> 回收</span></code></pre></div>
+            <h3
+            id="initpostgres最关键的三件事">InitPostgres：最关键的三件事</h3>
+            <p><code>InitPostgres()</code> 在 fork 之后、第一条 SQL
+            执行之前运行。它做三件关键的事：</p>
+            <p><strong>1. 绑定 SharedInvalidationCatCache</strong> —
+            订阅共享失效消息。当另一个 Backend 执行 DDL（比如
+            <code>ALTER TABLE</code>）时，catalog cache
+            需要被通知失效。这是通过 SI Message
+            Queue（共享内存中的一个环形缓冲区）实现的——发送方写入失效消息，所有订阅方在下一个
+            <code>AcceptInvalidationMessages()</code> 调用时处理。</p>
+            <p><strong>2. 初始化 Catalog Cache</strong> — PG 的
+            catalog（<code>pg_class</code>、<code>pg_attribute</code>、<code>pg_proc</code>
+            等）是 Relation Cache (<code>relcache</code>) 和 Catalog
+            Cache (<code>catcache</code>)
+            的后端。<code>InitPostgres()</code> 加载
+            <code>pg_database</code>、<code>pg_authid</code>、<code>pg_tablespace</code>
+            等关键系统表的 entries。</p>
+            <p><strong>3. 初始化 Portal 和 Resource Owner</strong> —
+            Portal 是”执行单元”的抽象（一条 SQL 或一个
+            CURSOR），Resource Owner 跟踪每个事务分配的内存、buffer
+            pin、锁等资源。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/utils/init/postinit.c, InitPostgres()</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 简化调用链</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> InitPostgres<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>in_dbname<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 与共享内存中的 PGPROC entry 关联</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    InitProcess<span class="op">();</span>                    <span class="co">// → 获取 PGPROC slot, 设置 MyProc</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 初始化 relcache / catcache / plan cache</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    InitPostgres_RelCache<span class="op">();</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    InitPostgres_CatCache<span class="op">();</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 设置搜索路径、时区等 session 参数</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    InitializeSession<span class="op">();</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 启动事务以读取 catalog</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    StartTransactionCommand<span class="op">();</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... 加载数据库 OID, namespace, 权限信息 ...</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    CommitTransactionCommand<span class="op">();</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## PostgresMain：查询处理主循环</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/tcop/postgres.c, PostgresMain()</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="co">// 主循环（简化）</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 读取客户端消息（SQL 查询）</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>    firstchar <span class="op">=</span> ReadCommand<span class="op">(&amp;</span>input_message<span class="op">);</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>firstchar<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="ch">&#39;Q&#39;</span><span class="op">:</span>   <span class="co">// simple query</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>        exec_simple_query<span class="op">(</span>input_message<span class="op">.</span>data<span class="op">);</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="ch">&#39;P&#39;</span><span class="op">:</span>   <span class="co">// parse (extended query protocol)</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>        exec_parse_message<span class="op">(...);</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="ch">&#39;B&#39;</span><span class="op">:</span>   <span class="co">// bind (extended query protocol)</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>        exec_bind_message<span class="op">(...);</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="ch">&#39;E&#39;</span><span class="op">:</span>   <span class="co">// execute (extended query protocol)</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>        exec_execute_message<span class="op">(...);</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="ch">&#39;X&#39;</span><span class="op">:</span>   <span class="co">// terminate</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> normal_exit<span class="op">;</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 处理共享失效消息（DDL 通知）</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>    AcceptInvalidationMessages<span class="op">();</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>PG 支持两种查询协议：Simple Query（一条 <code>Q</code>
+            消息发整个 SQL 字符串）和 Extended Query（Parse → Bind →
+            Execute 分三步，支持 prepared statement
+            和参数化查询）。JDBC、libpq 的 <code>PQexecParams()</code>
+            使用 Extended 协议；<code>psql</code> 默认使用 Simple
+            协议。</p>
+            <hr />
+            <h2
+            id="四共享内存初始化createsharedmemoryandsemaphores">四、共享内存初始化：CreateSharedMemoryAndSemaphores</h2>
+            <p><code>CreateSharedMemoryAndSemaphores()</code> 是 PG
+            启动时最长也最关键的初始化函数之一。它创建各个子系统所需的共享内存段和信号量，并且<strong>由
+            Postmaster 一次性分配，然后 fork
+            给子进程继承</strong>——这就是为什么 Postmaster 必须是所有
+            Backend 的父进程。</p>
+            <h3 id="调用时序">调用时序</h3>
+            <pre class="text"><code>PostmasterMain()
+  → CreateSharedMemoryAndSemaphores()
+    1. 计算总共享内存大小
+    2. shmget() / mmap() 分配共享内存段
+    3. PGShmemHeader 初始化
+    4. 分配信号量集合
+    5. 按子系统顺序初始化共享内存数据：
+       a. ShmemInitHash(&quot;LOCK hash&quot;, ...)         // 锁表
+       b. ShmemInitHash(&quot;Proc Signal hash&quot;, ...)  // 进程间信号
+       c. ShmemInitHash(&quot;Buffer Table&quot;, ...)      // Buffer 查找表
+       d. InitBufferPool()                        // shared_buffers
+       e. InitLockTable()                         // 重量级锁
+       f. InitProcGlobal()                        // PGPROC 数组
+       g. XLOGShmemInit()                         // WAL buffer
+       h. InitLWLocks()                           // LWLock 数组
+       i. InitBufferStrategy()                    // Clock sweep 状态
+       ...</code></pre>
+            <p>关键是<strong>分配顺序</strong>——Postmaster 在 fork
+            之前一次性分配所有共享内存，子进程通过继承指针直接访问。如果子进程自己做
+            <code>shmget()</code>，不但重复分配，而且每个 Backend
+            有自己的独立视图，无法通信。</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/ipc/ipci.c, CreateSharedMemoryAndSemaphores()</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 共享内存大小的计算（简化）</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>size <span class="op">=</span> add_size<span class="op">(</span>size<span class="op">,</span> ShmemBackendArraySize<span class="op">());</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>size <span class="op">=</span> add_size<span class="op">(</span>size<span class="op">,</span> BufferShmemSize<span class="op">());</span>        <span class="co">// shared_buffers</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>size <span class="op">=</span> add_size<span class="op">(</span>size<span class="op">,</span> LockShmemSize<span class="op">());</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>size <span class="op">=</span> add_size<span class="op">(</span>size<span class="op">,</span> ProcGlobalShmemSize<span class="op">());</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>size <span class="op">=</span> add_size<span class="op">(</span>size<span class="op">,</span> XLOGShmemSize<span class="op">());</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>size <span class="op">=</span> add_size<span class="op">(</span>size<span class="op">,</span> BTreeShmemSize<span class="op">());</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>size <span class="op">=</span> add_size<span class="op">(</span>size<span class="op">,</span> LWLockShmemSize<span class="op">());</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="co">// ... 以及后面每个模块的 request</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 共享内存的寻址</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>所有进程通过 `ShmemIndex`（一个 hash table）查找共享内存对象——类似操作系统中的<span class="st">&quot;符号表&quot;</span>。每个子系统在初始化时调用 `ShmemInitStruct<span class="op">(</span>name<span class="op">,</span> size<span class="op">,</span> found<span class="op">)</span>`，第一次调用分配空间，后续调用返回已有空间的指针。</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="co">// 示例：ProcGlobal 的分配</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>ProcGlobal <span class="op">=</span> <span class="op">(</span>PROC_HDR <span class="op">*)</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    ShmemInitStruct<span class="op">(</span><span class="st">&quot;Proc Header&quot;</span><span class="op">,</span> ProcGlobalShmemSize<span class="op">(),</span> <span class="op">&amp;</span>found<span class="op">);</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(!</span>found<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Postmaster 初始化路径：清零并设置</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    ProcGlobal<span class="op">-&gt;</span>FreeProcs <span class="op">=</span> <span class="op">...;</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="co">// Backend 路径：found == true，直接使用</span></span></code></pre></div>
+            <hr />
+            <h2 id="五关键共享内存结构">五、关键共享内存结构</h2>
+            <h3 id="pgproc-与-procarray">PGPROC 与 ProcArray</h3>
+            <p><code>PGPROC</code> 是每个 Backend
+            在共享内存中的”名片”。<code>ProcArray</code> 是所有
+            <code>PGPROC</code> 的数组：</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/proc.h</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> PGPROC <span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 基础标识</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>             pgprocno<span class="op">;</span>           <span class="co">// 在 ProcArray 中的索引</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    BackendId       backendId<span class="op">;</span>          <span class="co">// 在 PGPROC 数组之外的唯一 ID</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 事务信息</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    TransactionId   xid<span class="op">;</span>                <span class="co">// 当前事务 ID（只读事务为 InvalidTransactionId）</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    TransactionId   xmin<span class="op">;</span>               <span class="co">// 快照的最小活跃事务</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    LocalTransactionId lxid<span class="op">;</span>            <span class="co">// 本 Backend 的本地事务 ID</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 锁等待</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    LOCK           <span class="op">*</span>waitLock<span class="op">;</span>           <span class="co">// 正在等的锁</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    PGPROC         <span class="op">*</span>lockGroupLeader<span class="op">;</span>    <span class="co">// 并行查询中 leader 的 PGPROC</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>             waitStatus<span class="op">;</span>         <span class="co">// STATUS_OK / STATUS_WAITING</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">// LWLock 等待</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    LWLock         <span class="op">*</span>lwWaiting<span class="op">;</span>          <span class="co">// 正在等的 LWLock</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>             lwWaitMode<span class="op">;</span>         <span class="co">// LW_SHARED / LW_EXCLUSIVE</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 快照</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    XidCache        subxids<span class="op">;</span>            <span class="co">// 缓存的子事务 ID 列表</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 信号</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    sem_t          <span class="op">*</span>sem<span class="op">;</span>                <span class="co">// 本 Backend 的信号量（用于锁等待唤醒）</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>`ProcArray` 是所有活跃 Backend 的 `PGPROC` 的数组，定义在 `src<span class="op">/</span>backend<span class="op">/</span>storage<span class="op">/</span>ipc<span class="op">/</span>procarray<span class="op">.</span>c`。它被快照构建（`GetSnapshotData<span class="op">()</span>`）频繁扫描——这是 PG 的一个可扩展性热点。在 PG <span class="dv">14</span> 之前，`GetSnapshotData<span class="op">()</span>` 需要用 `ProcArrayLock` 的共享锁保护整个扫描；在有大量连接的场景下（如 <span class="dv">1000</span><span class="op">+</span> 连接），`ProcArrayLock` 成为瓶颈。PG <span class="dv">14</span> 引入了 `xid`<span class="op">/</span>`xmin` 的 per<span class="op">-</span>backend 进度原子更新，大幅减少了需要持锁的代码路径。</span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## PGXACT</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>`PGXACT` 是 `PGPROC` 的轻量级伴随结构，把 `GetSnapshotData<span class="op">()</span>` 扫描需要读的字段从 `PGPROC` 中分离出来，减少 CPU cache miss：</span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/proc.h</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> PGXACT <span class="op">{</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>    TransactionId  xid<span class="op">;</span>      <span class="co">// 当前事务 ID</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    TransactionId  xmin<span class="op">;</span>     <span class="co">// 最小活跃事务</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>    uint8          nxids<span class="op">;</span>    <span class="co">// 缓存的子事务数</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>    uint8          vacuumFlags<span class="op">;</span>  <span class="co">// PROC_IN_VACUUM / PROC_IS_AUTOVACUUM</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <h3 id="lwlock-数组">LWLock 数组</h3>
+            <p>LWLock 是 PG 内部使用最频繁的轻量级锁。所有 LWLock
+            在共享内存中作为 <code>LWLockPadded</code> 数组分配：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/lwlock.h</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">union</span> LWLockPadded <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    LWLock  lock<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span>    pad<span class="op">[</span>LWLOCK_PADDED_SIZE<span class="op">];</span>  <span class="co">// CPU cache line padding（避免 false sharing）</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> LWLockPadded<span class="op">;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 在共享内存中：</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>LWLockPadded <span class="op">*</span>MainLWLockArray<span class="op">;</span>  <span class="co">// 全局 LWLock 数组，每个子系统的锁有固定索引</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>PG <span class="dv">17</span> 中 LWLock 的实现使用原子操作（`pg_atomic_<span class="op">*</span>`）而非信号量——对短临界区来说，自旋等待比 `semop<span class="op">()</span>` 快得多。只有当自旋超过一定次数后，等待者才会 `semop<span class="op">()</span>` 进入内核等待。这个设计在<span class="st">&quot;锁持时间极短&quot;</span>的常见场景中很高效，但如果某处代码持 LWLock 做了重 I<span class="op">/</span>O 或函数调用链过深，就会触发 LWLock 争用风暴。</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 六、Background Worker：可编程的后台进程</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>PG <span class="fl">9.3</span> 引入了 Background Worker 框架，允许扩展注册自定义后台进程。`pg_stat_statements`（定期合并统计信息）、`pg_cron`（定时任务调度器）、`Citus` 的分布式执行器都基于这个框架。</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 注册与调度</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>Worker 在 `shared_preload_libraries` 加载时通过 `RegisterBackgroundWorker<span class="op">()</span>` 注册到共享内存中的 `BackgroundWorkerArray`。Postmaster 在 `ServerLoop` 中检查是否有 worker 需要启动，并 fork：</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/postmaster/bgworker.c</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> maybe_start_bgworkers<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>slot <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> slot <span class="op">&lt;</span> max_worker_processes<span class="op">;</span> slot<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>worker 注册了且还没启动<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>            pid <span class="op">=</span> fork_process<span class="op">();</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>pid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>                <span class="co">// 子进程</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>                InitPostmasterChild<span class="op">();</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>                StartBackgroundWorker<span class="op">();</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>Worker
+            类型有：<code>BgWorkerStart_PostmasterStart</code>（Postmaster
+            启动后就启动）、<code>BgWorkerStart_RecoveryFinished</code>（crash
+            recovery
+            完成后启动）、<code>BgWorkerStart_ConsistentState</code>（达到一致状态后启动）。</p>
+            <h3 id="worker-的限制">Worker 的限制</h3>
+            <ul>
+            <li>Worker 不能接受客户端连接（除非通过
+            <code>BGWORKER_CLASS_PARALLEL</code> 的并行查询
+            worker）</li>
+            <li>Worker 不能启动事务（需要自行调用
+            <code>StartTransactionCommand()</code>）</li>
+            <li>Worker PID 不列在 <code>pg_stat_activity</code>
+            中，除非它打开一个数据库连接</li>
+            <li><code>max_worker_processes</code>
+            限制所有辅助进程的总数（autovacuum worker + background
+            worker + logical replication worker）</li>
+            </ul>
+            <hr />
+            <h2
+            id="七为什么是进程而不是线程">七、为什么是进程而不是线程</h2>
+            <p>这是 PG 最常被问的问题。MySQL 和 InnoDB
+            用线程处理连接，PG 用进程。为什么？</p>
+            <table>
+            <colgroup>
+            <col style="width: 16%" />
+            <col style="width: 36%" />
+            <col style="width: 47%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>进程模型 (PG)</th>
+            <th>线程模型 (MySQL)</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>内存隔离</td>
+            <td>OS 保证——crash 不污染其他连接</td>
+            <td>需自行保证——野指针可能破坏整个进程</td>
+            </tr>
+            <tr>
+            <td>fork 开销</td>
+            <td>~5-10MB 私有内存/连接，fork 本身 ~0.5ms</td>
+            <td>创建线程 ~0.05ms，共享地址空间</td>
+            </tr>
+            <tr>
+            <td>1000 连接时的内存</td>
+            <td>5-10GB（只有私有内存）</td>
+            <td>100-500MB（共享代码段和 buffer pool）</td>
+            </tr>
+            <tr>
+            <td>共享缓存</td>
+            <td>shared_buffers 在 fork 之前分配，被所有 Backend
+            继承</td>
+            <td>InnoDB buffer pool 在所有线程间可见</td>
+            </tr>
+            <tr>
+            <td>信号处理</td>
+            <td>每个进程独立信号 mask，SIGCHLD 通知父进程</td>
+            <td>线程间信号混乱，通常不用信号做 IPC</td>
+            </tr>
+            <tr>
+            <td>调试</td>
+            <td>gdb <code>attach</code> 单个 Backend 即可</td>
+            <td>需要在多线程中导航</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>PG 的进程模型在一个关键点上很聪明：<strong>所有共享状态在
+            fork 之前分配在共享内存中，fork 之后的私有内存浪费只来自
+            Backend 自己的栈、堆、catalog
+            cache</strong>。<code>shared_buffers</code>（通常是内存大户）在所有进程间共享，不计入每个
+            Backend 的私有内存。</p>
+            <p>真正的风险不是 <code>fork()</code> 本身（0.5ms），而是
+            <code>max_connections</code> 设太高导致的工作内存膨胀——每个
+            Backend 可能同时使用多个 <code>work_mem</code> 配额（参考 <a
+            href="../26-config-pitfalls/26-config-pitfalls.html">配置陷阱</a>）。</p>
+            <hr />
+            <h2 id="八实验观察-pg-的进程树和共享内存">八、实验：观察 PG
+            的进程树和共享内存</h2>
+            <h3 id="进程树">进程树</h3>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 观察 Postmaster 及其直接子进程</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-eo</span> pid,ppid,comm,args <span class="kw">|</span> <span class="fu">grep</span> postgres <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> grep</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 示例输出（PID 列 → PPID 列 → 进程名 → 参数）：</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 1024     1  postgres  /usr/local/pgsql/bin/postgres -D /data/pgdata</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 1026  1024  postgres  postgres: checkpointer</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 1027  1024  postgres  postgres: background writer</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 1028  1024  postgres  postgres: walwriter</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 1029  1024  postgres  postgres: autovacuum launcher</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 1030  1024  postgres  postgres: user db 10.0.0.1(54321) SELECT</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="ex">注意所有子进程的</span> PPID 都是 Postmaster 的 PID（1024）。</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="co">### 共享内存段</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 PG 分配的共享内存段</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="ex">ipcs</span> <span class="at">-m</span> <span class="kw">|</span> <span class="fu">grep</span> postgres</span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 每个 PG 集群通常有 1-3 个共享内存段（取决于大小和平台）</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a><span class="co"># 0x0052e2c1 32769     postgres 600  134217728  1</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="co"># 13GB shared_buffers + 其他共享结构</span></span></code></pre></div>
+            <h3 id="用-gdb-观察-pgproc">用 GDB 观察 PGPROC</h3>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># attach 到一个 Backend</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">gdb</span> <span class="at">-p</span> <span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-f</span> <span class="st">&quot;postgres: user&quot;</span><span class="va">)</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 打印当前 Backend 的 PGPROC 结构</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="fu">gdb</span><span class="kw">)</span> <span class="ex">p</span> <span class="pp">*</span>MyProc</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出：xid, xmin, waitLock, pgprocno 等字段</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 ProcArray 中的活跃事务数</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="fu">gdb</span><span class="kw">)</span> <span class="ex">p</span> ProcGlobal-<span class="op">&gt;</span>allPgXact</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="fu">bash</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="co">### 连接开销的量化</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 用 pgbench 测试不同连接数下的内存和 fork 开销</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbench</span> <span class="at">-i</span> <span class="at">-s</span> 100 postgres</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 测量 10 个连接</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbench</span> <span class="at">-c</span> 10 <span class="at">-T</span> 30 postgres <span class="kw">&amp;</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-eo</span> pid,rss,comm <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&quot;postgres: user&quot;</span> <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{sum+=$2} END {print &quot;Total RSS (KB):&quot;, sum}&#39;</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a><span class="co"># 测量 100 个连接</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="ex">pgbench</span> <span class="at">-c</span> 100 <span class="at">-T</span> 30 postgres <span class="kw">&amp;</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 2</span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a><span class="fu">ps</span> <span class="at">-eo</span> pid,rss,comm <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&quot;postgres: user&quot;</span> <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;{sum+=$2} END {print &quot;Total RSS (KB):&quot;, sum}&#39;</span></span></code></pre></div>
+            <p>你会观察到每个 Backend 的 RSS 初始在 5-10MB，但会随着
+            catalog cache 的增长而上升。</p>
+            <hr />
+            <h2 id="九关键要点">九、关键要点</h2>
+            <ol type="1">
+            <li><strong>PG 是多进程架构</strong>——Postmaster
+            是根节点，每个连接是一个独立的 OS
+            进程。进程隔离是故障隔离的基础。</li>
+            <li><strong>共享内存在 fork
+            之前一次性分配</strong>——Postmaster 在
+            <code>CreateSharedMemoryAndSemaphores()</code>
+            中分配所有共享内存段，子进程通过继承指针直接访问。不需要每个
+            Backend 做 <code>shmget()</code>。</li>
+            <li><strong>PGPROC 和 ProcArray
+            是核心枢纽</strong>——<code>GetSnapshotData()</code> 扫描
+            <code>ProcArray</code>
+            获取活跃事务列表，这是快照隔离的基础。大量连接时这是性能热点。</li>
+            <li><strong>Background Worker
+            框架让扩展可以注册自定义后台进程</strong>——<code>pg_cron</code>、<code>pg_stat_statements</code>
+            等扩展都基于此。</li>
+            <li><strong>进程模型的代价是每个连接 ~5-10MB
+            私有内存</strong>——<code>max_connections</code>
+            设太高真正的风险不在 fork，而在
+            <code>work_mem × 连接数 × 操作数</code> 的内存爆炸。</li>
+            </ol>
+            <p>系列索引：<a href="../index.html">PostgreSQL
+            内核机制深度拆解</a> 下一章：<a
+            href="../02-page-tuple/02-page-tuple.html">页面布局与元组格式</a>，拆解
+            PG 的 8KB 页面物理布局、Heap Tuple 的 header
+            结构（xmin/xmax/ctid/t_infomask）、TOAST
+            外存机制——理解数据如何在磁盘和内存中表示。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/postmaster/postmaster.c</code>：PostmasterMain(),
+            ServerLoop(), BackendStartup(), reaper()</li>
+            <li><code>src/backend/storage/ipc/ipci.c</code>：CreateSharedMemoryAndSemaphores()</li>
+            <li><code>src/backend/storage/ipc/procarray.c</code>：ProcArrayAdd(),
+            ProcArrayRemove(), GetSnapshotData()</li>
+            <li><code>src/backend/storage/ipc/shmem.c</code>：ShmemInitStruct(),
+            ShmemAlloc()</li>
+            <li><code>src/backend/storage/lmgr/lwlock.c</code>：LWLockInitialize(),
+            LWLockAcquire(), LWLockRelease()</li>
+            <li><code>src/backend/utils/init/postinit.c</code>：InitPostgres()</li>
+            <li><code>src/backend/tcop/postgres.c</code>：PostgresMain(),
+            ReadCommand()</li>
+            <li><code>src/include/storage/proc.h</code>：PGPROC, PGXACT
+            结构体定义</li>
+            <li><code>src/include/storage/lwlock.h</code>：LWLock,
+            LWLockPadded 定义</li>
+            <li><code>src/backend/postmaster/bgworker.c</code>：RegisterBackgroundWorker(),
+            StartBackgroundWorker()</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 18: Server Setup and
+            Operation（连接管理、共享内存配置）</li>
+            <li>PostgreSQL Documentation, Chapter 19: Server
+            Configuration（<code>max_connections</code>,
+            <code>shared_buffers</code>）</li>
+            <li>PostgreSQL Documentation, Chapter 50: Overview of
+            PostgreSQL Internals（进程架构概述）</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/06-lock-manager/06-lock-manager.html">【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系</a></h3>
+                    <p>拆解 PostgreSQL 锁管理器的完整架构：SpinLock 自旋锁的硬件原语与使用边界、LWLock 从 PG 9.4 前到 PG 16 LWLockWaitListLock 的三代演进、Heavyweight Lock 的 LockAcquire() 完整路径和锁表结构、死锁检测 DeadLockCheck() 的等待图 DFS 算法、行级锁 FOR UPDATE/FOR SHARE/FOR KEY SHARE 的 t_infomask 实现，以及用 pg_locks 和 pg_blocking_pids() 追踪生产锁等待链的诊断方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/23-perf-investigation/23-perf-investigation.html">【PG 内核】性能异常调查方法论：从现象到内核根因的五层调查链</a></h3>
+                    <p>不是工具箱罗列，而是一条按顺序推进的调查链：从 pg_stat_statements 定位可疑 queryid，到 EXPLAIN (ANALYZE, BUFFERS) 解剖执行计划，到 pg_stat_activity + wait_event 诊断等待类型，到 pg_locks + pg_blocking_pids() 追踪锁等待树，最后用 OS 层工具（iostat/perf/bpftrace）确认物理瓶颈。覆盖三个特殊场景：计划缓存的快慢切换、CPU 100% 无慢查询的 LWLock 自旋根因、命中率 99% 但 IO 打满的统计骗局。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/03-mvcc-clog/03-mvcc-clog.html">【PG 内核】MVCC 实现：CLOG、hint bit 与快照可扩展性</a></h3>
+                    <p>在已有 MVCC 文章基础上深入 PG 并发控制的三个基础设施：CLOG 的 SLRU 结构（事务状态位、页面格式、SLRU 淘汰）、hint bit 的写入时机和竞争问题（何时写、谁写、写坏了怎么办）、PG 14 snapshot scalability 优化的具体机制（ProcArrayLock 为什么是瓶颈、xid/xmin 的原子更新如何减少持锁路径），以及事务 ID 回卷（wraparound）的威胁模型。最后与 InnoDB undo log 方案做系统性对比。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

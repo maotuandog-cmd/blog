@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】流复制：从 WAL Sender 到 Slot 溢出的多米诺效应 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+流复制的完整内核路径：WAL Sender 的 WalSndLoop→XLogSendPhysical
+发送链路、WAL Receiver 的 WalRcvLoop
+接收与恢复链路、同步复制的三种语义与等待机制、Failover 时 Timeline 的
+fork 原理与 split-brain 风险、Primary-standby 冲突的本质与
+max_standby_streaming_delay 的 trade-off、Replication Slot
+的内部结构。重点剖析 Slot 溢出多米诺效应——standby 宕机→slot 阻止 WAL
+回收→pg_wal 填满磁盘→primary PANIC 的完整事件链，以及 wal_keep_size 与
+slot 的互相影响。配合 pg_stat_replication 的三层延迟指标排查与
+conflict_reason 解读。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, streaming-replication, wal-sender, wal-receiver, synchronous-replication, replication-slot, failover, timeline, split-brain, pg-rewind, wal-recovery, slot-overflow, pg-stat-replication, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/18-streaming-repl/18-streaming-repl.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】流复制：从 WAL Sender 到 Slot 溢出的多米诺效应" />
+    <meta property="og:description" content="拆解 PostgreSQL 流复制的完整内核路径：WAL Sender 的 WalSndLoop→XLogSendPhysical 发送链路、WAL Receiver 的 WalRcvLoop 接收与恢复链路、同步复制的三种语义与等待机制、Failover 时 Timeline 的 fork 原理与 split-brain 风险、Primary-standby 冲突的本质与 max_standby_streaming_delay 的 trade-off、Replication Slot 的内部结构。重点剖析 Slot 溢出多米诺效应——standby 宕机→slot 阻止 WAL 回收→pg_wal 填满磁盘→primary PANIC 的完整事件链，以及 wal_keep_size 与 slot 的互相影响。配合 pg_stat_replication 的三层延迟指标排查与 conflict_reason 解读。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/18-streaming-repl/18-streaming-repl.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="streaming-replication" />
+    <meta property="article:tag" content="wal-sender" />
+    <meta property="article:tag" content="wal-receiver" />
+    <meta property="article:tag" content="synchronous-replication" />
+    <meta property="article:tag" content="replication-slot" />
+    <meta property="article:tag" content="failover" />
+    <meta property="article:tag" content="timeline" />
+    <meta property="article:tag" content="split-brain" />
+    <meta property="article:tag" content="pg-rewind" />
+    <meta property="article:tag" content="wal-recovery" />
+    <meta property="article:tag" content="slot-overflow" />
+    <meta property="article:tag" content="pg-stat-replication" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】流复制：从 WAL Sender 到 Slot 溢出的多米诺效应" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 流复制的完整内核路径：WAL Sender 的 WalSndLoop→XLogSendPhysical 发送链路、WAL Receiver 的 WalRcvLoop 接收与恢复链路、同步复制的三种语义与等待机制、Failover 时 Timeline 的 fork 原理与 split-brain 风险、Primary-standby 冲突的本质与 max_standby_streaming_delay 的 trade-off、Replication Slot 的内部结构。重点剖析 Slot 溢出多米诺效应——standby 宕机→slot 阻止 WAL 回收→pg_wal 填满磁盘→primary PANIC 的完整事件链，以及 wal_keep_size 与 slot 的互相影响。配合 pg_stat_replication 的三层延迟指标排查与 conflict_reason 解读。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】流复制：从 WAL Sender 到 Slot 溢出的多米诺效应", "description": "拆解 PostgreSQL 流复制的完整内核路径：WAL Sender 的 WalSndLoop→XLogSendPhysical 发送链路、WAL Receiver 的 WalRcvLoop 接收与恢复链路、同步复制的三种语义与等待机制、Failover 时 Timeline 的 fork 原理与 split-brain 风险、Primary-standby 冲突的本质与 max_standby_streaming_delay 的 trade-off、Replication Slot 的内部结构。重点剖析 Slot 溢出多米诺效应——standby 宕机→slot 阻止 WAL 回收→pg_wal 填满磁盘→primary PANIC 的完整事件链，以及 wal_keep_size 与 slot 的互相影响。配合 pg_stat_replication 的三层延迟指标排查与 conflict_reason 解读。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/18-streaming-repl/18-streaming-repl.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "streaming-replication", "wal-sender", "wal-receiver", "synchronous-replication", "replication-slot", "failover", "timeline", "split-brain", "pg-rewind", "wal-recovery", "slot-overflow", "pg-stat-replication"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】流复制：从 WAL Sender 到 Slot 溢出的多米诺效应</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#streaming-replication</span> <span>#wal-sender</span> <span>#wal-receiver</span> <span>#synchronous-replication</span> <span>#replication-slot</span> <span>#failover</span> <span>#timeline</span> <span>#split-brain</span> <span>#pg-rewind</span> <span>#wal-recovery</span> <span>#slot-overflow</span> <span>#pg-stat-replication</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/streaming-replication.html">#streaming-replication</a><a class="chip-link" href="/tags/wal-sender.html">#wal-sender</a><a class="chip-link" href="/tags/wal-receiver.html">#wal-receiver</a><a class="chip-link" href="/tags/synchronous-replication.html">#synchronous-replication</a><a class="chip-link" href="/tags/replication-slot.html">#replication-slot</a><a class="chip-link" href="/tags/failover.html">#failover</a><a class="chip-link" href="/tags/timeline.html">#timeline</a><a class="chip-link" href="/tags/split-brain.html">#split-brain</a><a class="chip-link" href="/tags/pg-rewind.html">#pg-rewind</a><a class="chip-link" href="/tags/wal-recovery.html">#wal-recovery</a><a class="chip-link" href="/tags/slot-overflow.html">#slot-overflow</a><a class="chip-link" href="/tags/pg-stat-replication.html">#pg-stat-replication</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#流复制从-wal-sender-到-slot-溢出的多米诺效应"
+                id="toc-流复制从-wal-sender-到-slot-溢出的多米诺效应">流复制：从
+                WAL Sender 到 Slot 溢出的多米诺效应</a>
+                <ul>
+                <li><a href="#一流复制的整体架构"
+                id="toc-一流复制的整体架构">一、流复制的整体架构</a>
+                <ul>
+                <li><a href="#wal-sender-的三种-wal-来源"
+                id="toc-wal-sender-的三种-wal-来源">WAL Sender 的三种
+                WAL 来源</a></li>
+                </ul></li>
+                <li><a href="#三wal-receiverwalrcvloop-的接收与恢复"
+                id="toc-三wal-receiverwalrcvloop-的接收与恢复">三、WAL
+                Receiver：WalRcvLoop 的接收与恢复</a>
+                <ul>
+                <li><a href="#接收端架构"
+                id="toc-接收端架构">接收端架构</a></li>
+                <li><a href="#三阶段延迟的精确语义"
+                id="toc-三阶段延迟的精确语义">三阶段延迟的精确语义</a></li>
+                <li><a href="#零值陷阱"
+                id="toc-零值陷阱">零值陷阱</a></li>
+                </ul></li>
+                <li><a href="#四同步复制的语义与等待机制"
+                id="toc-四同步复制的语义与等待机制">四、同步复制的语义与等待机制</a>
+                <ul>
+                <li><a href="#synchronous_commit-的五个级别"
+                id="toc-synchronous_commit-的五个级别">synchronous_commit
+                的五个级别</a></li>
+                </ul></li>
+                </ul></li>
+                <li><a href="#原始-timeline-1-到-xxx-位置的-wal-历史"
+                id="toc-原始-timeline-1-到-xxx-位置的-wal-历史">原始
+                Timeline 1 到 XXX 位置的 WAL 历史</a>
+                <ul>
+                <li><a href="#trade-off"
+                id="toc-trade-off">Trade-off</a></li>
+                <li><a href="#conflict_reason-解读"
+                id="toc-conflict_reason-解读">conflict_reason
+                解读</a></li>
+                <li><a href="#七replication-slot-的内部结构"
+                id="toc-七replication-slot-的内部结构">七、Replication
+                Slot 的内部结构</a>
+                <ul>
+                <li><a href="#slot-的设计目的"
+                id="toc-slot-的设计目的">Slot 的设计目的</a></li>
+                <li><a href="#pg_replication_slots-的内部结构"
+                id="toc-pg_replication_slots-的内部结构">pg_replication_slots
+                的内部结构</a></li>
+                <li><a href="#wal_keep_size-与-slot-的叠加陷阱"
+                id="toc-wal_keep_size-与-slot-的叠加陷阱">wal_keep_size
+                与 Slot 的叠加陷阱</a></li>
+                <li><a href="#恢复路径"
+                id="toc-恢复路径">恢复路径</a></li>
+                </ul></li>
+                <li><a href="#九排查pg_stat_replication-的三层延迟指标"
+                id="toc-九排查pg_stat_replication-的三层延迟指标">九、排查：pg_stat_replication
+                的三层延迟指标</a>
+                <ul>
+                <li><a href="#完整监控-sql"
+                id="toc-完整监控-sql">完整监控 SQL</a></li>
+                </ul></li>
+                <li><a href="#十关键要点"
+                id="toc-十关键要点">十、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#pg-开发者讨论" id="toc-pg-开发者讨论">PG
+                开发者讨论</a></li>
+                <li><a href="#工具" id="toc-工具">工具</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="流复制从-wal-sender-到-slot-溢出的多米诺效应">流复制：从
+            WAL Sender 到 Slot 溢出的多米诺效应</h1>
+            <p>在 PG 里配流复制不算难——<code>pg_basebackup</code>
+            拉一个基础备份，写一条 <code>primary_conninfo</code>，启动
+            standby
+            就行。但流复制在生产环境的故障形态远不止”延迟大了追一追”。它涉及
+            WAL Sender/Receiver
+            进程的内部协议、同步复制的持久性语义和等待链、Failover 时的
+            Timeline 协商、Replication Slot 对 WAL
+            回收的制约——以及最致命的多米诺效应：一个被遗忘的 Slot
+            可以悄无声息地填满磁盘，打垮 Primary。</p>
+            <p>本文从源码路径拆解 PG
+            流复制的内核骨架，重点解释三个运维中最常见但理解最浅的高风险场景：Slot
+            溢出如何从”standby 宕机”一步步发展到”primary
+            PANIC”、<code>pg_stat_replication</code>
+            的三层延迟指标为什么在 Slot 卡住时全都显示 0、以及 Promote
+            之后的 split-brain 为什么 <code>pg_rewind</code>
+            不能完全救你。</p>
+            <hr />
+            <h2 id="一流复制的整体架构">一、流复制的整体架构</h2>
+            <p>PG 的流复制基于 WAL 的物理日志传输，不是 SQL
+            级别的复制。Primary 把 WAL record 发给 standby，standby 像做
+            crash recovery 一样 replay 这些 record——redo 出来的页面和
+            primary
+            一模一样。这意味着流复制是<strong>物理复制</strong>，传输的是
+            page-level 的变更，不是逻辑行。</p>
+            <pre class="mermaid"><code>sequenceDiagram
+    participant P as Primary Backend
+    participant WB as WAL Buffer (Primary)
+    participant WS as WAL Sender
+    participant WR as WAL Receiver
+    participant S as Standby Recovery
+
+    P-&gt;&gt;WB: XLogInsert() 写入 WAL record
+    P-&gt;&gt;P: XLogFlush() 刷到磁盘
+    WS-&gt;&gt;WB: 读取 WAL record
+    WS-&gt;&gt;WR: 网络传输 (libpqwalreceiver)
+    WR-&gt;&gt;S: 写入 WAL 文件
+    S-&gt;&gt;S: StartupXLOG() → REDO 恢复
+    Note over WR,S: Standby 端按 LSN 顺序重放
+```text
+
+Primary 上的 WAL Sender（`walsender`）负责从 WAL 或 archive 读取 WAL record，通过网络发送。Standby 上的 WAL Receiver（`walreceiver`）接收这些 record，写入本地 WAL 文件，然后由 Startup 进程执行 REDO 恢复。`pg_stat_replication` 的三个延迟字段（`write_lag`、`flush_lag`、`replay_lag`）正是对应这个过程的三道闸门。
+
+---
+
+## 二、WAL Sender：WalSndLoop 的发送路径
+
+### 启动流程
+
+WAL Sender 是 Primary 上的一个 backend 进程。当一个带有 `replication=true` 参数的客户端连接到达时，Postmaster 看到这是一个复制连接，不走通常的 `PostgresMain()` 查询循环，而是进入 `WalSndMain()`：
+
+```c
+// src/backend/replication/walsender.c
+void WalSndMain(void) {
+    // 1. 初始化进程上下文，绑定 PGPROC
+    InitProcess();
+
+    // 2. 处理客户端的 IDENTIFY_SYSTEM 命令（获取 systemid, timeline, xlogpos）
+    // 3. 处理 CREATE_REPLICATION_SLOT / START_REPLICATION 等复制协议命令
+
+    // 4. 进入主循环：只在这里做一件事——发送 WAL
+    WalSndLoop();
+}</code></pre>
+            <p>WAL Sender 的大部分生命周期都在 <code>WalSndLoop()</code>
+            中：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/replication/walsender.c, WalSndLoop()</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> WalSndLoop<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 1. 等待 WAL 数据到达（或等待输出缓冲区可写）</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>        WaitLatchOrSocket<span class="op">(</span>MyLatch<span class="op">,</span> WL_SOCKET_READABLE <span class="op">|</span> WL_LATCH_SET <span class="op">|</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>                          WL_POSTMASTER_DEATH <span class="op">|</span> WL_EXIT_ON_PM_DEATH<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 2. 从 WAL 读取新的 record 放入输出缓冲区</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>pq_is_send_pending<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>            pq_flush_if_writable<span class="op">();</span>   <span class="co">// 先刷新输出缓冲区</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>            XLogSendPhysical<span class="op">();</span>       <span class="co">// 读取下一个 WAL record 并发送</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 3. 处理来自客户端的 feedback 消息（standby 报告自己的 flush LSN）</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>        ProcessRepliesIfAny<span class="op">();</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>这个循环的核心是一个生产者<span class="op">-</span>消费者结构：`XLogSendPhysical<span class="op">()</span>` 充当生产者，从 WAL 读取 record 写入发送缓冲区；`pq_flush_if_writable<span class="op">()</span>` 充当消费者，把缓冲区的内容通过网络 socket 发出去。如果 standby 消费得慢，发送缓冲区会填满，WAL Sender 会阻塞在 `pq_flush_if_writable<span class="op">()</span>` 上。</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## XLogSendPhysical：逐 record 的发送</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/replication/walsender.c, XLogSendPhysical()</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> XLogSendPhysical<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr  startptr<span class="op">;</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr  endptr<span class="op">;</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>    Size        nbytes<span class="op">;</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 确定发送范围：从 sentPtr（已发送位置）到当前 WAL 写入位置</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    startptr <span class="op">=</span> sentPtr<span class="op">;</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    endptr <span class="op">=</span> GetFlushRecPtr<span class="op">();</span>  <span class="co">// 当前已刷盘的 WAL 位置</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 边界保护：不能发送比 standby 自己 WAL 位置的更旧数据</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>startptr <span class="op">&lt;</span> sentPtr<span class="op">)</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        startptr <span class="op">=</span> sentPtr<span class="op">;</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 从 WAL 读取数据</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    XLogRead<span class="op">(</span>send_data<span class="op">,</span> startptr<span class="op">,</span> endptr <span class="op">-</span> startptr<span class="op">);</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 打包成复制协议消息（&#39;w&#39; 类型，代表 WAL data）</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    消息格式：&#39;w&#39; + startLSN + endLSN + timestamp + data</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>    pq_putmessage<span class="op">(</span><span class="ch">&#39;w&#39;</span><span class="op">,</span> send_data<span class="op">,</span> nbytes<span class="op">);</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 5. 更新 sentPtr</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>    sentPtr <span class="op">=</span> endptr<span class="op">;</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>关键点：<code>startptr</code> 不能超过 standby 报告的
+            <code>flush_lsn</code>。如果 standby 是一个 cascade
+            复制的中继（它也把自己的 WAL 发给下一个 standby），它的
+            <code>sentPtr</code> 受限于自己已经 flush 的 WAL
+            位置——它不能发送自己还没收到的东西。</p>
+            <h3 id="wal-sender-的三种-wal-来源">WAL Sender 的三种 WAL
+            来源</h3>
+            <p>WAL Sender 不一定总是从当前 WAL 段读取数据。当 standby
+            落后太多，需要的 WAL 段已经被回收时，有三种后备路径：</p>
+            <ol type="1">
+            <li><strong>当前 WAL 段</strong>：最直接的路径，从
+            <code>pg_wal</code> 目录中当前正在写入的 WAL 文件读取。</li>
+            <li><strong>历史 WAL 段</strong>：如果 standby 需要仍存在于
+            <code>pg_wal</code> 中的早期 WAL
+            段，直接从对应文件读取。</li>
+            <li><strong>WAL Archive</strong>：如果 WAL
+            段已被回收但归档到了 <code>archive_library</code>
+            指定的路径，WAL Sender 会调用
+            <code>XLogArchiveIsReadyOrErr()</code>
+            检查归档是否可用，然后通过 <code>XLogFileReadAnyTLI()</code>
+            读取。</li>
+            </ol>
+            <p>如果这三种来源都找不到所需的 WAL 段——standby 需要的 LSN
+            对应的 WAL 段既不在 <code>pg_wal</code> 中也没归档——WAL
+            Sender 会报错断开连接。这正是 Slot 溢出的直接后果：WAL 段被
+            Slot 保护不被回收，但如果 Slot 被删除或失效，standby
+            再连回来就永久缺了一段 WAL。</p>
+            <hr />
+            <h2 id="三wal-receiverwalrcvloop-的接收与恢复">三、WAL
+            Receiver：WalRcvLoop 的接收与恢复</h2>
+            <h3 id="接收端架构">接收端架构</h3>
+            <p>Standby 上的 WAL
+            Receiver（<code>walreceiver</code>）是一个由 Startup 进程
+            fork 出来的辅助进程。它的职责比较简单但同样关键：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/replication/walreceiver.c, WalReceiverMain()</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> WalReceiverMain<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 通过 libpqwalreceiver 库连接到 Primary</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    wrconn <span class="op">=</span> walrcv_connect<span class="op">(</span>conninfo<span class="op">,</span> <span class="op">&amp;</span>err<span class="op">);</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 发送 IDENTIFY_SYSTEM，获取 systemid, current_timeline, xlogpos</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    walrcv_identify_system<span class="op">(</span>wrconn<span class="op">,</span> <span class="op">&amp;</span>sysid<span class="op">,</span> <span class="op">&amp;</span>current_timeline<span class="op">,</span> <span class="op">&amp;</span>startpos<span class="op">);</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 发送 START_REPLICATION（指定 startpos 和 slot_name）</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    walrcv_startstreaming<span class="op">(</span>wrconn<span class="op">,</span> startpos<span class="op">,</span> slotname<span class="op">);</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 进入接收主循环</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    WalRcvLoop<span class="op">();</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>`WalRcvLoop<span class="op">()</span>` 是 WAL Receiver 的主循环：</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/replication/walreceiver.c, WalRcvLoop()</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> WalRcvLoop<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 1. 等待 Primary 发来的 WAL 消息</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        WaitLatchOrSocket<span class="op">(</span>MyLatch<span class="op">,</span> WL_SOCKET_READABLE <span class="op">|</span> <span class="op">...);</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 2. 读取消息类型 &#39;w&#39;（WAL data）或 &#39;k&#39;（keepalive）</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>type <span class="op">==</span> <span class="ch">&#39;w&#39;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 3. 把接收到的 WAL data 写入本地 WAL 文件</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>            XLogWalRcvWrite<span class="op">(</span>buf<span class="op">,</span> len<span class="op">,</span> startLSN<span class="op">);</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 4. 定期发送 feedback 消息（报告自己的 flush LSN）</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        XLogWalRcvSendReply<span class="op">();</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>XLogWalRcvWrite()</code> 把接收到的 WAL data
+            追加写入 standby 本地的 WAL 文件。对应
+            <code>pg_stat_replication</code> 的
+            <code>write_lag</code>——表示 WAL data 从 Primary 发送到
+            standby 写入本地 WAL 文件的延迟。</p>
+            <h3 id="三阶段延迟的精确语义">三阶段延迟的精确语义</h3>
+            <p>从 WAL Receiver
+            的代码路径可以精确定义三层延迟的语义：</p>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 28%" />
+            <col style="width: 42%" />
+            <col style="width: 28%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>对应操作</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>write_lag</code></td>
+            <td>WAL Receiver 把数据写到本地 WAL 文件页缓存（还没
+            fsync）</td>
+            <td>WAL 已经到达 standby 但还在 OS buffer 中</td>
+            </tr>
+            <tr>
+            <td><code>flush_lag</code></td>
+            <td>WAL Receiver 把数据 fsync 到磁盘</td>
+            <td>WAL 已持久化到 standby 磁盘</td>
+            </tr>
+            <tr>
+            <td><code>replay_lag</code></td>
+            <td>Startup 进程 REDO 完这条 WAL record</td>
+            <td>WAL 对应的数据变更已在 standby 上可见</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这三个阶段是严格有序的：write 先于 flush，flush 先于
+            replay。如果 <code>write_lag</code> 很大且接近
+            <code>flush_lag</code>，瓶颈在网络或 standby
+            的磁盘顺序写。如果 <code>flush_lag</code> 很小但
+            <code>replay_lag</code> 很大，瓶颈在 standby 的 redo
+            速度（CPU 或磁盘随机 IO）。</p>
+            <h3 id="零值陷阱">零值陷阱</h3>
+            <p>这三个值等于 0 有两种完全不同的含义：</p>
+            <ul>
+            <li><strong>真的没延迟</strong>：Standby 与 Primary
+            紧凑同步，所有 WAL 都及时处理完。</li>
+            <li><strong>Slot 卡住了</strong>：Standby 已经失联，没有新的
+            WAL
+            被消费，<code>write_lag</code>/<code>flush_lag</code>/<code>replay_lag</code>
+            都停在最后一次成功处理时的值。如果卡住的时间足够长，这些值会是
+            0 而非连续增长——因为计算方式是最后一批 WAL
+            的处理时间差，失联后没有新输入，自然没有延迟。</li>
+            </ul>
+            <p>区分的方法是看 <code>pg_stat_replication</code> 的
+            <code>state</code> 列：<code>streaming</code>
+            表示连接正常，延迟指标有意义；如果长时间没有
+            <code>state</code> 变化且 <code>sent_lsn</code> 等于
+            <code>write_lsn</code> 且长时间不变，说明 standby
+            可能已经失联。</p>
+            <hr />
+            <h2
+            id="四同步复制的语义与等待机制">四、同步复制的语义与等待机制</h2>
+            <h3 id="synchronous_commit-的五个级别">synchronous_commit
+            的五个级别</h3>
+            <p><code>synchronous_commit</code> 控制 Primary 上一个事务的
+            <code>COMMIT</code> 什么时候返回给客户端。它不是”同步复制 vs
+            异步复制”的二元开关，而是一个延迟-持久性的连续谱：</p>
+            <table>
+            <colgroup>
+            <col style="width: 13%" />
+            <col style="width: 34%" />
+            <col style="width: 23%" />
+            <col style="width: 28%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>设置</th>
+            <th>COMMIT 返回时机</th>
+            <th>持久性保证</th>
+            <th>对应 lag 指标</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>off</code></td>
+            <td>WAL record 写入 Primary 本地 WAL buffer 即返回</td>
+            <td>最多丢 <code>wal_writer_delay</code>（默认
+            200ms）的事务</td>
+            <td>无</td>
+            </tr>
+            <tr>
+            <td><code>local</code></td>
+            <td>WAL record 在 Primary 本地刷盘</td>
+            <td>Primary 不丢，standby 可能丢</td>
+            <td><code>flush_lag</code>（Primary 自己的）</td>
+            </tr>
+            <tr>
+            <td><code>remote_write</code></td>
+            <td>WAL 已经到 standby 的 OS buffer（write 完成）</td>
+            <td>Primary 和 standby 缓存中有，standby 掉电可能丢</td>
+            <td><code>write_lag</code></td>
+            </tr>
+            <tr>
+            <td><code>on</code></td>
+            <td>WAL 在 standby 上已刷盘（fsync 完成）</td>
+            <td>Primary 和 standby 磁盘都有</td>
+            <td><code>flush_lag</code></td>
+            </tr>
+            <tr>
+            <td><code>remote_apply</code></td>
+            <td>WAL 在 standby 上已 redo 完毕（可见）</td>
+            <td>写进去且能在 standby 上读到</td>
+            <td><code>replay_lag</code></td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>remote_write</code>、<code>on</code>、<code>remote_apply</code>
+            都涉及同步等待——Primary 的 COMMIT 必须等 standby
+            确认。这个等待是通过 <code>SyncRepWaitForLSN()</code>
+            实现的：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/replication/syncrep.c, SyncRepWaitForLSN()</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> SyncRepWaitForLSN<span class="op">(</span>XLogRecPtr lsn<span class="op">,</span> <span class="dt">bool</span> commit<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 检查 sync_standbys_names 里有没有同步 standby</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>SyncRepRequestedBySyncReplication<span class="op">())</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 把 COMMIT 的 LSN 注册到共享内存的同步复制队列</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    SyncRepQueueInsert<span class="op">(</span>lsn<span class="op">);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 循环等待：被 WAL Sender 的信号量唤醒</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 检查同步 standby 是否已经确认了这个 LSN</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>SyncRepCheckForStandby<span class="op">(</span>lsn<span class="op">))</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 类似 LWLock 等待：先自旋，再 sleep</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>        WaitLatch<span class="op">(</span>MyLatch<span class="op">,</span> WL_LATCH_SET <span class="op">|</span> WL_TIMEOUT <span class="op">|</span> WL_POSTMASTER_DEATH<span class="op">,</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>                  SYNCHRONOUS_COMMIT_TIMEOUT<span class="op">);</span>  <span class="co">// 默认 10 秒</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>关键细节：同步复制的等待不是在 backend 的查询循环中完成的——backend 在 `COMMIT` 时通过等待信号量，等 WAL Sender 收到 standby 的 feedback 消息后把它唤醒。WAL Sender 收到 standby 发来的 feedback（包含 standby 的最新 `flush_lsn` 和 `replay_lsn`），然后检查是否满足了同步复制要求，如果满足就 `SetLatch<span class="op">()</span>` 唤醒所有等待在这个 LSN 上的 backend。</span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## synchronous_standby_names 的语义</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>`GUC synchronous_standby_names` 指定哪些 standby 是同步 standby。它的格式支持两种策略：</span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `FIRST N <span class="op">(</span>standby1<span class="op">,</span> standby2<span class="op">,</span> <span class="op">...)</span>`：前 N 个 standby 确认就算同步完成。</span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `ANY N <span class="op">(</span>standby1<span class="op">,</span> standby2<span class="op">,</span> <span class="op">...)</span>`：任意 N 个 standby 确认就算同步完成。</span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>如果所有同步 standby 都不可达，Primary 的事务 `COMMIT` 会阻塞直到有一个同步 standby 恢复或超时（`wal_sender_timeout`，默认 <span class="dv">60</span> 秒）。这意味着一件事：<span class="op">**</span>同步复制的高可用不等于高持久——如果唯一同步 standby 宕机，Primary 的写操作会被阻塞。<span class="op">**</span> 这就是为什么生产环境通常配 `synchronous_commit <span class="op">=</span> remote_write` 或 `on` 但 `synchronous_standby_names` 至少包含两个 standby 的原因。</span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 五、Failover 与 Timeline 协商</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 什么是 Timeline</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>每当 PG 集群经历一次 promote（standby 提升为 primary），它就会创建一个新的 Timeline。Timeline 是一个单调递增的整数，初始值是 <span class="dv">1</span>。Promote 之后变成 <span class="dv">2</span>，再次 promote 变成 <span class="dv">3</span>，以此类推。</span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>WAL 文件名的格式是 `XXXXXXXXXXXXYYYYYYYY`，其中 `XXXXXXXX` 是 Timeline 编号，`YYYYYYYY` 是 WAL 段号。不同 Timeline 的 WAL 段可能有相同的段号，这意味着 PG 需要区分<span class="st">&quot;在原 Timeline 上产生的 WAL&quot;</span>和<span class="st">&quot;在新 Timeline 上产生的 WAL&quot;</span>。</span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## History 文件</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>每当 pg 离开一个旧 Timeline 进入新 Timeline 时，它会写入一个 History 文件。文件名为 `XXXXXXXX<span class="op">.</span>history`（`XXXXXXXX` 是新 Timeline 编号），内容格式：</span></code></pre></div>
+            <h1 id="原始-timeline-1-到-xxx-位置的-wal-历史">原始
+            Timeline 1 到 XXX 位置的 WAL 历史</h1>
+            <p>1 <switchpoint> <reason></p>
+            <pre class="text"><code>
+最典型的内容：
+</code></pre>
+            <p>1 0/9000000 no recovery target specified</p>
+            <pre class="text"><code>
+它的含义是：Timeline 1 在 LSN `0/9000000` 处结束——在此之前的 WAL 属于 Timeline 1，在此之后的 WAL 属于 Timeline 2。History 文件的作用是在集群重新整合时（例如老 Primary 重新加入为新 Standby），新集群能识别出在老 Primary 上 Timeline 发生了分叉，从而拒绝直接复制。
+
+### Promote 的流程与 split-brain 风险
+
+当执行 `pg_ctl promote` 或调用 `pg_promote()` 函数时，启动流程如下：
+</code></pre>
+            <ol type="1">
+            <li>Postmaster 发 SIGUSR1 给 Startup 进程</li>
+            <li>Startup 收到 promote 信号：
+            <ol type="a">
+            <li>暂停 WAL 恢复</li>
+            <li>把当前的 WAL 刷到磁盘</li>
+            <li>写入一个 checkpoint record（标记 timeline 变化）</li>
+            <li>创建新 timeline 的 history 文件</li>
+            <li>XLogCtl→ThisTimeLineID++（递增 Timeline）</li>
+            </ol></li>
+            <li>Startup 进程退出，Postmaster fork 新的 backend</li>
+            <li>新 timeline 上的 WAL 从 promote 的 LSN 开始写入</li>
+            </ol>
+            <pre class="text"><code>
+**split-brain 风险**：如果在 Promote 之后，老 Primary 仍然可写（没有被 fence 或隔离），两个 Primary 会各自产生自己的 WAL 历史。它们从 promote 的 LSN 点分叉，在此之后的 WAL 是不可调和的。`pg_rewind` 只能处理&quot;新 Primary 有老 Primary 的所有数据&quot;的场景——如果 split-brain 已经发生（两边都接受了写入），没有自动工具能合并这两条分叉的 WAL 历史。
+
+这就是为什么在自动化 failover 中，**fencing 是比 promote 更重要的一步**：必须确保老 Primary 不能接受任何写入，然后才能 promote standby。常用的 fencing 手段包括：STONITH（关机）、`pg_ctl stop -m immediate`、网络分区、或通过 `patroni`/`repmgr` 等工具停止老 Primary。
+
+### pg_rewind 的机制边界
+
+`pg_rewind` 的工作机制是：比较老 Primary（被 rewind 目标）和新 Primary（source）的数据文件差异，只复制被修改的页面。在 rewind 完成后，老 Primary 变成与新 Primary 数据一致的状态，可以作为 standby 重新加入。
+
+它的边界：
+
+1. **只比较数据文件，不比较 WAL 文件**。`pg_rewind` 通过扫描 source 和 target 的 WAL 来确定差异页面，但最终只复制数据文件。
+2. **需要 `wal_log_hints = on` 或启用了 checksum**。`pg_rewind` 需要区分&quot;页面被修改了&quot;和&quot;页面本身就有差异&quot;。`wal_log_hints` 保证每次 hint bit 的写入也产生 WAL record，这样 `pg_rewind` 能完整追踪页面的修改历史。
+3. **不能处理 split-brain**。如果老 Primary 在 promote 后还接受过写入，`pg_rewind` 只能让它回到与 source 一致的状态——那些在老 Primary 上产生的獨有数据会被丢弃。
+4. **没有 `wal_log_hints` 且没有 checksum 时无法使用**。这是最常见的坑：生产环境为了性能关掉了这两个选项，等到需要 `pg_rewind` 时发现根本没有足够的元数据来完成差异比较。
+
+---
+
+## 六、Primary-Standby 冲突：max_standby_streaming_delay
+
+### 冲突的本质
+
+在 standby 上可以执行只读查询（hot standby）。问题在于：standby 的 recovery 进程需要回放 WAL，而某些 WAL record 的回放与正在执行的查询冲突。典型的冲突场景：
+
+- **Access Exclusive 锁冲突**：WAL 中记录了一个 `DROP TABLE`，回放时需要排他锁；但 standby 上有一个查询正在 scan 这个表。
+- **Buffer pin 冲突**：WAL record 需要删除一个页面上的 dead tuple，但这个页面正在被一个查询 pin 住。
+- **Snapshot 冲突**：WAL 中的 VACUUM record 需要清理 dead tuple，但 standby 上的查询的快照还能看到这些 tuple。
+
+当 Recovery 进程遇到这种冲突时，它有两种选择：
+
+1. **等查询结束**：recovery 挂起，等待冲突的查询完成。但 recovery 暂停意味着 WAL apply 停止，复制延迟增加。
+2. **取消查询**：发出 `SIGINT` 给冲突的查询，让 recovery 继续。
+
+`max_standby_streaming_delay` 正是控制这个选择的时间阈值：
+
+```c
+// src/backend/access/transam/xlog.c, ResolveRecoveryConflictWithBufferPin()
+if (GetCurrentTimestamp() &gt; ltime + max_standby_streaming_delay) {
+    // 超时了，取消冲突的查询
+    SendRecoveryConflictWithBufferPin(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+}</code></pre>
+            <h3 id="trade-off">Trade-off</h3>
+            <table>
+            <colgroup>
+            <col style="width: 68%" />
+            <col style="width: 12%" />
+            <col style="width: 18%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>max_standby_streaming_delay 设置</th>
+            <th>效果</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>-1（默认）</td>
+            <td>永远等待查询结束</td>
+            <td>standby 上只有很短的查询，或不在乎复制延迟</td>
+            </tr>
+            <tr>
+            <td>0</td>
+            <td>立即取消所有冲突查询</td>
+            <td>复制延迟比 standby 查询更重要</td>
+            </tr>
+            <tr>
+            <td>30s</td>
+            <td>等 30 秒，查询还没结束就取消</td>
+            <td>典型的在线报表 standby</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>容易踩的坑</strong>：长查询（比如一个跑到 standby
+            上的大表
+            <code>SELECT COUNT(*)</code>）可以在整个运行期间持有 buffer
+            pin，这意味着 recovery 可能在
+            <code>max_standby_streaming_delay</code>
+            后取消这个查询——而且是一次又一次地取消，每次都重新开始。这就是为什么
+            standby 上的查询被反复 cancel 时要检查的经典根因：表在
+            primary 上有高频 DDL 或 VACUUM，导致 WAL 中有冲突的
+            record，而 standby 上有长时间运行的查询。</p>
+            <h3 id="conflict_reason-解读">conflict_reason 解读</h3>
+            <p>Standby 查询被 cancel 后，PostgreSQL
+            会在日志中写入原因，例如：</p>
+            <pre class="text"><code>ERROR: canceling statement due to conflict with recovery
+DETAIL: User query might have needed to see row versions that must be removed.</code></pre>
+            <p>对应 <code>pg_stat_database_conflicts</code>
+            视图中的冲突计数器：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>冲突列</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>confl_tablespace</code></td>
+            <td>表空间操作冲突</td>
+            </tr>
+            <tr>
+            <td><code>confl_lock</code></td>
+            <td>锁冲突（如 ACCESS EXCLUSIVE）</td>
+            </tr>
+            <tr>
+            <td><code>confl_snapshot</code></td>
+            <td>快照冲突（VACUUM 清理了查询需要看到的 tuple）</td>
+            </tr>
+            <tr>
+            <td><code>confl_bufferpin</code></td>
+            <td>Buffer pin 冲突</td>
+            </tr>
+            <tr>
+            <td><code>confl_deadlock</code></td>
+            <td>死锁（recovery 与查询之间）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>在排查 standby 查询被 cancel 的问题时，先看
+            <code>pg_stat_database_conflicts</code>
+            中哪个计数器在增长，再针对性地分析 primary 上是否有对应的
+            DDL 或 VACUUM 操作。</p>
+            <hr />
+            <h2 id="七replication-slot-的内部结构">七、Replication Slot
+            的内部结构</h2>
+            <h3 id="slot-的设计目的">Slot 的设计目的</h3>
+            <p>Replication Slot 是 PG 9.4 引入的机制。在 Slot
+            出现之前，primary 靠 <code>wal_keep_segments</code>（PG 13
+            前）或 <code>wal_keep_size</code>（PG 13+）来决定保留多少
+            WAL 段。这个机制有一个根本性的缺陷：primary 不知道 standby
+            需要什么 WAL——如果 standby
+            因为网络故障或负载峰值临时落后，primary 可能已经把 standby
+            需要的 WAL 段回收掉了。此时 standby
+            只能重做基础备份，无法追上。</p>
+            <p>Slot 解决了这个问题：每个 Slot 记录一个
+            <code>restart_lsn</code>，Primary 绝不会回收这个 LSN 之后的
+            WAL 段，保证 standby 始终有足够的 WAL 来恢复。</p>
+            <h3
+            id="pg_replication_slots-的内部结构">pg_replication_slots
+            的内部结构</h3>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/replication/slot.h</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> ReplicationSlot <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    ReplicationSlotPersistentData data<span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 内存中的状态</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    pid_t           active_pid<span class="op">;</span>         <span class="co">// 当前使用此 slot 的 WAL Sender 的 PID</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>             active_pid<span class="op">;</span>         <span class="co">// 如果为 0，slot 是 inactive 状态</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>            in_use<span class="op">;</span>             <span class="co">// slot 是否被占用</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span>            just_dirtied<span class="op">;</span>       <span class="co">// 是否需要持久化</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 其他字段...</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ReplicationSlot<span class="op">;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="co">// 持久化部分（写入 pg_replslot/&lt;name&gt;/state 文件）</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> ReplicationSlotPersistentData <span class="op">{</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    NameData        name<span class="op">;</span>               <span class="co">// slot 名称</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    ReplicationSlotPersistency persistency<span class="op">;</span>  <span class="co">// 持久化策略</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr      restart_lsn<span class="op">;</span>        <span class="co">// WAL 回收保护起点</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr      confirmed_flush<span class="op">;</span>    <span class="co">// 消费端确认的最后 LSN</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    Oid             database<span class="op">;</span>           <span class="co">// 如果是逻辑 slot，关联的数据库</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>    PluginPointer   plugin<span class="op">;</span>             <span class="co">// 逻辑 slot 的输出插件</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ReplicationSlotPersistentData<span class="op">;</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>关键字段 `restart_lsn` 是 WAL 回收的保护线——primary 的 checkpoint 进程在做 WAL 回收时，会遍历所有 slot 找到最老的 `restart_lsn`，然后回收比这个还老的 WAL 段。如果某个 slot 的 `restart_lsn` 永远不推进，对应的 WAL 段也永远不会被回收。</span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## active 与 inactive</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>`pg_replication_slots` 视图中的 `active` 列表示当前是否有 WAL Sender 进程在使用这个 slot：</span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `active <span class="op">=</span> t`：有一个 WAL Sender 正在发送 WAL，standby 在正常消费。</span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `active <span class="op">=</span> f`：没有 WAL Sender 使用此 slot。可能 standby 已断开，或者在重启中。</span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>关键风险点<span class="op">**</span>：即使 slot 是 inactive（`active <span class="op">=</span> f`），它的 `restart_lsn` 仍然保护 WAL 段不被回收。Primary 的 checkpoint 进程不会因为 slot inactive 就回收它保护的 WAL——它只看 `restart_lsn` 的值，不管 `active` 状态。</span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 八、Slot 溢出的多米诺效应</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a>这是 PG 流复制中最危险但最常见的高可用故障模式。事件链可以一直追溯到<span class="st">&quot;standby 宕机&quot;</span>这个看似不影响 primary 的事件。</span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 完整事件链</span></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a>sequenceDiagram</span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a>    participant S as Standby</span>
+<span id="cb9-48"><a href="#cb9-48" aria-hidden="true" tabindex="-1"></a>    participant Slot as Replication Slot</span>
+<span id="cb9-49"><a href="#cb9-49" aria-hidden="true" tabindex="-1"></a>    participant WAL as pg_wal <span class="op">(</span>Primary<span class="op">)</span></span>
+<span id="cb9-50"><a href="#cb9-50" aria-hidden="true" tabindex="-1"></a>    participant CKPT as Checkpointer</span>
+<span id="cb9-51"><a href="#cb9-51" aria-hidden="true" tabindex="-1"></a>    participant Disk as 磁盘</span>
+<span id="cb9-52"><a href="#cb9-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-53"><a href="#cb9-53" aria-hidden="true" tabindex="-1"></a>    Note over S<span class="op">:</span> Standby 宕机或网络断开</span>
+<span id="cb9-54"><a href="#cb9-54" aria-hidden="true" tabindex="-1"></a>    S<span class="op">--</span>xSlot<span class="op">:</span> WAL Sender 断开连接</span>
+<span id="cb9-55"><a href="#cb9-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-56"><a href="#cb9-56" aria-hidden="true" tabindex="-1"></a>    Note over Slot<span class="op">:</span> Slot 变为 inactive<span class="op">&lt;</span>br<span class="op">/&gt;</span>但 restart_lsn 不推进</span>
+<span id="cb9-57"><a href="#cb9-57" aria-hidden="true" tabindex="-1"></a>    Slot<span class="op">-&gt;&gt;</span>Slot<span class="op">:</span> active <span class="op">=</span> f<span class="op">&lt;</span>br<span class="op">/&gt;</span>restart_lsn 锁定在原位置</span>
+<span id="cb9-58"><a href="#cb9-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-59"><a href="#cb9-59" aria-hidden="true" tabindex="-1"></a>    Note over WAL<span class="op">:</span> Primary 正常接受写入</span>
+<span id="cb9-60"><a href="#cb9-60" aria-hidden="true" tabindex="-1"></a>    loop Primary 每产生一个 WAL 段</span>
+<span id="cb9-61"><a href="#cb9-61" aria-hidden="true" tabindex="-1"></a>        WAL<span class="op">-&gt;&gt;</span>WAL<span class="op">:</span> 新 WAL 段持续产生</span>
+<span id="cb9-62"><a href="#cb9-62" aria-hidden="true" tabindex="-1"></a>    end</span>
+<span id="cb9-63"><a href="#cb9-63" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-64"><a href="#cb9-64" aria-hidden="true" tabindex="-1"></a>    Note over CKPT<span class="op">:</span> Checkpoint 尝试回收旧 WAL</span>
+<span id="cb9-65"><a href="#cb9-65" aria-hidden="true" tabindex="-1"></a>    CKPT<span class="op">-&gt;&gt;</span>Slot<span class="op">:</span> 检查所有 slot 的 restart_lsn</span>
+<span id="cb9-66"><a href="#cb9-66" aria-hidden="true" tabindex="-1"></a>    Slot<span class="op">--&gt;&gt;</span>CKPT<span class="op">:</span> restart_lsn 还是 N 小时前的值</span>
+<span id="cb9-67"><a href="#cb9-67" aria-hidden="true" tabindex="-1"></a>    CKPT<span class="op">-&gt;&gt;</span>WAL<span class="op">:</span> 不能回收 restart_lsn 之后的任何 WAL</span>
+<span id="cb9-68"><a href="#cb9-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-69"><a href="#cb9-69" aria-hidden="true" tabindex="-1"></a>    Note over WAL<span class="op">:</span> WAL 段只增不减</span>
+<span id="cb9-70"><a href="#cb9-70" aria-hidden="true" tabindex="-1"></a>    loop 每产生 <span class="dv">16</span><span class="er">MB</span> WAL 段</span>
+<span id="cb9-71"><a href="#cb9-71" aria-hidden="true" tabindex="-1"></a>        WAL<span class="op">-&gt;&gt;</span>WAL<span class="op">:</span> pg_wal 目录持续膨胀</span>
+<span id="cb9-72"><a href="#cb9-72" aria-hidden="true" tabindex="-1"></a>    end</span>
+<span id="cb9-73"><a href="#cb9-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-74"><a href="#cb9-74" aria-hidden="true" tabindex="-1"></a>    Note over Disk<span class="op">:</span> 磁盘空间逼近耗尽</span>
+<span id="cb9-75"><a href="#cb9-75" aria-hidden="true" tabindex="-1"></a>    Disk<span class="op">-&gt;&gt;</span>Disk<span class="op">:</span> 使用率达到 <span class="dv">95</span><span class="op">%</span> → <span class="dv">98</span><span class="op">%</span> → <span class="dv">99</span><span class="op">%</span></span>
+<span id="cb9-76"><a href="#cb9-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-77"><a href="#cb9-77" aria-hidden="true" tabindex="-1"></a>    Note over Disk<span class="op">:</span> 磁盘满 → Primary PANIC</span>
+<span id="cb9-78"><a href="#cb9-78" aria-hidden="true" tabindex="-1"></a>    Disk<span class="op">--</span>xWAL<span class="op">:</span> 无法创建新 WAL 段</span>
+<span id="cb9-79"><a href="#cb9-79" aria-hidden="true" tabindex="-1"></a>    WAL<span class="op">--</span>xDisk<span class="op">:</span> PANIC<span class="op">:</span> could not write to file <span class="st">&quot;pg_wal/...&quot;</span></span>
+<span id="cb9-80"><a href="#cb9-80" aria-hidden="true" tabindex="-1"></a>    Note over Disk<span class="op">:</span> Primary crash → 所有连接断开</span></code></pre></div>
+            <p>每个环节的详细解释：</p>
+            <p><strong>第一环——standby 宕机</strong>：Standby
+            因硬件故障、网络分区、云实例回收等原因停止消费 WAL。Primary
+            上的 WAL Sender 检测到 TCP 断开（或
+            <code>wal_sender_timeout</code> 超时），释放连接，Slot 变为
+            <code>inactive</code>。</p>
+            <p><strong>第二环——restart_lsn 冻结</strong>：虽然 Slot
+            已经是 inactive，但它的 <code>restart_lsn</code>
+            没有推进。Standby 没有在消费 WAL，自然也不会发 feedback 更新
+            <code>restart_lsn</code>。</p>
+            <p><strong>第三环——WAL 回收被阻止</strong>：Primary 的
+            Checkpointer 在每次做 Checkpoint 时调用
+            <code>KeepLogSeg()</code>，检查所有 Replication Slot 的
+            <code>restart_lsn</code>，然后只回收
+            <code>restart_lsn</code> 之前的 WAL 段。如果某个 Slot 的
+            <code>restart_lsn</code> 停留在 3 小时前，这 3
+            小时内产生的所有 WAL 段都不能被回收。</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/xlog.c, KeepLogSeg()</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> KeepLogSeg<span class="op">(</span>XLogRecPtr <span class="op">*</span>recptr<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 遍历所有 replication slot</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> max_replication_slots<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>slot<span class="op">-&gt;</span>data<span class="op">.</span>invalidated <span class="op">==</span> RS_INVAL_NONE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 保护：不能回收比 restart_lsn 更新 WAL</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>slot<span class="op">-&gt;</span>data<span class="op">.</span>restart_lsn <span class="op">&lt;</span> <span class="op">*</span>recptr<span class="op">)</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>                <span class="op">*</span>recptr <span class="op">=</span> slot<span class="op">-&gt;</span>data<span class="op">.</span>restart_lsn<span class="op">;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 同样处理 wal_keep_size</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>wal_keep_size_mb <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>recptr <span class="op">=</span> Min<span class="op">(*</span>recptr<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>第四环——磁盘不断膨胀<span class="op">**</span>：PG 不会再回收受保护 WAL 段。随着 Primary 正常的写入负载，每个新的 <span class="dv">16</span><span class="er">MB</span> WAL 段都被追加到 `pg_wal` 目录。磁盘使用率持续攀升——可能只需要几十分钟到一个小时，取决于写入负载。在高负载 OLTP 环境中（每秒 <span class="dv">100</span><span class="er">MB</span> WAL），半小时就能产生 <span class="dv">10</span><span class="er">GB</span><span class="op">+</span> 无法回收的 WAL。</span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>第五环——磁盘满，Primary PANIC<span class="op">**</span>：当磁盘空间耗尽时，PG 无法创建新的 WAL 段。此时 PG 的 `XLogWrite<span class="op">()</span>` 函数会调用 `PANIC`：</span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/xlog.c, XLogWrite()</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>errno <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>    ereport<span class="op">(</span>PANIC<span class="op">,</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span>errcode_for_file_access<span class="op">(),</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>         errmsg<span class="op">(</span><span class="st">&quot;could not write to log file </span><span class="sc">%s</span><span class="st"> at offset </span><span class="sc">%u</span><span class="st">: %m&quot;</span><span class="op">,</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>                path<span class="op">,</span> offset<span class="op">)));</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>PANIC</code> 级别的错误导致 PG 立即终止所有 backend
+            进程，数据库进入恢复模式。在恢复启动时，PG 仍然需要读写
+            WAL——但磁盘已满——恢复也会失败。整个集群陷入不可用状态，唯一的恢复路径是手动清理磁盘空间（删除受保护的
+            WAL 段或删除 Slot）。</p>
+            <h3 id="wal_keep_size-与-slot-的叠加陷阱">wal_keep_size 与
+            Slot 的叠加陷阱</h3>
+            <p><code>wal_keep_size</code> 和 Replication Slot 的 WAL
+            保留策略是<strong>取更保守者（即更旧的重启点）的叠加</strong>关系，而不是取最大值。如果
+            <code>wal_keep_size = 10GB</code> 要保留 10GB WAL，而 Slot
+            的 <code>restart_lsn</code> 对应 50GB WAL，最终保留的是
+            50GB——不是 50+10=60GB，而是 Slot 要求保留的 50GB 包含了
+            <code>wal_keep_size</code> 要求的 10GB
+            覆盖范围，所以取更保守的 50GB。</p>
+            <p>但这里的真正风险不是数值叠加，而是<strong>错误理解</strong>：很多
+            DBA 认为设置了 <code>wal_keep_size</code> 就能控制 WAL
+            膨胀的上限，实际上 Slot 的保留要求绕过了
+            <code>wal_keep_size</code> 的限制。</p>
+            <h3 id="恢复路径">恢复路径</h3>
+            <p>发现 Slot 溢出后的处理步骤：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 确认是哪个 Slot 卡住了</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> slot_name,</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>       active,</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) <span class="kw">AS</span> <span class="fu">lag</span>,</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>       restart_lsn,</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>       (<span class="kw">SELECT</span> state <span class="kw">FROM</span> pg_stat_replication</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">WHERE</span> slot_name <span class="op">=</span> ps.slot_name) <span class="kw">AS</span> repl_state</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_replication_slots</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> active <span class="op">=</span> <span class="kw">false</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> restart_lsn;</span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>如果确认 <span class="kw">standby</span> 可以恢复（比如只是临时网络中断），让 <span class="kw">standby</span> 重新连接即可。如果 <span class="kw">standby</span> 已经永久不可恢复（比如云实例已被销毁）：</span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 删除没有 standby 的 slot（危险操作——standby 将无法追赶）</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_drop_replication_slot(<span class="st">&#39;stale_slot_name&#39;</span>);</span></code></pre></div>
+            <p>删除 Slot 后，PG 的 checkpoint 进程可以立即开始回收该
+            Slot 之前保护的 WAL 段。磁盘空间会随着下一个 checkpoint
+            回收而释放。</p>
+            <hr />
+            <h2
+            id="九排查pg_stat_replication-的三层延迟指标">九、排查：pg_stat_replication
+            的三层延迟指标</h2>
+            <h3 id="完整监控-sql">完整监控 SQL</h3>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- Primary 端：查看复制状态</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    application_name,</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    client_addr,</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    state,</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    sync_state,</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 三层延迟（微秒 → 格式化为可读）</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">CASE</span> <span class="cf">WHEN</span> write_lag <span class="kw">IS</span> <span class="kw">NULL</span> <span class="cf">THEN</span> <span class="st">&#39;N/A&#39;</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>         <span class="cf">ELSE</span> (<span class="fu">EXTRACT</span>(epoch <span class="kw">FROM</span> write_lag) <span class="op">*</span> <span class="dv">1000</span>):<span class="ch">:text</span> <span class="op">||</span> <span class="st">&#39; ms&#39;</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">END</span> <span class="kw">AS</span> write_lag_ms,</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">CASE</span> <span class="cf">WHEN</span> flush_lag <span class="kw">IS</span> <span class="kw">NULL</span> <span class="cf">THEN</span> <span class="st">&#39;N/A&#39;</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>         <span class="cf">ELSE</span> (<span class="fu">EXTRACT</span>(epoch <span class="kw">FROM</span> flush_lag) <span class="op">*</span> <span class="dv">1000</span>):<span class="ch">:text</span> <span class="op">||</span> <span class="st">&#39; ms&#39;</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">END</span> <span class="kw">AS</span> flush_lag_ms,</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">CASE</span> <span class="cf">WHEN</span> replay_lag <span class="kw">IS</span> <span class="kw">NULL</span> <span class="cf">THEN</span> <span class="st">&#39;N/A&#39;</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>         <span class="cf">ELSE</span> (<span class="fu">EXTRACT</span>(epoch <span class="kw">FROM</span> replay_lag) <span class="op">*</span> <span class="dv">1000</span>):<span class="ch">:text</span> <span class="op">||</span> <span class="st">&#39; ms&#39;</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">END</span> <span class="kw">AS</span> replay_lag_ms,</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- LSN 差距（字节）</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty(</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>        pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>    ) <span class="kw">AS</span> send_pending,</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty(</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>        pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn)</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>    ) <span class="kw">AS</span> write_pending,</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty(</span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>        pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn)</span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>    ) <span class="kw">AS</span> flush_pending,</span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty(</span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>        pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)</span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>    ) <span class="kw">AS</span> replay_pending</span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_replication;</span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 Slot 状态（包括 inactive slot）</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a>    slot_name,</span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>    slot_type,</span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a>    active,</span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty(</span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)</span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a>    ) <span class="kw">AS</span> retained_wal_size,</span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a>    restart_lsn,</span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a>    confirmed_flush_lsn,</span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a>    pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) <span class="op">&gt;</span> <span class="dv">10</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span></span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a>        <span class="kw">AS</span> danger_10gb</span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_replication_slots</span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> restart_lsn;</span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-47"><a href="#cb12-47" aria-hidden="true" tabindex="-1"></a><span class="co">-- Standby 端：查看 recovery 进度</span></span>
+<span id="cb12-48"><a href="#cb12-48" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb12-49"><a href="#cb12-49" aria-hidden="true" tabindex="-1"></a>    pg_is_in_recovery() <span class="kw">AS</span> is_standby,</span>
+<span id="cb12-50"><a href="#cb12-50" aria-hidden="true" tabindex="-1"></a>    pg_last_wal_receive_lsn() <span class="kw">AS</span> last_recv_lsn,</span>
+<span id="cb12-51"><a href="#cb12-51" aria-hidden="true" tabindex="-1"></a>    pg_last_wal_replay_lsn() <span class="kw">AS</span> last_replay_lsn,</span>
+<span id="cb12-52"><a href="#cb12-52" aria-hidden="true" tabindex="-1"></a>    pg_last_xact_replay_timestamp() <span class="kw">AS</span> last_xact_replay,</span>
+<span id="cb12-53"><a href="#cb12-53" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty(</span>
+<span id="cb12-54"><a href="#cb12-54" aria-hidden="true" tabindex="-1"></a>        pg_wal_lsn_diff(pg_last_wal_receive_lsn(),</span>
+<span id="cb12-55"><a href="#cb12-55" aria-hidden="true" tabindex="-1"></a>                        pg_last_wal_replay_lsn())</span>
+<span id="cb12-56"><a href="#cb12-56" aria-hidden="true" tabindex="-1"></a>    ) <span class="kw">AS</span> replay_pending,</span>
+<span id="cb12-57"><a href="#cb12-57" aria-hidden="true" tabindex="-1"></a>    <span class="co">-- 从接收 LSN 到 replay LSN 的时间差</span></span>
+<span id="cb12-58"><a href="#cb12-58" aria-hidden="true" tabindex="-1"></a>    <span class="fu">EXTRACT</span>(epoch <span class="kw">FROM</span> (now() <span class="op">-</span> pg_last_xact_replay_timestamp())):<span class="ch">:text</span> <span class="op">||</span> <span class="st">&#39; s&#39;</span></span>
+<span id="cb12-59"><a href="#cb12-59" aria-hidden="true" tabindex="-1"></a>        <span class="kw">AS</span> seconds_since_last_replay</span>
+<span id="cb12-60"><a href="#cb12-60" aria-hidden="true" tabindex="-1"></a>;</span>
+<span id="cb12-61"><a href="#cb12-61" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb12-62"><a href="#cb12-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-63"><a href="#cb12-63" aria-hidden="true" tabindex="-1"></a>### 三层延迟的溯源排查</span>
+<span id="cb12-64"><a href="#cb12-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-65"><a href="#cb12-65" aria-hidden="true" tabindex="-1"></a>| 现象 | 根因方向 | 排查手段 |</span>
+<span id="cb12-66"><a href="#cb12-66" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|---------|---------|</span></span>
+<span id="cb12-67"><a href="#cb12-67" aria-hidden="true" tabindex="-1"></a>| `write_lag` 大 | 网络带宽不足或 <span class="kw">standby</span> 磁盘顺序写慢 | `iperf` 测网络吞吐；`iostat` 看 <span class="kw">standby</span> 磁盘 `w_await` |</span>
+<span id="cb12-68"><a href="#cb12-68" aria-hidden="true" tabindex="-1"></a>| `flush_lag` 大（`write_lag` 小） | <span class="kw">standby</span> 的 fsync 慢 | 检查 <span class="kw">standby</span> 磁盘的 sync 延迟；`wal_sync_method` 是否为 `open_datasync` vs `fdatasync` |</span>
+<span id="cb12-69"><a href="#cb12-69" aria-hidden="true" tabindex="-1"></a>| `replay_lag` 大（`flush_lag` 小） | <span class="kw">standby</span> redo 慢 | `pg_stat_activity` 看 <span class="kw">standby</span> 是否有冲突查询被不断 cancel；`iostat` 看 <span class="kw">standby</span> 磁盘随机读延迟；`max_standby_streaming_delay` 是否设为 <span class="dv">0</span> 导致长查询反复被 <span class="kw">cancel</span> 又重试 |</span>
+<span id="cb12-70"><a href="#cb12-70" aria-hidden="true" tabindex="-1"></a>| 三层 <span class="fu">lag</span> 都是 <span class="dv">0</span> 但 `state` 列长时间不变 | <span class="kw">standby</span> 可能已失联 | 检查 `sent_lsn` 与 `write_lsn` 是否长时间不变——如果 WAL 在持续产生但这两个值不动，说明 <span class="kw">standby</span> 已断开 |</span>
+<span id="cb12-71"><a href="#cb12-71" aria-hidden="true" tabindex="-1"></a>| `flush_lsn` 与 `pg_current_wal_lsn()` 的差距持续扩大 | 复制完全跟不上 | 检查 <span class="kw">standby</span> 上的 `pg_last_wal_receive_lsn()` 是否在推进；如果不推进，standby 的 WAL Receiver 可能已经 crash 或被 OOM <span class="kw">kill</span> |</span>
+<span id="cb12-72"><a href="#cb12-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-73"><a href="#cb12-73" aria-hidden="true" tabindex="-1"></a>### Slot 警告阈值 SQL</span>
+<span id="cb12-74"><a href="#cb12-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-75"><a href="#cb12-75" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb12-76"><a href="#cb12-76" aria-hidden="true" tabindex="-1"></a><span class="co">-- 监控用：WAL 保留超过阈值的 slot 告警</span></span>
+<span id="cb12-77"><a href="#cb12-77" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> slot_wal <span class="kw">AS</span> (</span>
+<span id="cb12-78"><a href="#cb12-78" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span></span>
+<span id="cb12-79"><a href="#cb12-79" aria-hidden="true" tabindex="-1"></a>        slot_name,</span>
+<span id="cb12-80"><a href="#cb12-80" aria-hidden="true" tabindex="-1"></a>        active,</span>
+<span id="cb12-81"><a href="#cb12-81" aria-hidden="true" tabindex="-1"></a>        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) <span class="kw">AS</span> retained_bytes</span>
+<span id="cb12-82"><a href="#cb12-82" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> pg_replication_slots</span>
+<span id="cb12-83"><a href="#cb12-83" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> slot_type <span class="op">=</span> <span class="st">&#39;physical&#39;</span></span>
+<span id="cb12-84"><a href="#cb12-84" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb12-85"><a href="#cb12-85" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb12-86"><a href="#cb12-86" aria-hidden="true" tabindex="-1"></a>    slot_name,</span>
+<span id="cb12-87"><a href="#cb12-87" aria-hidden="true" tabindex="-1"></a>    active,</span>
+<span id="cb12-88"><a href="#cb12-88" aria-hidden="true" tabindex="-1"></a>    pg_size_pretty(retained_bytes) <span class="kw">AS</span> retained_size,</span>
+<span id="cb12-89"><a href="#cb12-89" aria-hidden="true" tabindex="-1"></a>    <span class="cf">CASE</span></span>
+<span id="cb12-90"><a href="#cb12-90" aria-hidden="true" tabindex="-1"></a>        <span class="cf">WHEN</span> retained_bytes <span class="op">&gt;</span> <span class="dv">50</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="cf">THEN</span> <span class="st">&#39;CRITICAL&#39;</span></span>
+<span id="cb12-91"><a href="#cb12-91" aria-hidden="true" tabindex="-1"></a>        <span class="cf">WHEN</span> retained_bytes <span class="op">&gt;</span> <span class="dv">20</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="cf">THEN</span> <span class="st">&#39;WARNING&#39;</span></span>
+<span id="cb12-92"><a href="#cb12-92" aria-hidden="true" tabindex="-1"></a>        <span class="cf">WHEN</span> retained_bytes <span class="op">&gt;</span> <span class="dv">5</span>  <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="cf">THEN</span> <span class="st">&#39;NOTICE&#39;</span></span>
+<span id="cb12-93"><a href="#cb12-93" aria-hidden="true" tabindex="-1"></a>        <span class="cf">ELSE</span> <span class="st">&#39;OK&#39;</span></span>
+<span id="cb12-94"><a href="#cb12-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">END</span> <span class="kw">AS</span> alert_level</span>
+<span id="cb12-95"><a href="#cb12-95" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> slot_wal</span>
+<span id="cb12-96"><a href="#cb12-96" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> retained_bytes <span class="kw">DESC</span>;</span></code></pre></div>
+            <hr />
+            <h2 id="十关键要点">十、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>WAL Sender
+            的生产-消费模型</strong>：<code>WalSndLoop()</code> 中
+            <code>XLogSendPhysical()</code>
+            是生产者，<code>pq_flush_if_writable()</code>
+            是消费者。Standby 消费慢时，WAL Sender 会阻塞在 socket
+            发送上，而不是在读取端堆积内存。</p></li>
+            <li><p><strong>同步复制的 COMMIT
+            等待是信号量驱动的</strong>：Backend 在同步复制中等待的不是
+            WAL Sender，而是 WAL Sender 收到 standby 的 feedback
+            消息后通过 <code>SetLatch()</code>
+            唤醒的。<code>synchronous_commit=on</code> 只是确认 standby
+            flush——不是确认 standby apply，更不是确认 standby
+            查询可见。</p></li>
+            <li><p><strong>Timeline 的 fork
+            是物理不可逆的</strong>：Promote 之后 WAL 历史在 promote 的
+            LSN 处分叉，两个分支的数据差异只能通过
+            <code>pg_rewind</code>
+            覆盖一方的数据文件来解决——不是合并，是丢弃一方的数据。Split-brain
+            发生后，至少有一边的数据会永久丢失。</p></li>
+            <li><p><strong>Replication Slot 的 <code>restart_lsn</code>
+            是 WAL 回收的硬约束</strong>：不管 Slot 是 active 还是
+            inactive，只要它的 <code>restart_lsn</code> 没推进，受保护的
+            WAL 段就不回收。Checkpoint
+            进程在每次检查时无条件遵守这个约束。</p></li>
+            <li><p><strong><code>max_standby_streaming_delay</code>
+            不是缓冲，是定时炸弹</strong>：长查询在 standby
+            上运行时，recovery
+            会在超时后取消它——如果查询被取消后重新执行（比如应用层重试），会反复进入冲突-取消循环。</p></li>
+            <li><p><strong>三层延迟的零值陷阱</strong>：<code>write_lag</code>/<code>flush_lag</code>/<code>replay_lag</code>
+            为 0 可能代表 standby 失联而非无延迟——必须配合
+            <code>state</code> 列和 LSN 差值来判断。</p></li>
+            </ol>
+            <p>上一章：<a href="../17-brin/17-brin.html">BRIN
+            与其他索引</a> 下一章：<a
+            href="../19-logical-repl/19-logical-repl.html">逻辑复制与逻辑解码</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/replication/walsender.c</code>：<code>WalSndMain()</code>,
+            <code>WalSndLoop()</code>, <code>XLogSendPhysical()</code>,
+            <code>ProcessRepliesIfAny()</code></li>
+            <li><code>src/backend/replication/walreceiver.c</code>：<code>WalReceiverMain()</code>,
+            <code>WalRcvLoop()</code>, <code>XLogWalRcvWrite()</code>,
+            <code>XLogWalRcvSendReply()</code></li>
+            <li><code>src/backend/replication/syncrep.c</code>：<code>SyncRepWaitForLSN()</code>,
+            <code>SyncRepQueueInsert()</code>,
+            <code>SyncRepCheckForStandby()</code></li>
+            <li><code>src/backend/access/transam/xlog.c</code>：<code>KeepLogSeg()</code>,
+            <code>XLogWrite()</code>,
+            <code>ResolveRecoveryConflictWithBufferPin()</code></li>
+            <li><code>src/backend/replication/slot.c</code>：<code>ReplicationSlotCreate()</code>,
+            <code>ReplicationSlotRelease()</code>,
+            <code>ReplicationSlotPersist()</code></li>
+            <li><code>src/include/replication/slot.h</code>：<code>ReplicationSlot</code>,
+            <code>ReplicationSlotPersistentData</code></li>
+            <li><code>src/backend/access/transam/xlogrecovery.c</code>：recovery
+            主循环，<code>StartupXLOG()</code></li>
+            <li><code>src/backend/replication/libpqwalreceiver/libpqwalreceiver.c</code>：libpq
+            实现的 WAL 连接与接收</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 27: High Availability,
+            Load Balancing, and Replication</li>
+            <li>PostgreSQL Documentation, Chapter 49: Replication
+            Progress Tracking（<code>pg_stat_replication</code>
+            各列定义）</li>
+            <li>PostgreSQL Documentation, Section 20.5: Write Ahead
+            Log（WAL 内部运作）</li>
+            <li>PostgreSQL Documentation, Section 29.3: Asynchronous
+            Behavior（<code>synchronous_commit</code> 各取值语义）</li>
+            <li>PostgreSQL Documentation, Section 30.4: Hot
+            Standby（<code>max_standby_streaming_delay</code>
+            与冲突处理）</li>
+            </ul>
+            <h3 id="pg-开发者讨论">PG 开发者讨论</h3>
+            <ul>
+            <li>Andres Freund, “Replication slot improvements in PG 12”,
+            PGConf.EU 2019 — slot 的持久化与 crash-safe 改进</li>
+            <li>Heikki Linnakangas, “History of Hot Standby and
+            Streaming Replication”, pgsql-hackers archives — hot standby
+            引入时的设计决策</li>
+            <li>Robert Haas, “Synchronous Replication: Quorum Commit and
+            Multiple Standbys”, pgsql-hackers 2015 —
+            <code>ANY</code>/<code>FIRST</code> 语法的设计讨论</li>
+            </ul>
+            <h3 id="工具">工具</h3>
+            <ul>
+            <li><code>patroni</code> (<a
+            href="https://github.com/zalando/patroni"
+            class="uri">https://github.com/zalando/patroni</a>) — PG
+            高可用管理，含自动 failover 和 fencing</li>
+            <li><code>pg_rewind</code> — PG 自带工具，用于将老 Primary
+            回退到与新 Primary 一致的状态</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/19-logical-repl/19-logical-repl.html">【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大</a></h3>
+                    <p>拆解 PostgreSQL 逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL 解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与 snapshot 重建机制、pgoutput 输出插件的二进制协议与行过滤变换、Publication/Subscription 模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing 为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable 后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在 reorder buffer 中的延迟放大效应。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/21-monitoring/21-monitoring.html">【PG 内核】监控体系与告警设计：从内核机制出发定义该监控什么</a></h3>
+                    <p>不从 Grafana 模板照抄，而是从 PG 内核机制推导出必须监控的六个维度：连接与 wait_event、存储膨胀与 XID wraparound、WAL 与复制延迟、查询性能突变、锁等待链、以及 shared_buffers 命中率骗局。每个维度配具体 SQL 和指标解读，告警阈值给出内核依据而非拍脑袋数字，同时盘点 pg_stat_statements queryid 冲突、track_io_timing 开销、pg_stat_activity 自身代价等监控工具本身的陷阱。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/22-classic-failures/22-classic-failures.html">【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因</a></h3>
+                    <p>拆解 PG 生产环境中最危险的五种故障模式——连接风暴与 work_mem 连锁效应、事务 ID wraparound 危机完整时间线、replication slot 溢出多米诺效应、OOM 连锁 kill、长事务 idle in transaction 隐性破坏。每个故障给出可复现的触发方法、Mermaid 时序图标注事件节点和排查断点、排查 SQL 脚本和修复边界，以及监控埋点策略让下次提前发现而非事后救火。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/24-recovery-corruption/24-recovery-corruption.html">【PG 内核】数据恢复与损坏应对：PITR、pg_resetwal 和页面损坏的边界</a></h3>
+                    <p>拆解 PostgreSQL 数据恢复路径的内部机制与操作边界：PITR 的三个关键窗口与 timeline fork 原理、pg_checksums 的校验粒度与盲区、pg_resetwal 的 hint bit 代价与 VACUUM FULL 陷进、pg_dump 并行调度的内部策略。重点在于每种操作做什么、不做什么、哪些后果不可逆。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

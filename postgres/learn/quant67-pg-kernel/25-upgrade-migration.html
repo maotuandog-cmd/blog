@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】大版本升级与迁移实战：pg_upgrade --link 为什么快以及为什么没有回滚 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 pg_upgrade 的三种模式（–link
+硬链接零拷贝、–clone CoW 快照、–copy
+物理复制）的执行流程、内部机制和不可回滚的根本原因；逻辑复制跨版本迁移的低停机方案及序列/large
+object/DDL
+三大盲区；四种常见坑的根因与应对；附带迁移方案决策树，从小库到大库选哪种方案一次说清。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, pg-upgrade, migration, hard-link, logical-replication, pg-dump, vacuumdb, disaster-recovery, inode, copy-on-write, database, kernel, ops" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/25-upgrade-migration/25-upgrade-migration.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】大版本升级与迁移实战：pg_upgrade --link 为什么快以及为什么没有回滚" />
+    <meta property="og:description" content="拆解 pg_upgrade 的三种模式（--link 硬链接零拷贝、--clone CoW 快照、--copy 物理复制）的执行流程、内部机制和不可回滚的根本原因；逻辑复制跨版本迁移的低停机方案及序列/large object/DDL 三大盲区；四种常见坑的根因与应对；附带迁移方案决策树，从小库到大库选哪种方案一次说清。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/25-upgrade-migration/25-upgrade-migration.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="pg-upgrade" />
+    <meta property="article:tag" content="migration" />
+    <meta property="article:tag" content="hard-link" />
+    <meta property="article:tag" content="logical-replication" />
+    <meta property="article:tag" content="pg-dump" />
+    <meta property="article:tag" content="vacuumdb" />
+    <meta property="article:tag" content="disaster-recovery" />
+    <meta property="article:tag" content="inode" />
+    <meta property="article:tag" content="copy-on-write" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】大版本升级与迁移实战：pg_upgrade --link 为什么快以及为什么没有回滚" />
+    <meta name="twitter:description" content="拆解 pg_upgrade 的三种模式（--link 硬链接零拷贝、--clone CoW 快照、--copy 物理复制）的执行流程、内部机制和不可回滚的根本原因；逻辑复制跨版本迁移的低停机方案及序列/large object/DDL 三大盲区；四种常见坑的根因与应对；附带迁移方案决策树，从小库到大库选哪种方案一次说清。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】大版本升级与迁移实战：pg_upgrade --link 为什么快以及为什么没有回滚", "description": "拆解 pg_upgrade 的三种模式（--link 硬链接零拷贝、--clone CoW 快照、--copy 物理复制）的执行流程、内部机制和不可回滚的根本原因；逻辑复制跨版本迁移的低停机方案及序列/large object/DDL 三大盲区；四种常见坑的根因与应对；附带迁移方案决策树，从小库到大库选哪种方案一次说清。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/25-upgrade-migration/25-upgrade-migration.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "pg-upgrade", "migration", "hard-link", "logical-replication", "pg-dump", "vacuumdb", "disaster-recovery", "inode", "copy-on-write"], "about": ["database", "kernel", "ops"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】大版本升级与迁移实战：pg_upgrade --link 为什么快以及为什么没有回滚</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span> · <span>ops</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#pg-upgrade</span> <span>#migration</span> <span>#hard-link</span> <span>#logical-replication</span> <span>#pg-dump</span> <span>#vacuumdb</span> <span>#disaster-recovery</span> <span>#inode</span> <span>#copy-on-write</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a><a class="chip-link" href="/categories/ops.html">ops</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/pg-upgrade.html">#pg-upgrade</a><a class="chip-link" href="/tags/migration.html">#migration</a><a class="chip-link" href="/tags/hard-link.html">#hard-link</a><a class="chip-link" href="/tags/logical-replication.html">#logical-replication</a><a class="chip-link" href="/tags/pg-dump.html">#pg-dump</a><a class="chip-link" href="/tags/vacuumdb.html">#vacuumdb</a><a class="chip-link" href="/tags/disaster-recovery.html">#disaster-recovery</a><a class="chip-link" href="/tags/inode.html">#inode</a><a class="chip-link" href="/tags/copy-on-write.html">#copy-on-write</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#大版本升级与迁移实战pg_upgrade-link-为什么快以及为什么没有回滚"
+                id="toc-大版本升级与迁移实战pg_upgrade-link-为什么快以及为什么没有回滚">大版本升级与迁移实战：pg_upgrade
+                –link 为什么快以及为什么没有回滚</a>
+                <ul>
+                <li><a href="#一pg_upgrade-的内部机制为什么-link-这么快"
+                id="toc-一pg_upgrade-的内部机制为什么-link-这么快">一、pg_upgrade
+                的内部机制：为什么 –link 这么快</a>
+                <ul>
+                <li><a href="#原教旨升级-vs-pg_upgrade"
+                id="toc-原教旨升级-vs-pg_upgrade">原教旨升级 vs
+                pg_upgrade</a></li>
+                <li><a href="#link-模式0-数据拷贝的秘密"
+                id="toc-link-模式0-数据拷贝的秘密">–link 模式：0
+                数据拷贝的秘密</a></li>
+                <li><a href="#前置条件"
+                id="toc-前置条件">前置条件</a></li>
+                </ul></li>
+                <li><a href="#二逻辑复制跨版本迁移"
+                id="toc-二逻辑复制跨版本迁移">二、逻辑复制跨版本迁移</a>
+                <ul>
+                <li><a href="#低停机迁移流程"
+                id="toc-低停机迁移流程">低停机迁移流程</a></li>
+                </ul></li>
+                <li><a href="#四迁移方案决策树"
+                id="toc-四迁移方案决策树">四、迁移方案决策树</a>
+                <ul>
+                <li><a href="#执行-pg_upgrade-check"
+                id="toc-执行-pg_upgrade-check">执行 pg_upgrade
+                –check</a></li>
+                <li><a href="#验证硬链接"
+                id="toc-验证硬链接">验证硬链接</a></li>
+                <li><a href="#确认后可删除老集群"
+                id="toc-确认后可删除老集群">确认后可删除老集群</a></li>
+                </ul></li>
+                <li><a href="#六关键要点"
+                id="toc-六关键要点">六、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#实验工具"
+                id="toc-实验工具">实验工具</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="大版本升级与迁移实战pg_upgrade-link-为什么快以及为什么没有回滚">大版本升级与迁移实战：pg_upgrade
+            –link 为什么快以及为什么没有回滚</h1>
+            <p>PG 大版本升级是一个让 DBA 失眠的话题。大版本升级（major
+            version upgrade）指的是从 PG 15 到 PG 16、PG 16 到 PG 17
+            这种跨越——数据文件格式、系统表结构、WAL
+            格式都可能变化，不能像小版本升级（16.2 到
+            16.4）那样直接替换二进制然后重启。本章拆解三种迁移方案的核心机制、致命边界和决策依据。</p>
+            <p>如果你只有 5 秒钟：小库（&lt;10GB）用
+            pg_dump/pg_restore，中型库用 pg_upgrade
+            <code>--link</code>，大库（&gt;500GB）且不能长时间停机用逻辑复制迁移。但”为什么不能混着用”和”每种方案出事之后还能怎么办”需要花
+            5000 字说清楚。</p>
+            <hr />
+            <h2
+            id="一pg_upgrade-的内部机制为什么-link-这么快">一、pg_upgrade
+            的内部机制：为什么 –link 这么快</h2>
+            <h3 id="原教旨升级-vs-pg_upgrade">原教旨升级 vs
+            pg_upgrade</h3>
+            <p>最早的 PG 大版本升级方法只有一种：pg_dump
+            导出老版本的逻辑数据，再 pg_restore
+            导入新版本。这个方案有几个硬伤：</p>
+            <ol type="1">
+            <li><strong>慢</strong>：全量数据走 SQL
+            层再写回磁盘，大库动辄数小时。</li>
+            <li><strong>膨胀</strong>：pg_restore
+            本质上是重建表和索引——数据文件和索引文件在新集群里物理布局完全不同，相当于做了一次全量
+            VACUUM FULL。</li>
+            <li><strong>统计信息清空</strong>：pg_dump
+            导出的是数据，不包括 <code>pg_statistic</code>
+            的内容。新集群里的优化器统计一片空白，必须全量
+            ANALYZE。</li>
+            </ol>
+            <p>pg_upgrade
+            的设计目标是<strong>就地升级</strong>——不搬数据，只在元数据层面完成版本迁移。它操作的对象是文件系统上的数据文件目录（<code>PGDATA</code>），而不是走
+            SQL
+            连接。这意味着它不需要把数据读出来、不需要重建索引、不需要生成
+            WAL。</p>
+            <h3 id="link-模式0-数据拷贝的秘密">–link 模式：0
+            数据拷贝的秘密</h3>
+            <p>pg_upgrade 有三种文件处理模式：</p>
+            <table>
+            <colgroup>
+            <col style="width: 7%" />
+            <col style="width: 21%" />
+            <col style="width: 16%" />
+            <col style="width: 26%" />
+            <col style="width: 26%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>模式</th>
+            <th>对数据文件的操作</th>
+            <th>额外磁盘空间</th>
+            <th>升级时长（数据部分）</th>
+            <th>升级后旧集群是否可用</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>--link</code></td>
+            <td><code>link()</code> 创建硬链接</td>
+            <td>只需复制 pg_catalog 的空间</td>
+            <td>只取决于 pg_catalog 大小</td>
+            <td>否——新旧共享 inode</td>
+            </tr>
+            <tr>
+            <td><code>--clone</code></td>
+            <td><code>ioctl(FICLONE)</code> 创建 CoW 快照</td>
+            <td>同 <code>--link</code>（CoW 写入时分配新块）</td>
+            <td>同 <code>--link</code></td>
+            <td>可当作独立副本</td>
+            </tr>
+            <tr>
+            <td>默认（无参数）</td>
+            <td>逐文件 <code>copy()</code></td>
+            <td>整个数据目录大小</td>
+            <td>取决于数据文件总大小</td>
+            <td>是——物理隔离</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><code>--link</code>
+            快的根本原因是<strong>它不拷贝数据文件</strong>。对用户表的数据文件，pg_upgrade
+            调用
+            <code>link(old_file, new_file)</code>——创建一个新的目录项，指向同一个
+            inode：</p>
+            <pre class="text"><code># --link 之前
+/data/old/pgdata/base/16384/49159     → inode #1048577 (data, 8GB)
+
+# --link 之后
+/data/old/pgdata/base/16384/49159     → inode #1048577 (data, 8GB)
+/data/new/pgdata/base/16384/49159     → inode #1048577 (same inode!)
+```text
+
+`link()` 是一个纯粹的文件系统元数据操作——不分配新数据块，不触发磁盘 I/O。无论这个用户表的数据文件是 1GB 还是 500GB，`link()` 调用的耗时都是常数级别的（通常在几十微秒以内）。这解释了为什么一个 500GB 的数据库，pg_upgrade `--link` 的实际执行时间可能只有几分钟——时间几乎全部花在复制系统表（pg_catalog）上，而系统表通常只有几十到几百 MB。
+
+### 不可回滚的根本原因
+
+`--link` 这么快，代价是**升级后没有回滚机制**。原因不在 pg_upgrade 的代码逻辑里，而在文件系统的硬链接语义里：
+
+1. 硬链接意味着&quot;多个目录项指向同一个 inode&quot;。对任何一个目录项写入，修改的是同一个 inode 对应的数据块。
+2. pg_upgrade 执行期间，新集群对用户表的数据文件不做任何修改——它只是创建了指向已有 inode 的硬链接。此时新老集群共享相同的物理数据块，数据在磁盘上只存了一份。
+3. **但升级后，一旦新集群启动，Backend 进程开始对用户表写入**（哪怕只是 hint bit 更新），新写入的数据就会直接反映到老集群的数据文件中——因为它们是同一个文件。
+4. 此时老集群如果启动，看到的数据文件已经是新版本格式下被修改过的状态，加上 pg_catalog 的结构已经被替换，老版本二进制根本无法正确解析——数据已经不可逆地污染了。
+
+这不是 pg_upgrade 的 bug，而是硬链接的语义决定的操作边界。使用 `--link` 之前必须接受&quot;升级后不能回退到老集群&quot;的代价。
+
+防御策略不是&quot;想好回滚方案&quot;，而是**升级后做充分的验证窗口**。常用做法是：
+
+1. 升级后不立即放生产流量，先跑 `analyze_new_cluster.sh`，再跑一批 regression test。
+2. 对关键业务表执行 `SELECT count(*)`、随机采样校验、检查索引有效性。
+3. 保留老版本的安装目录（二进制），但数据目录已经不能用了——所以备份不是可选项，是必须项。
+
+### --clone 模式：CoW 的中间地带
+
+`--clone` 模式是 PG 10 引入的。它在支持 reflink 的文件系统上（Btrfs、XFS、OCFS2，ZFS 目前不支持）使用 `ioctl(FICLONE)` 系统调用创建文件的写时复制（Copy-on-Write）快照。
+
+和 `--link` 的区别在于：`FICLONE` 创建的副本共享相同的物理数据块，但只要任一副本发生写入，文件系统会自动为新写入的数据分配新块——两个副本开始分叉，互不影响。这就是写时复制。
+
+`--clone` 的优势：创建时和 `--link` 一样快（元数据级别操作），但升级后旧集群理论上仍然可用——只要你在旧集群目录下不主动做任何修改，且新集群的修改不会在老副本上出现。如果你升级后发现问题需要回滚，可以保留旧集群目录原地回退。
+
+代价：需要文件系统支持 reflink（ext4 不支持），且随着新集群不断写入，分配的额外磁盘空间会逐渐增长。
+
+### pg_upgrade 执行流程
+
+`pg_upgrade` 的完整执行分三个阶段：
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant pg_upgrade as pg_upgrade 进程
+  participant Old as 老集群 (PGDATA)
+  participant New as 新集群 (PGDATA)
+  participant FS as 文件系统
+
+  Note over User,FS: 第一阶段：pg_upgrade --check（预检）
+  User-&gt;&gt;pg_upgrade: pg_upgrade --check -b old_bindir -B new_bindir -d old_data -D new_data
+  pg_upgrade-&gt;&gt;Old: 启动老集群（single-user mode）
+  pg_upgrade-&gt;&gt;Old: 加载 pg_upgrade_support 函数
+  pg_upgrade-&gt;&gt;Old: 检查 catalog schema 兼容性
+  pg_upgrade-&gt;&gt;Old: 检查所有扩展版本兼容性
+  pg_upgrade-&gt;&gt;Old: 检查数据类型二进制兼容性
+  pg_upgrade-&gt;&gt;Old: 检查 locale / encoding / lc_collate
+  pg_upgrade-&gt;&gt;Old: 关闭老集群
+  pg_upgrade--&gt;&gt;User: &quot;Clusters are compatible&quot;
+
+  Note over User,FS: 第二阶段：pg_upgrade 执行升级
+  User-&gt;&gt;pg_upgrade: pg_upgrade --link -b old_bindir -B new_bindir -d old_data -D new_data
+  pg_upgrade-&gt;&gt;Old: 启动老集群（single-user mode）
+  pg_upgrade-&gt;&gt;New: 使用 initdb 初始化新 PGDATA（空集群）
+  pg_upgrade-&gt;&gt;FS: 复制 pg_catalog 系统表文件（唯一的数据拷贝）
+  pg_upgrade-&gt;&gt;FS: link() 用户表数据文件 → 新 PGDATA
+  pg_upgrade-&gt;&gt;FS: 复制 CLOG / WAL / 2PC 等事务性文件
+  pg_upgrade-&gt;&gt;New: 更新 pg_control（版本信息、checkpoint 位置）
+  pg_upgrade-&gt;&gt;New: 重建 free space map (FSM) 和 visibility map (VM)
+  pg_upgrade--&gt;&gt;User: &quot;Upgrade Complete&quot;
+
+  Note over User,FS: 第三阶段：analyze_new_cluster
+  User-&gt;&gt;New: 启动新集群（正常模式）
+  User-&gt;&gt;pg_upgrade: ./analyze_new_cluster.sh
+  pg_upgrade-&gt;&gt;New: vacuumdb --all --analyze-only
+  pg_upgrade--&gt;&gt;User: 统计信息生成完毕</code></pre>
+            <p><strong>第一阶段：<code>pg_upgrade --check</code></strong>
+            是整个流程中最关键的安全检查。它启动老集群的 single-user
+            mode（不经过 Postmaster），加载
+            <code>pg_upgrade_support</code>
+            扩展提供的辅助函数，然后逐项检查：</p>
+            <ul>
+            <li><strong>Catalog schema 兼容性</strong>：pg_upgrade
+            内置了每个版本的系统表结构定义（在
+            <code>src/bin/pg_upgrade/check.c</code> 中）。它查询
+            <code>pg_catalog</code>
+            中的每个系统表，对比老集群的行类型和期望的行类型。如果某个列的类型或顺序不兼容（例如
+            PG 15→16 中 <code>pg_statistic_ext_data</code>
+            的结构变化），<code>--check</code>
+            会报错并列出不兼容的条目。</li>
+            <li><strong>扩展版本兼容性</strong>：遍历
+            <code>pg_extension</code> 中每个扩展，检查新版本的
+            <code>$libdir</code> 下是否有对应扩展的 <code>.so</code>
+            文件，且扩展的 SQL 定义在老集群和新集群中是否兼容。很多
+            pg_upgrade
+            失败就是因为老版本装了一个扩展，新版本没有装或者版本不兼容。</li>
+            <li><strong>数据类型二进制兼容性</strong>：检查老集群中所有复合类型、枚举类型的
+            OID
+            和布局是否在新版本系统中保持一致。如果某个类型在系统初始化时分配的
+            OID 不一致，pg_upgrade
+            会拒绝升级——因为它将直接复用老集群的数据文件，类型布局不一致会导致数据解析错误。</li>
+            <li><strong>locale / encoding /
+            lc_collate</strong>：这是最容易被忽略但最先检查的事。新集群
+            <code>initdb</code> 时指定的 locale
+            必须和老集群一致，否则字符串排序和比较的行为就不一致——这会导致索引损坏（B-tree
+            的排序顺序变了）。<code>--check</code> 会对比老集群
+            <code>pg_control</code> 中记录的 locale 和新集群
+            <code>initdb</code> 时使用的 locale，不匹配直接报错。</li>
+            <li><strong>磁盘空间</strong>：pg_upgrade
+            估算升级需要的额外空间——至少等于所有系统表的空间之和（因为
+            pg_catalog 会被拷贝）。</li>
+            </ul>
+            <p><strong>第二阶段：实际执行</strong>中，pg_upgrade
+            的处理逻辑按文件类型分为三类：</p>
+            <table>
+            <colgroup>
+            <col style="width: 37%" />
+            <col style="width: 37%" />
+            <col style="width: 25%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>文件类型</th>
+            <th>处理方式</th>
+            <th>原因</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>系统表（<code>pg_catalog</code> 中的 relation）</td>
+            <td>物理拷贝（<code>copy_file()</code>）</td>
+            <td>系统表的结构可能在大版本间变化，必须由新版本 initdb
+            重新创建，然后 pg_upgrade 把老数据迁移进去</td>
+            </tr>
+            <tr>
+            <td>用户表数据文件</td>
+            <td>硬链接/CoW/物理拷贝（取决于模式）</td>
+            <td>用户表的数据文件格式在大版本间保持兼容——tuple header
+            的布局没变，xmin/xmax/xid 位数没变（都是
+            32-bit），页面布局保持不变</td>
+            </tr>
+            <tr>
+            <td>事务文件（CLOG、WAL、2PC）</td>
+            <td>特殊处理</td>
+            <td>CLOG 的 SLRU 页面需要转换、WAL 段不迁移（新集群从干净的
+            WAL 日志开始）、2PC 状态文件需要转移</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>第三阶段：<code>analyze_new_cluster.sh</code></strong>
+            本质上是在新集群上执行
+            <code>vacuumdb --all --analyze-only</code>。因为
+            <code>pg_upgrade</code> 只迁移了数据文件，新集群的
+            <code>pg_statistic</code>
+            系统表是空的——优化器没有统计信息，查询计划的质量无从保证。<code>analyze_new_cluster.sh</code>
+            是必须执行的步骤，不能省略。</p>
+            <h3 id="前置条件">前置条件</h3>
+            <p>pg_upgrade 运行之前必须满足：</p>
+            <ol type="1">
+            <li><p><strong>目标版本的二进制已经安装</strong>，老版本和新版本的
+            <code>pg_upgrade</code>
+            二进制都必须可用。实际上只需要用新版本的
+            <code>pg_upgrade</code>，它会通过 <code>-b</code>
+            参数指定老版本 bindir 来调用老版本的
+            <code>postgres</code>（single-user mode）。</p></li>
+            <li><p><strong>所有扩展在目标版本中必须可用</strong>且版本兼容。在
+            <code>shared_preload_libraries</code>
+            中列出的扩展，新版本安装中必须有对应的 <code>.so</code> 和
+            <code>.control</code> 文件。</p></li>
+            <li><p><strong><code>pg_upgrade_support</code>
+            函数必须可用</strong>。这是一个特殊的扩展，在 PG 源码树的
+            <code>src/include/catalog/pg_upgrade_support.h</code>
+            中定义。它的作用是在升级过程中暴露内部 catalog 信息，让
+            pg_upgrade 能读取老集群的系统表结构。PG
+            官方打包中该扩展默认包含，但如果使用的是从源码编译的精简安装，需要确认
+            <code>pg_upgrade_support</code> 是否在 <code>$libdir</code>
+            中。</p></li>
+            <li><p><strong>老集群必须被干净地关闭</strong>（<code>pg_ctl stop -m fast</code>
+            或 <code>smart</code>），不能是 immediate shutdown 或者
+            crash 后的状态——否则 WAL
+            恢复不完全，数据文件可能处于不一致状态。</p></li>
+            </ol>
+            <hr />
+            <h2 id="二逻辑复制跨版本迁移">二、逻辑复制跨版本迁移</h2>
+            <p>对于无法接受 pg_upgrade
+            停机时间（哪怕只有几分钟）的场景，逻辑复制是唯一的零停机或低停机跨版本迁移方案。</p>
+            <h3 id="低停机迁移流程">低停机迁移流程</h3>
+            <pre class="mermaid"><code>flowchart TD
+  A[&quot;老版本 PG 16 Primary&lt;br/&gt;（承载生产流量）&quot;] --&gt; B[&quot;搭建 PG 17 Standby&lt;br/&gt;（空数据库）&quot;]
+  B --&gt; C[&quot;在 PG 17 上创建 Subscription&lt;br/&gt;逻辑订阅所有表&quot;]
+  C --&gt; D[&quot;初始数据同步&lt;br/&gt;（COPY 快照）&quot;]
+  D --&gt; E[&quot;增量同步追平&lt;br/&gt;（逻辑解码 + apply）&quot;]
+  E --&gt; F{&quot;复制延迟 &lt; 1s？&quot;}
+  F --&gt;|否| E
+  F --&gt;|是| G[&quot;暂停应用写入&lt;br/&gt;（短暂停机窗口）&quot;]
+  G --&gt; H[&quot;等待最后一批 WAL apply&quot;]
+  H --&gt; I[&quot;切换应用连接到 PG 17&quot;]
+  I --&gt; J[&quot;PG 17 承载生产流量&quot;]
+  J --&gt; K[&quot;验证稳定后删除老集群&quot;]
+```text
+
+核心思路是：用逻辑复制的 Publication/Subscription 机制在 PG 16（老版本，作为发布端 publisher）和 PG 17（新版本，作为订阅端 subscriber）之间建立订阅关系。逻辑复制的跨版本支持规则是：**订阅端的 PG 版本必须大于或等于发布端**——所以 PG 16 发布端到 PG 17 订阅端是官方明确支持的标准路径。老集群持续写入，新集群通过逻辑解码消费 WAL 并 apply。
+
+逻辑复制的优势：
+
+- **可回滚**：如果新集群出现问题，直接把应用连接切回老集群即可。因为老集群的写入从未停止，数据是完整的。回滚只是 DNS 或连接串的一次切换。
+- **停机时间可控**：唯一需要停机的是最后的切换窗口——暂停写入、等最后一批增量 apply、切换流量。这个窗口通常可以控制在秒到分钟级。
+- **可做灰度验证**：在正式切换之前，新集群可以接收一段时间的真实读流量进行验证。
+
+### 盲区与陷阱
+
+逻辑复制不是&quot;整库复制&quot;——它有几个明确的盲区：
+
+**序列（Sequence）：不在逻辑复制的范围内。** 序列的当前值（`last_value`）不会通过逻辑复制同步。切换到新集群后，如果应用依赖 `nextval()` 生成主键，新集群的序列从初始值开始——立刻产生主键冲突。解决方案：切换前手动在新集群上执行 `SELECT setval(&#39;seq_name&#39;, (SELECT max(id) FROM table_name))` 对所有序列进行同步。
+
+**Large Object：不在逻辑复制的范围内。** `pg_largeobject` 系统表存储的是 BLOB 的大对象数据块（每块 `LOBLKSIZE` 字节），这些数据不会通过逻辑复制传输。如果应用使用 `lo_import()` / `lo_export()` 接口存储大对象，需要在迁移前用其他方式（pg_dump 仅导出 large object、或应用层同步）处理。
+
+**DDL 复制**：PG 16 及之前版本的逻辑复制不复制 DDL。在迁移窗口期间对老集群执行的 `ALTER TABLE`、`CREATE INDEX` 等操作不会自动同步到新集群。PG 17 引入了 DDL 逻辑复制的初步支持（`CREATE TABLE`、`ALTER TABLE` 的基础操作可通过 subscription 的 `copy_data` 机制配合），但覆盖面有限。迁移期间建议锁定 DDL，或者手动在新集群执行相同的 DDL。
+
+**大事务的延迟放大效应**：逻辑复制的 reorder buffer 必须等待事务 COMMIT 才释放解码后的变更。如果一个事务修改了 1000 万行然后 `COMMIT`，这 1000 万行变更会在 COMMIT 瞬间全部涌入 apply worker——产生一个延迟尖峰。如果在迁移期间有批量 DML 操作，新集群的延迟可能突然变得很大。
+
+---
+
+## 三、常见坑与应对
+
+### 坑 1：pg_upgrade 后 shared_preload_libraries 配置丢失
+
+pg_upgrade 不迁移 `postgresql.conf`——它要求你手动把老集群的配置迁移到新集群。但最常见的问题是：`shared_preload_libraries` 中列出的扩展（如 `pg_stat_statements`、`auto_explain`、`pg_cron`、`auth_delay` 等），老集群里有，新集群的 `postgresql.conf` 里忘了配。
+
+后果：`pg_stat_statements` 不加载 → 没有查询统计 → Grafana 面板变空白。`auto_explain` 不加载 → 慢查询日志只记录执行时长但没有执行计划。`pg_cron` 不加载 → 定时任务静默不执行。
+
+应对：升级前用 `psql -c &quot;SHOW shared_preload_libraries&quot;` 导出老集群配置，对比新集群 `postgresql.conf` 中的值。同时检查每个扩展在新版本中是否可用（`pg_config --sharedir`/`extension/` 下的 `.control` 文件）。
+
+### 坑 2：pg_dump + pg_restore 迁移后统计信息消失
+
+`pg_dump` 导出的是逻辑数据——表和索引的定义和数据行，不包括 `pg_statistic` 系统表的内容。这是设计决策，不是 bug：统计信息是采样生成的，导入到一个数据布局完全不同的新集群中不适用（新集群的页面填充率、索引深度都可能不同）。
+
+后果：pg_restore 完成后的数据库，查询优化器对每个表都没有任何统计信息。PG 会使用硬编码的默认值做选择率估算——意味着复杂的 Join 查询可能选择灾难性的执行计划。
+
+应对：pg_restore 完成后，**必须立即执行 `vacuumdb --all --analyze-only`**（或逐个表的 `ANALYZE`）。在 `ANALYZE` 完成之前，新集群的查询性能是不可预期的。
+
+### 坑 3：pg_upgrade 后 vacuumdb --analyze-only 不能省
+
+这个坑和坑 2 根因不同——坑 2 是 pg_dump 没有导出统计信息，坑 3 是 pg_upgrade 创建的新集群是一个全新的 initdb 产物，系统表 `pg_statistic` 中没有任何内容。虽然数据文件通过硬链接保留了物理布局，但 `pg_upgrade` 没有跨集群迁移 `pg_statistic` 的行——老集群的统计信息在 pg_dump 阶段没有被导出。
+
+后果：同坑 2——优化器没有统计信息，查询计划质量退化。`analyze_new_cluster.sh` 脚本的存在就是为了解决这个问题，但它不会自动执行，需要手动调用。
+
+应对：升级后执行 `./analyze_new_cluster.sh` 或等效的 `vacuumdb --all --analyze-only`。对于几百 GB 以上的大表，`ANALYZE` 可能耗时数分钟到数十分钟——采样需要扫描一定比例的数据页。这个时间要算在升级的&quot;验证窗口&quot;内，不能省略。
+
+### 坑 4：locale / encoding / lc_collate 不兼容
+
+pg_upgrade `--check` 第一个检查的就是 locale 兼容性。locale 决定了字符串的排序规则——而 B-tree 索引的键顺序完全依赖这个排序规则。
+
+如果老集群使用 `en_US.UTF-8` 但新集群 `initdb` 时用了 `C` locale（或者反过来），`--check` 会直接失败。应对方法是在 `initdb` 新集群时显式指定 locale：
+
+```bash
+initdb --locale=en_US.UTF-8 --lc-collate=en_US.UTF-8 --lc-ctype=en_US.UTF-8 \
+       -D /data/new/pgdata</code></pre>
+            <p>但注意——如果老集群使用 <code>C</code> locale，换到非
+            <code>C</code> locale 后，索引维护和查询结果可能不一致（因为
+            <code>C</code> locale 是字节序，非 <code>C</code> locale
+            是语言学序）。<code>pg_upgrade --check</code>
+            要求完全一致是有原因的。</p>
+            <p>encoding 不兼容的情况更少见（因为 PG 中 encoding
+            一旦设定就不可能更改），但如果老集群使用 <code>EUC_JP</code>
+            而新集群 <code>initdb</code> 时用了
+            <code>UTF8</code>，<code>--check</code> 直接拒绝。</p>
+            <hr />
+            <h2 id="四迁移方案决策树">四、迁移方案决策树</h2>
+            <p>三种方案各有利弊和适用边界。下面的决策树按数据库规模和停机时间容忍度给出推荐路径：</p>
+            <pre class="mermaid"><code>flowchart TD
+  START[&quot;需要大版本升级&quot;] --&gt; Q_SIZE{&quot;数据总大小？&quot;}
+  
+  Q_SIZE --&gt;|&quot;&lt; 10GB&quot;| DUMP[&quot;A: pg_dump + pg_restore&quot;]
+  Q_SIZE --&gt;|&quot;10GB ~ 500GB&quot;| Q_DT{&quot;可接受停机？&quot;}
+  Q_SIZE --&gt;|&quot;&gt; 500GB&quot;| Q_LOW_DT{&quot;可接受停机？&quot;}
+  
+  Q_DT --&gt;|&quot;是（几分钟到几十分钟）&quot;| LINK[&quot;B: pg_upgrade --link&quot;]
+  Q_DT --&gt;|&quot;否&quot;| LOGREPL[&quot;C: 逻辑复制迁移&quot;]
+  
+  Q_LOW_DT --&gt;|&quot;是&quot;| LINK2[&quot;B: pg_upgrade --link&lt;br/&gt;（停机时间仅取决于 pg_catalog 大小）&quot;]
+  Q_LOW_DT --&gt;|&quot;否&quot;| LOGREPL2[&quot;C: 逻辑复制迁移&quot;]
+  
+  DUMP --&gt; CHECK1[&quot;优点：最简单、可回滚、跨架构&lt;br/&gt;缺点：慢、膨胀、丢统计信息&quot;]
+  LINK --&gt; CHECK2[&quot;优点：快、原地升级、无膨胀&lt;br/&gt;缺点：不可回滚、需要 --check 通过&quot;]
+  LOGREPL --&gt; CHECK3[&quot;优点：低停机、可回滚、可灰度&lt;br/&gt;缺点：序列/large object 需手动同步、DDL 需手动复制&quot;]
+  LINK2 --&gt; CHECK2
+  LOGREPL2 --&gt; CHECK3
+
+  style DUMP fill:#3fb950,color:#2d333b
+  style LINK fill:#388bfd,color:#2d333b
+  style LINK2 fill:#388bfd,color:#2d333b
+  style LOGREPL fill:#f0883e,color:#2d333b
+  style LOGREPL2 fill:#f0883e,color:#2d333b
+```bash
+
+### 方案 A：pg_dump + pg_restore（&lt;10GB 或特殊需求）
+
+适用场景：
+- 数据库很小，dump/restore 的总时长在可接受范围内
+- 需要跨架构迁移（如 x86 到 ARM）
+- 需要变更 encoding 或 locale
+- 需要做数据清理（去膨胀、改表结构）
+- 想要一个&quot;干净的&quot;新数据库（无历史膨胀）
+
+注意：这个方案的时间复杂度是 O(数据大小)，对 10GB 以下的库可能只需几分钟；对 500GB 的库可能需要数小时甚至更长。
+
+### 方案 B：pg_upgrade --link（10GB ~ 500GB，可接受停机）
+
+适用场景：
+- 数据量大，dump/restore 时间不可接受
+- pg_upgrade `--check` 通过
+- 接受了&quot;不可回滚&quot;的代价，并且做好了备份
+- 停机时间可以覆盖 pg_upgrade 执行（主要是 pg_catalog 复制）和 `analyze_new_cluster.sh` 执行的总和
+
+注意：即使数据文件是 0 拷贝，`analyze_new_cluster.sh` 的执行时间取决于表的数量和大小——对于有几千个表和几百 GB 数据的库，这一阶段可能耗时数十分钟。
+
+### 方案 C：逻辑复制迁移（&gt;500GB，不可接受长时间停机）
+
+适用场景：
+- 超大数据库，pg_upgrade 的 `analyze_new_cluster.sh` 阶段耗时太长
+- 不允许长时间停机
+- 可以接受迁移窗口内的运维复杂度（手动同步序列、手动复制 DDL）
+- 应用可以承受短暂写入暂停（切流量窗口）
+
+注意：这个方案的复杂度最高——需要管理 Publication/Subscription、监控复制延迟、手动处理序列和 DDL。复杂度换来的就是停机时间最短。
+
+---
+
+## 五、实验：pg_upgrade --link 从 PG 16 到 PG 17
+
+### 环境准备
+
+```bash
+# 假设 PG 16 和 PG 17 都安装在不同前缀下
+PG16_HOME=/usr/local/pgsql-16
+PG17_HOME=/usr/local/pgsql-17
+
+# 创建一个 PG 16 测试集群
+$PG16_HOME/bin/initdb -D /tmp/pg16-data
+echo &quot;shared_preload_libraries = &#39;pg_stat_statements&#39;&quot; &gt;&gt; /tmp/pg16-data/postgresql.conf
+$PG16_HOME/bin/pg_ctl -D /tmp/pg16-data -l /tmp/pg16.log start
+
+# 创建测试数据
+$PG16_HOME/bin/psql -d postgres -c &quot;
+  CREATE EXTENSION pg_stat_statements;
+  CREATE TABLE test_data (id SERIAL PRIMARY KEY, val TEXT);
+  INSERT INTO test_data (val) SELECT &#39;row_&#39; || generate_series(1, 1000000);
+  CREATE INDEX idx_test_val ON test_data(val);
+&quot;
+$PG16_HOME/bin/pg_ctl -D /tmp/pg16-data stop -m fast</code></pre>
+            <h3 id="执行-pg_upgrade-check">执行 pg_upgrade –check</h3>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="va">$PG17_HOME</span><span class="ex">/bin/pg_upgrade</span> <span class="at">--check</span> <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-b</span> <span class="va">$PG16_HOME</span>/bin <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-B</span> <span class="va">$PG17_HOME</span>/bin <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> /tmp/pg16-data <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-D</span> /tmp/pg17-data</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 预期输出：</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Performing Consistency Checks on Old Live Server</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="co"># -------------------------------------------------</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking cluster versions                                   ok</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking database user is the install user                  ok</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking database connection settings                       ok</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for prepared transactions                          ok</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for system-defined composite types in user tables  ok</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for reg* data types in user tables                 ok</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for contrib/isn with bigint-passing mismatch       ok</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for user-defined encoding conversions              ok</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for user-defined postfix operators                 ok</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for presence of required libraries                 ok</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking database user is the install user                  ok</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for prepared transactions                          ok</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="co"># Checking for new cluster tablespace directories             ok</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="co"># *Clusters are compatible*</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="ex">如果</span> <span class="kw">`</span><span class="at">--check</span><span class="kw">`</span> <span class="ex">报错，不要忽略错误继续执行——每个错误都代表一个升级后会导致数据不可访问或不一致的问题。</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="co">### 执行升级</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="va">$PG17_HOME</span><span class="ex">/bin/pg_upgrade</span> <span class="at">--link</span> <span class="dt">\</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>  <span class="at">-b</span> <span class="va">$PG16_HOME</span>/bin <span class="dt">\</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>  <span class="at">-B</span> <span class="va">$PG17_HOME</span>/bin <span class="dt">\</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> /tmp/pg16-data <span class="dt">\</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>  <span class="at">-D</span> /tmp/pg17-data</span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="co"># 预期输出：</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a><span class="co"># Performing Upgrade</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a><span class="co"># ------------------</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a><span class="co"># Adding &quot;.old&quot; suffix to old global/pg_control  ok</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a><span class="co"># Analyzing all rows in the new cluster           ok</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a><span class="co"># Freezing all rows in the new cluster            ok</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a><span class="co"># Deleting files from new pg_xact                 ok</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a><span class="co"># ...</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a><span class="co"># Upgrade Complete</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a><span class="co"># ----------------</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a><span class="co"># Optimizer statistics are not transferred by pg_upgrade.</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a><span class="co"># Once you start the new server, consider running:</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a><span class="co">#     ./analyze_new_cluster.sh</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a><span class="co"># Running this script will delete the old cluster&#39;s data files:</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a><span class="co">#     ./delete_old_cluster.sh</span></span></code></pre></div>
+            <h3 id="验证硬链接">验证硬链接</h3>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 比较老集群和新集群中同一个用户表文件的 inode</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="va">OLD_INODE</span><span class="op">=</span><span class="va">$(</span><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%i&#39;</span> /tmp/pg16-data/base/<span class="pp">*</span>/49159 <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="bu">echo</span> <span class="st">&quot;0&quot;</span><span class="va">)</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="va">NEW_INODE</span><span class="op">=</span><span class="va">$(</span><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%i&#39;</span> /tmp/pg17-data/base/<span class="pp">*</span>/49159 <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="bu">echo</span> <span class="st">&quot;0&quot;</span><span class="va">)</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$OLD_INODE</span><span class="st">&quot;</span> <span class="ot">=</span> <span class="st">&quot;</span><span class="va">$NEW_INODE</span><span class="st">&quot;</span> <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$OLD_INODE</span><span class="st">&quot;</span> <span class="ot">!=</span> <span class="st">&quot;0&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="bu">echo</span> <span class="st">&quot;相同 inode: </span><span class="va">$OLD_INODE</span><span class="st"> — 确认硬链接&quot;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="bu">echo</span> <span class="st">&quot;硬链接计数: </span><span class="va">$(</span><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%h&#39;</span> /tmp/pg17-data/base/<span class="pp">*</span>/49159<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 注意此时 ls -lh 显示的 &quot;文件大小&quot; 是相同的，但磁盘只占了一份空间</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 可以使用 du -sh 验证：</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="fu">du</span> <span class="at">-sh</span> /tmp/pg16-data /tmp/pg17-data</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 老集群和新集群的 du 报告大小可能不同——因为只有用户表数据文件共享 inode，</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 而系统表是独立拷贝的，FSM/VM 等辅助文件也不共享</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="fu">bash</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="co">### 启动新集群并生成统计信息</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="va">$PG17_HOME</span><span class="ex">/bin/pg_ctl</span> <span class="at">-D</span> /tmp/pg17-data <span class="at">-l</span> /tmp/pg17.log start</span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="ex">./analyze_new_cluster.sh</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="co"># 等价于：</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="va">$PG17_HOME</span><span class="ex">/bin/vacuumdb</span> <span class="at">--all</span> <span class="at">--analyze-only</span> <span class="at">-h</span> /tmp <span class="at">-p</span> 5432</span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="co"># 验证统计信息</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="va">$PG17_HOME</span><span class="ex">/bin/psql</span> <span class="at">-d</span> postgres <span class="at">-c</span> <span class="st">&quot;</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="st">  SELECT schemaname, relname, n_live_tup, n_dead_tup,</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="st">         last_analyze, last_autoanalyze</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="st">  FROM pg_stat_user_tables</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a><span class="st">  WHERE relname = &#39;test_data&#39;;</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="确认后可删除老集群">确认后可删除老集群</h3>
+            <p><code>bash # 确认新集群正常工作后 ./delete_old_cluster.sh</code>text</p>
+            <hr />
+            <h2 id="六关键要点">六、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>pg_upgrade <code>--link</code>
+            通过硬链接实现零数据拷贝</strong>——用户表的数据文件不被物理复制，新老集群指向相同的
+            inode。升级时间几乎全部花在系统表迁移上，与用户数据总量无关。</p></li>
+            <li><p><strong><code>--link</code>
+            不可回滚的根本原因是硬链接语义</strong>——升级后新集群一旦启动并写入，老集群的数据文件同时被污染。回滚的唯一安全策略是提前做全量备份。</p></li>
+            <li><p><strong><code>pg_upgrade --check</code>
+            是必须完整的检查点</strong>——它在 single-user mode
+            下逐个验证 catalog schema、扩展版本、数据类型兼容性、locale
+            一致性。必须等到 <code>--check</code> 输出 “Clusters are
+            compatible” 才能继续。</p></li>
+            <li><p><strong><code>analyze_new_cluster.sh</code>
+            不能省</strong>——pg_upgrade
+            不迁移统计信息，没有它新集群的查询优化器等于在黑暗中摸索。</p></li>
+            <li><p><strong>逻辑复制迁移的三个盲区</strong>：序列不在复制范围内（需要手动
+            <code>setval()</code>）、large object 不在复制范围内、DDL 在
+            PG 16 及之前版本不复制。</p></li>
+            <li><p><strong>迁移方案选型就是停机时间 vs
+            复杂度的权衡</strong>：pg_dump 最简单但最慢，pg_upgrade
+            <code>--link</code>
+            最快但不可回滚，逻辑复制复制最灵活但最复杂。</p></li>
+            </ol>
+            <p>上一章：<a
+            href="../24-recovery-corruption/24-recovery-corruption.html">数据恢复与损坏应对</a>
+            下一章：<a
+            href="../26-config-pitfalls/26-config-pitfalls.html">配置陷阱与生产最佳实践</a>，拆解
+            11 个最容易被误解的 GUC
+            参数，每个都从内核行为讲清楚”配错后会有什么症状、怎么从视图和日志里确认”。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/bin/pg_upgrade/pg_upgrade.c</code>：main()
+            入口，解析参数，分派 check/upgrade</li>
+            <li><code>src/bin/pg_upgrade/check.c</code>：<code>check_old_cluster()</code>
+            /
+            <code>check_new_cluster()</code>，预检逻辑的完整实现——catalog
+            schema、扩展、类型、locale 等所有检查项</li>
+            <li><code>src/bin/pg_upgrade/file.c</code>：<code>rewrite_data_file()</code>
+            / <code>link_file()</code> /
+            <code>clone_file()</code>，三种文件迁移模式的具体实现</li>
+            <li><code>src/bin/pg_upgrade/info.c</code>：<code>gen_db_file_maps()</code>，收集老集群和新集群中每个数据库、每个
+            relation 的文件路径映射</li>
+            <li><code>src/bin/pg_upgrade/relfilenode.c</code>：处理
+            relfilenode 的映射和转换</li>
+            <li><code>src/bin/pg_upgrade/server.c</code>：<code>start_postmaster()</code>
+            /
+            <code>stop_postmaster()</code>，升级期间启动和关闭集群（single-user
+            mode 和正常 mode）</li>
+            <li><code>src/bin/pg_upgrade/parallel.c</code>：PG 17 中
+            pg_upgrade 的并行升级支持</li>
+            <li><code>src/bin/pg_upgrade/pg_upgrade.h</code>：全局数据结构定义（<code>ClusterInfo</code>、<code>DbInfo</code>、<code>RelInfo</code>
+            等）</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, pg_upgrade —
+            完整的使用说明和选项参考</li>
+            <li>PostgreSQL Documentation, Chapter 30: Logical
+            Replication — 逻辑复制的触发条件、Publication/Subscription
+            DDL、冲突检测</li>
+            <li>PostgreSQL Documentation, Chapter 26: Backup and Restore
+            — 备份和恢复的官方指南</li>
+            <li>PostgreSQL Documentation, Appendix E: Release Notes —
+            每个大版本的升级注意事项（特别是 migration to version X
+            部分）</li>
+            </ul>
+            <h3 id="实验工具">实验工具</h3>
+            <ul>
+            <li><code>stat</code>：验证硬链接（inode
+            编号、硬链接计数）</li>
+            <li><code>du -sh</code>：验证磁盘空间占用（区分共享 inode
+            和独立拷贝）</li>
+            <li><code>pg_stat_user_tables</code>：验证升级后统计信息的存在性和完整性</li>
+            <li><code>pg_upgrade --check</code>：预检工具，应当在任何升级操作前首先运行</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/24-recovery-corruption/24-recovery-corruption.html">【PG 内核】数据恢复与损坏应对：PITR、pg_resetwal 和页面损坏的边界</a></h3>
+                    <p>拆解 PostgreSQL 数据恢复路径的内部机制与操作边界：PITR 的三个关键窗口与 timeline fork 原理、pg_checksums 的校验粒度与盲区、pg_resetwal 的 hint bit 代价与 VACUUM FULL 陷进、pg_dump 并行调度的内部策略。重点在于每种操作做什么、不做什么、哪些后果不可逆。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/26-config-pitfalls/26-config-pitfalls.html">【PG 内核】配置陷阱与生产最佳实践：11 个最危险的 GUC 和它们的正确设置</a></h3>
+                    <p>逐一拆解 11 个最容易被误解和配错的 PostgreSQL GUC 参数：shared_buffers 的 double buffering 反噬、work_mem 作为&#x27;每个操作&#x27;而非&#x27;每个查询&#x27;的内存炸弹、effective_cache_size 和 random_page_cost 如何误导优化器走向灾难计划、fsync=off 和 synchronous_commit=off 的数据丢失边界、huge_pages 在容器中的静默退化、maintenance_work_mem 不足导致 VACUUM 瘫痪、idle_in_transaction_session_timeout 为什么必须设、log_lock_waits 与 deadlock_timeout 的联动、以及 log_min_duration_statement 与 auto_explain 的日志洪水叠加。每条配查验 SQL 和 shell 命令——不是&#x27;设成 X 就好了&#x27;，而是&#x27;通过什么视图和日志确认当前设置有问题&#x27;。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/19-logical-repl/19-logical-repl.html">【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大</a></h3>
+                    <p>拆解 PostgreSQL 逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL 解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与 snapshot 重建机制、pgoutput 输出插件的二进制协议与行过滤变换、Publication/Subscription 模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing 为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable 后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在 reorder buffer 中的延迟放大效应。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

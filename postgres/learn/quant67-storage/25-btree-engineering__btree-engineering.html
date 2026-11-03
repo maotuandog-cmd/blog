@@ -1,0 +1,1653 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】B-Tree 与 B+Tree：页式存储引擎的工程实现 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="btree, b-plus-tree, concurrency, latch-coupling, page-layout, bulk-loading, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/25-btree-engineering/btree-engineering.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】B-Tree 与 B+Tree：页式存储引擎的工程实现" />
+    <meta property="og:description" content="数据库要把数据存到磁盘上，又要以尽可能少的磁盘 I/O 把数据找回来。这个矛盾催生了一系列面向磁盘的索引结构（Disk-oriented Index），其中最成功的就是 B-Tree 家族。从 1970 年 Rudolf Bayer 和 Edward McCreight 在波音科学研究实验室提出 B-Tree 起，这个…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/25-btree-engineering/btree-engineering.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="btree" />
+    <meta property="article:tag" content="b-plus-tree" />
+    <meta property="article:tag" content="concurrency" />
+    <meta property="article:tag" content="latch-coupling" />
+    <meta property="article:tag" content="page-layout" />
+    <meta property="article:tag" content="bulk-loading" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】B-Tree 与 B+Tree：页式存储引擎的工程实现" />
+    <meta name="twitter:description" content="数据库要把数据存到磁盘上，又要以尽可能少的磁盘 I/O 把数据找回来。这个矛盾催生了一系列面向磁盘的索引结构（Disk-oriented Index），其中最成功的就是 B-Tree 家族。从 1970 年 Rudolf Bayer 和 Edward McCreight 在波音科学研究实验室提出 B-Tree 起，这个…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】B-Tree 与 B+Tree：页式存储引擎的工程实现", "description": "数据库要把数据存到磁盘上，又要以尽可能少的磁盘 I/O 把数据找回来。这个矛盾催生了一系列面向磁盘的索引结构（Disk-oriented Index），其中最成功的就是 B-Tree 家族。从 1970 年 Rudolf Bayer 和 Edward McCreight 在波音科学研究实验室提出 B-Tree 起，这个…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/25-btree-engineering/btree-engineering.html"}, "datePublished": "2025-09-03T00:00:00+00:00", "dateModified": "2026-04-15T11:20:56+00:00", "keywords": ["btree", "b-plus-tree", "concurrency", "latch-coupling", "page-layout", "bulk-loading"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】B-Tree 与 B+Tree：页式存储引擎的工程实现</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-09-03</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#btree</span> <span>#b-plus-tree</span> <span>#concurrency</span> <span>#latch-coupling</span> <span>#page-layout</span> <span>#bulk-loading</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/24-storage-engine-overview/storage-engine-overview.html">上一篇：【存储工程】存储引擎概览：堆文件到 LSM-Tree 的演化路径</a><a class="post-series-nav__link" href="/post/storage/26-buffer-pool/buffer-pool.html">下一篇：【存储工程】Buffer Pool：数据库的内存管理</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/btree.html">#btree</a><a class="chip-link" href="/tags/b-plus-tree-d6a597.html">#b-plus-tree</a><a class="chip-link" href="/tags/concurrency-53e20a.html">#concurrency</a><a class="chip-link" href="/tags/latch-coupling.html">#latch-coupling</a><a class="chip-link" href="/tags/page-layout.html">#page-layout</a><a class="chip-link" href="/tags/bulk-loading.html">#bulk-loading</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一b-tree-基本原理"
+                id="toc-一b-tree-基本原理">一、B-Tree 基本原理</a>
+                <ul>
+                <li><a href="#为什么需要-b-tree"
+                id="toc-为什么需要-b-tree">1.1 为什么需要
+                B-Tree</a></li>
+                <li><a href="#b-tree-的定义" id="toc-b-tree-的定义">1.2
+                B-Tree 的定义</a></li>
+                <li><a href="#高度估算" id="toc-高度估算">1.3
+                高度估算</a></li>
+                <li><a href="#b-tree-的基本操作"
+                id="toc-b-tree-的基本操作">1.4 B-Tree
+                的基本操作</a></li>
+                <li><a href="#面向磁盘的设计"
+                id="toc-面向磁盘的设计">1.5 面向磁盘的设计</a></li>
+                </ul></li>
+                <li><a href="#二btree-与-b-tree-的区别"
+                id="toc-二btree-与-b-tree-的区别">二、B+Tree 与 B-Tree
+                的区别</a>
+                <ul>
+                <li><a href="#btree-的核心改动"
+                id="toc-btree-的核心改动">2.1 B+Tree 的核心改动</a></li>
+                <li><a href="#btree-的优势" id="toc-btree-的优势">2.2
+                B+Tree 的优势</a></li>
+                <li><a href="#btree-的代价" id="toc-btree-的代价">2.3
+                B+Tree 的代价</a></li>
+                <li><a href="#为什么数据库都选-btree"
+                id="toc-为什么数据库都选-btree">2.4 为什么数据库都选
+                B+Tree</a></li>
+                </ul></li>
+                <li><a href="#三页内布局"
+                id="toc-三页内布局">三、页内布局</a>
+                <ul>
+                <li><a href="#页的概念" id="toc-页的概念">3.1
+                页的概念</a></li>
+                <li><a href="#槽位页slotted-page布局"
+                id="toc-槽位页slotted-page布局">3.2 槽位页（Slotted
+                Page）布局</a></li>
+                <li><a href="#为什么用槽位页"
+                id="toc-为什么用槽位页">3.3 为什么用槽位页</a></li>
+                <li><a href="#内部节点的单元格式"
+                id="toc-内部节点的单元格式">3.4
+                内部节点的单元格式</a></li>
+                <li><a href="#叶子节点的单元格式"
+                id="toc-叶子节点的单元格式">3.5
+                叶子节点的单元格式</a></li>
+                <li><a href="#页内查找" id="toc-页内查找">3.6
+                页内查找</a></li>
+                </ul></li>
+                <li><a href="#四分裂与合并"
+                id="toc-四分裂与合并">四、分裂与合并</a>
+                <ul>
+                <li><a href="#节点分裂node-split"
+                id="toc-节点分裂node-split">4.1 节点分裂（Node
+                Split）</a></li>
+                <li><a href="#分裂的传播" id="toc-分裂的传播">4.2
+                分裂的传播</a></li>
+                <li><a href="#分裂策略的选择"
+                id="toc-分裂策略的选择">4.3 分裂策略的选择</a></li>
+                <li><a href="#节点合并merge与重分配redistribution"
+                id="toc-节点合并merge与重分配redistribution">4.4
+                节点合并（Merge）与重分配（Redistribution）</a></li>
+                <li><a href="#实践中的简化" id="toc-实践中的简化">4.5
+                实践中的简化</a></li>
+                </ul></li>
+                <li><a href="#五并发控制"
+                id="toc-五并发控制">五、并发控制</a>
+                <ul>
+                <li><a href="#问题的本质" id="toc-问题的本质">5.1
+                问题的本质</a></li>
+                <li><a href="#闩锁与锁的区别"
+                id="toc-闩锁与锁的区别">5.2 闩锁与锁的区别</a></li>
+                <li><a href="#闩锁耦合latch-coupling-crabbing"
+                id="toc-闩锁耦合latch-coupling-crabbing">5.3
+                闩锁耦合（Latch Coupling / Crabbing）</a></li>
+                <li><a href="#悲观闩锁的问题"
+                id="toc-悲观闩锁的问题">5.4 悲观闩锁的问题</a></li>
+                <li><a href="#乐观闩锁耦合optimistic-latch-coupling"
+                id="toc-乐观闩锁耦合optimistic-latch-coupling">5.5
+                乐观闩锁耦合（Optimistic Latch Coupling）</a></li>
+                <li><a href="#b-link-tree" id="toc-b-link-tree">5.6
+                B-link Tree</a></li>
+                <li><a href="#optimistic-lock-couplingolc"
+                id="toc-optimistic-lock-couplingolc">5.7 Optimistic Lock
+                Coupling（OLC）</a></li>
+                </ul></li>
+                <li><a href="#六前缀压缩与后缀截断"
+                id="toc-六前缀压缩与后缀截断">六、前缀压缩与后缀截断</a>
+                <ul>
+                <li><a href="#问题背景" id="toc-问题背景">6.1
+                问题背景</a></li>
+                <li><a href="#前缀压缩prefix-compression"
+                id="toc-前缀压缩prefix-compression">6.2 前缀压缩（Prefix
+                Compression）</a></li>
+                <li><a href="#后缀截断suffix-truncation"
+                id="toc-后缀截断suffix-truncation">6.3 后缀截断（Suffix
+                Truncation）</a></li>
+                <li><a href="#压缩的代价" id="toc-压缩的代价">6.4
+                压缩的代价</a></li>
+                </ul></li>
+                <li><a href="#七批量加载bulk-loading"
+                id="toc-七批量加载bulk-loading">七、批量加载（Bulk
+                Loading）</a>
+                <ul>
+                <li><a href="#为什么需要批量加载"
+                id="toc-为什么需要批量加载">7.1
+                为什么需要批量加载</a></li>
+                <li><a href="#自底向上构建bottom-up-construction"
+                id="toc-自底向上构建bottom-up-construction">7.2
+                自底向上构建（Bottom-up Construction）</a></li>
+                <li><a href="#装填因子fill-factor"
+                id="toc-装填因子fill-factor">7.3 装填因子（Fill
+                Factor）</a></li>
+                <li><a href="#实际数据库中的批量加载"
+                id="toc-实际数据库中的批量加载">7.4
+                实际数据库中的批量加载</a></li>
+                <li><a href="#批量加载的-io-模式"
+                id="toc-批量加载的-io-模式">7.5 批量加载的 I/O
+                模式</a></li>
+                </ul></li>
+                <li><a href="#八写时复制-b-tree"
+                id="toc-八写时复制-b-tree">八、写时复制 B-Tree</a>
+                <ul>
+                <li><a href="#什么是写时复制-b-tree"
+                id="toc-什么是写时复制-b-tree">8.1 什么是写时复制
+                B-Tree</a></li>
+                <li><a href="#lmdb-与-boltdb-的实现"
+                id="toc-lmdb-与-boltdb-的实现">8.2 LMDB 与 BoltDB
+                的实现</a></li>
+                <li><a href="#cow-b-tree-与-mvcc"
+                id="toc-cow-b-tree-与-mvcc">8.3 CoW B-Tree 与
+                MVCC</a></li>
+                <li><a href="#cow-b-tree-的代价"
+                id="toc-cow-b-tree-的代价">8.4 CoW B-Tree
+                的代价</a></li>
+                <li><a href="#适用场景" id="toc-适用场景">8.5
+                适用场景</a></li>
+                </ul></li>
+                <li><a href="#九innodb-btree-实现分析"
+                id="toc-九innodb-btree-实现分析">九、InnoDB B+Tree
+                实现分析</a>
+                <ul>
+                <li><a href="#innodb-的索引组织"
+                id="toc-innodb-的索引组织">9.1 InnoDB
+                的索引组织</a></li>
+                <li><a href="#innodb-页结构" id="toc-innodb-页结构">9.2
+                InnoDB 页结构</a></li>
+                <li><a href="#记录格式" id="toc-记录格式">9.3
+                记录格式</a></li>
+                <li><a href="#自适应哈希索引adaptive-hash-index"
+                id="toc-自适应哈希索引adaptive-hash-index">9.4
+                自适应哈希索引（Adaptive Hash Index）</a></li>
+                <li><a href="#innodb-的页分裂实现"
+                id="toc-innodb-的页分裂实现">9.5 InnoDB
+                的页分裂实现</a></li>
+                <li><a href="#innodb-的-change-buffer"
+                id="toc-innodb-的-change-buffer">9.6 InnoDB 的 Change
+                Buffer</a></li>
+                </ul></li>
+                <li><a href="#十btree-可视化与调试"
+                id="toc-十btree-可视化与调试">十、B+Tree
+                可视化与调试</a>
+                <ul>
+                <li><a href="#为什么需要可视化"
+                id="toc-为什么需要可视化">10.1 为什么需要可视化</a></li>
+                <li><a href="#innodb-的-innodb_ruby"
+                id="toc-innodb-的-innodb_ruby">10.2 InnoDB 的
+                innodb_ruby</a></li>
+                <li><a href="#postgresql-的-pageinspect"
+                id="toc-postgresql-的-pageinspect">10.3 PostgreSQL 的
+                pageinspect</a></li>
+                <li><a href="#理解页分裂" id="toc-理解页分裂">10.4
+                理解页分裂</a></li>
+                <li><a href="#innodb-的-information_schema-工具"
+                id="toc-innodb-的-information_schema-工具">10.5 InnoDB
+                的 INFORMATION_SCHEMA 工具</a></li>
+                <li><a href="#调试页分裂的实战案例"
+                id="toc-调试页分裂的实战案例">10.6
+                调试页分裂的实战案例</a></li>
+                </ul></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#书籍" id="toc-书籍">书籍</a></li>
+                <li><a href="#源码与文档"
+                id="toc-源码与文档">源码与文档</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>数据库要把数据存到磁盘上，又要以尽可能少的磁盘 I/O
+            把数据找回来。这个矛盾催生了一系列面向磁盘的索引结构（Disk-oriented
+            Index），其中最成功的就是 B-Tree 家族。从 1970 年 Rudolf
+            Bayer 和 Edward McCreight 在波音科学研究实验室提出 B-Tree
+            起，这个数据结构统治了关系型数据库的索引层超过半个世纪。MySQL/InnoDB、PostgreSQL、SQLite、Oracle、SQL
+            Server——几乎所有主流关系型数据库的默认索引结构都是
+            B+Tree，B-Tree 的一个变体。</p>
+            <p>B-Tree
+            的核心设计目标只有一个：把树的高度压到极低，让每次查找只需要
+            3 到 4 次磁盘
+            I/O。它做到这一点的方式是把节点大小对齐到磁盘页（Page），每个节点可以容纳成百上千个键（Key），从而获得极高的扇出（Fanout）。一棵扇出为
+            500 的 B+Tree，三层就能索引 1.25 亿条记录。</p>
+            <p>但教科书上的 B-Tree 和生产环境里的 B+Tree
+            之间隔着大量工程细节：页内怎么布局才能支持变长键值？节点分裂时怎么保证并发安全？怎么减少锁的粒度让读写互不阻塞？怎么批量加载数据而不是一条条插入？怎么通过前缀压缩和后缀截断在同一个页里塞进更多键？</p>
+            <p>本文从 B-Tree 的基本原理讲起，逐层拆解 B+Tree
+            的页内布局、分裂合并算法、并发控制方案、压缩优化手段、批量加载策略、写时复制变体，最后落到
+            InnoDB 的具体实现和可视化调试工具。</p>
+            <hr />
+            <h2 id="一b-tree-基本原理">一、B-Tree 基本原理</h2>
+            <h3 id="为什么需要-b-tree">1.1 为什么需要 B-Tree</h3>
+            <p>内存里做查找，平衡二叉搜索树（Balanced Binary Search
+            Tree）已经够用了——红黑树、AVL 树的查找时间复杂度都是 O(log
+            n)。但当数据量大到必须存在磁盘上时，二叉树有一个致命问题：树太高了。</p>
+            <p>假设有 1 亿条记录，一棵完美平衡的二叉树高度是 log₂(10⁸) ≈
+            27。每层一次磁盘 I/O，一次查找就需要 27
+            次随机读——在机械硬盘（HDD）上每次随机读约 10ms，一次查找就要
+            270ms，完全不可接受。</p>
+            <p>问题的根源在于二叉树每个节点只存一个键、只有两个子节点，扇出（Fanout）只有
+            2。如果把每个节点扩大到一整个磁盘页（通常 4KB 到
+            16KB），让每个节点能存几百个键、有几百个子节点，树的高度就能压下来。</p>
+            <p>这就是 B-Tree 的核心思想：用高扇出（High
+            Fanout）换低高度（Low Height），从而把磁盘 I/O
+            次数降到最低。</p>
+            <h3 id="b-tree-的定义">1.2 B-Tree 的定义</h3>
+            <p>一棵 m 阶（Order）B-Tree 满足以下性质：</p>
+            <ol type="1">
+            <li>每个节点（Node）最多有 m 个子节点；</li>
+            <li>每个非根的内部节点至少有 ⌈m/2⌉ 个子节点；</li>
+            <li>根节点（Root）至少有 2
+            个子节点（除非树只有根节点）；</li>
+            <li>一个有 k 个子节点的节点包含 k-1 个键；</li>
+            <li>所有叶子节点（Leaf
+            Node）在同一层——这保证了树是完美平衡的。</li>
+            </ol>
+            <p>这些约束保证了两件事：</p>
+            <ul>
+            <li><strong>树的高度是 O(log
+            n)</strong>：因为每个节点至少半满，扇出至少为 ⌈m/2⌉；</li>
+            <li><strong>查找、插入、删除的时间复杂度都是 O(log
+            n)</strong>：每次操作最多从根到叶子走一遍。</li>
+            </ul>
+            <h3 id="高度估算">1.3 高度估算</h3>
+            <p>设 B-Tree 的阶数为 m，树中有 n
+            个键。最坏情况下（每个节点恰好半满），树的高度 h 满足：</p>
+            <pre class="text"><code>h ≤ log_{⌈m/2⌉}((n+1)/2)</code></pre>
+            <p>以 InnoDB 为例：页大小 16KB，假设每个键占 8 字节（bigint
+            主键）、每个页指针占 6 字节，一个内部节点可以容纳约 16384 /
+            (8 + 6) ≈ 1170 个指针，即扇出约 1170。则：</p>
+            <pre class="text"><code>h = 1: 最多 1170 - 1 ≈ 1,169 条记录
+h = 2: 最多 1170 × 1169 ≈ 1,367,730 条记录
+h = 3: 最多 1170 × 1170 × 1169 ≈ 1.6 × 10⁹ 条记录
+h = 4: 最多约 1.87 × 10¹² 条记录</code></pre>
+            <p>三层 B+Tree 就能索引超过 16
+            亿条记录。考虑到根节点和部分内部节点常驻内存，实际需要的磁盘
+            I/O 通常只有 1 到 2 次。</p>
+            <h3 id="b-tree-的基本操作">1.4 B-Tree 的基本操作</h3>
+            <p><strong>查找（Search）</strong>：从根节点开始，在每个节点内部用二分查找（Binary
+            Search）定位键所在的区间，然后沿对应的子指针向下走，直到找到目标键或到达叶子节点。</p>
+            <p><strong>插入（Insert）</strong>：先执行查找，定位到应该插入的叶子节点。如果叶子节点有空间，直接插入。如果叶子节点已满（包含
+            m-1
+            个键），需要分裂（Split）：把节点一分为二，中间键提升（Promote）到父节点。如果父节点也满了，继续向上分裂，最坏情况下一直分裂到根节点，树的高度增加
+            1。</p>
+            <p><strong>删除（Delete）</strong>：先查找到目标键。如果键在叶子节点且删除后节点仍然至少半满，直接删除。否则需要从兄弟节点借键（Redistribution）或与兄弟节点合并（Merge）。如果合并导致父节点的键数低于下限，继续向上合并。</p>
+            <pre class="text"><code>查找路径示意（m=4 的 B-Tree）：
+
+                    [30]
+                   /    \
+            [10, 20]    [40, 50, 60]
+           / |  \       / |   |    \
+         [5] [15] [25] [35] [45] [55,65]
+
+查找 key=45:
+  1. 根节点: 45 &gt; 30 → 走右子树
+  2. [40, 50, 60]: 40 &lt; 45 &lt; 50 → 走第二个子指针
+  3. 到达叶子节点 [45] → 找到</code></pre>
+            <h3 id="面向磁盘的设计">1.5 面向磁盘的设计</h3>
+            <p>B-Tree
+            是专门为磁盘设计的数据结构，它的每一个设计决策都在减少磁盘
+            I/O：</p>
+            <ol type="1">
+            <li><strong>节点大小等于磁盘页大小</strong>：每读一个节点刚好一次
+            I/O，不浪费带宽；</li>
+            <li><strong>高扇出</strong>：树很矮，查找路径上的 I/O
+            次数少；</li>
+            <li><strong>节点至少半满</strong>：空间利用率有下限，不会退化成瘦长的树；</li>
+            <li><strong>有序存储</strong>：支持范围查询（Range
+            Query），顺序扫描时可以利用磁盘的顺序读优势。</li>
+            </ol>
+            <p>这些特性让 B-Tree 成为磁盘索引的标准选择，从 1970
+            年代沿用至今。</p>
+            <hr />
+            <h2 id="二btree-与-b-tree-的区别">二、B+Tree 与 B-Tree
+            的区别</h2>
+            <h3 id="btree-的核心改动">2.1 B+Tree 的核心改动</h3>
+            <p>B+Tree 是 B-Tree 的一个变体，最早由 IBM 的研究人员在 1970
+            年代提出。它对 B-Tree 做了两个关键改动：</p>
+            <ol type="1">
+            <li><strong>所有数据只存在叶子节点</strong>：内部节点（Internal
+            Node）只存键和子指针，不存数据。这意味着内部节点可以塞进更多的键，扇出更高，树更矮。</li>
+            <li><strong>叶子节点用链表（Linked
+            List）串起来</strong>：每个叶子节点有一个指向下一个叶子节点的指针（通常是双向链表），范围查询时不需要回到父节点，直接沿链表顺序扫描。</li>
+            </ol>
+            <pre class="text"><code>B-Tree vs B+Tree 的结构对比：
+
+B-Tree（数据散布在所有节点）：
+                [30, data₃₀]
+               /              \
+    [10, data₁₀, 20, data₂₀]  [40, data₄₀, 50, data₅₀]
+
+B+Tree（数据只在叶子节点）：
+                    [30]                    ← 内部节点：只有键
+               /          \
+    [10, 20] ──→ [30, 40, 50]              ← 叶子节点：键 + 数据
+              链表指针</code></pre>
+            <h3 id="btree-的优势">2.2 B+Tree 的优势</h3>
+            <p><strong>更高的扇出</strong>：内部节点不存数据，只存键和指针。同样
+            16KB 的页，B+Tree 的内部节点能容纳的键数量远多于
+            B-Tree。扇出越高，树越矮，查找需要的 I/O 越少。</p>
+            <p><strong>范围查询效率高</strong>：B-Tree
+            做范围扫描需要中序遍历（Inorder
+            Traversal），不断在内部节点和叶子节点之间跳转。B+Tree
+            只需要找到范围起点的叶子节点，然后沿链表顺序扫描，每个叶子节点恰好是一个磁盘页，顺序读性能远好于随机读。</p>
+            <p><strong>扫描成本可预测</strong>：B+Tree 的全表扫描（Full
+            Scan）成本等于叶子节点总数乘以每次 I/O
+            的时间，与内部节点数量无关。B-Tree 需要遍历所有节点。</p>
+            <p><strong>缓存效率更好</strong>：热点数据的查找路径上只有内部节点，这些节点不包含数据，更小、更容易全部驻留在缓冲池（Buffer
+            Pool）里。</p>
+            <h3 id="btree-的代价">2.3 B+Tree 的代价</h3>
+            <p><strong>单点查询略慢</strong>：在 B-Tree
+            中，如果目标键恰好在靠近根的内部节点，查找可以提前终止。B+Tree
+            必须走到叶子节点才能拿到数据，查找路径总是从根到叶。不过考虑到内部节点通常常驻内存，这个差异在实践中可以忽略。</p>
+            <p><strong>键的重复存储</strong>：分隔键（Separator
+            Key）在内部节点和叶子节点中都有副本。不过后面会看到，通过后缀截断（Suffix
+            Truncation），内部节点存储的只是键的一个前缀，实际浪费的空间很少。</p>
+            <h3 id="为什么数据库都选-btree">2.4 为什么数据库都选
+            B+Tree</h3>
+            <p>对
+            OLTP（在线事务处理）数据库来说，范围查询是核心需求——<code>SELECT ... WHERE id BETWEEN 100 AND 200</code>
+            这样的查询无处不在。B+Tree
+            的叶子链表让范围查询变成顺序扫描，性能提升可达一个数量级。</p>
+            <p>同时，OLTP
+            的典型负载是大量的小事务，每个事务只读写几条记录。B+Tree
+            的内部节点可以全部缓存到内存里，每次单点查找只需要读 1
+            个叶子页。这让 B+Tree
+            在实际工作负载下的性能表现几乎是最优的。</p>
+            <p>下面的表格总结了两者的关键区别：</p>
+            <pre class="text"><code>┌─────────────────┬────────────────────┬─────────────────────┐
+│     特性        │     B-Tree         │     B+Tree          │
+├─────────────────┼────────────────────┼─────────────────────┤
+│ 数据存储位置    │ 所有节点           │ 仅叶子节点          │
+│ 叶子节点链表    │ 无                 │ 有（双向链表）      │
+│ 内部节点扇出    │ 较低               │ 较高                │
+│ 范围查询效率    │ 需要中序遍历       │ 叶子链表顺序扫描    │
+│ 单点查找路径    │ 可能在中间层命中   │ 必须到叶子节点      │
+│ 全扫描成本      │ 遍历所有节点       │ 只遍历叶子节点      │
+│ 空间利用率      │ 键不重复           │ 分隔键有副本        │
+│ 实际使用        │ 文件系统（部分）   │ 几乎所有 RDBMS      │
+└─────────────────┴────────────────────┴─────────────────────┘</code></pre>
+            <hr />
+            <h2 id="三页内布局">三、页内布局</h2>
+            <h3 id="页的概念">3.1 页的概念</h3>
+            <p>B+Tree 的每个节点对应磁盘上的一个页（Page）。页是 B+Tree
+            与磁盘之间的 I/O
+            单位：读一个节点就是从磁盘读一个页，写一个节点就是把一个页刷回磁盘。</p>
+            <p>页的大小通常是固定的：InnoDB 默认 16KB，PostgreSQL 默认
+            8KB，SQLite 默认 4KB。页大小的选择是一个权衡：</p>
+            <ul>
+            <li><strong>页越大</strong>：扇出越高、树越矮、I/O
+            次数越少，但每次 I/O 传输的数据量越大，写放大越严重；</li>
+            <li><strong>页越小</strong>：写放大小、缓冲池能缓存更多页，但树更高、I/O
+            次数更多。</li>
+            </ul>
+            <h3 id="槽位页slotted-page布局">3.2 槽位页（Slotted
+            Page）布局</h3>
+            <p>大多数数据库使用槽位页（Slotted
+            Page）布局来组织页内数据。这种布局的核心思想是用一个间接层——槽位数组（Slot
+            Array）——来管理页内变长记录（Variable-length
+            Record）的物理位置。</p>
+            <p>一个槽位页的结构如下：</p>
+            <pre class="text"><code>┌──────────────────────────────────────────────────┐
+│                    Page Header                    │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ page_id │ page_type │ num_slots │ free_start │ │
+│ │ free_end │ checksum │ lsn │ ...             │ │
+│ └──────────────────────────────────────────────┘ │
+├──────────────────────────────────────────────────┤
+│  Slot Array (grows →)                            │
+│ ┌──────┬──────┬──────┬──────┬─────────────────┐ │
+│ │ S[0] │ S[1] │ S[2] │ S[3] │    ...          │ │
+│ └──────┴──────┴──────┴──────┴─────────────────┘ │
+│                                                  │
+│          Free Space（中间空闲区域）               │
+│                                                  │
+│ ┌─────────────────────────────────────────────┐  │
+│ │ Cell[3] │ Cell[2] │ Cell[1] │ Cell[0] │ ... │  │
+│ └─────────────────────────────────────────────┘  │
+│  Cell Data (← grows)                             │
+├──────────────────────────────────────────────────┤
+│                    Page Trailer                   │
+│ ┌──────────────────────────────────────────────┐ │
+│ │               checksum                       │ │
+│ └──────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────┘</code></pre>
+            <p><strong>Page Header</strong>：存储页的元数据——页
+            ID、页类型（叶子页 /
+            内部页）、槽位数量、空闲空间的起止偏移、校验和（Checksum）、日志序列号（LSN）等。InnoDB
+            的页头占 38 字节（<code>FIL_PAGE_DATA</code>
+            偏移量），加上页尾的 8 字节校验信息。</p>
+            <p><strong>Slot
+            Array</strong>：从页头之后向右增长。每个槽位（Slot）是一个 2
+            字节的偏移量，指向对应的单元（Cell）在页内的物理位置。槽位按键的逻辑顺序排列，但它们指向的单元在物理上可以是无序的。</p>
+            <p><strong>Cell
+            Data</strong>：从页尾向左增长。每个单元包含一条记录的实际数据。单元的物理顺序与逻辑顺序无关——插入新记录时，只需要在空闲区域的末尾追加单元，然后在槽位数组的正确位置插入一个新的偏移量。</p>
+            <p><strong>Free
+            Space</strong>：槽位数组和单元数据之间的空闲区域。当空闲空间耗尽时，先尝试整理碎片（Compaction）——把所有单元紧凑排列，回收被删除单元留下的空洞；如果整理后仍然不够，就触发页分裂。</p>
+            <h3 id="为什么用槽位页">3.3 为什么用槽位页</h3>
+            <p>槽位页的核心好处是：插入和删除操作不需要移动大量数据。</p>
+            <p>在一个没有间接层的页中，记录按键顺序紧密排列。插入一条新记录到中间位置，需要把后面的所有记录向后移动。如果记录是变长的，还要处理对齐和碎片问题。</p>
+            <p>有了槽位数组，插入变成了两步：</p>
+            <ol type="1">
+            <li>把新记录的数据追加到单元区域的末尾——O(1)；</li>
+            <li>在槽位数组的正确位置插入一个新的偏移量——需要移动后续的槽位，但每个槽位只有
+            2 字节，移动的数据量很小。</li>
+            </ol>
+            <p>删除则更简单：把对应的槽位从数组中移除，单元数据标记为可回收。</p>
+            <h3 id="内部节点的单元格式">3.4 内部节点的单元格式</h3>
+            <p>B+Tree 内部节点的每个单元包含一个键和一个子页指针（Child
+            Page Pointer）：</p>
+            <pre class="text"><code>内部节点单元格式：
+┌────────────┬───────────┐
+│ child_page │    key    │
+│  (4-6 B)   │ (variable)│
+└────────────┴───────────┘
+
+内部节点布局（逻辑视图）：
+ P₀ │ K₁ │ P₁ │ K₂ │ P₂ │ K₃ │ P₃
+
+ 含义：P₀ 指向所有 key &lt; K₁ 的子树
+       P₁ 指向所有 K₁ ≤ key &lt; K₂ 的子树
+       P₂ 指向所有 K₂ ≤ key &lt; K₃ 的子树
+       P₃ 指向所有 key ≥ K₃ 的子树</code></pre>
+            <p>注意最左边的指针 P₀
+            没有对应的键，它指向”小于第一个键”的子树。实现上通常在页头单独存储这个指针。</p>
+            <h3 id="叶子节点的单元格式">3.5 叶子节点的单元格式</h3>
+            <p>叶子节点的单元包含键和数据值（或指向数据的指针）：</p>
+            <pre class="text"><code>聚簇索引（Clustered Index）叶子单元：
+┌─────────┬───────────────────────┐
+│   key   │      row data         │
+│(variable)│  (所有列的实际数据)   │
+└─────────┴───────────────────────┘
+
+二级索引（Secondary Index）叶子单元：
+┌─────────┬───────────────────┐
+│   key   │   primary key     │
+│(variable)│ (指回聚簇索引)    │
+└─────────┴───────────────────┘</code></pre>
+            <p>在 InnoDB
+            中，聚簇索引的叶子节点直接存储整行数据，而二级索引的叶子节点存储的是对应的主键值，查完二级索引还需要一次”回表”（Bookmark
+            Lookup）到聚簇索引去取完整行。</p>
+            <h3 id="页内查找">3.6 页内查找</h3>
+            <p>在页内定位一个键的过程通常使用二分查找（Binary
+            Search）。槽位数组按键的逻辑顺序排列，二分查找直接在槽位数组上进行：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 伪代码：页内二分查找</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> page_search<span class="op">(</span>Page <span class="op">*</span>page<span class="op">,</span> Key target<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> lo <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> hi <span class="op">=</span> page<span class="op">-&gt;</span>num_slots <span class="op">-</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>lo <span class="op">&lt;=</span> hi<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> mid <span class="op">=</span> lo <span class="op">+</span> <span class="op">(</span>hi <span class="op">-</span> lo<span class="op">)</span> <span class="op">/</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>        Key mid_key <span class="op">=</span> get_key_at_slot<span class="op">(</span>page<span class="op">,</span> mid<span class="op">);</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> cmp <span class="op">=</span> compare_keys<span class="op">(</span>mid_key<span class="op">,</span> target<span class="op">);</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>cmp <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> mid<span class="op">;</span>       <span class="co">// 找到</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>cmp <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> lo <span class="op">=</span> mid <span class="op">+</span> <span class="dv">1</span><span class="op">;</span>      <span class="co">// 目标在右半部分</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>         hi <span class="op">=</span> mid <span class="op">-</span> <span class="dv">1</span><span class="op">;</span>      <span class="co">// 目标在左半部分</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> lo<span class="op">;</span>  <span class="co">// 插入位置</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>对于包含几百个键的页，二分查找最多需要约 10
+            次比较，全在内存中完成，耗时可以忽略不计。</p>
+            <hr />
+            <h2 id="四分裂与合并">四、分裂与合并</h2>
+            <h3 id="节点分裂node-split">4.1 节点分裂（Node Split）</h3>
+            <p>当一个节点已满（键的数量达到上限），需要插入新键时，就触发分裂。分裂是
+            B+Tree 维持平衡的核心机制。</p>
+            <p><strong>叶子节点分裂</strong>的步骤：</p>
+            <ol type="1">
+            <li>创建一个新的叶子页；</li>
+            <li>把原页中后半部分的记录移动到新页；</li>
+            <li>更新叶子链表指针：新页插入到原页和原页的下一个兄弟之间；</li>
+            <li>把新页的最小键（分隔键）和新页的指针插入到父节点。</li>
+            </ol>
+            <pre class="text"><code>分裂前：
+  父节点：[... | 30 | ...]
+              |
+  叶子节点：[10, 15, 20, 25, 30]  ← 已满，要插入 18
+
+分裂后：
+  父节点：[... | 20 | 30 | ...]
+              |       |
+  左叶子：[10, 15, 18]  右叶子：[20, 25, 30]
+            ──────────→
+            叶子链表指针</code></pre>
+            <p><strong>内部节点分裂</strong>的步骤类似，但中间键是被”提升”（Promote）到父节点，而不是被复制。</p>
+            <h3 id="分裂的传播">4.2 分裂的传播</h3>
+            <p>如果父节点在接收新的分隔键后也满了，父节点也要分裂，分隔键继续向上传播。最坏情况下，分裂一路传播到根节点：根节点分裂后，创建一个新的根节点，树的高度增加
+            1。</p>
+            <p>这种传播在实际中很少发生。以 InnoDB 为例，一个 16KB
+            的内部节点可以容纳约 1170
+            个指针，节点满的概率随着层数向上递减。</p>
+            <pre class="text"><code>根节点分裂（树长高 1 层）：
+
+分裂前：
+  根节点：[10, 20, 30, 40, 50]  ← 已满
+
+分裂后：
+       新根：[30]
+            /    \
+  [10, 20]     [40, 50]</code></pre>
+            <h3 id="分裂策略的选择">4.3 分裂策略的选择</h3>
+            <p>传统 B+Tree 总是在节点正中间分裂，即左右各占一半（50/50
+            Split）。但在实际负载中，插入模式往往不是均匀随机的：</p>
+            <p><strong>顺序插入</strong>（如自增主键）：每次插入都到最右边的叶子节点，50/50
+            分裂会导致左边的节点只有一半满就再也不会被写入，空间利用率只有约
+            50%。</p>
+            <p><strong>改进策略</strong>：</p>
+            <ul>
+            <li><strong>90/10 分裂</strong>：InnoDB
+            检测到顺序插入模式时，只把最后一条记录放到新页，原页保持几乎满——这样空间利用率接近
+            100%。InnoDB 通过页头中的 <code>PAGE_LAST_INSERT</code> 和
+            <code>PAGE_DIRECTION</code> 字段来判断插入模式。</li>
+            <li><strong>前缀分裂</strong>（PostgreSQL）：选择分隔键时，尽量选择一个短前缀，减少内部节点存储分隔键的空间开销。</li>
+            </ul>
+            <h3 id="节点合并merge与重分配redistribution">4.4
+            节点合并（Merge）与重分配（Redistribution）</h3>
+            <p>删除操作可能导致节点低于半满的下限。B-Tree
+            规定此时需要重新平衡：</p>
+            <p><strong>重分配（Redistribution）</strong>：如果兄弟节点有多余的键，从兄弟节点借一个键过来，同时更新父节点中的分隔键。</p>
+            <pre class="text"><code>重分配示例：
+
+操作前（左节点过空，右兄弟有余量）：
+  父节点：[... | 30 | ...]
+              |       |
+  左叶子：[10]      右叶子：[30, 35, 40, 45]
+
+操作后（从右兄弟借一个键）：
+  父节点：[... | 35 | ...]
+              |       |
+  左叶子：[10, 30]   右叶子：[35, 40, 45]</code></pre>
+            <p><strong>合并（Merge）</strong>：如果兄弟节点也没有多余的键（恰好半满），就把两个节点合并为一个，同时删除父节点中对应的分隔键。合并可能级联向上传播。</p>
+            <h3 id="实践中的简化">4.5 实践中的简化</h3>
+            <p>很多数据库在实现中并不严格执行合并操作。原因有几个：</p>
+            <ol type="1">
+            <li><strong>合并的代价高</strong>：需要加锁两个节点及其父节点，并发冲突大；</li>
+            <li><strong>删除后往往很快又有插入</strong>：合并了很快又要分裂，白忙一场；</li>
+            <li><strong>空间利用率的下限足够宽松</strong>：节点半满时空间利用率已经是
+            50%，可以接受。</li>
+            </ol>
+            <p>PostgreSQL 的 B+Tree
+            实现（nbtree）不做合并，只标记空页供后续复用。InnoDB
+            在页中记录数低于某个阈值（由 <code>MERGE_THRESHOLD</code>
+            控制，默认 50%）时才尝试合并，且合并失败不会重试。SQLite
+            在页面使用率低于一定比例时才触发合并。</p>
+            <hr />
+            <h2 id="五并发控制">五、并发控制</h2>
+            <h3 id="问题的本质">5.1 问题的本质</h3>
+            <p>B+Tree 的并发控制面临一个两难：</p>
+            <ul>
+            <li><strong>读操作</strong>不修改树，理论上多个读可以完全并行；</li>
+            <li><strong>写操作</strong>可能触发分裂或合并，影响从叶子到根的整条路径上的多个节点；</li>
+            <li>如果简单地给整棵树加一把大锁，并发度就降为
+            1，性能不可接受。</li>
+            </ul>
+            <p>目标是让读与读完全并行，读与写尽可能并行，写与写至少在操作不同叶子节点时可以并行。</p>
+            <h3 id="闩锁与锁的区别">5.2 闩锁与锁的区别</h3>
+            <p>在讨论 B+Tree
+            并发控制之前，需要区分两个容易混淆的概念：</p>
+            <p><strong>锁（Lock）</strong>：数据库事务级别的并发控制机制，由锁管理器（Lock
+            Manager）管理，支持死锁检测，持续时间跨越整个事务。保护的是逻辑资源——行、表、键范围。</p>
+            <p><strong>闩锁（Latch）</strong>：物理层的互斥原语，类似于操作系统的互斥锁（Mutex）或读写锁（RWLock），持续时间极短（通常是一次页操作的时间），不需要死锁检测（通过编码规范保证无死锁）。保护的是物理资源——内存中的页。</p>
+            <p>B+Tree 的并发控制用的是闩锁，不是锁。</p>
+            <pre class="text"><code>┌─────────────┬──────────────────┬──────────────────┐
+│    属性     │    Lock（锁）    │   Latch（闩锁）  │
+├─────────────┼──────────────────┼──────────────────┤
+│ 保护对象    │ 逻辑资源（行等） │ 物理资源（页等） │
+│ 持续时间    │ 整个事务         │ 一次操作         │
+│ 死锁处理    │ 死锁检测 + 回滚  │ 编码保证无死锁   │
+│ 等待策略    │ 等待队列         │ 自旋 / 睡眠      │
+│ 模式        │ S/X/IS/IX/SIX   │ Read / Write     │
+│ 开销        │ 较大             │ 很小             │
+└─────────────┴──────────────────┴──────────────────┘</code></pre>
+            <h3 id="闩锁耦合latch-coupling-crabbing">5.3 闩锁耦合（Latch
+            Coupling / Crabbing）</h3>
+            <p>闩锁耦合（Latch Coupling），也叫螃蟹协议（Crabbing
+            Protocol），是 B+Tree
+            并发控制的经典方案。核心思想是：在树上向下遍历时，像螃蟹一样交替地”抓住”和”放开”节点。</p>
+            <p><strong>读操作的协议</strong>：</p>
+            <ol type="1">
+            <li>对当前节点加读闩锁（Read Latch）；</li>
+            <li>对子节点加读闩锁；</li>
+            <li>释放当前节点的读闩锁；</li>
+            <li>重复 2-3，直到到达叶子节点。</li>
+            </ol>
+            <p>任何时刻，读操作最多持有两个读闩锁（当前节点和子节点），且持有时间很短。</p>
+            <p><strong>写操作的协议（悲观方式）</strong>：</p>
+            <ol type="1">
+            <li>对当前节点加写闩锁（Write Latch）；</li>
+            <li>对子节点加写闩锁；</li>
+            <li>如果子节点是”安全的”（不会因为这次操作而分裂或合并），释放所有祖先节点的写闩锁；</li>
+            <li>重复 2-3，直到到达叶子节点。</li>
+            </ol>
+            <p>“安全的”意思是：对于插入，节点还没满（不会分裂）；对于删除，节点超过半满（不会合并）。</p>
+            <pre class="text"><code>闩锁耦合示意（插入操作）：
+
+          [R]  ← ① 加 Write Latch
+         /   \
+       [A]   [B]  ← ② 对 A 加 Write Latch，A 未满 → 释放 R 的锁
+       / \
+     [C] [D]  ← ③ 对 C 加 Write Latch，C 未满 → 释放 A 的锁
+     ↓
+   执行插入，释放 C 的锁</code></pre>
+            <h3 id="悲观闩锁的问题">5.4 悲观闩锁的问题</h3>
+            <p>悲观方式的闩锁耦合有一个实际问题：写操作从根节点开始就加写闩锁。根节点是全局热点，所有操作都要经过它。如果一个写操作对根节点加了写闩锁，所有其他操作（包括读操作）都必须等待。</p>
+            <p>在高并发场景下，根节点上的写闩锁成为严重的瓶颈。</p>
+            <h3 id="乐观闩锁耦合optimistic-latch-coupling">5.5
+            乐观闩锁耦合（Optimistic Latch Coupling）</h3>
+            <p>为了解决悲观闩锁的根节点瓶颈，可以采用乐观策略：</p>
+            <ol type="1">
+            <li><strong>乐观阶段</strong>：从根到叶子的遍历过程中，只对内部节点加读闩锁（而不是写闩锁），对叶子节点加写闩锁；</li>
+            <li><strong>检查阶段</strong>：如果叶子节点的操作不需要修改任何内部节点（即不需要分裂或合并），直接完成操作；</li>
+            <li><strong>回退阶段</strong>：如果需要分裂或合并，释放所有闩锁，用悲观模式重新从根节点开始。</li>
+            </ol>
+            <p>大多数写操作（插入到未满的叶子、删除后叶子仍然超过半满）不会触发分裂或合并，因此乐观策略在绝大多数情况下都能成功，很少需要回退。这大大减少了根节点上写闩锁的竞争。</p>
+            <pre class="text"><code>乐观闩锁耦合流程：
+
+正常路径（大多数情况）：
+  R(read) → A(read) → C(read) → Leaf(write) → 插入成功 → 释放
+
+回退路径（需要分裂时）：
+  R(read) → A(read) → C(read) → Leaf(write) → 发现需要分裂
+  → 释放所有闩锁
+  → R(write) → A(write) → C(write) → Leaf(write) → 分裂 + 插入</code></pre>
+            <h3 id="b-link-tree">5.6 B-link Tree</h3>
+            <p>B-link Tree 是 Lehman 和 Yao 在 1981
+            年提出的一种并发友好的 B+Tree 变体（论文标题为”Efficient
+            Locking for Concurrent Operations on
+            B-Trees”）。核心改动是给每个节点增加一个”右链指针”（Right-link
+            Pointer）和一个”高键”（High Key）。</p>
+            <p><strong>右链指针</strong>：每个节点存储一个指向同层右兄弟的指针（叶子节点本来就有这个指针，B-link
+            Tree 把它扩展到内部节点）。</p>
+            <p><strong>高键</strong>：每个节点存储一个上界——这个节点中所有键都小于等于高键。如果要查的键大于高键，说明目标在右兄弟中。</p>
+            <p>这两个改动的好处是：在分裂过程中，即使一个读操作看到了”半完成”的分裂状态（新节点已创建但父节点还没更新），它也可以通过右链指针找到正确的节点。这意味着分裂操作不需要同时锁住父节点和子节点，每次只需要锁住一个节点，大大降低了锁的粒度。</p>
+            <pre class="text"><code>B-link Tree 结构：
+
+  [30 | high=50] ──→ [70 | high=∞]
+       |                    |
+  [10, 20, 30] ──→ [40, 50] ──→ [60, 70, 80]
+   high=30          high=50       high=∞
+
+分裂进行中（父节点尚未更新）：
+  [30 | high=50] ──→ [70 | high=∞]
+       |                    |
+  [10, 20] ──→ [25, 30] ──→ [40, 50] ──→ [60, 70, 80]
+   high=22      high=30      high=50       high=∞
+               新节点
+
+  此时查找 key=25：
+  1. 从父节点 [30] 向下走
+  2. 到达 [10, 20]，发现 25 &gt; high=22
+  3. 跟随右链指针到 [25, 30] → 找到</code></pre>
+            <h3 id="optimistic-lock-couplingolc">5.7 Optimistic Lock
+            Coupling（OLC）</h3>
+            <p>Optimistic Lock Coupling 是 Viktor Leis 等人在 2016
+            年提出的方案（论文：“The ART of Practical
+            Synchronization”），后来在 2019 年的论文”Optimistic Lock
+            Coupling: A Scalable and Efficient General-Purpose
+            Synchronization Method”中做了系统化阐述。</p>
+            <p>OLC
+            的核心思想是：用版本号（Version）代替读闩锁。每个节点维护一个版本计数器（Version
+            Counter），写操作会递增版本号。读操作不加锁，而是在开始时记录版本号，在结束时检查版本号是否变化。如果版本号没变，说明读期间没有并发写，读到的数据是一致的；如果版本号变了，重试。</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co">// OLC 伪代码</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Node <span class="op">{</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> version<span class="op">;</span>  <span class="co">// 低位为写锁标记，高位为版本号</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 读操作</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="dt">uint64_t</span> v <span class="op">=</span> node<span class="op">-&gt;</span>version<span class="op">;</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>is_locked<span class="op">(</span>v<span class="op">))</span> <span class="op">{</span> retry<span class="op">();</span> <span class="op">}</span>  <span class="co">// 如果正在被写，等待</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="co">// ... 读取数据 ...</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>node<span class="op">-&gt;</span>version <span class="op">!=</span> v<span class="op">)</span> <span class="op">{</span> retry<span class="op">();</span> <span class="op">}</span>  <span class="co">// 数据可能被修改，重试</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a><span class="co">// 写操作</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>lock<span class="op">(</span>node<span class="op">);</span>      <span class="co">// 设置写锁标记</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="co">// ... 修改数据 ...</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a>unlock<span class="op">(</span>node<span class="op">);</span>    <span class="co">// 清除写锁标记，递增版本号</span></span></code></pre></div>
+            <p>OLC
+            的读操作完全不修改共享状态（不加锁、不修改计数器），因此在多核
+            CPU 上不会产生缓存行失效（Cache Line
+            Invalidation），扩展性非常好。Leis 等人的实验表明，OLC
+            在高并发读为主的负载下性能可以接近无锁数据结构。</p>
+            <hr />
+            <h2 id="六前缀压缩与后缀截断">六、前缀压缩与后缀截断</h2>
+            <h3 id="问题背景">6.1 问题背景</h3>
+            <p>B+Tree
+            的性能直接取决于扇出——每个页能容纳多少个键。扇出越高，树越矮，I/O
+            越少。因此，在同样大小的页中塞进更多的键，就是一个核心优化目标。</p>
+            <p>对于变长键（Variable-length
+            Key），尤其是字符串键，直接存储完整的键值往往非常浪费空间。同一个页内的键通常有很长的公共前缀（Common
+            Prefix）——比如一张 URL 表的索引，同一个页内的 URL 可能都以
+            <code>https://www.example.com/products/</code> 开头。</p>
+            <h3 id="前缀压缩prefix-compression">6.2 前缀压缩（Prefix
+            Compression）</h3>
+            <p>前缀压缩的思想很简单：同一个页内的键，把公共前缀提取出来只存一份，每个键只存去掉公共前缀后的后缀部分。</p>
+            <pre class="text"><code>未压缩：
+  Slot 0: &quot;https://www.example.com/products/apple&quot;
+  Slot 1: &quot;https://www.example.com/products/banana&quot;
+  Slot 2: &quot;https://www.example.com/products/cherry&quot;
+  Slot 3: &quot;https://www.example.com/products/date&quot;
+
+前缀压缩后：
+  公共前缀: &quot;https://www.example.com/products/&quot;  (存一次)
+  Slot 0: &quot;apple&quot;
+  Slot 1: &quot;banana&quot;
+  Slot 2: &quot;cherry&quot;
+  Slot 3: &quot;date&quot;</code></pre>
+            <p>实际实现中更常用的是增量编码（Delta
+            Encoding）或前缀长度编码：每个键只存储与前一个键不同的部分，以及公共前缀的长度。</p>
+            <pre class="text"><code>增量编码：
+  Slot 0: prefix_len=0, suffix=&quot;apple&quot;      (完整键)
+  Slot 1: prefix_len=0, suffix=&quot;banana&quot;     (与前一个键无公共前缀)
+  Slot 2: prefix_len=0, suffix=&quot;cherry&quot;
+  Slot 3: prefix_len=0, suffix=&quot;date&quot;
+
+  对于有公共前缀的键更有效：
+  Slot 0: prefix_len=0, suffix=&quot;user:1001:name&quot;
+  Slot 1: prefix_len=9, suffix=&quot;02:name&quot;    (与前一个键共享 &quot;user:100&quot;)
+  Slot 2: prefix_len=9, suffix=&quot;03:email&quot;
+  Slot 3: prefix_len=9, suffix=&quot;03:name&quot;</code></pre>
+            <p>PostgreSQL 的 B-Tree
+            实现使用了一种类似的前缀压缩方案（称为 deduplication 和
+            suffix truncation 的组合优化），在 PostgreSQL 13
+            及以后版本中引入了 deduplication 特性来减少索引大小。</p>
+            <h3 id="后缀截断suffix-truncation">6.3 后缀截断（Suffix
+            Truncation）</h3>
+            <p>后缀截断是针对内部节点的优化。内部节点中的分隔键（Separator
+            Key）不需要完整——它只需要能区分左右子树就够了。</p>
+            <p>考虑分裂时的场景：左子树的最大键是
+            <code>"Alexander"</code>，右子树的最小键是
+            <code>"Bert"</code>。分隔键不需要是
+            <code>"Bert"</code>，它可以是 <code>"B"</code> 甚至
+            <code>"B"</code>——只要能把 <code>"Alexander"</code> 和
+            <code>"Bert"</code> 分开就行。</p>
+            <pre class="text"><code>不使用后缀截断：
+  内部节点：[... | &quot;Bert&quot; | ...]
+                   5 字节
+
+使用后缀截断：
+  内部节点：[... | &quot;B&quot; | ...]
+                   1 字节
+
+节省了 80% 的空间</code></pre>
+            <p>后缀截断让内部节点中的每个分隔键变得更短，从而在同一个页中能容纳更多的分隔键，提高扇出。</p>
+            <p>PostgreSQL 的 nbtree 实现从 PostgreSQL 12
+            开始在插入路径中使用后缀截断（参见 Peter Geoghegan
+            的相关提交），这是一个显著的优化，对字符串索引的页扇出提升效果明显。</p>
+            <h3 id="压缩的代价">6.4 压缩的代价</h3>
+            <p>前缀压缩增加了页内操作的复杂度：</p>
+            <ul>
+            <li><strong>查找变慢</strong>：二分查找时需要先重建完整键再比较，或者用特殊的比较函数直接在压缩格式上操作；</li>
+            <li><strong>插入 /
+            删除变复杂</strong>：修改一个键可能影响相邻键的前缀长度；</li>
+            <li><strong>随机访问性能下降</strong>：增量编码要从第一个键开始才能重建第
+            n 个键的完整值。</li>
+            </ul>
+            <p>实际实现中通常做折中：把页内的键分成若干组（Group），每组内使用前缀压缩，组间不压缩。这样二分查找可以先在组间跳转（无需解压），定位到目标组后再在组内顺序解压比较。</p>
+            <pre class="text"><code>分组前缀压缩（Group Prefix Compression）：
+
+  Group 0 (restart point):
+    [0] &quot;user:1001:email&quot;    ← 完整键
+    [1] prefix=10, &quot;02:email&quot;
+    [2] prefix=10, &quot;03:email&quot;
+    [3] prefix=10, &quot;04:email&quot;
+
+  Group 1 (restart point):
+    [4] &quot;user:1005:email&quot;    ← 完整键
+    [5] prefix=10, &quot;06:email&quot;
+    [6] prefix=10, &quot;07:email&quot;
+    [7] prefix=10, &quot;08:email&quot;
+
+  二分查找先比较 [0] 和 [4]（完整键），再在组内顺序查找。</code></pre>
+            <p>这种分组方式在 LevelDB/RocksDB 的 SSTable（Sorted String
+            Table）中广泛使用——每隔 16 个键设一个重启点（Restart
+            Point），重启点存完整键。</p>
+            <hr />
+            <h2 id="七批量加载bulk-loading">七、批量加载（Bulk
+            Loading）</h2>
+            <h3 id="为什么需要批量加载">7.1 为什么需要批量加载</h3>
+            <p>逐条插入数据到 B+Tree 的效率很低：</p>
+            <ol type="1">
+            <li><strong>每次插入都要从根遍历到叶子</strong>：O(log n)
+            次页访问；</li>
+            <li><strong>随机
+            I/O</strong>：如果键不是按顺序插入的，每次插入可能访问不同的叶子页，缓冲池命中率低；</li>
+            <li><strong>大量分裂开销</strong>：节点不断地填满、分裂、再填满，浪费
+            CPU 和 I/O；</li>
+            <li><strong>并发争用</strong>：分裂需要修改多个节点，闩锁冲突严重。</li>
+            </ol>
+            <p>如果有大量数据需要一次性导入（比如初始化数据库、恢复备份），逐条插入可能需要数小时甚至数天。批量加载（Bulk
+            Loading）可以把时间缩短到几分钟。</p>
+            <h3 id="自底向上构建bottom-up-construction">7.2
+            自底向上构建（Bottom-up Construction）</h3>
+            <p>批量加载的标准方法是自底向上构建（Bottom-up
+            Construction）：</p>
+            <ol type="1">
+            <li><strong>对输入数据排序</strong>：按键的顺序排序所有记录。如果数据已经有序（如从另一个有序索引导出），可以跳过这一步；</li>
+            <li><strong>填充叶子层</strong>：按顺序扫描排序后的数据，依次填入叶子页。每个叶子页填到目标装填因子（Fill
+            Factor）后，创建一个新的叶子页，并记录分隔键；</li>
+            <li><strong>构建内部层</strong>：收集叶子层产生的所有分隔键和页指针，用同样的方式填入内部节点页。如果内部节点层也超过一页，继续向上构建，直到根节点只有一页。</li>
+            </ol>
+            <pre class="text"><code>自底向上构建过程：
+
+输入数据（已排序）：[5, 10, 15, 20, 25, 30, 35, 40, 45]
+假设每个叶子页最多容纳 3 个键，装填因子 100%
+
+第一步：填充叶子层
+  Leaf₁: [5, 10, 15]  → 分隔键 20
+  Leaf₂: [20, 25, 30] → 分隔键 35
+  Leaf₃: [35, 40, 45]
+
+第二步：构建内部层
+  Internal₁: [P(Leaf₁), 20, P(Leaf₂), 35, P(Leaf₃)]
+
+第三步：Internal₁ 就是根节点
+
+结果：
+         [20, 35]
+        /    |    \
+  [5,10,15] [20,25,30] [35,40,45]
+     ──→        ──→</code></pre>
+            <h3 id="装填因子fill-factor">7.3 装填因子（Fill
+            Factor）</h3>
+            <p>装填因子控制每个页在批量加载时填充到多满。选择的依据取决于后续的写入模式：</p>
+            <ul>
+            <li><strong>Fill Factor =
+            100%</strong>：页完全填满。空间利用率最高，但后续任何插入都会立即触发分裂；</li>
+            <li><strong>Fill Factor =
+            70-90%</strong>：每个页预留一些空间给后续的随机插入，减少分裂频率；</li>
+            <li><strong>Fill Factor =
+            50%</strong>：等同于逐条插入的最坏情况，通常没有必要这么低。</li>
+            </ul>
+            <p>InnoDB 的 <code>ALTER TABLE ... ALGORITHM=INPLACE</code>
+            重建索引时使用的默认装填因子是约 93%（实际由
+            <code>innodb_fill_factor</code> 参数控制，默认
+            100，表示尽量填满，但会预留一些空间给页头和内部记录）。PostgreSQL
+            的 <code>CREATE INDEX</code> 默认装填因子是 90%（可通过
+            <code>fillfactor</code> 存储参数调整）。</p>
+            <h3 id="实际数据库中的批量加载">7.4
+            实际数据库中的批量加载</h3>
+            <p><strong>InnoDB 的排序索引构建（Sorted Index
+            Build）</strong>：MySQL 5.7
+            及以后，<code>CREATE INDEX</code> 和
+            <code>ALTER TABLE ... ADD INDEX</code>
+            使用排序索引构建。流程是先扫描聚簇索引提取所有键值对，在内存中（或借助临时文件）排序，然后自底向上构建
+            B+Tree。这比旧版本的逐条插入快 3 到 5 倍。</p>
+            <p><strong>PostgreSQL 的索引构建</strong>：PostgreSQL 的
+            <code>CREATE INDEX</code>
+            默认使用排序方式构建——先用外部排序（External
+            Sort）把数据排好序，然后自底向上构建
+            B-Tree。<code>CREATE INDEX CONCURRENTLY</code>
+            则使用逐条插入方式，以避免阻塞其他事务，但速度明显更慢。</p>
+            <p><strong>SQLite 的排序器（Sorter）</strong>：SQLite 在
+            <code>CREATE INDEX</code>
+            时先把所有键值对写入一个临时的排序器，排序后批量写入 B-Tree
+            页。</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- PostgreSQL：创建索引时指定装填因子</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_users_email <span class="kw">ON</span> users (email) <span class="kw">WITH</span> (fillfactor <span class="op">=</span> <span class="dv">80</span>);</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- MySQL/InnoDB：排序索引构建是默认行为</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> users <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_email (email), ALGORITHM<span class="op">=</span>INPLACE;</span></code></pre></div>
+            <h3 id="批量加载的-io-模式">7.5 批量加载的 I/O 模式</h3>
+            <p>批量加载的 I/O 模式以顺序写为主：</p>
+            <ol type="1">
+            <li>排序阶段：如果数据量超过内存，使用外部归并排序，产生顺序读写的临时文件；</li>
+            <li>构建阶段：叶子页按顺序生成、按顺序写入磁盘，几乎没有随机
+            I/O。</li>
+            </ol>
+            <p>相比逐条插入的大量随机 I/O，批量加载对磁盘更友好，尤其在
+            HDD 上性能差异可达数十倍。</p>
+            <hr />
+            <h2 id="八写时复制-b-tree">八、写时复制 B-Tree</h2>
+            <h3 id="什么是写时复制-b-tree">8.1 什么是写时复制
+            B-Tree</h3>
+            <p>写时复制（Copy-on-Write，CoW）B-Tree 是一种特殊的 B+Tree
+            变体：修改一个节点时，不是就地更新（In-place
+            Update）原页，而是把修改写到一个新页，然后更新父节点的指针指向新页。由于父节点也被修改了，父节点也要写到新位置——这个过程一直向上传播到根节点。每次事务提交都会产生一个新的根节点。</p>
+            <pre class="text"><code>写时复制过程（修改叶子节点 C）：
+
+原始状态：
+     Root → [A]
+            / \
+          [B] [C]  ← 修改 C
+
+修改后：
+     Root&#39; → [A&#39;]       ← 新根
+             / \
+           [B] [C&#39;]     ← 新页 C&#39;，原 C 保留
+
+     旧 Root → [A]      ← 旧版本仍然完整可读
+               / \
+             [B] [C]</code></pre>
+            <h3 id="lmdb-与-boltdb-的实现">8.2 LMDB 与 BoltDB
+            的实现</h3>
+            <p>LMDB（Lightning Memory-Mapped Database）是 CoW B+Tree
+            最著名的实现之一，由 Howard Chu 为 OpenLDAP 项目开发。BoltDB
+            是 LMDB 的 Go 语言移植版，被 etcd 用作底层存储引擎。</p>
+            <p>LMDB 的设计特点：</p>
+            <ol type="1">
+            <li><p><strong>双根节点</strong>：LMDB
+            维护两个根节点（存储在文件头部的两个元数据页中），交替更新。事务提交时，新的树根写入未在使用的那个元数据页，然后通过
+            <code>fdatasync()</code>
+            持久化。如果写入过程中崩溃，另一个元数据页仍然指向上一个一致的版本；</p></li>
+            <li><p><strong>不需要 WAL</strong>：传统的就地更新 B+Tree
+            需要预写日志（Write-Ahead Log，WAL）来保证崩溃恢复。CoW
+            B+Tree 的旧版本始终保持完整，不需要
+            WAL——这简化了代码，也减少了写放大；</p></li>
+            <li><p><strong>读事务无锁</strong>：旧版本的树在有读事务引用时不会被回收。读事务只需要记录自己开始时的根节点指针，就能看到一个一致的快照（Snapshot），不需要任何锁。</p></li>
+            </ol>
+            <pre class="text"><code>LMDB 的双元数据页机制：
+
+  Meta Page 0 → Root A (txn_id = 100)
+  Meta Page 1 → Root B (txn_id = 101)  ← 当前最新
+
+  新事务提交：
+  Meta Page 0 → Root C (txn_id = 102)  ← 更新这个
+  Meta Page 1 → Root B (txn_id = 101)
+
+  读事务使用 txn_id 最大的那个根</code></pre>
+            <h3 id="cow-b-tree-与-mvcc">8.3 CoW B-Tree 与 MVCC</h3>
+            <p>CoW B-Tree 天然支持多版本并发控制（Multi-Version
+            Concurrency
+            Control，MVCC）。每次事务提交都产生一个新版本的树，旧版本在没有活跃读事务引用时才能被回收。</p>
+            <p>这和 PostgreSQL 的 MVCC 实现形成对比：PostgreSQL
+            在每一行中存储版本信息（xmin/xmax），需要定期 VACUUM
+            回收旧版本。CoW B-Tree
+            的版本管理在树的级别，粒度更粗但实现更简单。</p>
+            <h3 id="cow-b-tree-的代价">8.4 CoW B-Tree 的代价</h3>
+            <ol type="1">
+            <li><p><strong>写放大</strong>：每次修改都要复制从叶子到根的整条路径。如果树有
+            4 层，每层一个 4KB 页，一次修改就需要写
+            16KB。如果一个事务修改了散布在不同叶子节点的多条记录，写放大更严重——每个叶子节点的修改都要独立传播到根；</p></li>
+            <li><p><strong>碎片化</strong>：新页写到文件末尾或空闲位置，文件的物理布局会变得碎片化。LMDB
+            使用空闲页列表（Free Page
+            List）来复用已释放的页，但碎片化仍然是长期运行中的问题；</p></li>
+            <li><p><strong>空间回收延迟</strong>：只要有活跃的读事务引用旧版本，旧页就不能回收。一个长时间运行的读事务会阻止空间回收，导致数据库文件不断增长。LMDB
+            和 BoltDB
+            都有这个问题——长事务是它们在生产环境中最常见的陷阱。</p></li>
+            </ol>
+            <h3 id="适用场景">8.5 适用场景</h3>
+            <p>CoW B-Tree 适合以下场景：</p>
+            <ul>
+            <li><strong>读多写少</strong>：读事务完全无锁，写事务有路径复制的开销；</li>
+            <li><strong>需要一致性快照</strong>：备份、复制、分析查询；</li>
+            <li><strong>嵌入式场景</strong>：不需要独立的 WAL
+            模块，代码简单，依赖少（LMDB 的核心代码只有约 1 万行
+            C）；</li>
+            <li><strong>配置存储</strong>：etcd 使用 BoltDB
+            存储集群配置，写入频率低但要求强一致性。</li>
+            </ul>
+            <p>不适合的场景：写密集型负载、大量随机更新、需要长事务。</p>
+            <hr />
+            <h2 id="九innodb-btree-实现分析">九、InnoDB B+Tree
+            实现分析</h2>
+            <h3 id="innodb-的索引组织">9.1 InnoDB 的索引组织</h3>
+            <p>InnoDB 使用 B+Tree 作为唯一的数据存储结构——不仅索引是
+            B+Tree，数据本身也存储在 B+Tree
+            的叶子节点中。这种设计称为索引组织表（Index-Organized
+            Table）。</p>
+            <p><strong>聚簇索引（Clustered Index）</strong>：InnoDB
+            的每张表都有一个聚簇索引，通常是主键。聚簇索引的叶子节点存储完整的行数据。如果表没有显式主键，InnoDB
+            会选择一个唯一非空索引作为聚簇索引；如果也没有，InnoDB
+            会生成一个隐藏的 6 字节行 ID（Row ID）作为聚簇索引。</p>
+            <p><strong>二级索引（Secondary
+            Index）</strong>：二级索引的叶子节点存储的是索引键加上对应行的主键值。查询通过二级索引找到主键后，还需要到聚簇索引中做一次回表查找（Bookmark
+            Lookup）。</p>
+            <pre class="text"><code>InnoDB 索引结构示意：
+
+聚簇索引（主键 = id）：
+  内部节点：[100 | 200 | 300]
+            /    |     |    \
+  叶子节点：
+  [id=1, name=&quot;Alice&quot;, ...] → [id=100, name=&quot;Bob&quot;, ...] → [id=200, ...]
+
+二级索引（name）：
+  内部节点：[&quot;Bob&quot; | &quot;Eve&quot;]
+            /      |      \
+  叶子节点：
+  [name=&quot;Alice&quot;, pk=1] → [name=&quot;Bob&quot;, pk=100] → [name=&quot;Eve&quot;, pk=200]
+
+查询 WHERE name = &quot;Bob&quot;:
+  1. 在二级索引中查找 &quot;Bob&quot; → 得到 pk=100
+  2. 在聚簇索引中查找 id=100 → 得到完整行</code></pre>
+            <h3 id="innodb-页结构">9.2 InnoDB 页结构</h3>
+            <p>InnoDB 的默认页大小是 16KB（可通过
+            <code>innodb_page_size</code> 参数调整为 4KB、8KB、32KB 或
+            64KB）。每个页的结构如下：</p>
+            <pre class="text"><code>InnoDB 16KB 页结构：
+┌────────────────────────────────────────────┐
+│ FIL Header (38 bytes)                       │
+│   - 页号、页类型、校验和、LSN              │
+│   - 前一页和后一页的指针                   │
+├────────────────────────────────────────────┤
+│ Page Header (56 bytes)                      │
+│   - 记录数、堆顶指针、空闲链表指针        │
+│   - 页方向、最后插入位置                   │
+│   - 页级别（叶子 = 0，内部 &gt; 0）          │
+│   - 索引 ID                                │
+├────────────────────────────────────────────┤
+│ Infimum Record (13 bytes)                   │
+│   - 虚拟最小记录（所有记录的逻辑起点）     │
+├────────────────────────────────────────────┤
+│ Supremum Record (13 bytes)                  │
+│   - 虚拟最大记录（所有记录的逻辑终点）     │
+├────────────────────────────────────────────┤
+│ User Records                                │
+│   - 实际的数据记录（变长）                 │
+│   - 按插入顺序排列（物理无序）             │
+│   - 通过 next_record 指针形成有序链表      │
+├────────────────────────────────────────────┤
+│ Free Space                                  │
+├────────────────────────────────────────────┤
+│ Page Directory (Slot Array)                 │
+│   - 每 4-8 条记录一个槽位                  │
+│   - 用于页内二分查找                       │
+├────────────────────────────────────────────┤
+│ FIL Trailer (8 bytes)                       │
+│   - 校验和、LSN（用于校验页完整性）        │
+└────────────────────────────────────────────┘</code></pre>
+            <p>几个关键设计：</p>
+            <ul>
+            <li><strong>Infimum 和
+            Supremum</strong>：每个页有两条虚拟记录——Infimum（下确界）比页中所有真实记录都小，Supremum（上确界）比所有真实记录都大。它们简化了边界处理逻辑；</li>
+            <li><strong>记录链表</strong>：页内的记录通过
+            <code>next_record</code>
+            偏移量形成单向有序链表。遍历页中记录的方式是从 Infimum
+            出发，沿 <code>next_record</code> 走到 Supremum；</li>
+            <li><strong>Page Directory</strong>：InnoDB
+            不对每条记录都建立槽位，而是每 4 到 8
+            条记录建一个槽位（称为”稀疏目录”）。页内查找先对 Page
+            Directory 做二分查找定位到一个组，再在组内顺序遍历。</li>
+            </ul>
+            <h3 id="记录格式">9.3 记录格式</h3>
+            <p>InnoDB 支持两种行格式（Row Format），以
+            <code>COMPACT</code> 格式为例（<code>DYNAMIC</code> 和
+            <code>COMPRESSED</code> 是其变体）：</p>
+            <pre class="text"><code>InnoDB COMPACT 行格式：
+
+┌─────────────────────┬────────────────────┬──────────────┐
+│  Variable-length    │   Record Header    │   Column     │
+│  Field Lengths      │   (5 bytes)        │   Data       │
+│  (逆序存储)         │                    │              │
+├─────────────────────┼────────────────────┼──────────────┤
+│ len₃ | len₂ | len₁  │ info_bits(4)       │ col₁ | col₂ │
+│                     │ n_owned(4)         │ | col₃ | ... │
+│                     │ heap_no(13)        │              │
+│                     │ record_type(3)     │              │
+│                     │ next_record(16)    │              │
+└─────────────────────┴────────────────────┴──────────────┘</code></pre>
+            <p>其中 <code>record_type</code>
+            区分了普通记录（0）、内部节点记录（1）、Infimum（2）、Supremum（3）。</p>
+            <h3 id="自适应哈希索引adaptive-hash-index">9.4
+            自适应哈希索引（Adaptive Hash Index）</h3>
+            <p>InnoDB 有一个独特的优化：自适应哈希索引（Adaptive Hash
+            Index，AHI）。它在 B+Tree 之上自动构建一个哈希索引（Hash
+            Index），缓存热点页的查找路径。</p>
+            <p>工作原理：InnoDB 监控 B+Tree
+            的查找模式。当它发现某个索引前缀的查找非常频繁（命中率超过阈值），就自动为这些键建立一个内存哈希表，直接映射到叶子页中的记录，跳过
+            B+Tree 的遍历过程。</p>
+            <pre class="text"><code>不使用 AHI：查找 key=42
+  Root Page → Internal Page → Leaf Page → Record
+  3 次页访问
+
+使用 AHI：查找 key=42
+  Hash Table: 42 → (page_no, offset)
+  1 次直接定位</code></pre>
+            <p>AHI 在等值查询（Point
+            Query）密集的场景下效果显著，但也有开销：</p>
+            <ul>
+            <li>维护哈希表需要额外的内存（从缓冲池中分配）；</li>
+            <li>页分裂或页驱逐时需要更新或失效哈希表中对应的条目；</li>
+            <li>在某些负载下（如范围扫描为主），AHI 反而是负担。</li>
+            </ul>
+            <p>可以通过 <code>innodb_adaptive_hash_index</code>
+            参数控制是否启用，默认启用。MySQL 8.0 将 AHI
+            分成了多个分区（由
+            <code>innodb_adaptive_hash_index_parts</code> 控制，默认
+            8），减少了全局闩锁争用。</p>
+            <h3 id="innodb-的页分裂实现">9.5 InnoDB 的页分裂实现</h3>
+            <p>InnoDB 的页分裂在源码中由
+            <code>btr_page_split_and_insert()</code> 函数实现（MySQL 8.0
+            源码路径：<code>storage/innobase/btr/btr0btr.cc</code>）。关键步骤：</p>
+            <ol type="1">
+            <li><p><strong>选择分裂点</strong>：如果检测到顺序插入模式（<code>PAGE_LAST_INSERT</code>
+            指向页尾且 <code>PAGE_DIRECTION</code> 为
+            <code>PAGE_RIGHT</code>），使用不对称分裂（右侧新页只包含新插入的记录）。否则使用对称分裂（从中间分）；</p></li>
+            <li><p><strong>创建新页</strong>：从表空间分配一个新的空闲页；</p></li>
+            <li><p><strong>移动记录</strong>：把分裂点之后的记录从原页移动到新页；</p></li>
+            <li><p><strong>更新链表指针</strong>：新页插入到叶子层的双向链表中——原页的
+            <code>FIL_PAGE_NEXT</code> 指向新页，新页的
+            <code>FIL_PAGE_PREV</code> 指向原页；</p></li>
+            <li><p><strong>插入分隔键到父页</strong>：把新页的最小键和页号插入到父节点。如果父节点也满了，递归分裂；</p></li>
+            <li><p><strong>写 redo log</strong>：整个分裂过程记录到 redo
+            log，保证崩溃恢复后分裂状态一致。</p></li>
+            </ol>
+            <h3 id="innodb-的-change-buffer">9.6 InnoDB 的 Change
+            Buffer</h3>
+            <p>对于二级索引的插入和更新，如果目标叶子页不在缓冲池中，InnoDB
+            不会立即从磁盘读取该页。而是把修改操作缓存到变更缓冲区（Change
+            Buffer），等到目标页下次因为其他查询被读入缓冲池时，再把缓存的修改合并（Merge）进去。</p>
+            <p>Change Buffer 本身也是一棵
+            B+Tree，存储在系统表空间（ibdata1）中。它可以显著减少二级索引维护的随机
+            I/O，特别是在写密集的负载下。</p>
+            <pre class="text"><code>Change Buffer 工作流程：
+
+1. INSERT INTO t (name) VALUES (&#39;foo&#39;);
+   → 二级索引页 P 不在缓冲池中
+   → 把 &quot;插入 name=&#39;foo&#39;&quot; 缓存到 Change Buffer
+
+2. 后续查询需要读页 P
+   → 从磁盘读入页 P
+   → 合并 Change Buffer 中关于页 P 的所有操作
+   → 页 P 现在包含了最新数据</code></pre>
+            <hr />
+            <h2 id="十btree-可视化与调试">十、B+Tree 可视化与调试</h2>
+            <h3 id="为什么需要可视化">10.1 为什么需要可视化</h3>
+            <p>在排查数据库性能问题时，仅靠 <code>EXPLAIN</code>
+            和执行计划往往不够。有时候需要直接看 B+Tree 的物理状态：</p>
+            <ul>
+            <li>某个索引的树高是多少？内部节点有几层？</li>
+            <li>叶子页的填充率如何？是不是有大量半空的页（说明频繁分裂）？</li>
+            <li>页分裂集中在哪些区域？是否存在热点页？</li>
+            <li>索引膨胀（Index Bloat）有多严重？空间利用率是多少？</li>
+            </ul>
+            <h3 id="innodb-的-innodb_ruby">10.2 InnoDB 的
+            innodb_ruby</h3>
+            <p><code>innodb_ruby</code> 是 Jeremy Cole 开发的一个 Ruby
+            工具（项目名为 <code>innodb_ruby</code>，GitHub 仓库
+            <code>jeremycole/innodb_ruby</code>），可以解析 InnoDB
+            的表空间文件（<code>.ibd</code>
+            文件），以可读的方式展示页结构、B+Tree
+            状态、记录内容等。</p>
+            <p>常用命令示例：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看表空间概览</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">innodb_space</span> <span class="at">-f</span> t.ibd space-summary</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 B+Tree 的层级结构</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="ex">innodb_space</span> <span class="at">-f</span> t.ibd <span class="at">-p</span> 3 page-dump</span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看索引的树高和页数统计</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a><span class="ex">innodb_space</span> <span class="at">-f</span> t.ibd space-index-pages-summary</span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 遍历叶子页，统计每个页的记录数和填充率</span></span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a><span class="ex">innodb_space</span> <span class="at">-f</span> t.ibd <span class="at">-p</span> 3 index-recurse</span></code></pre></div>
+            <p><code>innodb_space space-index-pages-summary</code>
+            的输出类似：</p>
+            <pre class="text"><code>page    index   level   data    free    records
+3       15      2       462     15074   33
+4       15      0       9812    5765    446
+5       15      0       15234   342     692
+6       15      0       15234   342     692
+7       15      1       4776    10800   339
+...</code></pre>
+            <p>其中 <code>level=0</code> 是叶子页，<code>level=1</code>
+            是第一层内部节点，<code>level=2</code>
+            是根节点。<code>data</code> 和 <code>free</code>
+            显示每个页的数据量和空闲空间，可以直接看出填充率。</p>
+            <h3 id="postgresql-的-pageinspect">10.3 PostgreSQL 的
+            pageinspect</h3>
+            <p>PostgreSQL 内置了 <code>pageinspect</code>
+            扩展，可以直接查看 B-Tree 索引页的内容。</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 启用扩展</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pageinspect;</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 B-Tree 索引的元信息（根页、树高、叶子页数等）</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> bt_metap(<span class="st">&#39;idx_users_email&#39;</span>);</span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a><span class="co">--  magic  | version | root | level | fastroot | fastlevel | ...</span></span>
+<span id="cb33-9"><a href="#cb33-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- --------+---------+------+-------+----------+-----------+</span></span>
+<span id="cb33-10"><a href="#cb33-10" aria-hidden="true" tabindex="-1"></a><span class="co">--  340322 |       4 |    3 |     2 |        3 |         2 |</span></span>
+<span id="cb33-11"><a href="#cb33-11" aria-hidden="true" tabindex="-1"></a><span class="co">--</span></span>
+<span id="cb33-12"><a href="#cb33-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- root=3: 根节点在第 3 页</span></span>
+<span id="cb33-13"><a href="#cb33-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- level=2: 树高 2（不包含叶子层），实际有 3 层</span></span>
+<span id="cb33-14"><a href="#cb33-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-15"><a href="#cb33-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看特定页的统计信息</span></span>
+<span id="cb33-16"><a href="#cb33-16" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> bt_page_stats(<span class="st">&#39;idx_users_email&#39;</span>, <span class="dv">3</span>);</span>
+<span id="cb33-17"><a href="#cb33-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-18"><a href="#cb33-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb33-19"><a href="#cb33-19" aria-hidden="true" tabindex="-1"></a><span class="co">--  blkno | type | live_items | dead_items | avg_item_size | ...</span></span>
+<span id="cb33-20"><a href="#cb33-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- -------+------+------------+------------+---------------+</span></span>
+<span id="cb33-21"><a href="#cb33-21" aria-hidden="true" tabindex="-1"></a><span class="co">--      3 | r    |         42 |          0 |            18 |</span></span>
+<span id="cb33-22"><a href="#cb33-22" aria-hidden="true" tabindex="-1"></a><span class="co">--</span></span>
+<span id="cb33-23"><a href="#cb33-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- type=&#39;r&#39;: root 页；&#39;i&#39;: internal；&#39;l&#39;: leaf</span></span>
+<span id="cb33-24"><a href="#cb33-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-25"><a href="#cb33-25" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看页内的具体条目</span></span>
+<span id="cb33-26"><a href="#cb33-26" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> bt_page_items(<span class="st">&#39;idx_users_email&#39;</span>, <span class="dv">3</span>);</span>
+<span id="cb33-27"><a href="#cb33-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-28"><a href="#cb33-28" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb33-29"><a href="#cb33-29" aria-hidden="true" tabindex="-1"></a><span class="co">--  itemoffset | ctid    | itemlen | data</span></span>
+<span id="cb33-30"><a href="#cb33-30" aria-hidden="true" tabindex="-1"></a><span class="co">-- ------------+---------+---------+--------------------------</span></span>
+<span id="cb33-31"><a href="#cb33-31" aria-hidden="true" tabindex="-1"></a><span class="co">--           1 | (1,0)   |      16 | 0x...</span></span>
+<span id="cb33-32"><a href="#cb33-32" aria-hidden="true" tabindex="-1"></a><span class="co">--           2 | (3,1)   |      18 | 0x616c696365</span></span></code></pre></div>
+            <h3 id="理解页分裂">10.4 理解页分裂</h3>
+            <p>通过可视化工具，可以诊断页分裂问题。典型的诊断流程：</p>
+            <ol type="1">
+            <li><p><strong>查看树高</strong>：如果索引很小但树高异常（如只有几千行但树高为
+            4），说明可能有大量空页或碎片；</p></li>
+            <li><p><strong>检查叶子页填充率</strong>：如果大量叶子页只有
+            50%
+            左右的填充率，说明页分裂很频繁。正常情况下叶子页填充率应该在
+            70% 以上；</p></li>
+            <li><p><strong>检查页的分布</strong>：如果页号不连续（如 3,
+            100, 5, 200,
+            7），说明物理顺序和逻辑顺序差异大，范围扫描会产生大量随机
+            I/O。</p></li>
+            </ol>
+            <h3 id="innodb-的-information_schema-工具">10.5 InnoDB 的
+            INFORMATION_SCHEMA 工具</h3>
+            <p>MySQL 提供了一些系统表来观察 B+Tree 的状态：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看索引统计信息</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a>    index_name,</span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a>    stat_name,</span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a>    stat_value,</span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a>    stat_description</span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> mysql.innodb_index_stats</span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> table_name <span class="op">=</span> <span class="st">&#39;users&#39;</span>;</span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-10"><a href="#cb34-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb34-11"><a href="#cb34-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- index_name | stat_name  | stat_value | stat_description</span></span>
+<span id="cb34-12"><a href="#cb34-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- -----------+------------+------------+------------------</span></span>
+<span id="cb34-13"><a href="#cb34-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- PRIMARY    | n_leaf_pages| 1024      | Number of leaf pages</span></span>
+<span id="cb34-14"><a href="#cb34-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- PRIMARY    | size        | 1088      | Number of pages</span></span>
+<span id="cb34-15"><a href="#cb34-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- PRIMARY    | n_diff_pfx01| 500000   | Distinct values</span></span></code></pre></div>
+            <p><code>n_leaf_pages</code> 是叶子页数量，<code>size</code>
+            是索引总页数（包含内部节点），两者之差就是内部节点页的数量。如果
+            <code>size</code> 远大于
+            <code>n_leaf_pages</code>，说明可能有大量空洞需要
+            <code>OPTIMIZE TABLE</code> 回收。</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看缓冲池中各索引页的状态</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb35-3"><a href="#cb35-3" aria-hidden="true" tabindex="-1"></a>    index_name,</span>
+<span id="cb35-4"><a href="#cb35-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> pages_in_buffer,</span>
+<span id="cb35-5"><a href="#cb35-5" aria-hidden="true" tabindex="-1"></a>    <span class="fu">SUM</span>(is_old) <span class="kw">AS</span> old_pages,</span>
+<span id="cb35-6"><a href="#cb35-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">SUM</span>(<span class="cf">IF</span>(is_old <span class="op">=</span> <span class="st">&#39;NO&#39;</span>, <span class="dv">1</span>, <span class="dv">0</span>)) <span class="kw">AS</span> young_pages</span>
+<span id="cb35-7"><a href="#cb35-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> information_schema.innodb_buffer_page</span>
+<span id="cb35-8"><a href="#cb35-8" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> table_name <span class="kw">LIKE</span> <span class="st">&#39;%users%&#39;</span></span>
+<span id="cb35-9"><a href="#cb35-9" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> index_name;</span></code></pre></div>
+            <h3 id="调试页分裂的实战案例">10.6 调试页分裂的实战案例</h3>
+            <p>场景：一个应用使用 UUID
+            作为主键，发现写入性能随数据量增长急剧下降。</p>
+            <p>分析思路：</p>
+            <ol type="1">
+            <li>UUID 是随机值，插入位置随机分布在整个 B+Tree 中；</li>
+            <li>几乎每次插入都命中不同的叶子页，缓冲池命中率低；</li>
+            <li>大量叶子页只有约 50% 的填充率（因为 50/50
+            分裂），空间浪费严重；</li>
+            <li>页分裂频繁触发，每次分裂需要修改 3
+            个页（原页、新页、父页）并写 redo log。</li>
+            </ol>
+            <p>解决方案：</p>
+            <ul>
+            <li>使用有序 UUID（如 UUID
+            v7，基于时间戳生成，保持时间顺序），让插入模式接近顺序插入；</li>
+            <li>或者使用自增整数主键，把 UUID 放到二级索引。</li>
+            </ul>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 InnoDB 的页分裂次数（需要开启 innodb_monitor）</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a>    name,</span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a>    <span class="fu">count</span></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> information_schema.innodb_metrics</span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> name <span class="kw">LIKE</span> <span class="st">&#39;%page_split%&#39;</span>;</span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出示例：</span></span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- name                          | count</span></span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- ------------------------------+-------</span></span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- index_page_splits             | 15234</span></span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- index_page_reorg_attempts     | 1823</span></span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- index_page_reorg_successful   | 1820</span></span></code></pre></div>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="论文">论文</h3>
+            <ol type="1">
+            <li><p>R. Bayer, E. McCreight, “Organization and Maintenance
+            of Large Ordered Indexes,” <em>Acta Informatica</em>,
+            vol. 1, no. 3, pp. 173–189, 1972. B-Tree
+            的原始论文。</p></li>
+            <li><p>D. Comer, “The Ubiquitous B-Tree,” <em>ACM Computing
+            Surveys</em>, vol. 11, no. 2, pp. 121–137, 1979. B-Tree
+            各种变体的经典综述。</p></li>
+            <li><p>P. L. Lehman, S. B. Yao, “Efficient Locking for
+            Concurrent Operations on B-Trees,” <em>ACM Transactions on
+            Database Systems</em>, vol. 6, no. 4, pp. 650–670, 1981.
+            B-link Tree
+            的原始论文，提出了右链指针和高键的概念。</p></li>
+            <li><p>V. Leis, M. Haubenschild, T. Neumann, “Optimistic
+            Lock Coupling: A Scalable and Efficient General-Purpose
+            Synchronization Method,” <em>IEEE Data Engineering
+            Bulletin</em>, vol. 42, no. 1, 2019. Optimistic Lock
+            Coupling 的系统阐述。</p></li>
+            <li><p>G. Graefe, “A Survey of B-Tree Locking Techniques,”
+            <em>ACM Transactions on Database Systems</em>, vol. 35, no.
+            3, 2010. B-Tree 锁技术的全面综述。</p></li>
+            <li><p>G. Graefe, “Modern B-Tree Techniques,”
+            <em>Foundations and Trends in Databases</em>, vol. 3, no. 4,
+            pp. 203–402, 2011. 现代 B-Tree
+            工程技术的百科全书式综述。</p></li>
+            </ol>
+            <h3 id="书籍">书籍</h3>
+            <ol start="7" type="1">
+            <li><p>A. Petrov, <em>Database Internals: A Deep Dive into
+            How Distributed Data Systems Work</em>, O’Reilly, 2019. 第 2
+            至 7 章系统讲解了 B-Tree
+            的存储布局、分裂合并、并发控制和磁盘结构。</p></li>
+            <li><p>R. Ramakrishnan, J. Gehrke, <em>Database Management
+            Systems</em>, 3rd Edition, McGraw-Hill, 2003. 第 9 至 11
+            章覆盖了 B+Tree 索引的基本理论。</p></li>
+            </ol>
+            <h3 id="源码与文档">源码与文档</h3>
+            <ol start="9" type="1">
+            <li><p>MySQL/InnoDB
+            源码，<code>storage/innobase/btr/btr0btr.cc</code>，B+Tree
+            分裂和合并的核心实现。版本参考：MySQL 8.0。</p></li>
+            <li><p>PostgreSQL
+            源码，<code>src/backend/access/nbtree/</code>，nbtree
+            模块。版本参考：PostgreSQL 16。Peter Geoghegan, “Suffix
+            Truncation for B-Tree Indexes,” PostgreSQL 12 release
+            notes。</p></li>
+            <li><p>Howard Chu, <em>LMDB: Lightning Memory-Mapped
+            Database Technical Information</em>, <a
+            href="http://www.lmdb.tech/doc/"
+            class="uri">http://www.lmdb.tech/doc/</a>. LMDB
+            的官方技术文档。</p></li>
+            <li><p>Jeremy Cole, <em>innodb_ruby</em>, <a
+            href="https://github.com/jeremycole/innodb_ruby"
+            class="uri">https://github.com/jeremycole/innodb_ruby</a>.
+            InnoDB 表空间解析工具。</p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../24-storage-engine-overview/storage-engine-overview.html">存储引擎概览：堆文件到
+            LSM-Tree 的演化路径</a> <strong>下一篇</strong>: <a
+            href="../26-buffer-pool/buffer-pool.html">Buffer
+            Pool：数据库的内存管理</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-02 · storage</p>
+                    <h3><a href="/post/storage/24-storage-engine-overview/storage-engine-overview.html">【存储工程】存储引擎概览：堆文件到 LSM-Tree 的演化路径</a></h3>
+                    <p>数据库系统的架构可以划分为两大层：上层的查询处理层负责解析 SQL、生成执行计划、优化查询；下层的存储引擎（Storage Engine）负责把数据持久化到磁盘，并在需要时高效地把数据取回来。查询处理层决定&quot;做什么&quot;，存储引擎决定&quot;怎么存、怎么取&quot;。同一个查询处理层可以对接不同的存储引擎——MySQL 的 InnoDB…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-07 · storage</p>
+                    <h3><a href="/post/storage/29-index-structures/index-structures.html">【存储工程】索引结构：从 B+Tree 到倒排索引</a></h3>
+                    <p>数据库里存了一亿行数据，要找出 userid 42 的那一行。没有索引的做法是全表扫描（Full Table Scan）——从第一个数据页读到最后一个数据页，逐行比对。假设每个数据页 16 KB，一亿行占 20 GB，即使顺序读能跑到 500 MB/s，也需要 40 秒。加一个 B+Tree 索引，三次磁盘 I/O 就…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-24 · storage</p>
+                    <h3><a href="/post/storage/15-xfs-architecture/xfs-architecture.html">【存储工程】XFS 架构：大文件与高并发</a></h3>
+                    <p>XFS 诞生于 1993 年的硅谷图形公司（Silicon Graphics, Inc.），最初运行在 IRIX 操作系统上。 SGI 的核心业务是高性能计算和影视后期制作，客户需要处理的文件动辄几十 GB 甚至数 TB。 当时主流的 EFS（Extent File System）在面对这类工作负载时已经力不从心：元数…</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

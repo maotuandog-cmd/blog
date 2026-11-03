@@ -1,0 +1,1718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】读取性能优化 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="深入分析存储读取性能优化——索引设计、Bloom
+Filter 调优、块缓存、压缩的 CPU-I/O 权衡、预读策略与读放大测量" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="read-optimization, bloom-filter, block-cache, read-amplification, prefetch, index-design, column-pruning, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/68-read-optimization/read-optimization.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】读取性能优化" />
+    <meta property="og:description" content="深入分析存储读取性能优化——索引设计、Bloom Filter 调优、块缓存、压缩的 CPU-I/O 权衡、预读策略与读放大测量" />
+    <meta property="og:url" content="https://quant67.com/post/storage/68-read-optimization/read-optimization.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="read-optimization" />
+    <meta property="article:tag" content="bloom-filter" />
+    <meta property="article:tag" content="block-cache" />
+    <meta property="article:tag" content="read-amplification" />
+    <meta property="article:tag" content="prefetch" />
+    <meta property="article:tag" content="index-design" />
+    <meta property="article:tag" content="column-pruning" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】读取性能优化" />
+    <meta name="twitter:description" content="深入分析存储读取性能优化——索引设计、Bloom Filter 调优、块缓存、压缩的 CPU-I/O 权衡、预读策略与读放大测量" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】读取性能优化", "description": "深入分析存储读取性能优化——索引设计、Bloom Filter 调优、块缓存、压缩的 CPU-I/O 权衡、预读策略与读放大测量", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/68-read-optimization/read-optimization.html"}, "datePublished": "2025-10-16T00:00:00+00:00", "dateModified": "2026-04-15T12:52:01+00:00", "keywords": ["read-optimization", "bloom-filter", "block-cache", "read-amplification", "prefetch", "index-design", "column-pruning"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】读取性能优化</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-10-16</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#read-optimization</span> <span>#bloom-filter</span> <span>#block-cache</span> <span>#read-amplification</span> <span>#prefetch</span> <span>#index-design</span> <span>#column-pruning</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/67-write-optimization/write-optimization.html">上一篇：【存储工程】写入性能优化</a><a class="post-series-nav__link" href="/post/storage/69-latency-analysis/latency-analysis.html">下一篇：【存储工程】存储全链路延迟分析</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/read-optimization.html">#read-optimization</a><a class="chip-link" href="/tags/bloom-filter.html">#bloom-filter</a><a class="chip-link" href="/tags/block-cache.html">#block-cache</a><a class="chip-link" href="/tags/read-amplification.html">#read-amplification</a><a class="chip-link" href="/tags/prefetch.html">#prefetch</a><a class="chip-link" href="/tags/index-design.html">#index-design</a><a class="chip-link" href="/tags/column-pruning.html">#column-pruning</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一读取性能的工程挑战"
+                id="toc-一读取性能的工程挑战">一、读取性能的工程挑战</a>
+                <ul>
+                <li><a href="#读放大的定义"
+                id="toc-读放大的定义">读放大的定义</a></li>
+                <li><a href="#读放大的来源"
+                id="toc-读放大的来源">读放大的来源</a></li>
+                <li><a href="#b-tree-与-lsm-tree-的读放大对比"
+                id="toc-b-tree-与-lsm-tree-的读放大对比">B-Tree 与
+                LSM-Tree 的读放大对比</a></li>
+                </ul></li>
+                <li><a href="#二索引设计与查询优化"
+                id="toc-二索引设计与查询优化">二、索引设计与查询优化</a>
+                <ul>
+                <li><a href="#sstable-的索引结构"
+                id="toc-sstable-的索引结构">SSTable 的索引结构</a></li>
+                <li><a href="#分区索引partitioned-index"
+                id="toc-分区索引partitioned-index">分区索引（Partitioned
+                Index）</a></li>
+                <li><a href="#前缀索引prefix-index"
+                id="toc-前缀索引prefix-index">前缀索引（Prefix
+                Index）</a></li>
+                <li><a href="#b-tree-索引的优化"
+                id="toc-b-tree-索引的优化">B-Tree 索引的优化</a></li>
+                <li><a href="#索引设计的工程判断"
+                id="toc-索引设计的工程判断">索引设计的工程判断</a></li>
+                </ul></li>
+                <li><a href="#三bloom-filter-调优"
+                id="toc-三bloom-filter-调优">三、Bloom Filter 调优</a>
+                <ul>
+                <li><a href="#bloom-filter-的工作原理"
+                id="toc-bloom-filter-的工作原理">Bloom Filter
+                的工作原理</a></li>
+                <li><a href="#误判率的数学关系"
+                id="toc-误判率的数学关系">误判率的数学关系</a></li>
+                <li><a href="#rocksdb-中的-bloom-filter-配置"
+                id="toc-rocksdb-中的-bloom-filter-配置">RocksDB 中的
+                Bloom Filter 配置</a></li>
+                <li><a href="#ribbon-filterbloom-filter-的替代方案"
+                id="toc-ribbon-filterbloom-filter-的替代方案">Ribbon
+                Filter：Bloom Filter 的替代方案</a></li>
+                <li><a href="#bloom-filter-调优的工程判断"
+                id="toc-bloom-filter-调优的工程判断">Bloom Filter
+                调优的工程判断</a></li>
+                </ul></li>
+                <li><a href="#四块缓存设计与调优"
+                id="toc-四块缓存设计与调优">四、块缓存设计与调优</a>
+                <ul>
+                <li><a href="#block-cache-的基本架构"
+                id="toc-block-cache-的基本架构">Block Cache
+                的基本架构</a></li>
+                <li><a href="#lru-cache-与-clock-cache"
+                id="toc-lru-cache-与-clock-cache">LRU Cache 与 Clock
+                Cache</a></li>
+                <li><a href="#block-cache-的容量规划"
+                id="toc-block-cache-的容量规划">Block Cache
+                的容量规划</a></li>
+                <li><a href="#rocksdb-block-cache-统计信息"
+                id="toc-rocksdb-block-cache-统计信息">RocksDB Block
+                Cache 统计信息</a></li>
+                <li><a href="#innodb-的-buffer-pool"
+                id="toc-innodb-的-buffer-pool">InnoDB 的 Buffer
+                Pool</a></li>
+                <li><a href="#block-cache-调优的工程判断"
+                id="toc-block-cache-调优的工程判断">Block Cache
+                调优的工程判断</a></li>
+                </ul></li>
+                <li><a href="#五压缩与解压缩的-cpu-io-权衡"
+                id="toc-五压缩与解压缩的-cpu-io-权衡">五、压缩与解压缩的
+                CPU-I/O 权衡</a>
+                <ul>
+                <li><a href="#权衡模型"
+                id="toc-权衡模型">权衡模型</a></li>
+                <li><a href="#按层压缩策略"
+                id="toc-按层压缩策略">按层压缩策略</a></li>
+                <li><a href="#压缩字典compression-dictionary"
+                id="toc-压缩字典compression-dictionary">压缩字典（Compression
+                Dictionary）</a></li>
+                <li><a href="#解压缓存uncompressed-block-cache"
+                id="toc-解压缓存uncompressed-block-cache">解压缓存（Uncompressed
+                Block Cache）</a></li>
+                </ul></li>
+                <li><a href="#六预读策略"
+                id="toc-六预读策略">六、预读策略</a>
+                <ul>
+                <li><a href="#linux-内核的预读机制"
+                id="toc-linux-内核的预读机制">Linux
+                内核的预读机制</a></li>
+                <li><a href="#存储引擎层的预读"
+                id="toc-存储引擎层的预读">存储引擎层的预读</a></li>
+                <li><a href="#madvise-与-fadvise"
+                id="toc-madvise-与-fadvise">madvise 与 fadvise</a></li>
+                <li><a href="#预读策略的工程判断"
+                id="toc-预读策略的工程判断">预读策略的工程判断</a></li>
+                </ul></li>
+                <li><a href="#七列式剪枝与谓词下推"
+                id="toc-七列式剪枝与谓词下推">七、列式剪枝与谓词下推</a>
+                <ul>
+                <li><a href="#列式剪枝"
+                id="toc-列式剪枝">列式剪枝</a></li>
+                <li><a href="#谓词下推"
+                id="toc-谓词下推">谓词下推</a></li>
+                <li><a href="#clickhouse-的数据跳跃索引"
+                id="toc-clickhouse-的数据跳跃索引">ClickHouse
+                的数据跳跃索引</a></li>
+                <li><a href="#列式剪枝与谓词下推的工程判断"
+                id="toc-列式剪枝与谓词下推的工程判断">列式剪枝与谓词下推的工程判断</a></li>
+                </ul></li>
+                <li><a href="#八读放大测量方法"
+                id="toc-八读放大测量方法">八、读放大测量方法</a>
+                <ul>
+                <li><a href="#方法一存储引擎统计信息"
+                id="toc-方法一存储引擎统计信息">方法一：存储引擎统计信息</a></li>
+                <li><a href="#方法二操作系统级-io-追踪"
+                id="toc-方法二操作系统级-io-追踪">方法二：操作系统级 I/O
+                追踪</a></li>
+                <li><a href="#方法三合成基准测试"
+                id="toc-方法三合成基准测试">方法三：合成基准测试</a></li>
+                <li><a href="#读放大的综合评估"
+                id="toc-读放大的综合评估">读放大的综合评估</a></li>
+                </ul></li>
+                <li><a href="#九数据库查询性能分析实战"
+                id="toc-九数据库查询性能分析实战">九、数据库查询性能分析实战</a>
+                <ul>
+                <li><a href="#场景描述"
+                id="toc-场景描述">场景描述</a></li>
+                <li><a href="#第一步分析执行计划"
+                id="toc-第一步分析执行计划">第一步：分析执行计划</a></li>
+                <li><a href="#第二步优化索引"
+                id="toc-第二步优化索引">第二步：优化索引</a></li>
+                <li><a href="#第三步进一步优化覆盖索引"
+                id="toc-第三步进一步优化覆盖索引">第三步：进一步优化——覆盖索引</a></li>
+                <li><a href="#第四步验证-buffer-pool-状态"
+                id="toc-第四步验证-buffer-pool-状态">第四步：验证 Buffer
+                Pool 状态</a></li>
+                <li><a href="#第五步检查系统层-io"
+                id="toc-第五步检查系统层-io">第五步：检查系统层
+                I/O</a></li>
+                <li><a href="#优化效果对比"
+                id="toc-优化效果对比">优化效果对比</a></li>
+                </ul></li>
+                <li><a href="#十参考文献"
+                id="toc-十参考文献">十、参考文献</a>
+                <ul>
+                <li><a href="#论文与书籍"
+                id="toc-论文与书籍">论文与书籍</a></li>
+                <li><a href="#官方文档与源码"
+                id="toc-官方文档与源码">官方文档与源码</a></li>
+                <li><a href="#工具与-benchmark"
+                id="toc-工具与-benchmark">工具与 Benchmark</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>存储系统的写入路径可以靠批量化、顺序化、延迟持久化来提速，但读取路径没有这些缓冲空间——用户发起一次点查（Point
+            Lookup），系统必须在有限时间内定位到数据所在的物理位置，读取对应的字节，解压、反序列化、返回结果。整条链路上的每一个环节都可能成为瓶颈。</p>
+            <p>读取性能优化的核心矛盾是：存储引擎的内部组织方式（排序、分层、压缩）是为写入吞吐量和空间效率服务的，但这些设计对读取路径引入了额外开销。一个
+            LSM-Tree 引擎为了保证写入性能，把数据分散在多层 SSTable
+            中，一次点查可能需要检查 L0 到 L6
+            共七层文件；一个列式存储引擎为了压缩率，把不同列分开存放，一次全列扫描可能需要读取数十个不相邻的数据块。这些额外的
+            I/O 操作就是读放大（Read Amplification）。</p>
+            <p>本文从读放大的定义出发，系统拆解索引设计、布隆过滤器（Bloom
+            Filter）调优、块缓存（Block Cache）、压缩的 CPU-I/O
+            权衡、预读策略、列式剪枝（Column
+            Pruning）等关键优化手段，最后给出一套可操作的读放大测量方法和数据库查询性能分析实战。</p>
+            <blockquote>
+            <p><strong>版本说明</strong>
+            本文涉及的引擎和工具版本：RocksDB 9.x、LevelDB
+            1.23、MySQL/InnoDB 8.4、PostgreSQL 17、ClickHouse
+            24.x、Parquet format v2.6、Linux
+            6.x。不同版本的默认参数和行为可能有差异，涉及版本差异的地方会单独标注。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一读取性能的工程挑战">一、读取性能的工程挑战</h2>
+            <h3 id="读放大的定义">读放大的定义</h3>
+            <p>读放大（Read Amplification）衡量的是：为了读取 1
+            字节的有效数据，存储引擎实际从磁盘读取了多少字节。更精确地说，有两种度量方式：</p>
+            <ul>
+            <li><strong>字节读放大</strong>：实际读取的磁盘字节数 /
+            用户请求的有效字节数。</li>
+            <li><strong>I/O 读放大</strong>：实际发起的磁盘 I/O 次数 /
+            逻辑上需要的 I/O 次数。</li>
+            </ul>
+            <p>这两个指标不总是同步变化。一次 I/O 读放大可能只有
+            2（读了两个块），但如果每个块 64 KB 而有效数据只有 100
+            字节，字节读放大就是 1280。</p>
+            <h3 id="读放大的来源">读放大的来源</h3>
+            <p>在不同的存储引擎架构中，读放大有不同的来源：</p>
+            <pre class="text"><code>                       用户请求: GET(key)
+                            |
+                            v
+                   +-----------------+
+                   |   Memtable 查找  |  命中 -&gt; 直接返回, 读放大 = 0
+                   +-----------------+
+                            |
+                            v (未命中)
+                   +-----------------+
+                   |   Block Cache   |  命中 -&gt; 读放大 = 0（已缓存）
+                   +-----------------+
+                            |
+                            v (未命中)
+          +----------------------------------+
+          |      逐层检查 SSTable 文件          |
+          |                                    |
+          |  L0: 检查所有 SSTable（可能 4-8 个） |
+          |  L1: 二分查找定位 1 个 SSTable       |
+          |  L2: 二分查找定位 1 个 SSTable       |
+          |  ...                               |
+          |  L6: 二分查找定位 1 个 SSTable       |
+          +----------------------------------+
+                            |
+                            v
+          对每个候选 SSTable：
+            1. 读取 Index Block（定位 Data Block）
+            2. 读取 Bloom Filter Block（判断 key 是否可能存在）
+            3. 如果 Bloom Filter 通过，读取 Data Block
+            4. 在 Data Block 中二分查找 key</code></pre>
+            <p>上图展示了 LSM-Tree 引擎的点查路径。每一个”读取 xxx
+            Block”都是一次潜在的磁盘 I/O。一个 7 层 LSM-Tree，L0 有 4
+            个文件，最坏情况下一次点查需要检查 4 + 6 = 10 个
+            SSTable。每个 SSTable 需要读取 Index Block + Bloom Filter
+            Block + Data Block，最坏情况下产生 30 次 I/O。这就是
+            LSM-Tree 读放大的根源。</p>
+            <h3 id="b-tree-与-lsm-tree-的读放大对比">B-Tree 与 LSM-Tree
+            的读放大对比</h3>
+            <table>
+            <colgroup>
+            <col style="width: 12%" />
+            <col style="width: 40%" />
+            <col style="width: 46%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>B-Tree（InnoDB）</th>
+            <th>LSM-Tree（RocksDB）</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>点查最坏 I/O 次数</td>
+            <td>树高（通常 3-4 次）</td>
+            <td>L0 文件数 + 其余层数（通常 10-15 次）</td>
+            </tr>
+            <tr>
+            <td>范围查询效率</td>
+            <td>叶子节点链表顺序扫描</td>
+            <td>需要归并多层迭代器</td>
+            </tr>
+            <tr>
+            <td>缓存友好性</td>
+            <td>热数据集中在上层节点</td>
+            <td>热数据分散在多层</td>
+            </tr>
+            <tr>
+            <td>空间放大影响</td>
+            <td>页分裂导致内部碎片</td>
+            <td>Compaction 临时空间膨胀</td>
+            </tr>
+            <tr>
+            <td>主要读放大来源</td>
+            <td>非叶子节点遍历</td>
+            <td>多层查找 + Bloom Filter 误判</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>B-Tree 的读放大相对可控——一棵高度为 4 的 B+ 树，点查最多
+            4 次 I/O，而且上层节点几乎都在缓存中，实际只需要 1-2 次磁盘
+            I/O。LSM-Tree 的读放大上限更高，但可以通过 Bloom
+            Filter、Block Cache、Compaction
+            策略等手段降低实际读放大。</p>
+            <p>读取优化的本质就是用各种手段减小这个放大因子：用索引减少需要扫描的数据范围，用
+            Bloom Filter 跳过不可能命中的文件，用缓存避免重复
+            I/O，用预读把随机 I/O 转换为顺序
+            I/O，用列式剪枝避免读取不需要的列。</p>
+            <hr />
+            <h2 id="二索引设计与查询优化">二、索引设计与查询优化</h2>
+            <p>索引是读取路径上最基础的优化手段。好的索引设计能让查询的
+            I/O 复杂度从 O(N) 降到 O(log N) 甚至 O(1)。</p>
+            <h3 id="sstable-的索引结构">SSTable 的索引结构</h3>
+            <p>以 RocksDB 的 SSTable（Sorted String Table）为例，每个
+            SSTable 文件包含以下几类索引块：</p>
+            <pre class="text"><code>+-------------------------------+
+|         Data Block 0          |
+|         Data Block 1          |
+|         ...                   |
+|         Data Block N          |
++-------------------------------+
+|       Meta Block (BF)         |   &lt;-- Bloom Filter
++-------------------------------+
+|     Meta Index Block          |   &lt;-- 指向 Meta Block
++-------------------------------+
+|       Index Block             |   &lt;-- 指向 Data Block, 记录每个 block 的最大 key
++-------------------------------+
+|          Footer               |   &lt;-- 指向 Index Block 和 Meta Index Block
++-------------------------------+</code></pre>
+            <p>Index Block 中存储的是每个 Data Block 的分隔键（Separator
+            Key）和对应的偏移量。查找一个 key 时，先在 Index Block
+            中做二分查找，定位到目标 Data Block，再在 Data Block
+            内部做二分查找。</p>
+            <h3 id="分区索引partitioned-index">分区索引（Partitioned
+            Index）</h3>
+            <p>当 SSTable 文件很大时，Index Block
+            本身也可能变得很大（几十 MB）。RocksDB
+            支持分区索引（Partitioned Index），把 Index Block
+            拆分成多个小的 Index Partition，再用一个顶层索引（Top-Level
+            Index）指向这些分区。</p>
+            <p>分区索引的好处：</p>
+            <ol type="1">
+            <li>减少内存占用——不需要把整个 Index Block
+            加载到内存，只加载 Top-Level Index 和命中的分区。</li>
+            <li>提高 Block Cache 利用率——Index Partition
+            作为独立的缓存单元，热分区留在缓存中，冷分区被淘汰。</li>
+            <li>减少 Cache Miss 的影响——一次 Cache Miss
+            只需要加载一个小分区，而不是整个 Index Block。</li>
+            </ol>
+            <p>在 RocksDB 中启用分区索引：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions table_options<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span><span class="dt">index_type</span> <span class="op">=</span> rocksdb<span class="op">::</span>BlockBasedTableOptions<span class="op">::</span>kTwoLevelIndexSearch<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>metadata_block_size <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span>  <span class="co">// 每个 Index Partition 的目标大小</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>pin_top_level_index_and_filter <span class="op">=</span> <span class="kw">true</span><span class="op">;</span>  <span class="co">// 固定顶层索引在内存中</span></span></code></pre></div>
+            <p><code>pin_top_level_index_and_filter</code> 设置为
+            <code>true</code> 时，顶层索引和顶层 Bloom Filter
+            被固定在内存中，不会被 Block Cache
+            淘汰。这保证了点查最多只增加一次额外的 I/O（读取 Index
+            Partition），而不是两次（读取 Top-Level Index + Index
+            Partition）。</p>
+            <h3 id="前缀索引prefix-index">前缀索引（Prefix Index）</h3>
+            <p>如果查询模式以特定前缀为主（例如用户 ID 作为 key
+            前缀），可以使用前缀索引（Prefix Index）来加速查找：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>prefix_extractor<span class="op">.</span>reset<span class="op">(</span>rocksdb<span class="op">::</span>NewFixedPrefixTransform<span class="op">(</span><span class="dv">8</span><span class="op">));</span>  <span class="co">// 取 key 的前 8 字节作为前缀</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions table_options<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span><span class="dt">index_type</span> <span class="op">=</span> rocksdb<span class="op">::</span>BlockBasedTableOptions<span class="op">::</span>kHashSearch<span class="op">;</span></span></code></pre></div>
+            <p>前缀索引在 Index Block 中为每个前缀建立哈希映射，把 O(log
+            N) 的二分查找变为 O(1)
+            的哈希查找。代价是索引只对前缀匹配查询有效，全范围扫描（Full
+            Range Scan）仍然需要回退到普通的二分查找。</p>
+            <h3 id="b-tree-索引的优化">B-Tree 索引的优化</h3>
+            <p>对于 B-Tree 引擎（如
+            InnoDB），索引优化的核心是减少树的高度和提高缓存命中率。</p>
+            <p>InnoDB 的聚簇索引（Clustered Index）把行数据直接存储在 B+
+            树的叶子节点中，主键查询只需要一次索引遍历。二级索引（Secondary
+            Index）的叶子节点存储的是主键值，查询时需要先通过二级索引找到主键，再通过聚簇索引找到行数据——这个过程叫回表（Index
+            Lookup），是 B-Tree 引擎读放大的主要来源之一。</p>
+            <p>覆盖索引（Covering
+            Index）可以消除回表。如果查询需要的所有列都包含在索引中，InnoDB
+            可以直接从索引中返回结果，不需要访问聚簇索引。</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建覆盖索引：包含 user_id 和 created_at 两列</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_user_created <span class="kw">ON</span> orders(user_id, created_at);</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 以下查询可以使用覆盖索引，不需要回表</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> user_id, created_at <span class="kw">FROM</span> orders <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">12345</span>;</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 以下查询需要回表，因为 amount 不在索引中</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> user_id, created_at, amount <span class="kw">FROM</span> orders <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">12345</span>;</span></code></pre></div>
+            <p>在 MySQL 中可以通过 <code>EXPLAIN</code>
+            确认是否使用了覆盖索引——如果 <code>Extra</code> 列显示
+            <code>Using index</code>，说明查询完全在索引中完成，不需要回表。</p>
+            <h3 id="索引设计的工程判断">索引设计的工程判断</h3>
+            <p>索引不是越多越好。每增加一个索引，写入时需要额外维护一棵
+            B+
+            树或一组排序结构，占用的存储空间和写入开销都会增加。对于写密集型工作负载，过多的索引会显著拖慢写入速度。</p>
+            <p>我认为索引设计应该从查询模式出发，而不是从数据模型出发。先收集生产环境的慢查询日志（Slow
+            Query Log），统计高频查询的 WHERE 条件和 JOIN
+            条件，再决定需要哪些索引。盲目为每个列建索引是新手常犯的错误。</p>
+            <hr />
+            <h2 id="三bloom-filter-调优">三、Bloom Filter 调优</h2>
+            <p>布隆过滤器（Bloom Filter）是 LSM-Tree
+            引擎中降低读放大的关键组件。它用一个概率数据结构（Probabilistic
+            Data Structure）回答”某个 key 是否可能存在于这个 SSTable
+            中”的问题。</p>
+            <h3 id="bloom-filter-的工作原理">Bloom Filter
+            的工作原理</h3>
+            <p>Bloom Filter 由一个长度为 m 的比特数组（Bit Array）和 k
+            个独立的哈希函数（Hash Function）组成。插入一个 key 时，用 k
+            个哈希函数分别计算出 k 个位置，把这些位置的比特设为
+            1。查询一个 key 时，同样计算 k
+            个位置，如果所有位置的比特都是
+            1，返回”可能存在”；如果任何一个位置是
+            0，返回”一定不存在”。</p>
+            <pre class="text"><code>Bloom Filter 查询示意：
+
+Bit Array (m=16):  [0,1,0,1,1,0,0,1,0,0,1,0,0,1,0,0]
+                       ^   ^ ^           ^
+                       |   | |           |
+                   hash1 hash2 hash3   hash4   --&gt; key &quot;user:1001&quot;
+
+所有位置均为 1 =&gt; &quot;可能存在&quot;（可能是误判）
+
+Bit Array (m=16):  [0,1,0,1,1,0,0,1,0,0,1,0,0,1,0,0]
+                             ^       ^
+                             |       |
+                         hash1     hash2   hash3 -&gt; 0 =&gt; &quot;一定不存在&quot;</code></pre>
+            <p>Bloom Filter 的关键特性：没有假阴性（False
+            Negative），但存在假阳性（False Positive）。也就是说，如果
+            Bloom Filter
+            说”不存在”，那一定不存在；但如果说”可能存在”，有一定概率是误判。</p>
+            <h3 id="误判率的数学关系">误判率的数学关系</h3>
+            <p>假阳性概率（False Positive Rate,
+            FPR）与三个参数有关：</p>
+            <pre class="text"><code>FPR ≈ (1 - e^(-kn/m))^k
+
+其中：
+  m = 比特数组长度（bits）
+  n = 已插入元素数量
+  k = 哈希函数个数</code></pre>
+            <p>当 k 取最优值 k = (m/n) * ln(2) 时，FPR 简化为：</p>
+            <pre class="text"><code>FPR ≈ (0.6185)^(m/n)</code></pre>
+            <p>这意味着每个 key 分配的比特数（bits per key,
+            BPK）直接决定了误判率。下表列出了不同 BPK
+            下的理论误判率：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>bits per key (m/n)</th>
+            <th>最优 k</th>
+            <th>理论 FPR</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>5</td>
+            <td>3</td>
+            <td>9.18%</td>
+            </tr>
+            <tr>
+            <td>8</td>
+            <td>6</td>
+            <td>2.16%</td>
+            </tr>
+            <tr>
+            <td>10</td>
+            <td>7</td>
+            <td>0.82%</td>
+            </tr>
+            <tr>
+            <td>12</td>
+            <td>8</td>
+            <td>0.31%</td>
+            </tr>
+            <tr>
+            <td>15</td>
+            <td>10</td>
+            <td>0.07%</td>
+            </tr>
+            <tr>
+            <td>20</td>
+            <td>14</td>
+            <td>0.006%</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>RocksDB 默认的 <code>bits_per_key</code> 是 10，对应约
+            0.82% 的误判率。这意味着每 100 次对不存在 key
+            的查询中，大约有 1 次会错误地触发 Data Block 的读取。</p>
+            <h3 id="rocksdb-中的-bloom-filter-配置">RocksDB 中的 Bloom
+            Filter 配置</h3>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions table_options<span class="op">;</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 基本配置：每个 key 分配 10 bits</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>filter_policy<span class="op">.</span>reset<span class="op">(</span>rocksdb<span class="op">::</span>NewBloomFilterPolicy<span class="op">(</span><span class="dv">10</span><span class="op">));</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 启用全量过滤器（Full Filter）而不是分块过滤器</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co">// RocksDB 7.0 以后默认使用 Full Filter</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>filter_policy<span class="op">.</span>reset<span class="op">(</span>rocksdb<span class="op">::</span>NewBloomFilterPolicy<span class="op">(</span><span class="dv">10</span><span class="op">,</span> <span class="kw">false</span><span class="op">));</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="co">// 对分区索引场景，启用分区过滤器</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>partition_filters <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span><span class="dt">index_type</span> <span class="op">=</span> rocksdb<span class="op">::</span>BlockBasedTableOptions<span class="op">::</span>kTwoLevelIndexSearch<span class="op">;</span></span></code></pre></div>
+            <p>Full Filter 把整个 SSTable 的所有 key 放入一个 Bloom
+            Filter 中，查询时不需要先确定 Data Block 再查找对应的 Bloom
+            Filter 分块，减少了一次间接访问。</p>
+            <h3 id="ribbon-filterbloom-filter-的替代方案">Ribbon
+            Filter：Bloom Filter 的替代方案</h3>
+            <p>RocksDB 从 7.0 版本开始引入了 Ribbon Filter 作为 Bloom
+            Filter 的替代方案。Ribbon Filter
+            基于异或满足性问题（XOR-Satisfiability），在相同的误判率下比
+            Bloom Filter 节省约 30% 的空间，代价是构建速度稍慢。</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 使用 Ribbon Filter 替代 Bloom Filter</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>filter_policy<span class="op">.</span>reset<span class="op">(</span>rocksdb<span class="op">::</span>NewRibbonFilterPolicy<span class="op">(</span><span class="dv">10</span><span class="op">));</span></span></code></pre></div>
+            <p>Ribbon Filter 的查询速度与 Bloom Filter
+            相当，但构建时需要更多 CPU 时间（大约慢 2-3 倍）。对于
+            SSTable 构建频率低（Compaction
+            不频繁）但查询频率高的场景，Ribbon Filter 是更好的选择；对于
+            Compaction 密集的场景，Bloom Filter
+            的构建速度优势更重要。</p>
+            <h3 id="bloom-filter-调优的工程判断">Bloom Filter
+            调优的工程判断</h3>
+            <p>Bloom Filter 的 bits per key 不是越大越好。增加 BPK
+            带来的收益是边际递减的——从 10 增加到 15 可以把 FPR 从 0.82%
+            降到 0.07%，但如果数据集有 10 亿个 key，这额外的 5 bits/key
+            意味着多占用约 600 MB 内存。</p>
+            <p>我认为调优 Bloom Filter
+            的正确思路是：先测量实际工作负载中”查询不存在的
+            key”的比例。如果应用层已经做了很好的路由（比如分片键保证查询一定能命中正确的分片），那么大部分查询都是命中的，Bloom
+            Filter
+            的误判率高一点也没关系。但如果应用层大量执行”查询可能不存在的
+            key”（比如缓存穿透场景），就需要把 BPK 调高，甚至考虑在 L0
+            和 L1 使用更高的 BPK。</p>
+            <p>RocksDB 支持按层配置不同的 Bloom Filter 参数：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 通过 ColumnFamilyOptions 的 advanced_options 可以为不同层设置不同的 filter 配置</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 实践中更常见的做法是为整个 CF 设置统一的 BPK，然后在 L0 层额外增大</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>optimize_filters_for_hits <span class="op">=</span> <span class="kw">true</span><span class="op">;</span>  <span class="co">// 如果大部分查询都命中，跳过最底层的 Bloom Filter</span></span></code></pre></div>
+            <p><code>optimize_filters_for_hits</code>
+            选项在假设”大部分查询都命中”的前提下，跳过最底层（通常是最大的）SSTable
+            的 Bloom Filter 构建，节省磁盘空间和 Compaction
+            CPU。但如果实际工作负载中有大量未命中的查询，这个优化反而会导致读延迟显著增加。</p>
+            <hr />
+            <h2 id="四块缓存设计与调优">四、块缓存设计与调优</h2>
+            <p>块缓存（Block
+            Cache）是存储引擎中最直接的读取性能优化手段：把从磁盘读取的数据块缓存在内存中，下次访问同一个块时直接从内存返回，避免磁盘
+            I/O。</p>
+            <h3 id="block-cache-的基本架构">Block Cache 的基本架构</h3>
+            <pre class="mermaid"><code>graph TD
+    A[&quot;用户请求: Get(key)&quot;] --&gt; B{&quot;Memtable 命中?&quot;}
+    B --&gt;|是| C[&quot;直接返回&quot;]
+    B --&gt;|否| D{&quot;Block Cache 命中?&quot;}
+    D --&gt;|是| E[&quot;从缓存读取 Data Block&quot;]
+    D --&gt;|否| F[&quot;从磁盘读取 Data Block&quot;]
+    F --&gt; G[&quot;解压缩&quot;]
+    G --&gt; H[&quot;插入 Block Cache&quot;]
+    H --&gt; E
+    E --&gt; I[&quot;在 Block 中二分查找 key&quot;]
+    I --&gt; J[&quot;返回结果&quot;]</code></pre>
+            <p>上图展示了 Block Cache 在读取路径中的位置。Block Cache
+            位于 Memtable 之后、磁盘 I/O 之前，是减少磁盘 I/O
+            的核心屏障。</p>
+            <h3 id="lru-cache-与-clock-cache">LRU Cache 与 Clock
+            Cache</h3>
+            <p>RocksDB 提供两种 Block Cache 实现：</p>
+            <p><strong>LRU Cache（最近最少使用缓存）</strong>：标准的
+            LRU
+            淘汰策略。每次访问一个缓存条目时，把它移到链表头部；空间不足时，淘汰链表尾部的条目。LRU
+            Cache
+            的问题在于需要互斥锁（Mutex）保护链表操作，在高并发场景下锁竞争会成为瓶颈。</p>
+            <p>RocksDB 的 LRU Cache
+            通过分片（Sharding）缓解锁竞争——默认创建 64
+            个分片，每个分片有独立的锁和 LRU 链表：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 创建 8 GB 的 LRU Block Cache，64 个分片</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>shared_ptr<span class="op">&lt;</span>rocksdb<span class="op">::</span>Cache<span class="op">&gt;</span> cache <span class="op">=</span> rocksdb<span class="op">::</span>NewLRUCache<span class="op">(</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="dv">8</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>  <span class="co">// 容量 8 GB</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="dv">6</span><span class="op">,</span>                           <span class="co">// num_shard_bits = 6, 即 2^6 = 64 个分片</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">false</span><span class="op">,</span>                       <span class="co">// strict_capacity_limit = false</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="fl">0.9</span>                          <span class="co">// high_pri_pool_ratio = 0.9</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span></code></pre></div>
+            <p><code>high_pri_pool_ratio</code>
+            参数控制高优先级池的比例。RocksDB 把 Index Block 和 Filter
+            Block 标记为高优先级，Data Block
+            标记为低优先级。高优先级池占 90%
+            的空间意味着索引和过滤器数据几乎不会被淘汰，保证了索引查找始终在内存中完成。</p>
+            <p><strong>HyperClockCache</strong>：RocksDB 从 8.x
+            版本引入的无锁缓存实现。它基于时钟算法（Clock
+            Algorithm）的变体，使用原子操作（Atomic
+            Operations）代替互斥锁，在高并发场景下吞吐量比 LRU Cache 高
+            30%-50%。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>HyperClockCacheOptions hcc_options<span class="op">(</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>    <span class="dv">8</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span>  <span class="co">// 容量 8 GB</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span>                    <span class="co">// estimated_entry_charge = 16 KB（估计的平均条目大小）</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="op">);</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>shared_ptr<span class="op">&lt;</span>rocksdb<span class="op">::</span>Cache<span class="op">&gt;</span> cache <span class="op">=</span> hcc_options<span class="op">.</span>MakeSharedCache<span class="op">();</span></span></code></pre></div>
+            <p>HyperClockCache
+            需要提前估计平均条目大小（<code>estimated_entry_charge</code>），这个值影响内部哈希表的预分配大小。如果估计不准确，可能导致内存使用效率下降。</p>
+            <h3 id="block-cache-的容量规划">Block Cache 的容量规划</h3>
+            <p>Block Cache 的容量应该根据工作集大小（Working Set
+            Size）来规划，而不是简单地分配”可用内存的 X%“。</p>
+            <p>关键指标：</p>
+            <ul>
+            <li><strong>缓存命中率（Cache Hit Ratio）</strong>：命中次数
+            / (命中次数 + 未命中次数)。生产环境中，Block Cache
+            命中率低于 90% 通常意味着缓存容量不足。</li>
+            <li><strong>缓存命中率与延迟的关系</strong>：假设 Block
+            Cache 命中延迟是 1 微秒，SSD 随机读延迟是 100 微秒，那么：
+            <ul>
+            <li>命中率 99%：平均延迟 = 0.99 * 1 + 0.01 * 100 = 1.99
+            微秒</li>
+            <li>命中率 95%：平均延迟 = 0.95 * 1 + 0.05 * 100 = 5.95
+            微秒</li>
+            <li>命中率 90%：平均延迟 = 0.90 * 1 + 0.10 * 100 = 10.9
+            微秒</li>
+            </ul></li>
+            </ul>
+            <p>命中率每下降 5 个百分点，平均延迟增加 5 微秒。在 HDD
+            环境下这个差距更大——HDD 随机读延迟在 5-10 毫秒，命中率从 99%
+            降到 95% 意味着平均延迟从 50 微秒增加到 500 微秒，差了 10
+            倍。</p>
+            <h3 id="rocksdb-block-cache-统计信息">RocksDB Block Cache
+            统计信息</h3>
+            <p>通过 <code>Statistics</code> 接口可以获取 Block Cache
+            的详细运行状态：</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>statistics <span class="op">=</span> rocksdb<span class="op">::</span>CreateDBStatistics<span class="op">();</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 获取统计信息</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string stats<span class="op">;</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>statistics<span class="op">-&gt;</span>ToString<span class="op">(</span><span class="kw">nullptr</span><span class="op">,</span> <span class="op">&amp;</span>stats<span class="op">);</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="co">// 关键指标</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a><span class="co">// rocksdb.block.cache.hit        - 缓存命中次数</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="co">// rocksdb.block.cache.miss       - 缓存未命中次数</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a><span class="co">// rocksdb.block.cache.add        - 缓存插入次数</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="co">// rocksdb.block.cache.data.hit   - Data Block 命中次数</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="co">// rocksdb.block.cache.index.hit  - Index Block 命中次数</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="co">// rocksdb.block.cache.filter.hit - Filter Block 命中次数</span></span></code></pre></div>
+            <p>监控时应当分别关注 Data Block、Index Block 和 Filter
+            Block 的命中率。如果 Index Block 的命中率低于 99%，说明
+            Block Cache 容量严重不足或 <code>high_pri_pool_ratio</code>
+            设置太低——索引数据的频繁淘汰会导致几乎每次查询都需要额外的磁盘
+            I/O 来加载索引。</p>
+            <h3 id="innodb-的-buffer-pool">InnoDB 的 Buffer Pool</h3>
+            <p>InnoDB 的缓冲池（Buffer Pool）与 RocksDB 的 Block Cache
+            在目标上一致，但设计上有几个关键差异：</p>
+            <ol type="1">
+            <li><strong>缓存单位不同</strong>：InnoDB 以页（Page，默认
+            16 KB）为单位缓存，RocksDB 以数据块（Block，默认 4
+            KB）为单位。</li>
+            <li><strong>LRU 分代</strong>：InnoDB 的 LRU
+            链表分为两段——new sublist（热端，占 5/8）和 old
+            sublist（冷端，占 3/8）。新插入的页先进入 old sublist
+            的头部，只有在 old sublist 中存活超过
+            <code>innodb_old_blocks_time</code>（默认 1000
+            毫秒）后再次被访问，才提升到 new
+            sublist。这个设计可以防止全表扫描一次性冲刷整个缓存。</li>
+            <li><strong>脏页管理</strong>：InnoDB 的 Buffer Pool
+            不仅缓存读取的数据，还缓存修改后尚未刷盘的脏页。Block Cache
+            只缓存从磁盘读取的数据，写入走独立的 Write Buffer / Memtable
+            路径。</li>
+            </ol>
+            <p>InnoDB Buffer Pool 的核心配置：</p>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- Buffer Pool 总大小，通常设置为物理内存的 50%-80%</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">GLOBAL</span> innodb_buffer_pool_size <span class="op">=</span> <span class="dv">8589934592</span>;  <span class="co">-- 8 GB</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- Buffer Pool 实例数，减少锁竞争</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">GLOBAL</span> innodb_buffer_pool_instances <span class="op">=</span> <span class="dv">8</span>;       <span class="co">-- 8 个实例</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 新页在 old sublist 中的最小停留时间</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> <span class="kw">GLOBAL</span> innodb_old_blocks_time <span class="op">=</span> <span class="dv">1000</span>;          <span class="co">-- 1000 毫秒</span></span></code></pre></div>
+            <h3 id="block-cache-调优的工程判断">Block Cache
+            调优的工程判断</h3>
+            <p>缓存调优中最常见的错误是给 Block Cache
+            分配了过多内存，挤占了操作系统页缓存（Page
+            Cache）的空间。RocksDB 的数据文件也会被操作系统缓存在 Page
+            Cache 中。如果 Block Cache 配置了 12 GB，Page Cache 只剩 2
+            GB，可能出现 Block Cache 和 Page Cache
+            缓存相同数据的双重缓存问题——浪费内存，降低整体命中率。</p>
+            <p>避免双重缓存的方法：</p>
+            <ol type="1">
+            <li>使用 Direct I/O 绕过 Page Cache，让所有缓存管理由 Block
+            Cache 负责。</li>
+            <li>如果不使用 Direct I/O，需要协调 Block Cache 和 Page
+            Cache 的总容量，确保两者之和不超过物理内存的 80%。</li>
+            </ol>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 启用 Direct I/O 读取，避免双重缓存</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>use_direct_reads <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 启用 Direct I/O 写入（Compaction 和 Flush）</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>use_direct_io_for_flush_and_compaction <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span></code></pre></div>
+            <hr />
+            <h2 id="五压缩与解压缩的-cpu-io-权衡">五、压缩与解压缩的
+            CPU-I/O 权衡</h2>
+            <p>存储引擎中的数据通常以压缩形式存放在磁盘上。读取时需要先从磁盘读取压缩数据，再在
+            CPU 上执行解压缩。压缩节省了磁盘 I/O 量，但增加了 CPU
+            开销——这就是压缩的 CPU-I/O 权衡。</p>
+            <h3 id="权衡模型">权衡模型</h3>
+            <p>用一个简单的延迟模型量化这个权衡：</p>
+            <pre class="text"><code>T_read = T_io + T_decompress
+
+T_io          = 压缩后数据大小 / 磁盘带宽
+T_decompress  = 原始数据大小 / 解压速度
+
+压缩净收益 = T_read(不压缩) - T_read(压缩)
+           = 原始大小/磁盘带宽 - (原始大小/压缩率/磁盘带宽 + 原始大小/解压速度)
+           = 原始大小 * (1/磁盘带宽 - 1/(压缩率*磁盘带宽) - 1/解压速度)
+           = 原始大小 * ((1 - 1/压缩率)/磁盘带宽 - 1/解压速度)</code></pre>
+            <p>当压缩净收益 &gt; 0
+            时，压缩有利于读取性能。这个条件可以改写为：</p>
+            <pre class="text"><code>解压速度 &gt; 磁盘带宽 * 压缩率 / (压缩率 - 1)</code></pre>
+            <p>以下表格展示了不同存储介质和压缩算法组合下的净收益情况。数据块大小
+            64 KB，压缩率假设 2.5:1：</p>
+            <table>
+            <colgroup>
+            <col style="width: 11%" />
+            <col style="width: 7%" />
+            <col style="width: 26%" />
+            <col style="width: 28%" />
+            <col style="width: 26%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>存储介质</th>
+            <th>带宽</th>
+            <th>LZ4 解压 (4000 MB/s)</th>
+            <th>Zstd 解压 (1200 MB/s)</th>
+            <th>Zlib 解压 (400 MB/s)</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>HDD (150 MB/s)</td>
+            <td>150 MB/s</td>
+            <td>净收益 36 微秒</td>
+            <td>净收益 33 微秒</td>
+            <td>净收益 21 微秒</td>
+            </tr>
+            <tr>
+            <td>SATA SSD (500 MB/s)</td>
+            <td>500 MB/s</td>
+            <td>净收益 6.1 微秒</td>
+            <td>净收益 3.9 微秒</td>
+            <td>损失 8.7 微秒</td>
+            </tr>
+            <tr>
+            <td>NVMe SSD (3000 MB/s)</td>
+            <td>3000 MB/s</td>
+            <td>净收益 0.7 微秒</td>
+            <td>损失 4.2 微秒</td>
+            <td>损失 24 微秒</td>
+            </tr>
+            <tr>
+            <td>Intel Optane (2500 MB/s)</td>
+            <td>2500 MB/s</td>
+            <td>净收益 0.9 微秒</td>
+            <td>损失 3.0 微秒</td>
+            <td>损失 19 微秒</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>上表中的数据是基于公式的理论计算，用于展示趋势，非实测结果。</p>
+            <p>核心结论：随着存储介质速度的提升，压缩的收益逐渐缩小甚至变为负数。在
+            NVMe SSD 上，只有 LZ4 这种极速解压算法还能保持正收益，Zstd
+            和 Zlib 的解压开销已经超过了 I/O 节省。</p>
+            <h3 id="按层压缩策略">按层压缩策略</h3>
+            <p>基于上面的分析，LSM-Tree 引擎通常采用按层压缩（Per-Level
+            Compression）策略：</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compression_per_level <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kNoCompression<span class="op">,</span>      <span class="co">// L0: 不压缩（频繁读写，延迟敏感）</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>     <span class="co">// L1: LZ4（中等频率访问）</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kLZ4Compression<span class="op">,</span>     <span class="co">// L2: LZ4</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD<span class="op">,</span>               <span class="co">// L3: Zstd（访问频率降低，空间优先）</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD<span class="op">,</span>               <span class="co">// L4: Zstd</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD<span class="op">,</span>               <span class="co">// L5: Zstd</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>    rocksdb<span class="op">::</span>kZSTD<span class="op">,</span>               <span class="co">// L6: Zstd（最底层，数据量最大）</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+            <p>L0 层不压缩，因为 L0 的 SSTable 会参与频繁的 Compaction
+            和查询；L1-L2 使用 LZ4，平衡速度和压缩率；L3 以下使用
+            Zstd，因为底层数据量大、访问频率低，空间节省比 CPU
+            开销更重要。</p>
+            <h3
+            id="压缩字典compression-dictionary">压缩字典（Compression
+            Dictionary）</h3>
+            <p>对于小数据块（4-16
+            KB），标准压缩算法的压缩率会显著下降，因为每个块内部可供参考的重复模式太少。Zstd
+            的压缩字典（Compression
+            Dictionary）可以缓解这个问题——用训练数据集生成一个共享字典，压缩时引用字典中的模式，而不仅仅是当前块内的模式。</p>
+            <p>RocksDB 支持在 SSTable 级别使用压缩字典：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compression <span class="op">=</span> rocksdb<span class="op">::</span>kZSTD<span class="op">;</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>CompressionOptions compression_opts<span class="op">;</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>compression_opts<span class="op">.</span>max_dict_bytes <span class="op">=</span> <span class="dv">16384</span><span class="op">;</span>     <span class="co">// 字典最大 16 KB</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>compression_opts<span class="op">.</span>zstd_max_train_bytes <span class="op">=</span> <span class="dv">1048576</span><span class="op">;</span>  <span class="co">// 用最多 1 MB 数据训练字典</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compression_opts <span class="op">=</span> compression_opts<span class="op">;</span></span></code></pre></div>
+            <p>在小值场景中（例如元数据存储、配置存储），压缩字典可以把压缩率从
+            1.2:1 提升到 2.5:1 以上，效果很显著。但字典本身需要存储在
+            SSTable 中，增加了文件大小和构建时间。</p>
+            <h3
+            id="解压缓存uncompressed-block-cache">解压缓存（Uncompressed
+            Block Cache）</h3>
+            <p>如果同一个 Data Block 被反复访问，每次从 Block Cache
+            读取压缩数据后都需要解压，CPU 开销会很可观。RocksDB
+            支持一个额外的非压缩缓存（Uncompressed Block
+            Cache），缓存解压后的数据块，避免重复解压：</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 主 Block Cache：缓存压缩后的数据块</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> compressed_cache <span class="op">=</span> rocksdb<span class="op">::</span>NewLRUCache<span class="op">(</span><span class="dv">4</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">);</span>  <span class="co">// 4 GB</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 非压缩缓存：缓存解压后的数据块</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span> uncompressed_cache <span class="op">=</span> rocksdb<span class="op">::</span>NewLRUCache<span class="op">(</span><span class="dv">2</span><span class="bu">ULL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">);</span>  <span class="co">// 2 GB</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>BlockBasedTableOptions table_options<span class="op">;</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_cache <span class="op">=</span> uncompressed_cache<span class="op">;</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a>table_options<span class="op">.</span>block_cache_compressed <span class="op">=</span> compressed_cache<span class="op">;</span></span></code></pre></div>
+            <p>这种双层缓存结构的好处是：热数据在非压缩缓存中以解压形式存在，读取时零
+            CPU
+            开销；温数据在压缩缓存中以压缩形式存在，占用较少内存但需要解压。代价是总内存使用量增加，需要仔细平衡两个缓存的大小。</p>
+            <p>实际工程中我们发现，双层缓存在 CPU
+            是瓶颈的场景（例如高并发小值读取）下效果明显，但在 I/O
+            是瓶颈的场景下收益有限——因为瓶颈不在解压速度，而在磁盘带宽。</p>
+            <hr />
+            <h2 id="六预读策略">六、预读策略</h2>
+            <p>预读（Readahead /
+            Prefetch）的核心思想是：在应用实际请求数据之前，提前把数据从磁盘加载到内存中，把同步的磁盘
+            I/O 变成异步的内存访问。</p>
+            <h3 id="linux-内核的预读机制">Linux 内核的预读机制</h3>
+            <p>Linux 内核的页缓存（Page
+            Cache）内置了自适应预读（Adaptive
+            Readahead）机制。当内核检测到顺序读取模式时，会自动预读后续的页：</p>
+            <pre class="text"><code>初始窗口: 128 KB（默认，由 /sys/block/&lt;dev&gt;/queue/read_ahead_kb 控制）
+检测到顺序读取后，窗口指数增长：128 KB -&gt; 256 KB -&gt; 512 KB -&gt; ...
+最大窗口: 默认 128 KB（可通过 read_ahead_kb 调整）
+检测到随机读取时，窗口缩回或关闭预读</code></pre>
+            <p>查看和修改预读窗口大小：</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前预读窗口大小（单位 KB）</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/queue/read_ahead_kb</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 修改预读窗口大小（需要 root 权限）</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 256 <span class="op">&gt;</span> /sys/block/sda/queue/read_ahead_kb</span></code></pre></div>
+            <p>内核预读对顺序扫描场景（全表扫描、Compaction、备份）效果显著，但对随机点查几乎无效——随机点查没有顺序模式可供检测，预读反而会浪费
+            I/O 带宽，读取不需要的数据。</p>
+            <h3 id="存储引擎层的预读">存储引擎层的预读</h3>
+            <p>存储引擎通常实现自己的预读逻辑，而不是完全依赖内核预读，原因有两个：</p>
+            <ol type="1">
+            <li>内核预读基于文件偏移的顺序性判断，无法感知存储引擎的逻辑访问模式（例如
+            SSTable 的 Data Block
+            是逻辑上顺序但物理上可能不连续的）。</li>
+            <li>使用 Direct I/O 绕过 Page Cache
+            后，内核预读不再生效，必须由引擎自己管理。</li>
+            </ol>
+            <p>RocksDB 的迭代器（Iterator）支持配置预读大小：</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>ReadOptions read_options<span class="op">;</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 为迭代器启用预读</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a>read_options<span class="op">.</span>readahead_size <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 预读 2 MB</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-6"><a href="#cb25-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 自适应预读：初始不预读，检测到顺序访问后自动启用</span></span>
+<span id="cb25-7"><a href="#cb25-7" aria-hidden="true" tabindex="-1"></a>read_options<span class="op">.</span>adaptive_readahead <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb25-8"><a href="#cb25-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-9"><a href="#cb25-9" aria-hidden="true" tabindex="-1"></a><span class="co">// Compaction 时的预读大小</span></span>
+<span id="cb25-10"><a href="#cb25-10" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Options options<span class="op">;</span></span>
+<span id="cb25-11"><a href="#cb25-11" aria-hidden="true" tabindex="-1"></a>options<span class="op">.</span>compaction_readahead_size <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// Compaction 读取时预读 2 MB</span></span></code></pre></div>
+            <p><code>adaptive_readahead</code> 是 RocksDB 在 7.x
+            版本引入的特性，它让迭代器从零预读开始，在检测到连续的 Data
+            Block 读取后自动增大预读窗口，最大不超过
+            <code>readahead_size</code>。这比固定预读更灵活——短范围查询不会浪费
+            I/O，长范围扫描可以享受预读带来的带宽提升。</p>
+            <h3 id="madvise-与-fadvise">madvise 与 fadvise</h3>
+            <p>在使用 mmap 或 Page Cache 的场景中，应用程序可以通过
+            <code>madvise()</code> 和 <code>posix_fadvise()</code>
+            系统调用向内核提供访问模式的提示：</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/mman.h&gt;</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a><span class="co">// madvise：对已映射的内存区域提供访问模式提示</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>addr <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> file_size<span class="op">,</span> PROT_READ<span class="op">,</span> MAP_PRIVATE<span class="op">,</span> fd<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 告知内核将顺序访问，启用预读</span></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr<span class="op">,</span> file_size<span class="op">,</span> MADV_SEQUENTIAL<span class="op">);</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-10"><a href="#cb26-10" aria-hidden="true" tabindex="-1"></a><span class="co">// 告知内核将随机访问，关闭预读</span></span>
+<span id="cb26-11"><a href="#cb26-11" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr<span class="op">,</span> file_size<span class="op">,</span> MADV_RANDOM<span class="op">);</span></span>
+<span id="cb26-12"><a href="#cb26-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-13"><a href="#cb26-13" aria-hidden="true" tabindex="-1"></a><span class="co">// 告知内核即将访问指定范围，提前加载到内存</span></span>
+<span id="cb26-14"><a href="#cb26-14" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr <span class="op">+</span> offset<span class="op">,</span> length<span class="op">,</span> MADV_WILLNEED<span class="op">);</span></span>
+<span id="cb26-15"><a href="#cb26-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-16"><a href="#cb26-16" aria-hidden="true" tabindex="-1"></a><span class="co">// 告知内核指定范围不再需要，可以回收</span></span>
+<span id="cb26-17"><a href="#cb26-17" aria-hidden="true" tabindex="-1"></a>madvise<span class="op">(</span>addr <span class="op">+</span> offset<span class="op">,</span> length<span class="op">,</span> MADV_DONTNEED<span class="op">);</span></span></code></pre></div>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="co">// posix_fadvise：对文件描述符提供访问模式提示</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;data.sst&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 顺序访问提示</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_SEQUENTIAL<span class="op">);</span></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a><span class="co">// 随机访问提示</span></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> POSIX_FADV_RANDOM<span class="op">);</span></span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a><span class="co">// 预取指定范围</span></span>
+<span id="cb27-13"><a href="#cb27-13" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span> POSIX_FADV_WILLNEED<span class="op">);</span></span>
+<span id="cb27-14"><a href="#cb27-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-15"><a href="#cb27-15" aria-hidden="true" tabindex="-1"></a><span class="co">// 访问完毕，可以淘汰</span></span>
+<span id="cb27-16"><a href="#cb27-16" aria-hidden="true" tabindex="-1"></a>posix_fadvise<span class="op">(</span>fd<span class="op">,</span> offset<span class="op">,</span> length<span class="op">,</span> POSIX_FADV_DONTNEED<span class="op">);</span></span></code></pre></div>
+            <p><code>MADV_WILLNEED</code> /
+            <code>POSIX_FADV_WILLNEED</code>
+            可以看作应用层控制的显式预读：应用程序知道即将访问哪些范围，主动通知内核提前加载。这比内核的自适应预读更精确，不会预读不需要的数据。</p>
+            <h3 id="预读策略的工程判断">预读策略的工程判断</h3>
+            <p>预读是一把双刃剑。过度预读会导致：</p>
+            <ol type="1">
+            <li><strong>I/O
+            带宽浪费</strong>：预读的数据如果没有被后续访问命中，就白白消耗了磁盘带宽。</li>
+            <li><strong>缓存污染</strong>：预读的数据占据了 Page Cache
+            或 Block Cache 的空间，可能把真正需要的热数据淘汰出去。</li>
+            <li><strong>延迟抖动</strong>：大量预读 I/O 和前台请求竞争
+            I/O 队列，可能导致前台请求的 P99 延迟上升。</li>
+            </ol>
+            <p>正确的做法是根据访问模式选择预读策略：</p>
+            <ul>
+            <li><strong>点查为主</strong>：关闭预读或使用
+            <code>MADV_RANDOM</code>，让每次 I/O 只读取需要的块。</li>
+            <li><strong>范围扫描</strong>：启用自适应预读，初始窗口小，顺序模式确认后逐步增大。</li>
+            <li><strong>全表扫描 /
+            Compaction</strong>：使用较大的固定预读（1-2
+            MB），最大化顺序读吞吐。</li>
+            <li><strong>混合工作负载</strong>：使用
+            <code>adaptive_readahead</code>，让引擎自动判断。</li>
+            </ul>
+            <hr />
+            <h2 id="七列式剪枝与谓词下推">七、列式剪枝与谓词下推</h2>
+            <p>列式存储（Columnar
+            Storage）的读取优化核心是两个技术：列式剪枝（Column
+            Pruning）和谓词下推（Predicate
+            Pushdown）。它们分别解决”不读不需要的列”和”不读不需要的行”的问题。</p>
+            <h3 id="列式剪枝">列式剪枝</h3>
+            <p>列式存储引擎（如
+            Parquet、ORC）把同一列的数据连续存放在一起。如果查询只需要表中的几列，引擎可以只读取这些列的数据块，完全跳过其他列——这就是列式剪枝。</p>
+            <p>以 Parquet 文件为例：</p>
+            <pre class="text"><code>Parquet 文件物理布局:
+
++-----------------+
+| Row Group 0     |
+|  Column Chunk: user_id     (offset: 0,    size: 64 KB)  |
+|  Column Chunk: name        (offset: 64K,  size: 128 KB) |
+|  Column Chunk: email       (offset: 192K, size: 256 KB) |
+|  Column Chunk: created_at  (offset: 448K, size: 32 KB)  |
++-----------------+
+| Row Group 1     |
+|  Column Chunk: user_id     (offset: 480K, size: 64 KB)  |
+|  ...                                                     |
++-----------------+
+| Footer          |
+|  Schema + Column Metadata + Row Group Metadata           |
++-----------------+</code></pre>
+            <p>查询 <code>SELECT user_id, created_at FROM users</code>
+            时，引擎只需要读取每个 Row Group 中 <code>user_id</code> 和
+            <code>created_at</code> 的 Column Chunk，跳过
+            <code>name</code> 和
+            <code>email</code>。在上面的例子中，只需要读取 64 + 32 = 96
+            KB，而不是整个 Row Group 的 480 KB。</p>
+            <p>列式剪枝的效果取决于查询涉及的列占总列数的比例。对于宽表（几十到上百列），如果查询只涉及
+            3-5 列，列式剪枝可以减少 90% 以上的 I/O 量。</p>
+            <h3 id="谓词下推">谓词下推</h3>
+            <p>谓词下推（Predicate
+            Pushdown）把过滤条件下推到存储层执行，在读取数据的同时就过滤掉不满足条件的行，避免把大量无用数据传输到计算层。</p>
+            <p>Parquet 和 ORC 支持两层谓词下推：</p>
+            <p><strong>Row Group 级过滤</strong>：Parquet 的 Row Group
+            Metadata
+            中记录了每列的统计信息（最小值、最大值、空值计数）。如果查询条件
+            <code>WHERE created_at &gt; '2025-01-01'</code>，而某个 Row
+            Group 的 <code>created_at</code> 最大值是
+            <code>2024-06-30</code>，引擎可以直接跳过整个 Row
+            Group，不读取任何数据。</p>
+            <p><strong>Page 级过滤</strong>：Parquet v2
+            支持页级统计信息（Column Index），可以在 Page 粒度做过滤，比
+            Row Group 级更精细。</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode python"><code class="sourceCode python"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PyArrow 读取 Parquet 时使用谓词下推（Python 3.10+, PyArrow 15+）</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow.parquet <span class="im">as</span> pq</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 指定只读取需要的列（列式剪枝）</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用过滤条件（谓词下推）</span></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pq.read_table(</span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&#39;users.parquet&#39;</span>,</span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a>    columns<span class="op">=</span>[<span class="st">&#39;user_id&#39;</span>, <span class="st">&#39;created_at&#39;</span>],           <span class="co"># 列式剪枝</span></span>
+<span id="cb29-9"><a href="#cb29-9" aria-hidden="true" tabindex="-1"></a>    filters<span class="op">=</span>[(<span class="st">&#39;created_at&#39;</span>, <span class="st">&#39;&gt;&#39;</span>, <span class="st">&#39;2025-01-01&#39;</span>)]   <span class="co"># 谓词下推</span></span>
+<span id="cb29-10"><a href="#cb29-10" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+            <h3 id="clickhouse-的数据跳跃索引">ClickHouse
+            的数据跳跃索引</h3>
+            <p>ClickHouse 在列式存储的基础上引入了数据跳跃索引（Data
+            Skipping Index），进一步减少扫描范围。数据跳跃索引不是传统的
+            B-Tree 索引，而是为数据块（Granule，默认 8192
+            行）记录的汇总信息。</p>
+            <p>常见的跳跃索引类型：</p>
+            <table>
+            <colgroup>
+            <col style="width: 38%" />
+            <col style="width: 23%" />
+            <col style="width: 38%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>索引类型</th>
+            <th>原理</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>minmax</td>
+            <td>记录每个 Granule 中列的最小值和最大值</td>
+            <td>范围查询</td>
+            </tr>
+            <tr>
+            <td>set(N)</td>
+            <td>记录每个 Granule 中列的去重值集合（最多 N 个）</td>
+            <td>低基数列的等值查询</td>
+            </tr>
+            <tr>
+            <td>bloom_filter</td>
+            <td>为每个 Granule 构建 Bloom Filter</td>
+            <td>高基数列的等值查询</td>
+            </tr>
+            <tr>
+            <td>ngrambf_v1</td>
+            <td>为字符串列构建 n-gram Bloom Filter</td>
+            <td>模糊匹配（LIKE ‘%keyword%’）</td>
+            </tr>
+            </tbody>
+            </table>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- ClickHouse 创建带跳跃索引的表</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="kw">events</span> (</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a>    event_date <span class="dt">Date</span>,</span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a>    user_id UInt64,</span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a>    event_type String,</span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a>    payload String,</span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_user_id user_id <span class="kw">TYPE</span> bloom_filter(<span class="fl">0.01</span>) GRANULARITY <span class="dv">4</span>,</span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_event_type event_type <span class="kw">TYPE</span> <span class="kw">set</span>(<span class="dv">100</span>) GRANULARITY <span class="dv">4</span></span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a>) ENGINE <span class="op">=</span> MergeTree()</span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> (event_date, user_id);</span></code></pre></div>
+            <p><code>GRANULARITY 4</code> 表示每 4 个 Granule（4 * 8192
+            = 32768
+            行）构建一个索引条目。粒度越小，索引越精确但占用空间越大。</p>
+            <h3
+            id="列式剪枝与谓词下推的工程判断">列式剪枝与谓词下推的工程判断</h3>
+            <p>列式剪枝和谓词下推的效果高度依赖数据的物理布局。有几个常见的坑：</p>
+            <ol type="1">
+            <li><p><strong>Row Group 太大</strong>：如果每个 Row Group
+            包含 100 万行，而查询只需要其中的 100
+            行，即使谓词下推跳过了大部分 Row Group，命中的 Row Group
+            仍然需要全量读取。解决方案是在写入时合理设置 Row Group
+            大小（Parquet 默认 128 MB 的 Row Group
+            偏大，对于频繁过滤的分析场景可以缩小到 32-64 MB）。</p></li>
+            <li><p><strong>数据未按查询条件排序</strong>：谓词下推依赖统计信息（min/max）来跳过数据块。如果数据的排列顺序和查询条件无关，每个
+            Row Group 的 min/max
+            范围几乎覆盖全域，谓词下推就失效了。解决方案是在写入时按常用查询条件排序数据。</p></li>
+            <li><p><strong>高基数列的 Bloom Filter
+            空间膨胀</strong>：为高基数列（如 UUID）的每个 Granule 构建
+            Bloom Filter，空间开销可能很大。需要评估 Bloom Filter 节省的
+            I/O 是否能抵消额外的存储和内存开销。</p></li>
+            </ol>
+            <hr />
+            <h2 id="八读放大测量方法">八、读放大测量方法</h2>
+            <p>优化读取性能的前提是能准确测量读放大。直觉和猜测在性能优化中不可靠——必须用数据说话。</p>
+            <h3
+            id="方法一存储引擎统计信息">方法一：存储引擎统计信息</h3>
+            <p>大多数存储引擎提供了内置的 I/O 统计接口。</p>
+            <p><strong>RocksDB</strong>：<code>PerfContext</code> 和
+            <code>IOStatsContext</code> 提供了每次操作的详细 I/O
+            统计：</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;rocksdb/perf_context.h&quot;</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;rocksdb/iostats_context.h&quot;</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 启用线程级 PerfContext</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>SetPerfLevel<span class="op">(</span>rocksdb<span class="op">::</span>PerfLevel<span class="op">::</span>kEnableTimeAndCPUTimeExceptForMutex<span class="op">);</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>get_perf_context<span class="op">()-&gt;</span>Reset<span class="op">();</span></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>get_iostats_context<span class="op">()-&gt;</span>Reset<span class="op">();</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="co">// 执行一次读取</span></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string value<span class="op">;</span></span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a>rocksdb<span class="op">::</span>Status s <span class="op">=</span> db<span class="op">-&gt;</span>Get<span class="op">(</span>rocksdb<span class="op">::</span>ReadOptions<span class="op">(),</span> <span class="st">&quot;my_key&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">);</span></span>
+<span id="cb31-12"><a href="#cb31-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-13"><a href="#cb31-13" aria-hidden="true" tabindex="-1"></a><span class="co">// 读取 I/O 统计</span></span>
+<span id="cb31-14"><a href="#cb31-14" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span><span class="op">&amp;</span> perf <span class="op">=</span> <span class="op">*</span>rocksdb<span class="op">::</span>get_perf_context<span class="op">();</span></span>
+<span id="cb31-15"><a href="#cb31-15" aria-hidden="true" tabindex="-1"></a><span class="kw">auto</span><span class="op">&amp;</span> io <span class="op">=</span> <span class="op">*</span>rocksdb<span class="op">::</span>get_iostats_context<span class="op">();</span></span>
+<span id="cb31-16"><a href="#cb31-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-17"><a href="#cb31-17" aria-hidden="true" tabindex="-1"></a>printf<span class="op">(</span><span class="st">&quot;块读取次数:       </span><span class="sc">%lu\n</span><span class="st">&quot;</span><span class="op">,</span> perf<span class="op">.</span>block_read_count<span class="op">);</span></span>
+<span id="cb31-18"><a href="#cb31-18" aria-hidden="true" tabindex="-1"></a>printf<span class="op">(</span><span class="st">&quot;块读取字节数:     </span><span class="sc">%lu\n</span><span class="st">&quot;</span><span class="op">,</span> perf<span class="op">.</span>block_read_byte<span class="op">);</span></span>
+<span id="cb31-19"><a href="#cb31-19" aria-hidden="true" tabindex="-1"></a>printf<span class="op">(</span><span class="st">&quot;块缓存命中次数:   </span><span class="sc">%lu\n</span><span class="st">&quot;</span><span class="op">,</span> perf<span class="op">.</span>block_cache_hit_count<span class="op">);</span></span>
+<span id="cb31-20"><a href="#cb31-20" aria-hidden="true" tabindex="-1"></a>printf<span class="op">(</span><span class="st">&quot;Bloom Filter 有用次数: </span><span class="sc">%lu\n</span><span class="st">&quot;</span><span class="op">,</span> perf<span class="op">.</span>bloom_sst_hit_count<span class="op">);</span></span>
+<span id="cb31-21"><a href="#cb31-21" aria-hidden="true" tabindex="-1"></a>printf<span class="op">(</span><span class="st">&quot;Bloom Filter 误判次数: </span><span class="sc">%lu\n</span><span class="st">&quot;</span><span class="op">,</span> perf<span class="op">.</span>bloom_sst_miss_count<span class="op">);</span></span>
+<span id="cb31-22"><a href="#cb31-22" aria-hidden="true" tabindex="-1"></a>printf<span class="op">(</span><span class="st">&quot;磁盘读取字节数:   </span><span class="sc">%lu\n</span><span class="st">&quot;</span><span class="op">,</span> io<span class="op">.</span>bytes_read<span class="op">);</span></span></code></pre></div>
+            <p>通过对比
+            <code>block_read_byte</code>（实际读取的块字节数）和有效数据大小（<code>value.size()</code>），就可以计算出单次操作的字节读放大。</p>
+            <p><strong>MySQL/InnoDB</strong>：通过
+            <code>performance_schema</code> 或
+            <code>SHOW ENGINE INNODB STATUS</code> 获取 I/O 统计：</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看 InnoDB Buffer Pool 统计</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a>SHOW ENGINE INNODB STATUS\G</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 通过 performance_schema 获取文件 I/O 统计</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> performance_schema.file_summary_by_instance</span>
+<span id="cb32-6"><a href="#cb32-6" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> FILE_NAME <span class="kw">LIKE</span> <span class="st">&#39;%ibd&#39;</span></span>
+<span id="cb32-7"><a href="#cb32-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> SUM_NUMBER_OF_BYTES_READ <span class="kw">DESC</span></span>
+<span id="cb32-8"><a href="#cb32-8" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">10</span>;</span></code></pre></div>
+            <h3 id="方法二操作系统级-io-追踪">方法二：操作系统级 I/O
+            追踪</h3>
+            <p>当存储引擎的内置统计不够详细时，可以用操作系统工具直接追踪进程的磁盘
+            I/O。</p>
+            <p><strong>iostat</strong>：查看设备级的 I/O 吞吐量和
+            IOPS：</p>
+            <div class="sourceCode" id="cb33"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 每 1 秒输出一次，显示扩展统计</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-x</span> 1</span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 关注的指标：</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a><span class="co"># r/s      - 每秒读取请求数</span></span>
+<span id="cb33-6"><a href="#cb33-6" aria-hidden="true" tabindex="-1"></a><span class="co"># rkB/s    - 每秒读取 KB 数</span></span>
+<span id="cb33-7"><a href="#cb33-7" aria-hidden="true" tabindex="-1"></a><span class="co"># r_await  - 平均读取延迟（毫秒）</span></span>
+<span id="cb33-8"><a href="#cb33-8" aria-hidden="true" tabindex="-1"></a><span class="co"># rareq-sz - 平均读取请求大小（KB）</span></span></code></pre></div>
+            <p><strong>blktrace / bpftrace</strong>：追踪块设备层的单次
+            I/O 请求：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 bpftrace 追踪 block I/O 请求（需要 root 权限）</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 统计每个进程的读取 I/O 大小分布</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:block:block_rq_complete /args-&gt;rwbs == &quot;R&quot;/ {</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="st">    @bytes[comm] = hist(args-&gt;nr_sector * 512);</span></span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a><span class="st">&#39;</span></span></code></pre></div>
+            <p><strong>strace</strong>：追踪进程的系统调用，查看每次
+            <code>read()</code>/<code>pread64()</code>
+            的参数和返回值：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 追踪 RocksDB 进程的读取系统调用</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-p</span> <span class="op">&lt;</span>pid<span class="op">&gt;</span> -e trace=pread64,read <span class="at">-T</span> <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-50</span></span></code></pre></div>
+            <p><code>strace</code> 的开销较大（通常让目标进程慢 2-5
+            倍），生产环境中应使用 <code>perf trace</code> 或
+            <code>bpftrace</code> 等低开销工具。</p>
+            <h3 id="方法三合成基准测试">方法三：合成基准测试</h3>
+            <p>用合成基准测试（Synthetic
+            Benchmark）在可控条件下测量读放大：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 db_bench 测量 RocksDB 的读放大</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 先写入数据</span></span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./db_bench</span> <span class="at">--benchmarks</span><span class="op">=</span>fillrandom <span class="dt">\</span></span>
+<span id="cb36-4"><a href="#cb36-4" aria-hidden="true" tabindex="-1"></a>           <span class="at">--num</span><span class="op">=</span>1000000 <span class="dt">\</span></span>
+<span id="cb36-5"><a href="#cb36-5" aria-hidden="true" tabindex="-1"></a>           <span class="at">--key_size</span><span class="op">=</span>16 <span class="dt">\</span></span>
+<span id="cb36-6"><a href="#cb36-6" aria-hidden="true" tabindex="-1"></a>           <span class="at">--value_size</span><span class="op">=</span>100 <span class="dt">\</span></span>
+<span id="cb36-7"><a href="#cb36-7" aria-hidden="true" tabindex="-1"></a>           <span class="at">--db</span><span class="op">=</span>/data/test_db</span>
+<span id="cb36-8"><a href="#cb36-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb36-9"><a href="#cb36-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 点查基准测试，测量读放大</span></span>
+<span id="cb36-10"><a href="#cb36-10" aria-hidden="true" tabindex="-1"></a><span class="ex">./db_bench</span> <span class="at">--benchmarks</span><span class="op">=</span>readrandom <span class="dt">\</span></span>
+<span id="cb36-11"><a href="#cb36-11" aria-hidden="true" tabindex="-1"></a>           <span class="at">--num</span><span class="op">=</span>1000000 <span class="dt">\</span></span>
+<span id="cb36-12"><a href="#cb36-12" aria-hidden="true" tabindex="-1"></a>           <span class="at">--use_existing_db</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb36-13"><a href="#cb36-13" aria-hidden="true" tabindex="-1"></a>           <span class="at">--db</span><span class="op">=</span>/data/test_db <span class="dt">\</span></span>
+<span id="cb36-14"><a href="#cb36-14" aria-hidden="true" tabindex="-1"></a>           <span class="at">--statistics</span><span class="op">=</span>true <span class="dt">\</span></span>
+<span id="cb36-15"><a href="#cb36-15" aria-hidden="true" tabindex="-1"></a>           <span class="at">--perf_level</span><span class="op">=</span>3 <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;(block.cache|bloom|read)&quot;</span></span></code></pre></div>
+            <h3 id="读放大的综合评估">读放大的综合评估</h3>
+            <p>单一的读放大数字往往不够——需要区分不同操作类型的读放大：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>操作类型</th>
+            <th>典型读放大（LSM-Tree）</th>
+            <th>主要优化手段</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>点查（存在的 key）</td>
+            <td>1-3x</td>
+            <td>Block Cache, 分区索引</td>
+            </tr>
+            <tr>
+            <td>点查（不存在的 key）</td>
+            <td>1-10x</td>
+            <td>Bloom Filter</td>
+            </tr>
+            <tr>
+            <td>短范围查询（100 行）</td>
+            <td>2-5x</td>
+            <td>预读, Block Cache</td>
+            </tr>
+            <tr>
+            <td>全表扫描</td>
+            <td>1-1.5x</td>
+            <td>顺序预读, 列式剪枝</td>
+            </tr>
+            <tr>
+            <td>前缀扫描</td>
+            <td>1-3x</td>
+            <td>前缀 Bloom Filter, 前缀索引</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>读放大并不是越低越好——有时候为了降低读放大而做的优化（例如增大
+            Block Cache）会引入其他代价（内存占用、GC
+            压力）。优化目标应该是在给定的硬件资源约束下，最小化端到端查询延迟。</p>
+            <hr />
+            <h2
+            id="九数据库查询性能分析实战">九、数据库查询性能分析实战</h2>
+            <p>本节通过一个具体的案例，演示如何诊断和优化一个实际的读取性能问题。</p>
+            <h3 id="场景描述">场景描述</h3>
+            <p>假设有一个订单查询服务，使用 MySQL 8.4 / InnoDB
+            引擎，表结构如下：</p>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span> BIGINT <span class="kw">PRIMARY</span> <span class="kw">KEY</span> AUTO_INCREMENT,</span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a>    user_id BIGINT <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb37-4"><a href="#cb37-4" aria-hidden="true" tabindex="-1"></a>    status TINYINT <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> <span class="dv">0</span>,</span>
+<span id="cb37-5"><a href="#cb37-5" aria-hidden="true" tabindex="-1"></a>    amount <span class="dt">DECIMAL</span>(<span class="dv">10</span>, <span class="dv">2</span>) <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb37-6"><a href="#cb37-6" aria-hidden="true" tabindex="-1"></a>    created_at DATETIME <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb37-7"><a href="#cb37-7" aria-hidden="true" tabindex="-1"></a>    updated_at DATETIME <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb37-8"><a href="#cb37-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_user_id (user_id),</span>
+<span id="cb37-9"><a href="#cb37-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">INDEX</span> idx_created_at (created_at)</span>
+<span id="cb37-10"><a href="#cb37-10" aria-hidden="true" tabindex="-1"></a>) ENGINE<span class="op">=</span>InnoDB;</span></code></pre></div>
+            <p>表中有 5000 万行数据，约 12 GB。Buffer Pool 配置为 4
+            GB。业务反馈查询
+            <code>SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20</code>
+            的 P99 延迟超过 200 毫秒。</p>
+            <h3 id="第一步分析执行计划">第一步：分析执行计划</h3>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">12345</span> <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span> <span class="kw">LIMIT</span> <span class="dv">20</span>\G</span></code></pre></div>
+            <p>预期输出（以下为模拟输出，非实际执行结果，仅用于说明分析方法）：</p>
+            <pre class="text"><code>           id: 1
+  select_type: SIMPLE
+        table: orders
+   partitions: NULL
+         type: ref
+possible_keys: idx_user_id
+          key: idx_user_id
+      key_len: 8
+          ref: const
+         rows: 4500
+     filtered: 100.00
+        Extra: Using filesort</code></pre>
+            <p>问题分析：</p>
+            <ol type="1">
+            <li><code>type: ref</code> 表示使用了
+            <code>idx_user_id</code> 索引，这没问题。</li>
+            <li><code>rows: 4500</code> 表示 MySQL 预估需要扫描 4500
+            行——这个用户有大量订单。</li>
+            <li><code>Extra: Using filesort</code>
+            表示需要额外的排序操作，因为 <code>idx_user_id</code>
+            索引不包含 <code>created_at</code> 的排序信息。</li>
+            </ol>
+            <h3 id="第二步优化索引">第二步：优化索引</h3>
+            <p>问题的根源在于 <code>idx_user_id</code> 索引只包含
+            <code>user_id</code>，无法满足
+            <code>ORDER BY created_at DESC</code> 的排序需求。MySQL
+            必须先通过索引找到所有 <code>user_id = 12345</code>
+            的行，回表读取完整数据，再在内存中排序。</p>
+            <p>创建一个复合索引（Composite
+            Index）可以同时满足过滤和排序需求：</p>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建复合索引：先按 user_id 过滤，再按 created_at 降序排列</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_user_created (user_id, created_at <span class="kw">DESC</span>);</span></code></pre></div>
+            <p>创建复合索引后重新分析执行计划：</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">12345</span> <span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span> <span class="kw">LIMIT</span> <span class="dv">20</span>\G</span></code></pre></div>
+            <p>预期改善后的输出：</p>
+            <pre class="text"><code>           id: 1
+  select_type: SIMPLE
+        table: orders
+   partitions: NULL
+         type: ref
+possible_keys: idx_user_id,idx_user_created
+          key: idx_user_created
+      key_len: 8
+          ref: const
+         rows: 20
+     filtered: 100.00
+        Extra: NULL</code></pre>
+            <p>改善点：</p>
+            <ol type="1">
+            <li><code>key: idx_user_created</code>
+            使用了新的复合索引。</li>
+            <li><code>rows: 20</code> 由于索引本身按
+            <code>created_at</code> 降序排列，<code>LIMIT 20</code>
+            只需要读取索引的前 20 个条目。</li>
+            <li><code>Extra</code> 中没有
+            <code>Using filesort</code>，排序通过索引完成。</li>
+            </ol>
+            <h3
+            id="第三步进一步优化覆盖索引">第三步：进一步优化——覆盖索引</h3>
+            <p>上面的查询仍然需要回表（通过主键到聚簇索引读取完整行），因为查询使用了
+            <code>SELECT *</code>。如果业务只需要部分列，可以使用覆盖索引：</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果业务只需要 id, user_id, amount, created_at</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">ADD</span> <span class="kw">INDEX</span> idx_user_created_covering</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a>    (user_id, created_at <span class="kw">DESC</span>, <span class="kw">id</span>, amount);</span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 修改查询，只查需要的列</span></span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">id</span>, user_id, amount, created_at</span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> orders</span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="dv">12345</span></span>
+<span id="cb43-9"><a href="#cb43-9" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> created_at <span class="kw">DESC</span></span>
+<span id="cb43-10"><a href="#cb43-10" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>;</span></code></pre></div>
+            <p>覆盖索引消除了回表操作，所有数据都从索引中获取。对于这个查询，I/O
+            次数从”索引查找 + 20 次回表”减少为”索引查找 + 索引中顺序读取
+            20 个条目”。</p>
+            <h3 id="第四步验证-buffer-pool-状态">第四步：验证 Buffer
+            Pool 状态</h3>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 检查 Buffer Pool 命中率</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a>SHOW <span class="kw">GLOBAL</span> STATUS <span class="kw">LIKE</span> <span class="st">&#39;Innodb_buffer_pool_read%&#39;</span>;</span></code></pre></div>
+            <p>关键指标：</p>
+            <pre class="text"><code>Innodb_buffer_pool_read_requests  - Buffer Pool 读取请求总数（逻辑读）
+Innodb_buffer_pool_reads          - 必须从磁盘读取的次数（物理读）
+命中率 = 1 - (reads / read_requests) * 100%</code></pre>
+            <p>如果命中率低于 95%，说明 Buffer Pool
+            容量不足以缓存工作集，需要增大
+            <code>innodb_buffer_pool_size</code>
+            或优化查询减少数据访问量。</p>
+            <h3 id="第五步检查系统层-io">第五步：检查系统层 I/O</h3>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 MySQL 进程的 I/O 统计（Linux）</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-d</span> <span class="at">-p</span> <span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-f</span> mysqld<span class="va">)</span> 1</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出包含：</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a><span class="co"># kB_rd/s  - 每秒读取 KB 数</span></span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a><span class="co"># kB_wr/s  - 每秒写入 KB 数</span></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a><span class="co"># iodelay  - I/O 延迟（时钟周期）</span></span></code></pre></div>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看磁盘级别的延迟分布</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-x</span> 1</span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 重点关注：</span></span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a><span class="co"># r_await  - 平均读取延迟（毫秒）</span></span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a><span class="co"># %util    - 磁盘利用率</span></span></code></pre></div>
+            <p>如果 <code>r_await</code> 超过 10 毫秒（SSD
+            场景），可能存在 I/O 队列拥堵或磁盘本身性能问题。如果
+            <code>%util</code> 持续在 90%
+            以上，说明磁盘已经成为瓶颈，需要考虑升级存储硬件或增加缓存。</p>
+            <h3 id="优化效果对比">优化效果对比</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>优化阶段</th>
+            <th>扫描行数</th>
+            <th>回表次数</th>
+            <th>是否需要排序</th>
+            <th>预期延迟</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>原始查询</td>
+            <td>4500</td>
+            <td>4500</td>
+            <td>是（filesort）</td>
+            <td>&gt; 200 毫秒</td>
+            </tr>
+            <tr>
+            <td>复合索引</td>
+            <td>20</td>
+            <td>20</td>
+            <td>否</td>
+            <td>约 5-10 毫秒</td>
+            </tr>
+            <tr>
+            <td>覆盖索引</td>
+            <td>20</td>
+            <td>0</td>
+            <td>否</td>
+            <td>约 1-3 毫秒</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>上表中的延迟为基于经验的估计值，实际延迟取决于数据分布、Buffer
+            Pool 命中率、磁盘性能等因素。</p>
+            <p>这个案例展示了读取性能优化的典型思路：先通过执行计划定位问题（扫描行数过多、不必要的排序），再通过索引优化减少扫描范围，最后通过覆盖索引消除回表。每一步都用具体的指标验证效果，而不是凭直觉判断。</p>
+            <hr />
+            <h2 id="十参考文献">十、参考文献</h2>
+            <h3 id="论文与书籍">论文与书籍</h3>
+            <ul>
+            <li>Patrick O’Neil et al., “The Log-Structured Merge-Tree
+            (LSM-Tree)”, Acta Informatica, 1996. 读放大的概念最早在
+            LSM-Tree 论文的讨论中被系统分析。</li>
+            <li>Burton H. Bloom, “Space/Time Trade-offs in Hash Coding
+            with Allowable Errors”, Communications of the ACM, 1970.
+            Bloom Filter 的原始论文。</li>
+            <li>Peter Boncz, Thomas Neumann, Viktor Leis, “Adaptive
+            Radix Trees”, 2013. 一种面向现代 CPU
+            缓存层次设计的索引结构。</li>
+            </ul>
+            <h3 id="官方文档与源码">官方文档与源码</h3>
+            <ul>
+            <li>RocksDB Wiki: Bloom Filter, <a
+            href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter"
+            class="uri">https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter</a></li>
+            <li>RocksDB Wiki: Block Cache, <a
+            href="https://github.com/facebook/rocksdb/wiki/Block-Cache"
+            class="uri">https://github.com/facebook/rocksdb/wiki/Block-Cache</a></li>
+            <li>RocksDB Wiki: Partitioned Index/Filters, <a
+            href="https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters"
+            class="uri">https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters</a></li>
+            <li>RocksDB 源码（9.x）:
+            <code>table/block_based/block_based_table_reader.cc</code>,
+            <code>Get()</code> 路径的核心实现。</li>
+            <li>MySQL 8.4 Reference Manual: InnoDB Buffer Pool, <a
+            href="https://dev.mysql.com/doc/refman/8.4/en/innodb-buffer-pool.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.4/en/innodb-buffer-pool.html</a></li>
+            <li>MySQL 8.4 Reference Manual: EXPLAIN Output Format, <a
+            href="https://dev.mysql.com/doc/refman/8.4/en/explain-output.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.4/en/explain-output.html</a></li>
+            <li>Apache Parquet Format Specification v2.6, <a
+            href="https://parquet.apache.org/documentation/latest/"
+            class="uri">https://parquet.apache.org/documentation/latest/</a></li>
+            <li>ClickHouse Documentation: Data Skipping Indexes, <a
+            href="https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree#table_engine-mergetree-data_skipping-indexes"
+            class="uri">https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree#table_engine-mergetree-data_skipping-indexes</a></li>
+            </ul>
+            <h3 id="工具与-benchmark">工具与 Benchmark</h3>
+            <ul>
+            <li><code>db_bench</code>：RocksDB
+            自带的基准测试工具，源码位于
+            <code>tools/db_bench_tool.cc</code>。</li>
+            <li><code>iostat</code>：Linux sysstat 包提供的 I/O
+            统计工具。</li>
+            <li><code>bpftrace</code>：基于 eBPF
+            的动态追踪工具，适合低开销的 I/O 追踪。</li>
+            <li><code>perf</code>：Linux
+            性能分析工具，<code>perf trace</code> 可以替代
+            <code>strace</code> 做低开销的系统调用追踪。</li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../67-write-optimization/write-optimization.html">写入性能优化</a>
+            <strong>下一篇</strong>: <a
+            href="../69-latency-analysis/latency-analysis.html">存储全链路延迟分析</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-09 · storage</p>
+                    <h3><a href="/post/storage/31-lsm-tree-tuning/lsm-tree-tuning.html">【存储工程】LSM-Tree 工程调优：三种放大的权衡</a></h3>
+                    <p>LSM-Tree 的核心设计是把随机写转换为顺序写，但这个转换不是免费的。写入经过 MemTable 刷盘、再经过多次 Compaction 合并，每一字节的用户数据在磁盘上可能被反复读写数十次。读取一个 key 时，最坏情况下需要逐层搜索，直到命中或遍历全部层级。与此同时，旧版本数据和墓碑标记占用的额外空间，在 Co…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-30 · database / storage</p>
+                    <h3><a href="/post/db/lakehouse/02-parquet-format/02-parquet-format.html">【数据湖与开放表格式】Parquet 文件格式深拆</a></h3>
+                    <p>拆 Parquet 的物理结构：file → row group → column chunk → page，footer 里的 FileMetaData（Thrift）与 PAR1 magic。讲清 PLAIN/RLE-bitpacking/字典/DELTA_BINARY_PACKED/BYTE_STREAM_SPLIT 各自压谁，Dremel 的 repetition/definition level 如何表达嵌套，column index/offset index 与 split-block bloom filter 怎样让谓词在读盘前裁掉 page。基于本机 pyarrow 24.0.0 真实 dump footer 与编码。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-18 · database / storage</p>
+                    <h3><a href="/post/db/columnar-engine/07-index-skipping/07-index-skipping.html">【列存引擎内核】索引与跳数索引</a></h3>
+                    <p>ClickHouse PRIMARY KEY 排序键稀疏索引语义、Data Skipping Index（minmax/set/bloom_filter）与 Mark Range 协同；对照 PostgreSQL B-Tree。24.x LTS。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-10 · storage</p>
+                    <h3><a href="/post/storage/32-rocksdb-practice/rocksdb-practice.html">【存储工程】RocksDB 工程实践</a></h3>
+                    <p>从 Column Family、Write Buffer、Block Cache、Compaction、Rate Limiter 到 Direct I/O 和监控，系统拆解 RocksDB 在生产环境中的关键配置与故障模式，并给出 SSD 场景下的配置模板和 db_bench 基准测试方法。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

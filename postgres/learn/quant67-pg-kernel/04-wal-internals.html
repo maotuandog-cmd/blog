@@ -1,0 +1,1256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】WAL 内部机制：从事务提交到磁盘刷写 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL WAL
+的完整内部机制：XLogInsert() 从分段锁到 WAL Buffer
+的插入路径、XLogRecord 的物理布局（Header + Block Headers +
+Data）、Checkpoint 的两阶段流程与 IO 摊平算法、REDO 恢复的 RMGR
+分发、wal_level 三级差异的 WAL 记录对比。运维部分聚焦 checkpoint IO
+风暴的根因与 checkpoint_completion_target 的调优陷阱、max_wal_size
+设小导致 WAL 段疯狂切换的机制，以及用 pg_waldump 定位问题 WAL record
+的实操方法。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, wal, xloginsert, checkpoint, redo, recovery, wal-writer, wal-level, pg-waldump, xlogrecord, checkpoint-completion-target, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/04-wal-internals/04-wal-internals.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】WAL 内部机制：从事务提交到磁盘刷写" />
+    <meta property="og:description" content="拆解 PostgreSQL WAL 的完整内部机制：XLogInsert() 从分段锁到 WAL Buffer 的插入路径、XLogRecord 的物理布局（Header + Block Headers + Data）、Checkpoint 的两阶段流程与 IO 摊平算法、REDO 恢复的 RMGR 分发、wal_level 三级差异的 WAL 记录对比。运维部分聚焦 checkpoint IO 风暴的根因与 checkpoint_completion_target 的调优陷阱、max_wal_size 设小导致 WAL 段疯狂切换的机制，以及用 pg_waldump 定位问题 WAL record 的实操方法。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/04-wal-internals/04-wal-internals.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="wal" />
+    <meta property="article:tag" content="xloginsert" />
+    <meta property="article:tag" content="checkpoint" />
+    <meta property="article:tag" content="redo" />
+    <meta property="article:tag" content="recovery" />
+    <meta property="article:tag" content="wal-writer" />
+    <meta property="article:tag" content="wal-level" />
+    <meta property="article:tag" content="pg-waldump" />
+    <meta property="article:tag" content="xlogrecord" />
+    <meta property="article:tag" content="checkpoint-completion-target" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】WAL 内部机制：从事务提交到磁盘刷写" />
+    <meta name="twitter:description" content="拆解 PostgreSQL WAL 的完整内部机制：XLogInsert() 从分段锁到 WAL Buffer 的插入路径、XLogRecord 的物理布局（Header + Block Headers + Data）、Checkpoint 的两阶段流程与 IO 摊平算法、REDO 恢复的 RMGR 分发、wal_level 三级差异的 WAL 记录对比。运维部分聚焦 checkpoint IO 风暴的根因与 checkpoint_completion_target 的调优陷阱、max_wal_size 设小导致 WAL 段疯狂切换的机制，以及用 pg_waldump 定位问题 WAL record 的实操方法。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】WAL 内部机制：从事务提交到磁盘刷写", "description": "拆解 PostgreSQL WAL 的完整内部机制：XLogInsert() 从分段锁到 WAL Buffer 的插入路径、XLogRecord 的物理布局（Header + Block Headers + Data）、Checkpoint 的两阶段流程与 IO 摊平算法、REDO 恢复的 RMGR 分发、wal_level 三级差异的 WAL 记录对比。运维部分聚焦 checkpoint IO 风暴的根因与 checkpoint_completion_target 的调优陷阱、max_wal_size 设小导致 WAL 段疯狂切换的机制，以及用 pg_waldump 定位问题 WAL record 的实操方法。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/04-wal-internals/04-wal-internals.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "wal", "xloginsert", "checkpoint", "redo", "recovery", "wal-writer", "wal-level", "pg-waldump", "xlogrecord", "checkpoint-completion-target"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】WAL 内部机制：从事务提交到磁盘刷写</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#wal</span> <span>#xloginsert</span> <span>#checkpoint</span> <span>#redo</span> <span>#recovery</span> <span>#wal-writer</span> <span>#wal-level</span> <span>#pg-waldump</span> <span>#xlogrecord</span> <span>#checkpoint-completion-target</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/wal.html">#wal</a><a class="chip-link" href="/tags/xloginsert.html">#xloginsert</a><a class="chip-link" href="/tags/checkpoint.html">#checkpoint</a><a class="chip-link" href="/tags/redo.html">#redo</a><a class="chip-link" href="/tags/recovery.html">#recovery</a><a class="chip-link" href="/tags/wal-writer.html">#wal-writer</a><a class="chip-link" href="/tags/wal-level.html">#wal-level</a><a class="chip-link" href="/tags/pg-waldump.html">#pg-waldump</a><a class="chip-link" href="/tags/xlogrecord.html">#xlogrecord</a><a class="chip-link" href="/tags/checkpoint-completion-target.html">#checkpoint-completion-target</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#wal-内部机制从事务提交到磁盘刷写"
+                id="toc-wal-内部机制从事务提交到磁盘刷写">WAL
+                内部机制：从事务提交到磁盘刷写</a>
+                <ul>
+                <li><a href="#一wal-的设计约束为什么不能直接写数据页"
+                id="toc-一wal-的设计约束为什么不能直接写数据页">一、WAL
+                的设计约束：为什么不能直接写数据页</a></li>
+                <li><a href="#二wal-record-的物理布局"
+                id="toc-二wal-record-的物理布局">二、WAL Record
+                的物理布局</a>
+                <ul>
+                <li><a href="#xlogrecord-头部"
+                id="toc-xlogrecord-头部">XLogRecord 头部</a></li>
+                <li><a href="#block-header页级操作的描述"
+                id="toc-block-header页级操作的描述">Block
+                Header：页级操作的描述</a></li>
+                <li><a href="#reservexloginsertlocation预留-wal-空间"
+                id="toc-reservexloginsertlocation预留-wal-空间">3.2
+                ReserveXLogInsertLocation：预留 WAL 空间</a></li>
+                </ul></li>
+                <li><a href="#四wal-写入路径buffer-wal-segment-文件"
+                id="toc-四wal-写入路径buffer-wal-segment-文件">四、WAL
+                写入路径：Buffer → WAL Segment 文件</a>
+                <ul>
+                <li><a href="#wal-writer-的职责"
+                id="toc-wal-writer-的职责">4.1 WAL Writer
+                的职责</a></li>
+                <li><a href="#wal_sync_method-的语义"
+                id="toc-wal_sync_method-的语义">4.3 wal_sync_method
+                的语义</a></li>
+                </ul></li>
+                <li><a href="#五checkpoint-的两阶段流程"
+                id="toc-五checkpoint-的两阶段流程">五、Checkpoint
+                的两阶段流程</a>
+                <ul>
+                <li><a href="#触发条件" id="toc-触发条件">5.1
+                触发条件</a></li>
+                <li><a href="#createcheckpoint-的两阶段"
+                id="toc-createcheckpoint-的两阶段">5.2 CreateCheckPoint
+                的两阶段</a></li>
+                <li><a
+                href="#io-摊平checkpoint_completion_target-的内部算法"
+                id="toc-io-摊平checkpoint_completion_target-的内部算法">5.3
+                IO 摊平：checkpoint_completion_target
+                的内部算法</a></li>
+                </ul></li>
+                <li><a href="#七wal_level-的三级差异"
+                id="toc-七wal_level-的三级差异">七、wal_level
+                的三级差异</a></li>
+                <li><a href="#八运维实战"
+                id="toc-八运维实战">八、运维实战</a>
+                <ul>
+                <li><a href="#checkpoint-io-风暴根因与调优"
+                id="toc-checkpoint-io-风暴根因与调优">8.1 Checkpoint IO
+                风暴：根因与调优</a></li>
+                <li><a href="#pg_waldump定位问题-wal-record"
+                id="toc-pg_waldump定位问题-wal-record">8.3
+                pg_waldump：定位问题 WAL Record</a></li>
+                </ul></li>
+                <li><a href="#九实验观察-wal-写入行为"
+                id="toc-九实验观察-wal-写入行为">九、实验：观察 WAL
+                写入行为</a>
+                <ul>
+                <li><a href="#测量不同-wal_level-的-wal-写入量"
+                id="toc-测量不同-wal_level-的-wal-写入量">9.1 测量不同
+                wal_level 的 WAL 写入量</a></li>
+                <li><a href="#模拟-wal-段疯狂切换"
+                id="toc-模拟-wal-段疯狂切换">9.3 模拟 WAL
+                段疯狂切换</a></li>
+                </ul></li>
+                <li><a href="#十关键要点"
+                id="toc-十关键要点">十、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1 id="wal-内部机制从事务提交到磁盘刷写">WAL
+            内部机制：从事务提交到磁盘刷写</h1>
+            <p>执行 <code>INSERT INTO t VALUES (1, 'hello')</code>
+            之后，PG 在返回 “INSERT 0 1”
+            之前做了什么？不是直接把数据写到 <code>t</code> 的 heap
+            文件里。在数据页落盘之前，PG 先把修改记录写到
+            WAL（Write-Ahead Log）——只有 WAL
+            成功刷盘之后，数据页才能安全地写入磁盘。这是崩溃恢复的基础：最坏情况下，PG
+            丢失所有未刷盘的数据页，但只要 WAL 完整，就能通过 REDO
+            恢复所有已提交的事务。</p>
+            <p>但 WAL 不只是”先写日志再写数据”八个字那么简单。一条
+            INSERT 从调用 <code>XLogInsert()</code> 到 WAL segment
+            文件落盘，中间经过了 WALInsertLock 分段锁、WAL Buffer
+            的双活页机制、WalWriter 的异步刷盘以及
+            <code>wal_sync_method</code> 决定的 OS 同步策略。Checkpoint
+            也不是”定时写脏页”——它分两个阶段：先确定 REDO 起始点，再写
+            checkpoint record，而这中间的 IO 摊平算法
+            <code>checkpoint_completion_target</code>
+            藏着一个多数人不理解的陷阱。</p>
+            <p>本文以 PG 17 源码为准，拆解 WAL
+            的五个核心机制：插入路径、record
+            物理布局、写入链路、checkpoint 流程和 REDO
+            恢复。后半部分聚焦生产环境中三个最常见的 WAL
+            问题：checkpoint IO 风暴、WAL 段疯狂切换，以及
+            <code>pg_waldump</code> 的实操定位。</p>
+            <hr />
+            <h2 id="一wal-的设计约束为什么不能直接写数据页">一、WAL
+            的设计约束：为什么不能直接写数据页</h2>
+            <p>如果 PG 每次 <code>COMMIT</code>
+            都把修改过的数据页刷盘，至少有三个致命问题：</p>
+            <p><strong>1. 随机写放大。</strong>
+            一个事务可能修改多个页面（heap 页 +
+            索引页），这些页面分散在文件的不同位置。把每个修改的页都
+            fsync 一次等于多次随机 I/O。</p>
+            <p><strong>2. 页面撕裂。</strong> OS 和磁盘的原子写单位是
+            sector（512B 或 4KB），而 PG 的页面是
+            8KB。如果系统在写页面中途崩溃，磁盘上留下的是半新半旧的页面——checksum
+            会对不上，但旧数据也已经不可逆地损坏了。</p>
+            <p><strong>3. 无法支持复制和 PITR。</strong>
+            没有变更日志，standby
+            无法重放主库的操作，PITR（Point-in-Time
+            Recovery）也无法做到”恢复到下午 3:12:00 的状态”。</p>
+            <p>WAL 的解决方案是：所有修改只追加到一个顺序文件中，每个
+            record 自包含（有
+            checksum），可以按顺序逐个重放。关键性质：</p>
+            <ul>
+            <li><strong>Write-Ahead</strong>：数据页刷盘之前，对应的 WAL
+            record 必须已经刷盘。</li>
+            <li><strong>顺序写</strong>：WAL 是追加写，没有寻道——即使
+            HDD 上也能跑到接近磁盘顺序带宽。</li>
+            <li><strong>幂等 REDO</strong>：每个 WAL record
+            携带足够信息（整页镜像或操作描述），恢复时按 LSN
+            顺序重放，已重放过的页面不会重复重放（通过页面上的
+            <code>pd_lsn</code> 判断）。</li>
+            </ul>
+            <hr />
+            <h2 id="二wal-record-的物理布局">二、WAL Record
+            的物理布局</h2>
+            <h3 id="xlogrecord-头部">XLogRecord 头部</h3>
+            <p>每个 WAL record 以 <code>XLogRecord</code> 结构开头。PG
+            17 的定义在
+            <code>src/include/access/xlogrecord.h</code>：</p>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/xlogrecord.h</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> XLogRecord <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    uint32      xl_tot_len<span class="op">;</span>     <span class="co">// 整个 record 的总长度（包括 header）</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    TransactionId xl_xid<span class="op">;</span>       <span class="co">// 产生此 record 的事务 ID</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr  xl_prev<span class="op">;</span>        <span class="co">// 上一个 record 的起始 LSN（形成链）</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    uint8       xl_info<span class="op">;</span>        <span class="co">// flag bits（XLR_SPECIAL_REL_UPDATE 等）</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    RmgrId      xl_rmid<span class="op">;</span>        <span class="co">// 资源管理器 ID（RM_HEAP, RM_BTREE, RM_XLOG 等）</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    pg_crc32c   xl_crc<span class="op">;</span>         <span class="co">// CRC-32C 校验和（覆盖整个 record）</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 后面紧跟着：</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">//   XLogRecordBlockHeader（可能有多个，每个 block 一个）</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">//   XLogRecordDataHeader[Short|Long]（main data）</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> XLogRecord<span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>`xl_rmid` 是 RMGR ID，决定恢复时由哪个资源管理器处理这个 record：</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/xlog_internal.h</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_XLOG_ID          </span><span class="dv">0</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_XACT_ID          </span><span class="dv">1</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_SMGR_ID          </span><span class="dv">2</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_CLOG_ID          </span><span class="dv">3</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_DBASE_ID         </span><span class="dv">4</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="co">// ...</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_HEAP_ID          </span><span class="dv">10</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_BTREE_ID         </span><span class="dv">12</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RM_GIN_ID           </span><span class="dv">15</span></span></code></pre></div>
+            <h3 id="block-header页级操作的描述">Block
+            Header：页级操作的描述</h3>
+            <p>如果 WAL record
+            涉及对某些页面的修改，<code>XLogRecord</code>
+            之后会跟一个或多个 <code>XLogRecordBlockHeader</code>。每个
+            block header 描述对 <strong>一个页面</strong> 的修改：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/access/xlogrecord.h</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> XLogRecordBlockHeader <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    uint8       block_id<span class="op">;</span>       <span class="co">// 此 block 在 record 中的编号（0-31）</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    uint8       fork_flags<span class="op">;</span>     <span class="co">// fork 类型（MAIN_FORKNUM 等）+ flags</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    uint16      data_length<span class="op">;</span>    <span class="co">// 紧跟在后面的 block data 的长度</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 接着是：</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">//   BlockIdData  (RelFileNode + BlockNumber) 或 XLogRecordBlockCompressHeader</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">//   block data（整页镜像或 diff 数据）</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> XLogRecordBlockHeader<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>Block 的映像有三种注册方式（通过 `fork_flags` 的高位 bit 区分）：</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 注册方式 <span class="op">|</span> fork_flags 标志 <span class="op">|</span> 含义 <span class="op">|</span> 恢复时如何使用 <span class="op">|</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="op">|---------|----------------|------|--------------|</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `REG_BUF_STANDARD` <span class="op">|</span> `BKPBLOCK_HAS_IMAGE` <span class="op">|</span> 记录整页镜像（FPW<span class="op">,</span> Full Page Write） <span class="op">|</span> 直接覆盖目标页 <span class="op">|</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `REG_BUF_STANDARD` <span class="op">|</span> 无 image flag <span class="op">|</span> 只记录操作描述（如<span class="st">&quot;在 offset 插入这个 tuple&quot;</span>） <span class="op">|</span> 在目标页上重放操作 <span class="op">|</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `REG_BUF_STANDARD` <span class="op">|</span> `BKPBLOCK_HAS_IMAGE \<span class="op">|</span> BKPBLOCK_COMPRESSED` <span class="op">|</span> 整页压缩镜像 <span class="op">|</span> 解压后覆盖目标页 <span class="op">|</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>FPW（Full Page Write）的意义<span class="op">**</span>：checkpoint 之后每个页面第一次被修改时，PG 把整页镜像写入 WAL。这听起来浪费，但它是防止页面撕裂的关键。如果不用 FPW，恢复时 REDO 操作必须假设目标页是 checkpoint 时的旧版本——但一次中途崩溃可能让页面处于<span class="st">&quot;旧 header + 新数据&quot;</span>的撕裂状态。FPW 绕过了这个问题：直接用整页镜像覆盖，确保页面的完整性和自一致性。</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>FPW 的数据量是 WAL 写入量的主要来源。一个 UPDATE 只改了几十个字节，但如果涉及的页面是 checkpoint 后的首次修改，FPW 会把整个 <span class="dv">8</span><span class="er">KB</span> 页面写进 WAL。这也解释了为什么 checkpoint 之后 WAL 写入会出现一个高峰。</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 一个 INSERT 的 WAL Record 示例</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>执行 `INSERT INTO t VALUES <span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="ch">&#39;h</span><span class="er">ello</span><span class="ch">&#39;</span><span class="op">)</span>` 并提交，产生的 WAL record 链：</span></code></pre></div>
+            <p>Record 1: RM_HEAP, xl_info=XLOG_HEAP_INSERT Block 0 (heap
+            page): 操作描述（offset=N, tuple data） Data: xl_heap_insert
+            structure</p>
+            <p>Record 2: RM_XACT, xl_info=XLOG_XACT_COMMIT Data:
+            xl_xact_commit structure (xid, timestamp, rels…)</p>
+            <pre class="text"><code>
+如果 heap 页是 checkpoint 之后首次修改，Record 1 的 Block 0 会包含完整的 8KB FPW 镜像。
+
+---
+
+## 三、XLogInsert 的完整路径
+
+`XLogInsert()` 是 WAL 写入的外部入口（RMGR 调用它），内部通过 `XLogInsertRecord()` 完成实际插入。调用链：
+</code></pre>
+            <p>XLogInsert() // src/backend/access/transam/xloginsert.c →
+            XLogInsertRecord() // 组装 XLogRecord, 插入 WAL Buffer →
+            ReserveXLogInsertLocation() // 获取 WAL 中的插入位置
+            (WALInsertLock) → CopyXLogRecordToWAL() // 逐 block 复制到
+            WAL Buffer 页 → WALInsertLockRelease() // 释放分段锁</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">### 3.1 WALInsertLock：分段锁的并发设计</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="ex">多个</span> Backend 同时产生 WAL record 时，如果用一个全局锁保护 WAL Buffer 的写入位置，锁竞争会成为瓶颈。PG 的策略是把 WAL 插入位置分成多个 <span class="pp">**</span>WALInsertLock<span class="pp">**</span> 插槽：</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">c</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> src/backend/access/transam/xloginsert.c</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> PG 17 默认 WALInsertLock 数量 <span class="er">(</span><span class="ex">xlog.h</span><span class="kw">)</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="co">#define NUM_XLOGINSERT_LOCKS  8</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> 每个 Backend 在插入 WAL 时：</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> 1. 持有一个 WALInsertLock（通过 MyProc-<span class="op">&gt;</span>lockGroupLeader 或 hash<span class="er">(</span><span class="ex">ProcNumber</span><span class="kw">)</span> <span class="ex">选择）</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> 2. 在自己的 slot 中预留空间</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> 3. 复制数据到 WAL Buffer</span></code></pre></div>
+            <p>分段锁的关键性质：<strong>预留空间时无需等待其他 Backend
+            完成拷贝</strong>。每个 Backend 在自己的 slot 中预留 LSN
+            区间，然后独立拷贝数据。WAL Writer 在刷盘时按 LSN
+            顺序写入——它不管各 slot 的拷贝是否完成，只等”WAL flush
+            position 之前的区间全部就位”。</p>
+            <h3 id="reservexloginsertlocation预留-wal-空间">3.2
+            ReserveXLogInsertLocation：预留 WAL 空间</h3>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/xloginsert.c</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">// ReserveXLogInsertLocation() 的核心逻辑（简化）</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> XLogRecPtr</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>ReserveXLogInsertLocation<span class="op">(</span><span class="dt">int</span> size<span class="op">)</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 检查 WAL Writer 是否已刷到安全位置，如果 WAL Buffer 满了则自旋等待</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">do</span> <span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>WAL buffer 空间不足<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>            WALInsertLockRelease<span class="op">();</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>            WaitXLogInsertionsToFinish<span class="op">(</span>RequiredFree<span class="op">);</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>            WALInsertLockAcquire<span class="op">();</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 2. 为当前 record 预留空间</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>        StartPos <span class="op">=</span> XLogBytePosToRecPtr<span class="op">(</span>CurrPos<span class="op">);</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        CurrPos <span class="op">+=</span> size<span class="op">;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 3. 如果跨越 WAL segment 边界</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>CurrPos <span class="op">/</span> XLOG_SEG_SIZE <span class="op">!=</span> PrePos <span class="op">/</span> XLOG_SEG_SIZE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>            AdvanceXLInsertBuffer<span class="op">(</span>CurrPos<span class="op">);</span>  <span class="co">// 分配新 WAL buffer</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">while</span> <span class="op">(</span><span class="kw">false</span><span class="op">);</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> StartPos<span class="op">;</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>预留在 WAL Buffer 中的空间是 <span class="op">**</span>Lock 区域的私人空间<span class="op">**</span>，其他 Backend 不能碰，但 WAL Writer 可以安全刷盘——因为它只刷<span class="st">&quot;所有 Lock 都已完成的连续字节&quot;</span>。</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.3 CopyXLogRecordToWAL：组装并拷贝</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/xloginsert.c</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a><span class="co">// 拷贝过程（简化）</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>CopyXLogRecordToWAL<span class="op">(</span><span class="dt">int</span> write_len<span class="op">,</span> XLogRecPtr StartPos<span class="op">)</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 组装 XLogRecord header（填充 xl_prev, xl_rmid, xl_xid 等）</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>    XLogRecord <span class="op">*</span>rechdr <span class="op">=</span> <span class="op">&amp;</span>hdr_rdt<span class="op">;</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>    rechdr<span class="op">-&gt;</span>xl_tot_len <span class="op">=</span> write_len<span class="op">;</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>    rechdr<span class="op">-&gt;</span>xl_prev <span class="op">=</span> ProcLastRecPtr<span class="op">;</span></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 计算 CRC（覆盖除 xl_crc 字段外的整个 record）</span></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a>    INIT_CRC32C<span class="op">(</span>rechdr<span class="op">-&gt;</span>xl_crc<span class="op">);</span></span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a>    COMP_CRC32C<span class="op">(</span>rechdr<span class="op">-&gt;</span>xl_crc<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 按字节拷贝到 WAL Buffer</span></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a>    memcpy<span class="op">(</span>wal_buffer <span class="op">+</span> offset<span class="op">,</span> rec_data<span class="op">,</span> rec_len<span class="op">);</span></span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. 更新 WAL 插入位置（原子写）</span></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a>    pg_atomic_write_u64<span class="op">(&amp;</span>WALInsertLocks<span class="op">[</span>l<span class="op">].</span>insertingAt<span class="op">,</span> CurrPos<span class="op">);</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>完成拷贝后，这条 WAL record 就在 WAL Buffer
+            中了。接下来由 WAL Writer 负责异步刷盘（或者同步提交时
+            Backend 自己 fsync）。</p>
+            <hr />
+            <h2 id="四wal-写入路径buffer-wal-segment-文件">四、WAL
+            写入路径：Buffer → WAL Segment 文件</h2>
+            <h3 id="wal-writer-的职责">4.1 WAL Writer 的职责</h3>
+            <p>WAL Writer 进程（<code>postgres: walwriter</code>）在
+            <code>src/backend/postmaster/walwriter.c</code>
+            中启动，入口是 <code>WalWriterMain()</code>：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/postmaster/walwriter.c, WalWriterMain() 核心逻辑（简化）</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 等待 WAL flush position 落后于 insert position（有数据需要刷）</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    WaitXLogActivity<span class="op">(</span>WAL_WRITER_FLUSH_AFTER<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 把 WAL Buffer 中已完成的 WAL record 写入 OS page cache</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    XLogBackgroundFlush<span class="op">();</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 如果累积了足够的数据或时间，调用 issue_xlog_fsync()</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>足够条件<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        issue_xlog_fsync<span class="op">(</span>openLogFile<span class="op">,</span> openLogSegNo<span class="op">);</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>注意 WAL Writer 做的是<span class="op">**</span>异步刷盘<span class="op">**</span>。它把 WAL 数据从 WAL Buffer 写到 OS page cache，然后定期 fsync。对于普通事务，`COMMIT` 后的数据不保证立即落盘——这取决于 `synchronous_commit` 和 `wal_sync_method` 的设置。</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.2 同步提交时 Backend 直接 fsync</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>当 `synchronous_commit <span class="op">=</span> on`（默认）时，`COMMIT` 的调用路径是：</span></code></pre></div>
+            <p>CommitTransaction() → RecordTransactionCommit() →
+            XLogFlush(XactLastRecEnd) // 阻塞等待 WAL 刷盘到此 LSN</p>
+            <pre class="text"><code>
+`XLogFlush()` 的逻辑是：
+
+```c
+// src/backend/access/transam/xlog.c
+void XLogFlush(XLogRecPtr record) {
+    if (record &lt;= LogwrtResult.Flush)
+        return;  // 已经刷盘了
+
+    // 1. 如果 WAL Buffer 中还有未写入 OS page cache 的数据，先 write()
+    XLogWrite(LogwrtResult.Write, record, ...);
+
+    // 2. fsync / fdatasync 确保落盘
+    issue_xlog_fsync(openLogFile, openLogSegNo);
+
+    // 3. 更新共享内存中的 flush position
+    LogwrtResult.Flush = record;
+}</code></pre>
+            <h3 id="wal_sync_method-的语义">4.3 wal_sync_method
+            的语义</h3>
+            <p><code>wal_sync_method</code> 控制
+            <code>issue_xlog_fsync()</code> 使用哪个系统调用来刷盘：</p>
+            <table>
+            <colgroup>
+            <col style="width: 16%" />
+            <col style="width: 50%" />
+            <col style="width: 33%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>值</th>
+            <th>系统调用</th>
+            <th>语义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>fsync</code>（默认 Linux）</td>
+            <td><code>fsync()</code></td>
+            <td>刷数据 + 元数据（文件大小不会变就不用刷元数据）</td>
+            </tr>
+            <tr>
+            <td><code>fdatasync</code></td>
+            <td><code>fdatasync()</code></td>
+            <td>只刷数据，不刷元数据（文件大小变化时仍刷元数据）</td>
+            </tr>
+            <tr>
+            <td><code>open_datasync</code></td>
+            <td><code>open(O_DSYNC)</code></td>
+            <td>每次 <code>write()</code> 自带同步语义</td>
+            </tr>
+            <tr>
+            <td><code>open_sync</code></td>
+            <td><code>open(O_SYNC)</code></td>
+            <td>每次 <code>write()</code> 自带同步语义（+ 元数据）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>在 Linux 上，<code>fsync</code> 和 <code>fdatasync</code>
+            的性能差异很小。<code>open_datasync</code>
+            把同步负担交给每次 <code>write()</code>，在特定文件系统（如
+            ext4 + data=ordered）上可以减少一次显式的 fsync
+            调用，但实测差异通常不如 direct I/O 和
+            <code>wal_block_size</code> 的影响大。</p>
+            <p>PG 15
+            引入了实验性支持：<code>wal_sync_method = 'recovery_init_sync_method'</code>
+            设置允许直接使用 <code>O_DIRECT | O_DSYNC</code>
+            组合——数据绕过 OS page cache 直接写入磁盘，消除了 double
+            buffering，但需要存储支持 512B 对齐写入。</p>
+            <hr />
+            <h2 id="五checkpoint-的两阶段流程">五、Checkpoint
+            的两阶段流程</h2>
+            <h3 id="触发条件">5.1 触发条件</h3>
+            <p>Checkpoint 由 Checkpointer
+            进程（<code>postgres: checkpointer</code>）执行，触发条件有三个：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>触发条件</th>
+            <th>GUC 参数</th>
+            <th>默认值</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>时间到了</td>
+            <td><code>checkpoint_timeout</code></td>
+            <td>5 min</td>
+            </tr>
+            <tr>
+            <td>WAL 段数超限</td>
+            <td><code>max_wal_size</code></td>
+            <td>1 GB</td>
+            </tr>
+            <tr>
+            <td>手动 <code>CHECKPOINT</code> 命令</td>
+            <td>-</td>
+            <td>-</td>
+            </tr>
+            <tr>
+            <td>PG 关闭时</td>
+            <td>-</td>
+            <td>-</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>三个触发条件中，任意一个满足就触发一次 checkpoint。</p>
+            <h3 id="createcheckpoint-的两阶段">5.2 CreateCheckPoint
+            的两阶段</h3>
+            <p><code>CreateCheckPoint()</code> 在
+            <code>src/backend/access/transam/xlog.c</code>
+            中定义。它的核心流程分为两个阶段：</p>
+            <p><strong>Phase 1：确定 REDO point</strong></p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/xlog.c, CreateCheckPoint() Phase 1（简化）</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 1. 获取当前 WAL 插入位置作为 checkpoint 结束 LSN</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>checkPoint<span class="op">.</span>redo <span class="op">=</span> GetRedoRecPtr<span class="op">();</span>  <span class="co">// 获取最老的脏页 LSN</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>                                    <span class="co">// 即 REDO 必须从这个 LSN 开始</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. 让共享内存中的 checkpoint 信息对所有进程可见</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>SpinLockAcquire<span class="op">(&amp;</span>XLogCtl<span class="op">-&gt;</span>info_lck<span class="op">);</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>XLogCtl<span class="op">-&gt;</span>RedoRecPtr <span class="op">=</span> checkPoint<span class="op">.</span>redo<span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>SpinLockRelease<span class="op">(&amp;</span>XLogCtl<span class="op">-&gt;</span>info_lck<span class="op">);</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>`GetRedoRecPtr<span class="op">()</span>` 的内部逻辑是扫描所有 buffer，找到最老的脏页 LSN。因为脏页在系统崩溃时会丢失，而 WAL 从该 LSN 开始需要重放才能恢复所有已暂存（committed 但未刷盘）的数据。REDO point 越老，下次崩溃恢复需要重放的 WAL 越少——因为更多的脏页已被刷盘，对应的 WAL 段可以被回收。</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>Phase <span class="dv">2</span>：刷脏页并写 checkpoint record<span class="op">**</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/xlog.c, CreateCheckPoint() Phase 2（简化）</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="co">// 1. 刷所有脏页到磁盘</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>CheckPointGuts<span class="op">(</span>checkPoint<span class="op">.</span>redo<span class="op">,</span> flags<span class="op">);</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="co">//   → CheckPointBuffers()         // 刷 shared_buffers 脏页</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="co">//   → CheckPointSnapBuilding()    // 刷 snap 构建相关的状态</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="co">//   → CheckPointReplicationSlots()// 刷 replication slot 状态</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="co">//   → CheckPointSnapBuild()       // 刷逻辑解码 snapshot builder 状态</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a><span class="co">//   → CheckPointTwoPhase()        // 刷 2PC 状态文件</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. 写 checkpoint WAL record</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>XLogBeginInsert<span class="op">();</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>XLogRegisterData<span class="op">(&amp;</span>checkPoint<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>checkPoint<span class="op">));</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>recptr <span class="op">=</span> XLogInsert<span class="op">(</span>RM_XLOG_ID<span class="op">,</span> XLOG_CHECKPOINT_SHUTDOWN<span class="op">);</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a><span class="co">// 3. 更新 pg_control 文件</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>UpdateControlFile<span class="op">();</span></span></code></pre></div>
+            <p>Phase 2 的核心是 <code>CheckPointGuts()</code>：把
+            shared_buffers 中所有脏页刷盘。刷完之后，REDO point 之前的
+            WAL 段理论上可以回收（因为所有脏页已经安全落盘）。然后写一条
+            WAL record（<code>XLOG_CHECKPOINT_SHUTDOWN</code> 或
+            <code>XLOG_CHECKPOINT_ONLINE</code>）标记 checkpoint
+            完成，并更新 <code>pg_control</code> 文件中的 checkpoint
+            信息。</p>
+            <p><strong>pg_control
+            文件</strong>（<code>$PGDATA/global/pg_control</code>）是崩溃恢复的入口。它记录最新
+            checkpoint 的 LSN、REDO point 的
+            LSN、timeline、状态（<code>DB_IN_PRODUCTION</code> /
+            <code>DB_IN_ARCHIVE_RECOVERY</code>
+            等），以及其他全局元数据。<code>pg_controldata</code>
+            工具可以直接查看它。</p>
+            <h3 id="io-摊平checkpoint_completion_target-的内部算法">5.3
+            IO 摊平：checkpoint_completion_target 的内部算法</h3>
+            <p>Checkpoint 的 IO
+            量取决于脏页数量。如果不做任何控制，checkpoint 开始后 PG
+            会全力刷脏页，导致磁盘 IO 瞬时高峰——这就是 checkpoint IO
+            风暴。</p>
+            <p><code>checkpoint_completion_target</code> 控制
+            Checkpointer 如何把刷脏页的工作摊平到
+            <code>checkpoint_timeout</code> 时间窗口内。默认值 0.9
+            表示：checkpoint 的刷脏工作应该在 checkpoint 间隔的 90%
+            时间内均匀完成。</p>
+            <p>内部算法（在
+            <code>src/backend/access/transam/xlog.c</code> 的
+            <code>CheckpointWriteDelay()</code> 中）：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 每刷一定数量的 buffer 后调用 CheckpointWriteDelay()</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 计算目标进度：</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>progress <span class="op">=</span> <span class="op">(</span>当前已刷脏页数<span class="op">)</span> <span class="op">/</span> <span class="op">(</span>预期总脏页数<span class="op">);</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>elapsed <span class="op">=</span> <span class="op">(</span>当前时间 <span class="op">-</span> checkpoint 开始时间<span class="op">);</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>target_elapsed <span class="op">=</span> checkpoint_timeout <span class="op">*</span> checkpoint_completion_target <span class="op">*</span> progress<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 如果刷得太快（progress 超前于 elapsed），sleep</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>elapsed <span class="op">&lt;</span> target_elapsed<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    sleep_time <span class="op">=</span> target_elapsed <span class="op">-</span> elapsed<span class="op">;</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    pg_usleep<span class="op">(</span>sleep_time <span class="op">*</span> <span class="dv">1000000</span><span class="bu">L</span><span class="op">);</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>核心陷阱：如果 `checkpoint_completion_target <span class="op">=</span> <span class="fl">0.9</span>` 看起来<span class="st">&quot;接近 1，已经够激进了&quot;</span>，但实际效果取决于 `checkpoint_timeout` 和 `max_wal_size` 谁先触发 checkpoint：</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 如果 checkpoint 由 `max_wal_size` 触发（WAL 写入速度很高），而 `checkpoint_timeout` 是 <span class="dv">5</span> 分钟、`completion_target` 是 <span class="fl">0.9</span>，那么 Checkpointer 的任务窗口是 <span class="op">**</span><span class="fl">4.5</span> 分钟<span class="op">**</span>。如果实际脏页量需要 <span class="dv">10</span> 分钟才能在不打满 IO 的情况下刷完，那么 <span class="fl">4.5</span> 分钟窗口根本不够——Checkpointer 会卡在 sleep 和 write 之间，最终在 checkpoint 结束时仍然全力冲刺刷脏页。</span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 实际情况中，如果 WAL 写入速率很高（例如 <span class="dv">100</span><span class="er">MB</span><span class="op">/</span>s），`max_wal_size <span class="op">=</span> <span class="dv">1</span><span class="er">GB</span>` 的默认值意味着约 <span class="dv">10</span> 秒就触发一次 checkpoint。此时 `completion_target` 根本不起作用——总时间窗口太短，无法摊平。</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 六、REDO 恢复：StartupXLOG</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>当 PG crash 后重启时，`PostmasterMain<span class="op">()</span>` 调用 `StartupXLOG<span class="op">()</span>` 执行 REDO 恢复。`StartupXLOG<span class="op">()</span>` 是 `src<span class="op">/</span>backend<span class="op">/</span>access<span class="op">/</span>transam<span class="op">/</span>xlog<span class="op">.</span>c` 中最长也最复杂的函数（PG <span class="dv">17</span> 中约 <span class="dv">2000</span> 行）。</span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 6.1 恢复流程</span></span></code></pre></div>
+            <p>StartupXLOG() 1. 读取 pg_control 文件，确认数据库状态 2.
+            找到最新 checkpoint record → 从 pg_control 读取 checkpoint
+            LSN → 定位到这个 WAL record → 解析 checkpoint 中的 REDO
+            point LSN 3. 从 REDO point 开始，逐条读取 WAL record →
+            每读到一条 record，检查 CRC 校验和 → 对于每条
+            record，调用对应 RMGR 的 redo 函数：
+            RmgrTable[record-&gt;xl_rmid].rm_redo(record) 4.
+            恢复结束，创建 restartpoint（如果此实例是 standby） 5. 启动
+            WAL Writer, Checkpointer 等辅助进程</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co">### 6.2 RMGR 分发</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">每个</span> RMGR（Resource Manager）是一个静态结构，在 <span class="kw">`</span><span class="ex">src/include/access/rmgr.h</span><span class="kw">`</span> 中注册：</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">c</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> 例：Heap RMGR 的 redo 入口</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="ex">//</span> src/backend/access/heap/heapam.c</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="ex">const</span> RmgrData RmgrTable[] = {</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    <span class="ex">//</span> ...</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    <span class="ex">[RM_HEAP_ID]</span> = {</span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>        <span class="ex">.rm_name</span>    = <span class="st">&quot;Heap&quot;</span>,</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>        <span class="ex">.rm_redo</span>    = heap_redo,</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>        <span class="ex">.rm_desc</span>    = heap_desc,</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>        <span class="ex">.rm_identify</span> = heap_identify,</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>    <span class="er">}</span><span class="ex">,</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="er">}</span><span class="kw">;</span></span></code></pre></div>
+            <p><code>heap_redo()</code> 根据 WAL record 的
+            <code>xl_info</code> 字段分发到具体的 redo 函数：</p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/heap/heapam.c</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> heap_redo<span class="op">(</span>XLogReaderState <span class="op">*</span>record<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    uint8   info <span class="op">=</span> XLogRecGetInfo<span class="op">(</span>record<span class="op">)</span> <span class="op">&amp;</span> <span class="op">~</span>XLR_INFO_MASK<span class="op">;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>info <span class="op">&amp;</span> XLOG_HEAP_OPMASK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> XLOG_HEAP_INSERT<span class="op">:</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>            heap_xlog_insert<span class="op">(</span>record<span class="op">);</span>  <span class="co">// 重放 INSERT</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> XLOG_HEAP_DELETE<span class="op">:</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>            heap_xlog_delete<span class="op">(</span>record<span class="op">);</span>  <span class="co">// 重放 DELETE</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> XLOG_HEAP_UPDATE<span class="op">:</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>            heap_xlog_update<span class="op">(</span>record<span class="op">);</span>  <span class="co">// 重放 UPDATE</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ...</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 6.3 REDO 的幂等性</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>恢复过程中 PG 如何保证不会重复 REDO 一个页面？每个页面上的 `pd_lsn` 字段（`PageHeaderData<span class="op">.</span>pd_lsn`，<span class="dv">8</span> bytes）是关键。REDO 函数在重放每个 record 之前检查：</span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="co">// REDO 函数中的典型逻辑</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>record_LSN <span class="op">&lt;=</span> page<span class="op">-&gt;</span>pd_lsn<span class="op">)</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span><span class="op">;</span>  <span class="co">// 此页面已经 REDO 过了，跳过</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a><span class="co">// ... 执行 REDO 操作 ...</span></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>page<span class="op">-&gt;</span>pd_lsn <span class="op">=</span> record_LSN<span class="op">;</span></span></code></pre></div>
+            <p>这也是为什么
+            FPW（整页镜像）在恢复时可以直接覆盖页面而不比较
+            LSN——整页镜像本身就是最终的页面状态。</p>
+            <hr />
+            <h2 id="七wal_level-的三级差异">七、wal_level
+            的三级差异</h2>
+            <p><code>wal_level</code> 控制 WAL
+            中记录多少信息，直接影响复制和恢复能力。</p>
+            <table>
+            <colgroup>
+            <col style="width: 25%" />
+            <col style="width: 20%" />
+            <col style="width: 32%" />
+            <col style="width: 20%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>wal_level</th>
+            <th>记录内容</th>
+            <th>WAL 量（相对）</th>
+            <th>支持能力</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>minimal</code></td>
+            <td>只记录崩溃恢复所需的最小信息</td>
+            <td>最低</td>
+            <td>崩溃恢复（无复制）</td>
+            </tr>
+            <tr>
+            <td><code>replica</code>（默认）</td>
+            <td><code>minimal</code> 的所有内容 +
+            物理复制所需的额外信息</td>
+            <td>中等</td>
+            <td>崩溃恢复 + 流复制</td>
+            </tr>
+            <tr>
+            <td><code>logical</code></td>
+            <td><code>replica</code> 的所有内容 +
+            逻辑解码所需的额外信息</td>
+            <td>最高</td>
+            <td>崩溃恢复 + 流复制 + 逻辑复制/逻辑解码</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>三级的核心差异在 <strong>FPW
+            行为</strong>和<strong>附加信息</strong>：</p>
+            <p><strong>wal_level =
+            minimal</strong>：在大批量操作（<code>COPY</code>、<code>CREATE TABLE AS</code>、<code>CREATE INDEX</code>）时，如果表在创建或
+            bulk load 时被标记为 <code>RELATION_IS_LOCAL</code> 或使用了
+            <code>wal_skip_threshold</code>，PG 会跳过 WAL
+            写入。这不是跳过所有 WAL——正常 INSERT/UPDATE/DELETE 仍然写
+            WAL——而是优化了”数据本来就不在 shared_buffers
+            中（新页面直接被写入新的 relfilenode）“的场景。如果 crash
+            发生，新创建的表可能丢失，但不影响已存在的表。</p>
+            <p><strong>wal_level =
+            replica</strong>：强制所有操作写完整的 WAL record，包括
+            FPW。<code>COPY</code> 等大批量操作不能跳过 WAL
+            写入。这是流复制的基础——standby 需要完整的变更历史来保持和
+            primary 一致。</p>
+            <p><strong>wal_level = logical</strong>：在
+            <code>replica</code>
+            的基础上，额外记录逻辑解码所需的信息：每个 UPDATE 和 DELETE
+            必须保留旧行的完整 image（不只是操作描述），以便
+            <code>pgoutput</code> 插件能重建行的前后状态。这导致 logical
+            级别的 WAL 写入量可能比 replica 高出 2-4 倍，取决于
+            UPDATE/DELETE 的比例。</p>
+            <hr />
+            <h2 id="八运维实战">八、运维实战</h2>
+            <h3 id="checkpoint-io-风暴根因与调优">8.1 Checkpoint IO
+            风暴：根因与调优</h3>
+            <p><strong>症状</strong>：系统每 5 分钟出现一次 IO
+            写入高峰，高峰期间查询延迟显著增加，<code>iostat</code>
+            显示磁盘 util 接近 100%。</p>
+            <p><strong>根因</strong>：checkpoint 触发后，Checkpointer
+            需要在固定时间窗口内刷完所有脏页。如果窗口太短或脏页太多，就会形成
+            IO 风暴。</p>
+            <p><strong>排查路径</strong>：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 观察 checkpoint 触发频率</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pg_stat_bgwriter;</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 关注 checkpoints_timed（时间触发）和 checkpoints_req（WAL 触发）的比值</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 checkpoints_req &gt;&gt; checkpoints_timed，说明 max_wal_size 太容易触发</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 观察 checkpoint 写入量</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- buffers_checkpoint：checkpoint 刷了多少 buffer</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- buffers_clean：bgwriter 刷了多少 buffer</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 buffers_checkpoint &gt;&gt; buffers_clean，说明 bgwriter 没分担足够的脏页刷盘</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 看实际的 WAL 写入速率</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_wal_lsn_diff(pg_current_wal_lsn(), <span class="st">&#39;0/0&#39;</span>) <span class="op">/</span> <span class="dv">1024</span> <span class="op">/</span> <span class="dv">1024</span> <span class="kw">AS</span> wal_mb;</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 连续两次执行，除以时间差，得到 WAL 写入速率（MB/s）</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="co">-- 4. 确认 checkpoint 间隔</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pg_control_checkpoint();</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对比两次查询的 checkpoint_time 字段的间隔</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>调优策略<span class="op">**</span>：</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>增大 `max_wal_size`<span class="op">**</span>：如果 `checkpoints_req`（WAL 触发）过多，说明 WAL 段积累太快。把 `max_wal_size` 从 <span class="dv">1</span>GB 调到 <span class="dv">8</span><span class="op">-</span><span class="dv">16</span>GB 能显著降低 <span class="kw">checkpoint</span> 频率。但代价是：崩溃恢复时需要重放更多的 WAL，恢复时间变长。恢复时间 ≈ WAL 量 <span class="op">/</span> 恢复吞吐（SSD 上约 <span class="dv">200</span><span class="op">-</span><span class="dv">500</span>MB<span class="op">/</span>s）。<span class="dv">16</span>GB WAL 在 SSD 上恢复约 <span class="dv">30</span><span class="op">-</span><span class="dv">80</span> 秒。</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>增加 `checkpoint_timeout`<span class="op">**</span>：如果脏页总量不大但 `checkpoint_timeout` 触发太快（默认 <span class="dv">5</span> 分钟），可以调大（如 <span class="dv">15</span><span class="op">-</span><span class="dv">30</span> 分钟）。代价同样是更长的恢复时间。</span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> <span class="op">**</span>调整 `checkpoint_completion_target`<span class="op">**</span>：如果 <span class="kw">checkpoint</span> 由 `max_wal_size` 触发，并且 WAL 写入速率接近或超过磁盘带宽的一半，`completion_target` 设为 <span class="fl">0.9</span> 可能根本不够。此时该调到 <span class="fl">0.5</span><span class="op">-</span><span class="fl">0.7</span> 吗？不是——Cheap 的<span class="ot">&quot;摊平窗口&quot;</span> <span class="op">=</span> `min(checkpoint_timeout, max_wal_size <span class="op">/</span> WAL 写入速率) <span class="op">*</span> completion_target`。如果这个窗口太小，该调的其实是 `max_wal_size`。</span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> <span class="op">**</span>启用 `wal_compression <span class="op">=</span> zstd`<span class="op">**</span>（PG <span class="dv">15</span><span class="op">+</span>）：压缩 FPW 镜像，减少 WAL 写入量。CPU 开销可控（zstd 压缩比和速度的平衡很好），能显著降低 <span class="kw">checkpoint</span> 期间的 WAL 写入压力。</span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a><span class="fl">5.</span> <span class="op">**</span>提高 `bgwriter` 的积极性<span class="op">**</span>：bgwriter 能在 <span class="kw">checkpoint</span> 之前刷掉一部分脏页，减少 <span class="kw">checkpoint</span> 的压力。相关参数：`bgwriter_lru_maxpages`（每次最多刷多少页）、`bgwriter_delay`（多久醒来一次）。bgwriter 按 `bgwriter_lru_multiplier` 计算每次应刷的页数，公式基于最近的平均 buffer 替换需求。</span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>### <span class="fl">8.2</span> max_wal_size 设小导致 WAL 段疯狂切换</span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>症状<span class="op">**</span>：`pg_stat_bgwriter` 中 `checkpoints_req` 非常高（每秒多次），`pg_ls_waldir()` 显示 WAL 文件不断创建和删除，但每个文件都很小。系统 CPU sys 高（大量 `walwriter` 的 `open()`<span class="op">/</span>`unlink()` 系统调用）。</span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>根因<span class="op">**</span>：`max_wal_size` 设得过小，WAL 段积累速度远超设定值。每次 WAL 超过 `max_wal_size`，PG 触发一次 checkpoint，刷脏页后回收 WAL 段。如果 WAL 写入速率很高，这个循环在几秒内完成，然后又触发下一次 checkpoint。每次 <span class="kw">checkpoint</span> 带来的 FPW 写入进一步增加了 WAL 量，形成恶性循环。</span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a># 观察 WAL 段文件大小和创建速率</span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a>ls <span class="op">-</span>lh $PGDATA<span class="op">/</span>pg_wal<span class="op">/</span> | head <span class="op">-</span><span class="dv">20</span></span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a># 观察 WAL <span class="kw">segment</span> 切换频率（PG 日志或 pg_stat_wal）</span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pg_stat_wal;</span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a><span class="co">-- wal_segment_size 默认 16MB，所以：</span></span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a><span class="co">-- wal_bytes / 16MB = segment 切换次数</span></span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 wal_bytes 增长 1GB 而 max_wal_size=1GB，每 1GB 触发一次 checkpoint</span></span></code></pre></div>
+            <p><strong>修复</strong>：<code>max_wal_size</code>
+            应该设为约 <strong>3-5 倍</strong> 于”正常负载下一个
+            checkpoint_timeout 时间窗口内的 WAL 写入量”。计算：WAL
+            写入速率 (MB/s) × <code>checkpoint_timeout</code> (s) ×
+            3。例如 WAL 写入速率
+            20MB/s，<code>checkpoint_timeout=300s</code>，则
+            <code>max_wal_size ≥ 20 × 300 × 3 = 18GB</code>。</p>
+            <h3 id="pg_waldump定位问题-wal-record">8.3
+            pg_waldump：定位问题 WAL Record</h3>
+            <p><code>pg_waldump</code> 是 PG 自带的 WAL 解码工具，可以把
+            WAL segment 中的 record 转成人类可读的格式。</p>
+            <p><strong>常用命令</strong>：</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前 WAL 段中最新 10 条 record</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">-n</span> 10</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 从指定 LSN 开始查看</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">-s</span> 0/01000028 <span class="at">-n</span> 20</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 只看特定 RMGR（如 Heap）的 record</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">-r</span> Heap <span class="at">-n</span> 20</span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 只看特定事务 ID</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">-x</span> 12345</span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 record 的统计信息（按 RMGR 和 record 类型统计数量和大小）</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">--stats</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出格式：</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a><span class="co"># rmgr: Heap        len (rec/tot):     54/    54, tx:        585,</span></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a><span class="co">#     lsn: 0/01000028, prev 0/01000000, desc: INSERT off 2, blkref #0: ...</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a><span class="co"># rmgr 表示资源管理器，desc 是对操作的描述</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a><span class="ex">**排查场景</span> 1：WAL 写入量异常大<span class="pp">**</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a><span class="co"># 统计各 RMGR 的 WAL 输出量</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">-z</span> 0/01000000 <span class="at">--stats</span><span class="op">=</span>record <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-30</span></span></code></pre></div>
+            <p>如果 <code>Heap</code> 占 80% 以上，且操作类型以
+            <code>INSERT</code> 为主，说明是正常的写入。如果
+            <code>Heap</code> 的
+            <code>FPW</code>（整页镜像）占比过高，说明 checkpoint
+            频率太高导致大量 FPW——回到 8.1 节调整参数。</p>
+            <p><strong>排查场景 2：定位某个事务写了多少 WAL</strong></p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查找事务 12345 的开始和结束</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">-x</span> 12345</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 统计此事务的 WAL 量</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="ex">pg_waldump</span> <span class="at">-p</span> <span class="va">$PGDATA</span>/pg_wal <span class="at">-x</span> 12345 <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;BEGIN{sum=0} /len.*tot:/{match($0, /[0-9]+\/[0-9]+/); print $0; sum+=gensub(/.*\/([0-9]+),.*/, &quot;\\1&quot;, &quot;g&quot;, $0)} END{print &quot;Total bytes:&quot;, sum}&#39;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="ex">text</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="ex">**排查场景</span> 3：确认 WAL 段是否可安全回收<span class="pp">**</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 replication slot 的 restart_lsn</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> slot_name, restart_lsn,</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>       <span class="ex">pg_wal_lsn_diff</span><span class="er">(</span><span class="fu">pg_current_wal_lsn()</span><span class="ex">,</span> restart_lsn<span class="kw">)</span> <span class="ex">/</span> 1024 / 1024 AS lag_mb</span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="ex">FROM</span> pg_replication_slots<span class="kw">;</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="co"># restart_lsn 之前的 WAL 段不能回收。</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a><span class="co"># 如果某个 slot 的 lag_mb 很大且 active=false，说明 standby 已经离线</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a><span class="co"># WAL 一直攒着不被回收——最终可能导致 pg_wal 占满磁盘</span></span></code></pre></div>
+            <hr />
+            <h2 id="九实验观察-wal-写入行为">九、实验：观察 WAL
+            写入行为</h2>
+            <h3 id="测量不同-wal_level-的-wal-写入量">9.1 测量不同
+            wal_level 的 WAL 写入量</h3>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 准备测试表</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> wal_test (<span class="kw">id</span> SERIAL <span class="kw">PRIMARY</span> <span class="kw">KEY</span>, <span class="kw">data</span> TEXT);</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="co">-- 先跑 4 轮预热</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> wal_test (<span class="kw">data</span>) <span class="kw">SELECT</span> md5(<span class="kw">random</span>():<span class="ch">:text</span>) <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>);</span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在每次测试前重启 PG 并切换 wal_level</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 然后执行相同负载：</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> wal_test (<span class="kw">data</span>) <span class="kw">SELECT</span> md5(<span class="kw">random</span>():<span class="ch">:text</span>) <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>);</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a><span class="kw">DELETE</span> <span class="kw">FROM</span> wal_test <span class="kw">WHERE</span> <span class="kw">id</span> % <span class="dv">10</span> <span class="op">=</span> <span class="dv">0</span>;</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> wal_test <span class="kw">SET</span> <span class="kw">data</span> <span class="op">=</span> md5(<span class="kw">random</span>():<span class="ch">:text</span>) <span class="kw">WHERE</span> <span class="kw">id</span> % <span class="dv">5</span> <span class="op">=</span> <span class="dv">0</span>;</span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 测量 WAL 写入量</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_current_wal_lsn() <span class="kw">AS</span> end_lsn;</span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 实验前后 LSN 差值即 WAL 写入量</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>对比 `minimal`、`replica`、`logical` 三种 wal_level 下的 WAL 写入量，观察 `logical` 级别下 <span class="kw">UPDATE</span><span class="op">/</span><span class="kw">DELETE</span> 带来的额外 WAL。</span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a>### <span class="fl">9.2</span> 观察 <span class="kw">checkpoint</span> 对 WAL 写入的影响</span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察 FPW 行为：checkpoint 后第一次 UPDATE 产生 FPW</span></span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a><span class="kw">CHECKPOINT</span>;  <span class="co">-- 强制一次 checkpoint</span></span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a><span class="co">-- 记录当前 WAL LSN</span></span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_current_wal_lsn();</span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a><span class="co">-- 执行一次 UPDATE</span></span>
+<span id="cb15-29"><a href="#cb15-29" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> wal_test <span class="kw">SET</span> <span class="kw">data</span> <span class="op">=</span> <span class="st">&#39;x&#39;</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb15-30"><a href="#cb15-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-31"><a href="#cb15-31" aria-hidden="true" tabindex="-1"></a><span class="co">-- 记录 WAL LSN 差异</span></span>
+<span id="cb15-32"><a href="#cb15-32" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_current_wal_lsn();</span>
+<span id="cb15-33"><a href="#cb15-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 这个 UPDATE 对应的 WAL record 包含整页镜像（FPW），WAL 量应该约 8KB</span></span>
+<span id="cb15-34"><a href="#cb15-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-35"><a href="#cb15-35" aria-hidden="true" tabindex="-1"></a><span class="co">-- 再次 UPDATE 同一行（同一页面）</span></span>
+<span id="cb15-36"><a href="#cb15-36" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> wal_test <span class="kw">SET</span> <span class="kw">data</span> <span class="op">=</span> <span class="st">&#39;y&#39;</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>;</span>
+<span id="cb15-37"><a href="#cb15-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-38"><a href="#cb15-38" aria-hidden="true" tabindex="-1"></a><span class="co">-- 这次不需要 FPW，WAL 量只有几十字节</span></span></code></pre></div>
+            <h3 id="模拟-wal-段疯狂切换">9.3 模拟 WAL 段疯狂切换</h3>
+            <div class="sourceCode" id="cb16"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 把 max_wal_size 设得极小（需要重启）</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">SYSTEM</span> <span class="kw">SET</span> max_wal_size <span class="op">=</span> <span class="st">&#39;64MB&#39;</span>;</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_reload_conf();</span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 疯狂写入</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> wal_test (<span class="kw">data</span>) <span class="kw">SELECT</span> md5(<span class="kw">random</span>():<span class="ch">:text</span>) <span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">500000</span>);</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察 checkpoint 频率</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> checkpoints_timed, checkpoints_req <span class="kw">FROM</span> pg_stat_bgwriter;</span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- checkpoints_req 应该涨了好几倍</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>完成后记得恢复 `max_wal_size`。</span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a>### <span class="fl">9.4</span> 用 pg_waldump 解读 WAL</span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a># 找到当前使用的 WAL <span class="kw">segment</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_walfile_name(pg_current_wal_lsn());</span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a># 解码此 WAL <span class="kw">segment</span> 中的 <span class="dt">record</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>pg_waldump <span class="op">-</span>p $PGDATA<span class="op">/</span>pg_wal <span class="op">-</span>s <span class="dv">0</span><span class="op">/</span><span class="dv">01000000</span> <span class="op">-</span>n <span class="dv">30</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a># 观察输出中的 rmgr 字段：</span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a># rmgr: <span class="kw">Heap</span>        — <span class="kw">heap</span> 表的操作</span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a># rmgr: Btree       — B<span class="op">-</span>Tree 索引的操作</span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a># rmgr: <span class="kw">Transaction</span> — 事务提交<span class="op">/</span>回滚</span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a># rmgr: XLOG        — checkpoint、WAL 切换等</span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a># rmgr: <span class="kw">Storage</span>     — 文件创建<span class="op">/</span>截断</span></code></pre></div>
+            <hr />
+            <h2 id="十关键要点">十、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>WAL record 由 <code>XLogRecord</code> 头部 +
+            Block Headers + Data 组成</strong>。Block Header 中的
+            FPW（整页镜像）是 WAL
+            写入量的主要来源，它的存在是为了防止页面撕裂。</p></li>
+            <li><p><strong><code>XLogInsert()</code> 通过 8 个
+            WALInsertLock 实现并发插入</strong>。每个 Backend 在独立的
+            slot 中预留 LSN 区间和拷贝数据。WAL Writer
+            在刷盘时只刷已完成的连续字节——不等待各 slot
+            的拷贝，但串行化按 LSN 顺序落盘。</p></li>
+            <li><p><strong>WAL Writer 异步刷盘，Backend
+            在同步提交时自己调用
+            <code>XLogFlush()</code></strong>。<code>wal_sync_method</code>
+            控制使用
+            <code>fsync</code>/<code>fdatasync</code>/<code>O_DSYNC</code>
+            中的哪一个。</p></li>
+            <li><p><strong>Checkpoint 分两阶段</strong>：确定 REDO
+            point（找到最老脏页的 LSN）→ 刷脏页 → 写 checkpoint WAL
+            record → 更新 <code>pg_control</code>。REDO point
+            决定了崩溃恢复的起点。</p></li>
+            <li><p><strong>REDO 恢复通过 <code>pd_lsn</code>
+            保证幂等性</strong>。每次 REDO 操作前检查页面
+            <code>pd_lsn</code>，如果页面 LSN 已经比当前 record LSN
+            新，跳过。</p></li>
+            <li><p><strong><code>wal_level</code> 的三级差异核心在 FPW
+            行为和附加信息</strong>：<code>minimal</code> 在 bulk load
+            时优化 WAL；<code>logical</code> 在每次 UPDATE/DELETE
+            时记录旧行完整 image。</p></li>
+            <li><p><strong><code>checkpoint_completion_target</code>
+            的陷阱</strong>：它摊平的是 <code>checkpoint_timeout</code>
+            窗口内的刷脏工作，但如果 checkpoint 由
+            <code>max_wal_size</code> 触发且 WAL
+            写入速率太高，窗口太短，<code>completion_target</code>
+            起不到摊平作用。此时该调的是
+            <code>max_wal_size</code>。</p></li>
+            <li><p><strong><code>max_wal_size</code> 太小会导致 WAL
+            段频繁切换 + checkpoint IO
+            风暴</strong>的恶性循环。正确值应设为正常负载下
+            checkpoint_timeout 窗口内 WAL 量的 3-5 倍。</p></li>
+            </ol>
+            <p>上一章：<a href="../03-mvcc-clog/03-mvcc-clog.html">MVCC
+            实现：CLOG、hint bit 与快照可扩展性</a> 下一章：<a
+            href="../05-buffer-manager/05-buffer-manager.html">Buffer
+            Manager</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/access/transam/xlog.c</code>：CreateCheckPoint(),
+            StartupXLOG(), XLogFlush(), XLogWrite(),
+            CheckPointGuts()</li>
+            <li><code>src/backend/access/transam/xloginsert.c</code>：XLogInsert(),
+            XLogInsertRecord(), ReserveXLogInsertLocation(),
+            CopyXLogRecordToWAL()</li>
+            <li><code>src/include/access/xlogrecord.h</code>：XLogRecord,
+            XLogRecordBlockHeader, XLogRecordBlockImageHeader,
+            XLogRecordBlockCompressHeader 结构体定义</li>
+            <li><code>src/include/access/xlog_internal.h</code>：RMGR ID
+            定义（RM_XLOG_ID, RM_HEAP_ID 等）, XLogSegSize, WAL segment
+            相关常量</li>
+            <li><code>src/backend/access/heap/heapam.c</code>：heap_redo(),
+            heap_xlog_insert/delete/update()</li>
+            <li><code>src/backend/postmaster/checkpointer.c</code>：CheckpointerMain()</li>
+            <li><code>src/backend/postmaster/walwriter.c</code>：WalWriterMain()</li>
+            <li><code>src/include/access/rmgr.h</code>：RmgrData
+            结构体定义，RmgrTable 数组声明</li>
+            <li><code>src/include/storage/bufpage.h</code>：PageHeaderData.pd_lsn
+            字段</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 30: Reliability and
+            the Write-Ahead Log（WAL 配置与 checkpoint）</li>
+            <li>PostgreSQL Documentation, Section 19.5: Write Ahead
+            Log（wal_level, wal_sync_method, max_wal_size 等 GUC
+            详解）</li>
+            <li>PostgreSQL Documentation, Section 19.5.2:
+            Checkpoints（checkpoint_timeout,
+            checkpoint_completion_target）</li>
+            <li>PostgreSQL Documentation, Section 30.5: WAL
+            Internals（WAL 内部机制的官方描述）</li>
+            <li>PostgreSQL Documentation, pg_waldump 参考页</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Mohan, C. et al. <em>ARIES: A Transaction Recovery
+            Method Supporting Fine-Granularity Locking and Partial
+            Rollbacks Using Write-Ahead Logging</em>. ACM TODS 1992. —
+            WAL/ARIES 算法的理论基础，PG 的 checkpoint 和 REDO
+            设计直接来源于此。</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/24-recovery-corruption/24-recovery-corruption.html">【PG 内核】数据恢复与损坏应对：PITR、pg_resetwal 和页面损坏的边界</a></h3>
+                    <p>拆解 PostgreSQL 数据恢复路径的内部机制与操作边界：PITR 的三个关键窗口与 timeline fork 原理、pg_checksums 的校验粒度与盲区、pg_resetwal 的 hint bit 代价与 VACUUM FULL 陷进、pg_dump 并行调度的内部策略。重点在于每种操作做什么、不做什么、哪些后果不可逆。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/19-logical-repl/19-logical-repl.html">【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大</a></h3>
+                    <p>拆解 PostgreSQL 逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL 解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与 snapshot 重建机制、pgoutput 输出插件的二进制协议与行过滤变换、Publication/Subscription 模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing 为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable 后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在 reorder buffer 中的延迟放大效应。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

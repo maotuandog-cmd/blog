@@ -1,0 +1,1787 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】XFS 架构：大文件与高并发 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="发布来自土法炼钢兴趣小组的知识、笔记、进展和应用。主题包括数据结构和算法、编程语言、网络安全、密码学等。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="xfs, filesystem, allocation-groups, btree, reflink, cow, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/15-xfs-architecture/xfs-architecture.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】XFS 架构：大文件与高并发" />
+    <meta property="og:description" content="XFS 诞生于 1993 年的硅谷图形公司（Silicon Graphics, Inc.），最初运行在 IRIX 操作系统上。 SGI 的核心业务是高性能计算和影视后期制作，客户需要处理的文件动辄几十 GB 甚至数 TB。 当时主流的 EFS（Extent File System）在面对这类工作负载时已经力不从心：元数…" />
+    <meta property="og:url" content="https://quant67.com/post/storage/15-xfs-architecture/xfs-architecture.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="xfs" />
+    <meta property="article:tag" content="filesystem" />
+    <meta property="article:tag" content="allocation-groups" />
+    <meta property="article:tag" content="btree" />
+    <meta property="article:tag" content="reflink" />
+    <meta property="article:tag" content="cow" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】XFS 架构：大文件与高并发" />
+    <meta name="twitter:description" content="XFS 诞生于 1993 年的硅谷图形公司（Silicon Graphics, Inc.），最初运行在 IRIX 操作系统上。 SGI 的核心业务是高性能计算和影视后期制作，客户需要处理的文件动辄几十 GB 甚至数 TB。 当时主流的 EFS（Extent File System）在面对这类工作负载时已经力不从心：元数…" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】XFS 架构：大文件与高并发", "description": "XFS 诞生于 1993 年的硅谷图形公司（Silicon Graphics, Inc.），最初运行在 IRIX 操作系统上。 SGI 的核心业务是高性能计算和影视后期制作，客户需要处理的文件动辄几十 GB 甚至数 TB。 当时主流的 EFS（Extent File System）在面对这类工作负载时已经力不从心：元数…", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/15-xfs-architecture/xfs-architecture.html"}, "datePublished": "2025-08-24T00:00:00+00:00", "dateModified": "2026-04-15T10:56:08+00:00", "keywords": ["xfs", "filesystem", "allocation-groups", "btree", "reflink", "cow"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】XFS 架构：大文件与高并发</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-24</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#xfs</span> <span>#filesystem</span> <span>#allocation-groups</span> <span>#btree</span> <span>#reflink</span> <span>#cow</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/14-ext4-architecture/ext4-architecture.html">上一篇：【存储工程】ext4 架构与调优</a><a class="post-series-nav__link" href="/post/storage/16-btrfs-cow/btrfs-cow.html">下一篇：【存储工程】Btrfs：写时复制文件系统</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/xfs.html">#xfs</a><a class="chip-link" href="/tags/filesystem.html">#filesystem</a><a class="chip-link" href="/tags/allocation-groups.html">#allocation-groups</a><a class="chip-link" href="/tags/btree.html">#btree</a><a class="chip-link" href="/tags/reflink.html">#reflink</a><a class="chip-link" href="/tags/cow.html">#cow</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一xfs-设计哲学"
+                id="toc-一xfs-设计哲学">一、XFS 设计哲学</a>
+                <ul>
+                <li><a href="#起源sgi-irix-与大规模存储"
+                id="toc-起源sgi-irix-与大规模存储">1.1 起源：SGI IRIX
+                与大规模存储</a></li>
+                <li><a href="#核心设计原则" id="toc-核心设计原则">1.2
+                核心设计原则</a></li>
+                <li><a href="#与-ext4-的定位差异"
+                id="toc-与-ext4-的定位差异">1.3 与 ext4
+                的定位差异</a></li>
+                <li><a href="#xfs-在-linux-内核中的位置"
+                id="toc-xfs-在-linux-内核中的位置">1.4 XFS 在 Linux
+                内核中的位置</a></li>
+                </ul></li>
+                <li><a href="#二allocation-groups-并行设计"
+                id="toc-二allocation-groups-并行设计">二、Allocation
+                Groups 并行设计</a>
+                <ul>
+                <li><a href="#分配组的基本概念"
+                id="toc-分配组的基本概念">2.1 分配组的基本概念</a></li>
+                <li><a href="#ag-的内部结构" id="toc-ag-的内部结构">2.2
+                AG 的内部结构</a></li>
+                <li><a href="#并行分配机制" id="toc-并行分配机制">2.3
+                并行分配机制</a></li>
+                <li><a href="#ag-数量的选择" id="toc-ag-数量的选择">2.4
+                AG 数量的选择</a></li>
+                </ul></li>
+                <li><a href="#三btree-元数据管理"
+                id="toc-三btree-元数据管理">三、B+Tree 元数据管理</a>
+                <ul>
+                <li><a href="#为什么选择-b树"
+                id="toc-为什么选择-b树">3.1 为什么选择 B+树</a></li>
+                <li><a href="#空闲空间-b树" id="toc-空闲空间-b树">3.2
+                空闲空间 B+树</a></li>
+                <li><a href="#inode-b树" id="toc-inode-b树">3.3 Inode
+                B+树</a></li>
+                <li><a href="#文件区段-b树" id="toc-文件区段-b树">3.4
+                文件区段 B+树</a></li>
+                <li><a href="#反向映射-b树" id="toc-反向映射-b树">3.5
+                反向映射 B+树</a></li>
+                <li><a href="#引用计数-b树" id="toc-引用计数-b树">3.6
+                引用计数 B+树</a></li>
+                </ul></li>
+                <li><a href="#四日志设计"
+                id="toc-四日志设计">四、日志设计</a>
+                <ul>
+                <li><a href="#元数据日志的基本原理"
+                id="toc-元数据日志的基本原理">4.1
+                元数据日志的基本原理</a></li>
+                <li><a href="#日志结构" id="toc-日志结构">4.2
+                日志结构</a></li>
+                <li><a href="#日志事务与预留"
+                id="toc-日志事务与预留">4.3 日志事务与预留</a></li>
+                <li><a href="#日志条带单元" id="toc-日志条带单元">4.4
+                日志条带单元</a></li>
+                <li><a href="#外部日志设备" id="toc-外部日志设备">4.5
+                外部日志设备</a></li>
+                <li><a href="#日志大小规划" id="toc-日志大小规划">4.6
+                日志大小规划</a></li>
+                </ul></li>
+                <li><a href="#五延迟分配与预分配"
+                id="toc-五延迟分配与预分配">五、延迟分配与预分配</a>
+                <ul>
+                <li><a href="#延迟分配" id="toc-延迟分配">5.1
+                延迟分配</a></li>
+                <li><a href="#预分配机制" id="toc-预分配机制">5.2
+                预分配机制</a></li>
+                <li><a href="#allocsize-挂载选项"
+                id="toc-allocsize-挂载选项">5.3 allocsize
+                挂载选项</a></li>
+                <li><a href="#fallocate-与显式预分配"
+                id="toc-fallocate-与显式预分配">5.4 fallocate
+                与显式预分配</a></li>
+                </ul></li>
+                <li><a href="#六reflink-与-cow"
+                id="toc-六reflink-与-cow">六、Reflink 与 CoW</a>
+                <ul>
+                <li><a href="#reflink-的基本原理"
+                id="toc-reflink-的基本原理">6.1 Reflink
+                的基本原理</a></li>
+                <li><a href="#写时复制" id="toc-写时复制">6.2
+                写时复制</a></li>
+                <li><a href="#cp-reflink" id="toc-cp-reflink">6.3 cp
+                –reflink</a></li>
+                <li><a href="#使用-duperemove-进行去重"
+                id="toc-使用-duperemove-进行去重">6.4 使用 duperemove
+                进行去重</a></li>
+                <li><a href="#reflink-与快照语义"
+                id="toc-reflink-与快照语义">6.5 Reflink
+                与快照语义</a></li>
+                <li><a href="#启用-reflink" id="toc-启用-reflink">6.6
+                启用 Reflink</a></li>
+                </ul></li>
+                <li><a href="#七实时子卷realtime-subvolume"
+                id="toc-七实时子卷realtime-subvolume">七、实时子卷（Realtime
+                Subvolume）</a>
+                <ul>
+                <li><a href="#实时子卷的用途"
+                id="toc-实时子卷的用途">7.1 实时子卷的用途</a></li>
+                <li><a href="#rt-子卷的工作方式"
+                id="toc-rt-子卷的工作方式">7.2 RT
+                子卷的工作方式</a></li>
+                <li><a href="#将文件分配到-rt-子卷"
+                id="toc-将文件分配到-rt-子卷">7.3 将文件分配到 RT
+                子卷</a></li>
+                <li><a href="#rt-子卷的限制" id="toc-rt-子卷的限制">7.4
+                RT 子卷的限制</a></li>
+                </ul></li>
+                <li><a href="#八xfs-诊断工具"
+                id="toc-八xfs-诊断工具">八、XFS 诊断工具</a>
+                <ul>
+                <li><a href="#xfs_info查看文件系统参数"
+                id="toc-xfs_info查看文件系统参数">8.1
+                xfs_info：查看文件系统参数</a></li>
+                <li><a href="#xfs_db低级元数据调试"
+                id="toc-xfs_db低级元数据调试">8.2
+                xfs_db：低级元数据调试</a></li>
+                <li><a href="#xfs_repair文件系统修复"
+                id="toc-xfs_repair文件系统修复">8.3
+                xfs_repair：文件系统修复</a></li>
+                <li><a href="#xfs_fsr在线碎片整理"
+                id="toc-xfs_fsr在线碎片整理">8.4
+                xfs_fsr：在线碎片整理</a></li>
+                <li><a href="#xfs_scrub在线一致性检查"
+                id="toc-xfs_scrub在线一致性检查">8.5
+                xfs_scrub：在线一致性检查</a></li>
+                </ul></li>
+                <li><a href="#九xfs-性能调优"
+                id="toc-九xfs-性能调优">九、XFS 性能调优</a>
+                <ul>
+                <li><a href="#mkfs.xfs-格式化参数"
+                id="toc-mkfs.xfs-格式化参数">9.1 mkfs.xfs
+                格式化参数</a></li>
+                <li><a href="#挂载选项调优" id="toc-挂载选项调优">9.2
+                挂载选项调优</a></li>
+                <li><a href="#数据库工作负载调优"
+                id="toc-数据库工作负载调优">9.3
+                数据库工作负载调优</a></li>
+                <li><a href="#io-调度器配合" id="toc-io-调度器配合">9.4
+                I/O 调度器配合</a></li>
+                <li><a href="#调优参数速查表"
+                id="toc-调优参数速查表">9.5 调优参数速查表</a></li>
+                </ul></li>
+                <li><a href="#十xfs-在生产环境"
+                id="toc-十xfs-在生产环境">十、XFS 在生产环境</a>
+                <ul>
+                <li><a href="#rhel-默认文件系统"
+                id="toc-rhel-默认文件系统">10.1 RHEL
+                默认文件系统</a></li>
+                <li><a href="#数据库工作负载"
+                id="toc-数据库工作负载">10.2 数据库工作负载</a></li>
+                <li><a href="#虚拟化与容器存储"
+                id="toc-虚拟化与容器存储">10.3 虚拟化与容器存储</a></li>
+                <li><a href="#大规模部署经验"
+                id="toc-大规模部署经验">10.4 大规模部署经验</a></li>
+                <li><a href="#xfs-与其他文件系统的选型"
+                id="toc-xfs-与其他文件系统的选型">10.5 XFS
+                与其他文件系统的选型</a></li>
+                <li><a href="#xfs-的演进方向"
+                id="toc-xfs-的演进方向">10.6 XFS 的演进方向</a></li>
+                </ul></li>
+                <li><a href="#参考文献" id="toc-参考文献">参考文献</a>
+                <ul>
+                <li><a href="#规范与设计文档"
+                id="toc-规范与设计文档">规范与设计文档</a></li>
+                <li><a href="#源码" id="toc-源码">源码</a></li>
+                <li><a href="#书籍与演讲"
+                id="toc-书籍与演讲">书籍与演讲</a></li>
+                <li><a href="#工具" id="toc-工具">工具</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h2 id="一xfs-设计哲学">一、XFS 设计哲学</h2>
+            <h3 id="起源sgi-irix-与大规模存储">1.1 起源：SGI IRIX
+            与大规模存储</h3>
+            <p>XFS 诞生于 1993 年的硅谷图形公司（Silicon Graphics,
+            Inc.），最初运行在 IRIX 操作系统上。 SGI
+            的核心业务是高性能计算和影视后期制作，客户需要处理的文件动辄几十
+            GB 甚至数 TB。 当时主流的 EFS（Extent File
+            System）在面对这类工作负载时已经力不从心：元数据操作串行、单线程分配、文件大小受限。
+            XFS
+            就是为了解决这些问题而设计的——从第一天起，它的目标就是「大文件、高并发、可扩展」。</p>
+            <p>1994 年，XFS 在 IRIX 5.3 上正式发布。2001 年，SGI 将 XFS
+            移植到 Linux 内核（2.4 系列），并以 GPL 协议开源。 此后 XFS
+            在 Linux
+            社区持续演进，逐步成为企业级工作负载的首选文件系统之一。
+            2014 年起，Red Hat Enterprise Linux 7 将 XFS
+            设为默认文件系统（Default File
+            System），这一决定延续至今。</p>
+            <h3 id="核心设计原则">1.2 核心设计原则</h3>
+            <p>XFS 的设计围绕四个核心原则展开：</p>
+            <p><strong>可扩展性（Scalability）</strong>。文件系统的元数据结构必须能随磁盘容量线性扩展，不能在容量翻倍时出现性能悬崖。
+            XFS 通过分配组（Allocation
+            Group）实现元数据的水平分区，允许多个 CPU
+            同时操作不同区域的元数据。</p>
+            <p><strong>大文件友好</strong>。XFS 从设计之初就使用 64
+            位地址空间，理论上支持的最大文件大小为 8
+            EiB，最大卷大小同样为 8 EiB。 作为对比，ext4 的最大卷大小为
+            1 EiB，最大文件大小为 16 TiB。</p>
+            <p><strong>高效的元数据管理</strong>。所有元数据结构——inode
+            索引、空闲空间、区段映射——都使用 B+树（B+Tree）组织。 B+树
+            在有序查找、范围扫描和插入删除方面都有 O(log n)
+            的时间复杂度，适合管理数百万乃至数十亿条记录。</p>
+            <p><strong>日志保护</strong>。XFS 使用元数据日志（Metadata
+            Journal）保证崩溃一致性。
+            只有元数据写入日志，数据本身不写日志，这在保障一致性的同时避免了日志带来的写放大。</p>
+            <h3 id="与-ext4-的定位差异">1.3 与 ext4 的定位差异</h3>
+            <p>ext4
+            是一个通用文件系统，擅长处理大量小文件的日常工作负载，启动速度快，工具链成熟。
+            XFS 的设计侧重点不同：它在大文件顺序
+            I/O、高并发元数据操作、大容量卷管理方面有结构性优势。</p>
+            <p>下面这张表总结了两者的关键差异：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>ext4</th>
+            <th>XFS</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>最大卷大小</td>
+            <td>1 EiB</td>
+            <td>8 EiB</td>
+            </tr>
+            <tr>
+            <td>最大文件大小</td>
+            <td>16 TiB</td>
+            <td>8 EiB</td>
+            </tr>
+            <tr>
+            <td>元数据结构</td>
+            <td>H-Tree（目录）+ 区段树</td>
+            <td>全面 B+树</td>
+            </tr>
+            <tr>
+            <td>并行分配</td>
+            <td>单一块组锁</td>
+            <td>分配组级别并行</td>
+            </tr>
+            <tr>
+            <td>在线缩容</td>
+            <td>支持</td>
+            <td>不支持</td>
+            </tr>
+            <tr>
+            <td>默认日志模式</td>
+            <td>ordered</td>
+            <td>ordered</td>
+            </tr>
+            <tr>
+            <td>reflink 支持</td>
+            <td>否</td>
+            <td>是（内核 4.9 起）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>XFS 不支持在线缩容（Online
+            Shrink），这是它的一个已知限制。
+            如果预计卷大小会频繁变化，需要在部署前考虑这一点。</p>
+            <h3 id="xfs-在-linux-内核中的位置">1.4 XFS 在 Linux
+            内核中的位置</h3>
+            <p>XFS 的内核代码位于 <code>fs/xfs/</code> 目录下，代码量约
+            15 万行（Linux 6.5）。 它通过 VFS（Virtual File
+            System）层向上提供标准的 POSIX
+            文件操作接口，向下通过块设备层（Block
+            Layer）与存储设备交互。 XFS 在 VFS
+            和块设备层之间实现了自己的一套完整元数据管理和空间分配逻辑。</p>
+            <pre class="text"><code>用户态应用程序
+     │
+     ▼
+┌──────────────────────┐
+│  VFS 层              │
+│  open/read/write/... │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  XFS 文件系统层       │
+│  ├─ 分配组管理       │
+│  ├─ B+树元数据       │
+│  ├─ 日志子系统       │
+│  └─ 延迟分配引擎     │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  块设备层            │
+│  bio → request       │
+└──────────┬───────────┘
+           │
+           ▼
+      存储设备</code></pre>
+            <h2 id="二allocation-groups-并行设计">二、Allocation Groups
+            并行设计</h2>
+            <h3 id="分配组的基本概念">2.1 分配组的基本概念</h3>
+            <p>分配组（Allocation Group，AG）是 XFS
+            实现并行化的核心机制。 <code>mkfs.xfs</code>
+            在格式化时将整个卷（Volume）划分为若干等大的 AG，每个 AG
+            独立管理自己的 inode、空闲空间和区段映射。 默认情况下，AG
+            的大小由 <code>mkfs.xfs</code> 根据卷大小自动计算，通常在
+            256 MiB 到 1 TiB 之间。 AG 的数量通常在 4 到
+            数千个之间，取决于卷的总容量。</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看已有 XFS 文件系统的 AG 数量和大小</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_info</span> /dev/sda1</span></code></pre></div>
+            <p>典型输出如下：</p>
+            <pre class="text"><code>meta-data=/dev/sda1        isize=512    agcount=4, agsize=65536 blks
+         =                 sectsz=512   attr=2, projid32bit=1
+         =                 crc=1        finobt=1, sparse=1, rmapbt=0
+         =                 reflink=1    bigtime=1 inobtcount=1 nrext64=0
+data     =                 bsize=4096   blocks=262144, imaxpct=25
+         =                 sunit=0      swidth=0 blks
+naming   =version 2        bsize=4096   ascii-ci=0, ftype=1
+log      =internal         bsize=4096   blocks=16384, version=2
+         =                 sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none             extsz=4096   blocks=0, rtextents=0</code></pre>
+            <p>输出中 <code>agcount=4</code> 表示有 4
+            个分配组，<code>agsize=65536 blks</code> 表示每个 AG 包含
+            65536 个块。</p>
+            <h3 id="ag-的内部结构">2.2 AG 的内部结构</h3>
+            <p>每个 AG
+            都有一套完整且独立的元数据结构，可以看作一个「迷你文件系统」。
+            AG 内部的布局从磁盘偏移 0 开始，依次排列如下：</p>
+            <pre class="text"><code>AG 内部布局：
+┌──────────────────────────────────────────────┐
+│  超级块副本（Superblock Copy）                │  扇区 0
+├──────────────────────────────────────────────┤
+│  AGF（AG Free Space Header）                 │  扇区 1
+├──────────────────────────────────────────────┤
+│  AGI（AG Inode Header）                      │  扇区 2
+├──────────────────────────────────────────────┤
+│  AGFL（AG Free List）                        │  扇区 3
+├──────────────────────────────────────────────┤
+│  B+树根节点区域                               │
+│  ├─ 按块号排序的空闲空间 B+树（bnobt）        │
+│  ├─ 按大小排序的空闲空间 B+树（cntbt）        │
+│  ├─ inode B+树（inobt）                      │
+│  ├─ 空闲 inode B+树（finobt）                │
+│  └─ 反向映射 B+树（rmapbt，可选）             │
+├──────────────────────────────────────────────┤
+│  数据区域                                     │
+│  （inode 块、数据块、空闲块混合分布）          │
+└──────────────────────────────────────────────┘</code></pre>
+            <p><strong>超级块副本</strong>。每个 AG
+            都保存一份超级块（Superblock）的副本。 如果 AG 0
+            的主超级块损坏，<code>xfs_repair</code> 可以从其他 AG
+            的副本中恢复。</p>
+            <p><strong>AGF</strong>（AG Free Space Header）。记录该 AG
+            的空闲空间统计信息和两棵空闲空间 B+树的根节点位置。</p>
+            <p><strong>AGI</strong>（AG Inode Header）。记录该 AG 的
+            inode 分配信息和 inode B+树的根节点位置。</p>
+            <p><strong>AGFL</strong>（AG Free
+            List）。保留一小部分预留块，供 B+树
+            在分裂或合并时使用，避免在元数据操作的关键路径上再去做空间分配。</p>
+            <h3 id="并行分配机制">2.3 并行分配机制</h3>
+            <p>AG 设计的核心价值在于并行性。 每个 AG
+            有自己独立的锁（Per-AG
+            Lock），当多个线程同时创建文件或分配磁盘空间时，只要它们落在不同的
+            AG 上，就不会产生锁竞争。</p>
+            <p>XFS 的 inode 分配器会尽量在目标目录所在的 AG 中分配新
+            inode，同时也会考虑各 AG 的负载均衡。 具体策略定义在内核源码
+            <code>fs/xfs/xfs_ialloc.c</code> 中的
+            <code>xfs_ialloc_ag_select()</code> 函数里。
+            简化后的选择逻辑如下：</p>
+            <pre class="text"><code>inode 分配的 AG 选择逻辑：
+
+1. 优先选择父目录所在的 AG
+2. 如果该 AG 的空闲 inode 不足，则轮转到下一个 AG
+3. 每个 AG 维护一个 inode 计数，避免单个 AG 过载
+4. 最终选择空闲 inode 最多的 AG</code></pre>
+            <p>这种设计在高并发场景下效果明显。
+            例如，一台多核服务器上运行着数十个进程同时写日志文件。
+            如果使用 ext4，所有进程在分配 inode 时会竞争同一把全局锁。
+            而在 XFS 上，这些进程的 inode 分配会分散到不同的 AG
+            上，锁竞争显著降低。</p>
+            <h3 id="ag-数量的选择">2.4 AG 数量的选择</h3>
+            <p>AG 数量并非越多越好。过多的 AG 会导致：</p>
+            <ul>
+            <li>每个 AG 的空间太小，大文件无法在单个 AG
+            内获得连续区段；</li>
+            <li>B+树的数量增加，内存开销上升；</li>
+            <li>超级块副本占用的空间增加。</li>
+            </ul>
+            <p><code>mkfs.xfs</code>
+            的默认策略已经经过仔细调优，大多数场景下不需要手动调整。
+            如果确实需要，可以通过 <code>-d agcount=N</code> 或
+            <code>-d agsize=N</code> 参数指定：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动指定 AG 大小为 1 TiB</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-d</span> agsize=1099511627776 /dev/sda1</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动指定 AG 数量为 8</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-d</span> agcount=8 /dev/sda1</span></code></pre></div>
+            <h2 id="三btree-元数据管理">三、B+Tree 元数据管理</h2>
+            <h3 id="为什么选择-b树">3.1 为什么选择 B+树</h3>
+            <p>文件系统的元数据管理本质上是一个索引问题：给定一个逻辑文件偏移，快速找到对应的物理块号；给定一段空闲空间需求，快速找到满足条件的连续区间。</p>
+            <p>B+树 是解决这类问题的经典数据结构。它的核心特性如下：</p>
+            <ul>
+            <li>所有数据都存储在叶节点，内部节点只存储索引键；</li>
+            <li>叶节点之间通过指针相连，支持高效的范围扫描；</li>
+            <li>树的高度通常只有 2-3
+            层，即使管理数十亿条记录，查找操作也只需要 2-3 次磁盘
+            I/O。</li>
+            </ul>
+            <p>XFS 在元数据管理中全面使用 B+树，包括以下几种：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>B+树类型</th>
+            <th>键值</th>
+            <th>用途</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>bnobt</td>
+            <td>起始块号</td>
+            <td>按块号排序的空闲空间索引</td>
+            </tr>
+            <tr>
+            <td>cntbt</td>
+            <td>区段大小</td>
+            <td>按大小排序的空闲空间索引</td>
+            </tr>
+            <tr>
+            <td>inobt</td>
+            <td>inode 号</td>
+            <td>已分配 inode 的索引</td>
+            </tr>
+            <tr>
+            <td>finobt</td>
+            <td>inode 号</td>
+            <td>有空闲槽位的 inode 块索引</td>
+            </tr>
+            <tr>
+            <td>bmbt</td>
+            <td>文件逻辑偏移</td>
+            <td>文件区段映射</td>
+            </tr>
+            <tr>
+            <td>rmapbt</td>
+            <td>物理块号</td>
+            <td>反向映射（物理块→owner）</td>
+            </tr>
+            <tr>
+            <td>refcntbt</td>
+            <td>物理块号</td>
+            <td>引用计数（reflink 使用）</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="空闲空间-b树">3.2 空闲空间 B+树</h3>
+            <p>每个 AG 维护两棵空闲空间 B+树（Free Space
+            B+Tree），它们索引的是同一份数据，但排序方式不同：</p>
+            <ul>
+            <li><strong>bnobt</strong>（By Block Number
+            B+Tree）：按空闲区段的起始块号排序。用于在指定位置附近查找空闲空间，支持局部性分配。</li>
+            <li><strong>cntbt</strong>（By Count
+            B+Tree）：按空闲区段的大小排序。用于快速找到满足特定大小需求的最小可用区段。</li>
+            </ul>
+            <p>这种双 B+树
+            设计的好处在于：无论是按位置查找还是按大小查找，都能在 O(log
+            n) 时间内完成，不需要遍历整个空闲空间列表。</p>
+            <pre class="text"><code>空闲空间双 B+树 结构示意：
+
+bnobt（按块号排序）              cntbt（按大小排序）
+┌────────────┐                  ┌────────────┐
+│   根节点    │                  │   根节点    │
+└─────┬──────┘                  └─────┬──────┘
+      │                               │
+  ┌───┴───┐                       ┌───┴───┐
+  ▼       ▼                       ▼       ▼
+┌────┐ ┌────┐                  ┌────┐ ┌────┐
+│叶1 │→│叶2 │                  │叶1 │→│叶2 │
+└────┘ └────┘                  └────┘ └────┘
+
+叶节点内容：                    叶节点内容：
+  块100, 长度5                    长度2, 块500
+  块200, 长度8                    长度5, 块100
+  块500, 长度2                    长度8, 块200</code></pre>
+            <p>当需要分配一段连续空间时，XFS 的空间分配器（Space
+            Allocator）根据分配策略选择使用哪棵树：</p>
+            <ul>
+            <li><strong>精确大小分配</strong>：先查
+            cntbt，找到大小最接近需求的区段；</li>
+            <li><strong>邻近分配</strong>：先查
+            bnobt，在目标位置附近找空闲区段，以提高数据局部性。</li>
+            </ul>
+            <h3 id="inode-b树">3.3 Inode B+树</h3>
+            <p>每个 AG 维护一棵 inode B+树（inobt），记录该 AG
+            中所有已分配的 inode 块（Inode Chunk）。 XFS 将 inode 按 64
+            个一组分配，称为一个 inode 块。 inobt 的叶节点记录每个 inode
+            块的状态：块的起始位置和一个 64 位位图（Bitmap），指示哪些
+            inode 槽位已分配、哪些空闲。</p>
+            <p>从内核 3.16 起，XFS 引入了空闲 inode B+树（finobt，Free
+            Inode B+Tree）。 finobt 只索引那些至少有一个空闲槽位的 inode
+            块。 它的作用是加速 inode 分配：当需要分配新 inode
+            时，不必遍历整棵 inobt 去寻找有空闲槽位的块，直接查 finobt
+            即可。</p>
+            <h3 id="文件区段-b树">3.4 文件区段 B+树</h3>
+            <p>每个文件的区段映射（Extent Map）存储在 inode
+            的数据叉（Data Fork）中。 XFS
+            使用一种分层策略来管理区段映射：</p>
+            <p><strong>内联格式（Extent
+            List）</strong>。当文件的区段数量较少（通常 ≤ 19
+            个区段，取决于 inode 大小）时，区段记录直接存储在 inode
+            内部。 每条区段记录（Extent Record）占 128
+            位，格式如下：</p>
+            <pre class="text"><code>区段记录格式（128 位）：
+┌──────┬────────────────────┬────────────────────┬──────────────┐
+│ flag │  逻辑偏移（54位）   │  物理块号（52位）   │ 块数（21位） │
+│ 1位  │  文件内偏移         │  磁盘上的起始块     │ 区段长度     │
+└──────┴────────────────────┴────────────────────┴──────────────┘</code></pre>
+            <p>其中 flag 位标识该区段是否为「未写入」状态（Unwritten
+            Extent），用于预分配。</p>
+            <p><strong>B+树格式（BMap
+            B+Tree）</strong>。当文件的区段数量超过 inode
+            能容纳的上限时，XFS 将区段映射转换为 B+树。 B+树
+            的根节点存储在 inode 内部，叶节点存储在外部磁盘块上。
+            每个叶节点包含多条区段记录，以文件逻辑偏移为键排序。</p>
+            <p>这种设计使得小文件（只有几个区段）不需要额外的磁盘 I/O
+            来读取区段映射——一切都在 inode 内部完成。
+            而大文件（可能有数百万个区段）则能通过 B+树
+            高效索引，避免线性扫描。</p>
+            <h3 id="反向映射-b树">3.5 反向映射 B+树</h3>
+            <p>反向映射 B+树（Reverse Mapping B+Tree，rmapbt）是 XFS v5
+            格式引入的可选特性。
+            它记录的是物理块到所属者（Owner）的映射：给定一个物理块号，rmapbt
+            能告诉你这个块属于哪个文件的哪个偏移，或者属于哪个元数据结构。</p>
+            <p>rmapbt 的主要用途包括：</p>
+            <ul>
+            <li><strong>在线一致性检查</strong>：<code>xfs_scrub</code>
+            工具利用 rmapbt 交叉验证正向映射和反向映射是否一致。</li>
+            <li><strong>在线修复</strong>：如果正向映射损坏，可以从反向映射中重建。</li>
+            <li><strong>reflink 支持</strong>：reflink
+            操作需要知道一个物理块是否有多个引用者，rmapbt
+            提供了这一信息。</li>
+            </ul>
+            <p>启用 rmapbt 会增加约 1-2%
+            的空间开销和少量写入开销，但在数据保护方面的价值通常值得这个代价。</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 格式化时启用反向映射 B+树</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-m</span> rmapbt=1 /dev/sda1</span></code></pre></div>
+            <h3 id="引用计数-b树">3.6 引用计数 B+树</h3>
+            <p>引用计数 B+树（Reference Count B+Tree，refcntbt）用于支持
+            reflink 特性。 当多个文件共享同一物理区段时，refcntbt
+            记录每个共享区段的引用计数。 只有当引用计数降为 0
+            时，物理空间才会被真正释放。</p>
+            <p>refcntbt 的叶节点格式如下：</p>
+            <pre class="text"><code>refcntbt 叶节点记录：
+┌────────────────┬──────────────┬──────────────┐
+│ 起始物理块号    │ 块数          │ 引用计数      │
+└────────────────┴──────────────┴──────────────┘</code></pre>
+            <h2 id="四日志设计">四、日志设计</h2>
+            <h3 id="元数据日志的基本原理">4.1 元数据日志的基本原理</h3>
+            <p>XFS 使用预写日志（Write-Ahead
+            Log，WAL）来保证崩溃一致性（Crash Consistency）。
+            核心规则很简单：任何元数据修改，必须先写入日志，然后才能写入元数据的最终位置。
+            如果系统在中途崩溃，重新挂载时内核会重放（Replay）日志中的记录，将元数据恢复到一致状态。</p>
+            <p>XFS 默认只记录元数据的日志，不记录数据。这是
+            <code>ordered</code> 模式（也是 ext4 的默认模式）。
+            在这种模式下，内核保证：在元数据日志提交之前，相关的数据已经写入磁盘。
+            这样做的好处是避免了数据日志带来的写放大——对于大文件顺序写入场景，这一点尤为重要。</p>
+            <h3 id="日志结构">4.2 日志结构</h3>
+            <p>XFS 的日志由连续的日志记录（Log
+            Record）组成，每条日志记录包含一个或多个日志项（Log Item）。
+            日志记录的头部包含序列号（Log Sequence
+            Number，LSN），用于在恢复时确定记录的先后顺序。</p>
+            <p>日志是一个环形缓冲区（Circular
+            Buffer）。新的日志记录追加到尾部，已经提交并刷盘的记录可以被覆盖。
+            日志的头部位置（Head）和尾部位置（Tail）由超级块中的 LSN
+            字段追踪。</p>
+            <pre class="text"><code>日志环形缓冲区：
+
+        tail                    head
+         │                       │
+         ▼                       ▼
+┌────────┬───────┬───────┬───────┬────────┐
+│已释放  │ rec 5 │ rec 6 │ rec 7 │ 已释放  │
+│（可覆盖）│      │       │       │（可覆盖）│
+└────────┴───────┴───────┴───────┴────────┘</code></pre>
+            <h3 id="日志事务与预留">4.3 日志事务与预留</h3>
+            <p>XFS 的日志系统使用事务（Transaction）模型。
+            一个事务包含一组逻辑上相关的元数据修改，要么全部提交，要么全部回滚。
+            在事务开始前，XFS
+            会在日志中预留（Reserve）足够的空间，确保事务在写入过程中不会因为日志空间不足而失败。</p>
+            <p>预留机制的一个重要细节是：XFS 使用两阶段提交（Two-Phase
+            Commit）。 第一阶段将日志项写入内存中的日志缓冲区（In-Core
+            Log Buffer，iclog）。 第二阶段将 iclog
+            刷写到磁盘上的日志设备。</p>
+            <pre class="text"><code>事务提交流程：
+
+1. 事务开始 → 预留日志空间
+2. 修改内存中的元数据
+3. 将修改记录写入 iclog（内存）
+4. 事务提交 → iclog 标记为待刷写
+5. iclog 满或显式 fsync → 刷写到磁盘日志
+6. 日志落盘后 → 元数据可以写入最终位置
+7. 元数据落盘后 → 日志空间可回收</code></pre>
+            <h3 id="日志条带单元">4.4 日志条带单元</h3>
+            <p>在使用 RAID 阵列（RAID Array）时，XFS
+            允许将日志的写入粒度对齐到 RAID 条带单元大小（Log Stripe
+            Unit）。 这样可以避免日志写入跨越条带边界，减少 RAID
+            层面的读-改-写（Read-Modify-Write）操作。</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 格式化时指定日志条带单元，单位为字节</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-l</span> su=65536 /dev/sda1</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 挂载时指定日志写入大小</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> logbsize=256k /dev/sda1 /mnt/data</span></code></pre></div>
+            <p><code>logbsize</code>
+            挂载选项控制内存中日志缓冲区的大小。 较大的
+            <code>logbsize</code>
+            可以减少日志刷写的频率，但会增加崩溃后需要重放的数据量。
+            对于写入密集的工作负载，将 <code>logbsize</code> 设为 256k
+            通常是一个合理的起点。</p>
+            <h3 id="外部日志设备">4.5 外部日志设备</h3>
+            <p>XFS 支持将日志放置在独立的块设备上（External Log
+            Device），通常是一块高速 SSD 或 NVMe 设备。 这种配置将日志
+            I/O 和数据 I/O 分离到不同的设备上，避免两者之间的 I/O
+            竞争。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 格式化时指定外部日志设备</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-l</span> logdev=/dev/nvme0n1 /dev/sda1</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 挂载时指定外部日志设备</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> logdev=/dev/nvme0n1 /dev/sda1 /mnt/data</span></code></pre></div>
+            <p>外部日志设备在以下场景中特别有价值：</p>
+            <ul>
+            <li>数据设备是大容量 HDD 阵列，日志设备是低延迟 NVMe
+            SSD；</li>
+            <li>写入密集的数据库工作负载，日志提交延迟是关键瓶颈；</li>
+            <li>需要将日志写入与数据写入的磁盘寻道完全隔离。</li>
+            </ul>
+            <h3 id="日志大小规划">4.6 日志大小规划</h3>
+            <p>日志太小会导致事务频繁等待日志空间回收，影响写入吞吐量。
+            日志太大则浪费磁盘空间，并且崩溃恢复时间变长。</p>
+            <p><code>mkfs.xfs</code>
+            的默认日志大小已经针对卷大小做了合理计算。
+            如果需要手动调整，可以参考以下经验值：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>卷大小</th>
+            <th>推荐日志大小</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>&lt; 1 TiB</td>
+            <td>默认即可（通常 64-128 MiB）</td>
+            </tr>
+            <tr>
+            <td>1-10 TiB</td>
+            <td>128-512 MiB</td>
+            </tr>
+            <tr>
+            <td>&gt; 10 TiB</td>
+            <td>512 MiB - 2 GiB</td>
+            </tr>
+            </tbody>
+            </table>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动指定日志大小为 512 MiB</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-l</span> size=512m /dev/sda1</span></code></pre></div>
+            <h2 id="五延迟分配与预分配">五、延迟分配与预分配</h2>
+            <h3 id="延迟分配">5.1 延迟分配</h3>
+            <p>延迟分配（Delayed Allocation，delalloc）是 XFS
+            的一个关键性能优化。 当应用程序调用 <code>write()</code>
+            写入数据时，XFS 并不立即分配物理磁盘块。
+            相反，它只是在内存中记录「这段数据需要 N
+            个块」，并将数据暂存在页缓存（Page Cache）中。
+            真正的物理块分配推迟到数据实际刷写（Writeback）到磁盘时才执行。</p>
+            <p>这种设计有三个好处：</p>
+            <p><strong>减少碎片</strong>。延迟分配允许 XFS
+            在真正分配时看到完整的写入模式。
+            例如，应用程序可能通过多次小的 <code>write()</code>
+            调用写入一个大文件。 如果每次 <code>write()</code>
+            都立即分配，分配器只能看到每次请求的几个块，难以做出全局最优的分配决策。
+            延迟到 writeback
+            时，分配器能看到积累的全部待分配数据，从而分配更大的连续区段。</p>
+            <p><strong>减少元数据操作</strong>。多次小写入合并为一次大分配，减少了
+            B+树 的插入操作和日志写入。</p>
+            <p><strong>支持取消分配</strong>。如果数据在刷写前被删除或截断，就不需要分配和释放物理块，减少了不必要的
+            I/O。</p>
+            <h3 id="预分配机制">5.2 预分配机制</h3>
+            <p>XFS 的推测性预分配（Speculative
+            Preallocation）在延迟分配的基础上更进一步。
+            当文件正在增长时，XFS
+            会预测文件的最终大小，并提前预留比当前需要更多的空间。</p>
+            <p>预分配的大小策略定义在内核源码
+            <code>fs/xfs/xfs_iomap.c</code> 中。 简化后的逻辑如下：</p>
+            <pre class="text"><code>预分配大小计算（简化）：
+
+如果文件大小 &lt; 64 KiB：
+    预分配 = 文件当前大小的 2 倍
+如果文件大小在 64 KiB 到 1 GiB 之间：
+    预分配 = 逐步增加，最大到 64 MiB
+如果文件大小 &gt; 1 GiB：
+    预分配 = 64 MiB（默认上限）</code></pre>
+            <p>预分配的区段在 inode
+            中标记为「未写入」（Unwritten），这意味着：</p>
+            <ul>
+            <li>这些区段已经在磁盘上预留了物理空间；</li>
+            <li>如果读取这些区段，会返回零，不会泄露旧数据；</li>
+            <li>当应用程序真正写入这些区段时，只需要将「未写入」标记清除即可，不需要重新分配。</li>
+            </ul>
+            <h3 id="allocsize-挂载选项">5.3 allocsize 挂载选项</h3>
+            <p><code>allocsize</code> 挂载选项允许管理员覆盖 XFS
+            的默认预分配大小上限：</p>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置预分配大小上限为 1 GiB</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> allocsize=1g /dev/sda1 /mnt/data</span></code></pre></div>
+            <p>较大的 <code>allocsize</code> 适用于：</p>
+            <ul>
+            <li>已知文件最终会很大的场景（如视频录制、数据库表空间）；</li>
+            <li>追求最大顺序 I/O 性能的场景。</li>
+            </ul>
+            <p>较大的 <code>allocsize</code> 的代价：</p>
+            <ul>
+            <li>如果文件实际没有增长到预分配的大小，预留的空间会在文件关闭后释放，但在文件打开期间这些空间对其他文件不可用；</li>
+            <li>在存储空间紧张的系统上，过大的预分配可能导致空间提前耗尽的假象。</li>
+            </ul>
+            <p>从内核 4.13 起，XFS
+            的推测性预分配默认行为改为动态模式（Dynamic Speculative
+            Preallocation），自动根据文件增长模式调整预分配大小，大多数场景下不再需要手动设置
+            <code>allocsize</code>。</p>
+            <h3 id="fallocate-与显式预分配">5.4 fallocate
+            与显式预分配</h3>
+            <p>除了 XFS 的自动预分配之外，应用程序还可以通过
+            <code>fallocate()</code> 系统调用显式预分配空间：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;/mnt/data/bigfile&quot;</span><span class="op">,</span> O_WRONLY <span class="op">|</span> O_CREAT<span class="op">,</span> <span class="bn">0644</span><span class="op">);</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co">// 预分配 10 GiB 空间，不写入数据</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>fallocate<span class="op">(</span>fd<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">10</span><span class="bu">LL</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">);</span></span></code></pre></div>
+            <p><code>fallocate()</code> 在 XFS
+            上的实现非常高效：它直接操作区段
+            B+树，在元数据层面标记一段连续空间为「未写入」，不需要实际写入数据。
+            这在需要一次性预留大量空间的场景中（如数据库预扩展表空间文件）非常有用。</p>
+            <p>XFS 还支持 <code>fallocate()</code> 的
+            <code>FALLOC_FL_INSERT_RANGE</code> 和
+            <code>FALLOC_FL_COLLAPSE_RANGE</code>
+            标志，允许在文件中间插入或移除区段，无需复制数据。</p>
+            <h2 id="六reflink-与-cow">六、Reflink 与 CoW</h2>
+            <h3 id="reflink-的基本原理">6.1 Reflink 的基本原理</h3>
+            <p>引用链接（Reflink）是 XFS 从内核 4.9
+            开始支持的特性，允许多个文件共享同一物理数据块，而不需要实际复制数据。
+            这在概念上类似于硬链接（Hard Link），但硬链接共享的是
+            inode，而 reflink 共享的是数据区段。 两个通过 reflink
+            创建的文件拥有独立的 inode
+            和独立的元数据，只是它们的区段记录指向相同的物理块。</p>
+            <pre class="text"><code>reflink 文件共享示意：
+
+文件 A 的 inode              文件 B 的 inode
+├─ 区段 [0, 100) → 块 1000  ├─ 区段 [0, 100) → 块 1000  ← 共享
+├─ 区段 [100, 200) → 块 2000 ├─ 区段 [100, 200) → 块 2000 ← 共享
+└─ 区段 [200, 300) → 块 3000 └─ 区段 [200, 250) → 块 5000 ← 独立
+
+refcntbt 记录：
+  块 1000, 长度 100, 引用计数 = 2
+  块 2000, 长度 100, 引用计数 = 2
+  块 3000, 长度 100, 引用计数 = 1
+  块 5000, 长度 50,  引用计数 = 1</code></pre>
+            <h3 id="写时复制">6.2 写时复制</h3>
+            <p>当任何一方修改共享的数据块时，XFS
+            触发写时复制（Copy-on-Write，CoW）操作：</p>
+            <ol type="1">
+            <li>分配新的物理块；</li>
+            <li>将原始数据复制到新块中；</li>
+            <li>在新块上执行修改；</li>
+            <li>更新修改方的区段映射，指向新块；</li>
+            <li>将原始块的引用计数减 1。</li>
+            </ol>
+            <p>这个过程对应用程序完全透明。CoW
+            操作只发生在实际写入时，读取共享数据不会触发复制。</p>
+            <h3 id="cp-reflink">6.3 cp –reflink</h3>
+            <p>GNU coreutils 从 8.24 版本起支持 <code>--reflink</code>
+            选项，可以利用文件系统的 reflink
+            能力创建文件的即时副本：</p>
+            <div class="sourceCode" id="cb20"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 reflink 副本（接近瞬时完成）</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">--reflink</span><span class="op">=</span>always source.img dest.img</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 自动检测文件系统是否支持 reflink</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">--reflink</span><span class="op">=</span>auto source.img dest.img</span></code></pre></div>
+            <p>reflink 复制与普通复制的性能差异极其显著。 对于一个 100
+            GiB 的文件，普通 <code>cp</code> 需要数分钟完成数据复制。
+            <code>cp --reflink</code>
+            只需要复制元数据（区段映射和引用计数），通常在毫秒级别完成。</p>
+            <h3 id="使用-duperemove-进行去重">6.4 使用 duperemove
+            进行去重</h3>
+            <p><code>duperemove</code>
+            是一个用户态工具，能扫描文件系统中的重复数据块，并利用
+            reflink 将它们去重：</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 安装 duperemove</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="ex">yum</span> install duperemove  <span class="co"># RHEL/CentOS</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="ex">apt</span> install duperemove  <span class="co"># Debian/Ubuntu</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 扫描并去重指定目录</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="ex">duperemove</span> <span class="at">-dr</span> /mnt/data/vm-images/</span></code></pre></div>
+            <p><code>-d</code>
+            参数表示执行去重操作（不仅仅是扫描），<code>-r</code>
+            表示递归处理子目录。</p>
+            <p><code>duperemove</code> 的工作原理：</p>
+            <ol type="1">
+            <li>将文件分割为固定大小的块（默认 128 KiB）；</li>
+            <li>计算每个块的校验和（Hash）；</li>
+            <li>找到校验和相同的块对；</li>
+            <li>对校验和相同的块进行逐字节比较确认；</li>
+            <li>使用 <code>FIDEDUPERANGE</code> ioctl 调用让文件系统执行
+            reflink 去重。</li>
+            </ol>
+            <p>去重后，重复数据块只保留一份物理副本，多个文件通过
+            reflink 共享。 后续写入任何共享块时，CoW
+            机制自动保证数据独立性。</p>
+            <h3 id="reflink-与快照语义">6.5 Reflink 与快照语义</h3>
+            <p>reflink
+            可以实现文件级别的快照（Snapshot）语义，无需卷管理器（Volume
+            Manager）的支持。
+            对于虚拟机镜像管理、容器存储等场景，这种文件级快照非常实用：</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 为虚拟机磁盘创建快照</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">--reflink</span><span class="op">=</span>always vm-disk.qcow2 vm-disk-snap-<span class="va">$(</span><span class="fu">date</span> +%Y%m%d<span class="va">)</span>.qcow2</span></code></pre></div>
+            <p>与 LVM 快照（LVM Snapshot）相比，reflink
+            快照有以下优势：</p>
+            <ul>
+            <li>不需要预留快照空间；</li>
+            <li>快照数量不受 LVM 卷组限制；</li>
+            <li>每个快照都是普通文件，可以独立管理；</li>
+            <li>不会因为快照过多导致性能退化（LVM 快照的链式 CoW
+            会随快照数量增加而变慢）。</li>
+            </ul>
+            <h3 id="启用-reflink">6.6 启用 Reflink</h3>
+            <p>reflink 需要在 <code>mkfs.xfs</code> 格式化时启用。在
+            <code>xfsprogs</code> 4.17 及以后的版本中，reflink
+            默认启用。</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 显式启用 reflink（通常不需要，默认已启用）</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-m</span> reflink=1 /dev/sda1</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查现有文件系统是否启用了 reflink</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_info</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> reflink</span></code></pre></div>
+            <p>注意：reflink 与 DAX（Direct Access）模式不兼容。
+            如果需要在持久内存（Persistent Memory）设备上使用 DAX
+            模式，不能同时启用 reflink。</p>
+            <h2 id="七实时子卷realtime-subvolume">七、实时子卷（Realtime
+            Subvolume）</h2>
+            <h3 id="实时子卷的用途">7.1 实时子卷的用途</h3>
+            <p>实时子卷（Realtime Subvolume，RT）是 XFS 从 IRIX
+            时代继承的特性。
+            它允许将文件系统分为两个部分：常规数据区域和实时数据区域。
+            实时区域使用独立的存储设备（RT
+            Device），采用固定大小的区段分配策略，为对带宽（Bandwidth）有严格要求的工作负载提供可预测的
+            I/O 性能。</p>
+            <p>在 SGI 的原始应用场景中，RT
+            子卷用于影视后期的视频流采集和回放。
+            这类工作负载要求在指定时间窗口内完成固定量的
+            I/O，不允许因元数据操作或空间碎片导致的延迟毛刺。</p>
+            <h3 id="rt-子卷的工作方式">7.2 RT 子卷的工作方式</h3>
+            <p>RT 子卷的空间管理与常规数据区域不同：</p>
+            <ul>
+            <li>常规数据区域使用 B+树 管理可变大小的区段；</li>
+            <li>RT 区域使用位图（Bitmap）管理固定大小的区段。</li>
+            </ul>
+            <p>固定大小区段的好处是分配和释放都是 O(1)
+            操作，不涉及树的分裂或合并，延迟可预测。</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 格式化时指定 RT 设备和 RT 区段大小</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-r</span> rtdev=/dev/nvme1n1,extsize=1m /dev/sda1</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 挂载时指定 RT 设备</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> rtdev=/dev/nvme1n1 /dev/sda1 /mnt/data</span></code></pre></div>
+            <h3 id="将文件分配到-rt-子卷">7.3 将文件分配到 RT 子卷</h3>
+            <p>要将文件分配到 RT 子卷，需要在文件的 inode 标志中设置
+            <code>XFS_XFLAG_REALTIME</code>。 可以通过
+            <code>xfs_io</code> 工具完成：</p>
+            <div class="sourceCode" id="cb25"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建文件并标记为实时文件</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_io</span> <span class="at">-f</span> <span class="at">-c</span> <span class="st">&quot;chattr +rt&quot;</span> /mnt/data/video-stream.raw</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看文件的 RT 标志</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_io</span> <span class="at">-c</span> <span class="st">&quot;lsattr&quot;</span> /mnt/data/video-stream.raw</span></code></pre></div>
+            <p>也可以通过设置目录的继承属性（Inherit
+            Attribute），让该目录下新创建的文件自动分配到 RT 子卷：</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置目录的 RT 继承标志</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_io</span> <span class="at">-c</span> <span class="st">&quot;chattr +rt&quot;</span> /mnt/data/video/</span></code></pre></div>
+            <h3 id="rt-子卷的限制">7.4 RT 子卷的限制</h3>
+            <p>RT 子卷在 Linux 上的使用有一些限制需要注意：</p>
+            <ul>
+            <li>RT 子卷不支持 reflink；</li>
+            <li>RT 子卷的空间不会被 <code>df</code>
+            命令的常规输出反映，需要使用 <code>xfs_info</code>
+            查看；</li>
+            <li>RT 子卷上的文件不能跨区域引用常规数据区域的数据；</li>
+            <li>社区对 RT 子卷的测试和维护力度弱于常规数据区域。</li>
+            </ul>
+            <p>在现代 Linux 环境中，RT 子卷的使用场景已经比较小众。
+            大多数高带宽 I/O 需求可以通过 NVMe SSD、合理的预分配和 I/O
+            调度器调优来满足，不一定需要 RT 子卷。</p>
+            <h2 id="八xfs-诊断工具">八、XFS 诊断工具</h2>
+            <h3 id="xfs_info查看文件系统参数">8.1
+            xfs_info：查看文件系统参数</h3>
+            <p><code>xfs_info</code> 是最常用的 XFS
+            诊断工具，用于查看已挂载文件系统的格式化参数：</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_info</span> /mnt/data</span></code></pre></div>
+            <p>输出会显示块大小、AG 数量和大小、inode
+            大小、日志大小、是否启用了 reflink、rmapbt 等特性。
+            在排查问题时，<code>xfs_info</code>
+            通常是第一个要执行的命令。</p>
+            <h3 id="xfs_db低级元数据调试">8.2
+            xfs_db：低级元数据调试</h3>
+            <p><code>xfs_db</code> 是 XFS
+            的低级调试工具，可以直接读取和修改磁盘上的元数据结构。
+            它只能在未挂载的文件系统上使用（或以只读模式操作已挂载的文件系统）。</p>
+            <p>常见用法：</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 以只读模式打开文件系统</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span> <span class="at">-r</span> /dev/sda1</span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看超级块信息</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span><span class="op">&gt;</span> sb 0</span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span><span class="op">&gt;</span> p</span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 AG 0 的空闲空间头</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span><span class="op">&gt;</span> agf 0</span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span><span class="op">&gt;</span> p</span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看指定 inode 的信息</span></span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span><span class="op">&gt;</span> inode 131</span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span><span class="op">&gt;</span> p</span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-16"><a href="#cb28-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 inode 的区段映射</span></span>
+<span id="cb28-17"><a href="#cb28-17" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span><span class="op">&gt;</span> bmap</span></code></pre></div>
+            <p><code>xfs_db</code>
+            还可以用于统计文件系统的碎片程度：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 统计空闲空间碎片</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_db</span> <span class="at">-r</span> <span class="at">-c</span> <span class="st">&quot;frag -f&quot;</span> /dev/sda1</span></code></pre></div>
+            <h3 id="xfs_repair文件系统修复">8.3
+            xfs_repair：文件系统修复</h3>
+            <p><code>xfs_repair</code> 用于检查和修复不一致的 XFS
+            文件系统。它必须在文件系统未挂载的状态下运行。</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 标准修复</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_repair</span> /dev/sda1</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 仅检查，不修复</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_repair</span> <span class="at">-n</span> /dev/sda1</span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 如果日志损坏，先清零日志再修复</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_repair</span> <span class="at">-L</span> /dev/sda1</span></code></pre></div>
+            <p><code>xfs_repair</code> 的工作流程：</p>
+            <ol type="1">
+            <li><strong>阶段
+            1</strong>：读取并验证超级块。如果主超级块损坏，尝试从其他
+            AG 的副本恢复。</li>
+            <li><strong>阶段 2</strong>：扫描并验证所有 AG
+            的元数据结构——空闲空间 B+树、inode B+树等。</li>
+            <li><strong>阶段 3</strong>：扫描所有
+            inode，验证区段映射、目录结构。</li>
+            <li><strong>阶段 4</strong>：检查目录树的连通性，修复孤立
+            inode。</li>
+            <li><strong>阶段 5</strong>：重建 AG 级别的空闲空间
+            B+树。</li>
+            <li><strong>阶段 6</strong>：重建 AG 级别的 inode
+            B+树。</li>
+            <li><strong>阶段 7</strong>：最终验证和写回。</li>
+            </ol>
+            <p><code>-L</code>
+            参数（清零日志）应该作为最后手段使用。它会丢弃日志中未提交的事务，可能导致最近修改的元数据丢失。</p>
+            <h3 id="xfs_fsr在线碎片整理">8.4 xfs_fsr：在线碎片整理</h3>
+            <p><code>xfs_fsr</code>（XFS File System Reorganizer）是 XFS
+            的在线碎片整理（Online Defragmentation）工具。
+            它通过重新分配文件的物理区段来减少碎片，工作原理是：</p>
+            <ol type="1">
+            <li>创建一个临时文件；</li>
+            <li>将原文件的数据以连续方式写入临时文件；</li>
+            <li>交换原文件和临时文件的区段映射；</li>
+            <li>删除临时文件。</li>
+            </ol>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 对整个文件系统执行碎片整理</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_fsr</span> /mnt/data</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 只对指定文件执行碎片整理</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_fsr</span> /mnt/data/database/data.ibd</span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置碎片整理的运行时间限制（秒）</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_fsr</span> <span class="at">-t</span> 3600 /mnt/data</span></code></pre></div>
+            <p>检查文件的碎片程度：</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 filefrag 查看文件的区段分布</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">filefrag</span> <span class="at">-v</span> /mnt/data/database/data.ibd</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>Filesystem type is: 58465342
+File size of /mnt/data/database/data.ibd is 10737418240 (2621440 blocks of 4096 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..  524287:     262144..    786431: 524288:
+   1:   524288.. 1048575:    1048576..   1572863: 524288:    786432:
+   2:  1048576.. 1572863:    2097152..   2621439: 524288:   1572864:
+   3:  1572864.. 2097151:    3145728..   3670015: 524288:   2621440:
+   4:  2097152.. 2621439:    4194304..   4718591: 524288:   3670016: last,eof
+/mnt/data/database/data.ibd: 5 extents found</code></pre>
+            <p>5 个区段对于一个 10 GiB
+            的文件来说碎片程度极低，通常不需要整理。</p>
+            <h3 id="xfs_scrub在线一致性检查">8.5
+            xfs_scrub：在线一致性检查</h3>
+            <p><code>xfs_scrub</code> 是较新的工具（内核 4.15
+            起），可以在文件系统挂载状态下执行一致性检查：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 对已挂载的文件系统执行在线检查</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_scrub</span> /mnt/data</span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 检查并尝试自动修复</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_scrub</span> <span class="at">-y</span> /mnt/data</span></code></pre></div>
+            <p><code>xfs_scrub</code> 利用反向映射
+            B+树（rmapbt）交叉验证元数据的一致性。 因此，在启用了 rmapbt
+            的文件系统上，<code>xfs_scrub</code> 的检查能力更强。</p>
+            <h2 id="九xfs-性能调优">九、XFS 性能调优</h2>
+            <h3 id="mkfs.xfs-格式化参数">9.1 mkfs.xfs 格式化参数</h3>
+            <p>格式化参数在文件系统的整个生命周期中都无法更改，因此需要在格式化时仔细规划。</p>
+            <h4 id="块大小">块大小</h4>
+            <p>XFS 的默认块大小（Block Size）为 4096 字节，与大多数
+            Linux 发行版的页大小一致。
+            对于主要存储大文件的场景，可以考虑使用更大的块大小来减少元数据开销：</p>
+            <div class="sourceCode" id="cb35"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 64 KiB 块大小（仅适用于 64 KiB 页大小的内核，如 ARM64 某些配置）</span></span>
+<span id="cb35-2"><a href="#cb35-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-b</span> size=65536 /dev/sda1</span></code></pre></div>
+            <p>注意：块大小不能超过系统页大小。在 x86_64 的标准 4 KiB
+            页大小内核上，块大小最大为 4 KiB。</p>
+            <h4 id="inode-大小">Inode 大小</h4>
+            <p>XFS 的默认 inode 大小为 512 字节（ext4 为 256 字节）。
+            更大的 inode 可以存储更多的内联区段记录和扩展属性（Extended
+            Attribute），减少间接块的使用：</p>
+            <div class="sourceCode" id="cb36"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 1024 字节的 inode</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-i</span> size=1024 /dev/sda1</span></code></pre></div>
+            <p>对于扩展属性使用较多的场景（如
+            SELinux、ACL、Samba），较大的 inode 有助于将这些属性存储在
+            inode 内部，避免额外的磁盘 I/O。</p>
+            <h4 id="raid-对齐">RAID 对齐</h4>
+            <p>在 RAID 阵列上格式化 XFS 时，正确设置条带单元（Stripe
+            Unit）和条带宽度（Stripe Width）至关重要：</p>
+            <div class="sourceCode" id="cb37"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 假设 RAID 10 阵列：4 块盘，每块盘条带大小 64 KiB</span></span>
+<span id="cb37-2"><a href="#cb37-2" aria-hidden="true" tabindex="-1"></a><span class="co"># su = 条带单元大小，sw = 数据盘数量</span></span>
+<span id="cb37-3"><a href="#cb37-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-d</span> su=64k,sw=4 /dev/md0</span></code></pre></div>
+            <p><code>su</code>（Stripe Unit）是单块磁盘上的条带大小。
+            <code>sw</code>（Stripe
+            Width）是数据盘的数量（不含校验盘）。
+            正确设置这两个参数后，XFS
+            的空间分配器会尽量按条带宽度的倍数分配区段，最大化顺序 I/O
+            性能。</p>
+            <h4 id="目录块大小">目录块大小</h4>
+            <p>目录块大小（Directory Block Size）影响目录操作的性能。
+            默认值等于文件系统块大小。对于包含大量小文件的目录（如邮件服务器的
+            Maildir），可以增大目录块大小：</p>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置目录块大小为 64 KiB</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-n</span> size=65536 /dev/sda1</span></code></pre></div>
+            <h3 id="挂载选项调优">9.2 挂载选项调优</h3>
+            <h4 id="inode64">inode64</h4>
+            <p><code>inode64</code> 挂载选项允许 XFS 在整个卷的所有 AG
+            中分配 inode，而不是仅在卷的前 1 TiB 范围内。
+            在大容量卷上，这可以更好地利用所有 AG 的并行能力：</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> inode64 /dev/sda1 /mnt/data</span></code></pre></div>
+            <p>在 64 位系统上，<code>inode64</code> 从内核 3.7
+            起默认启用。 如果需要与某些 32 位 NFS 客户端兼容，可以使用
+            <code>inode32</code> 回退到旧行为。</p>
+            <h4 id="noatime-与-relatime">noatime 与 relatime</h4>
+            <p><code>noatime</code> 禁止更新文件的访问时间戳（Access
+            Time），减少不必要的元数据写入：</p>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime /dev/sda1 /mnt/data</span></code></pre></div>
+            <p><code>relatime</code>（Relative Access
+            Time）是一个折中方案：只有当访问时间早于修改时间时才更新。
+            大多数 Linux 发行版默认使用 <code>relatime</code>。
+            对于读密集的工作负载（如静态文件服务器），<code>noatime</code>
+            可以进一步减少 I/O。</p>
+            <h4 id="logbsize">logbsize</h4>
+            <p><code>logbsize</code>
+            控制内存中日志缓冲区的大小，影响日志写入效率：</p>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置日志缓冲区大小为 256 KiB</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> logbsize=256k /dev/sda1 /mnt/data</span></code></pre></div>
+            <p>合法值包括 32k、64k、128k、256k。
+            较大的值可以减少日志刷写次数，适合写入密集的工作负载。
+            如果文件系统使用了日志条带单元（<code>-l su=</code>），<code>logbsize</code>
+            必须是条带单元的整数倍。</p>
+            <h4 id="allocsize">allocsize</h4>
+            <p>前面在延迟分配章节已经讨论过。在内核 4.13
+            之前的版本上，对于大文件写入场景，显式设置
+            <code>allocsize</code> 可能有帮助：</p>
+            <div class="sourceCode" id="cb42"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb42-1"><a href="#cb42-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> allocsize=1g /dev/sda1 /mnt/data</span></code></pre></div>
+            <h3 id="数据库工作负载调优">9.3 数据库工作负载调优</h3>
+            <p>XFS
+            是许多数据库系统推荐的底层文件系统。以下是针对数据库工作负载的具体调优建议。</p>
+            <h4 id="mysql-innodb">MySQL / InnoDB</h4>
+            <p>InnoDB 使用大文件存储表空间数据，XFS
+            的大文件支持和预分配能力与 InnoDB 配合良好。</p>
+            <p>推荐配置：</p>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co"># mkfs 参数</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-f</span> <span class="at">-d</span> su=64k,sw=4 <span class="at">-l</span> su=64k,size=512m /dev/sda1</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="co"># mount 参数</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime,logbsize=256k,allocsize=64m /dev/sda1 /mnt/mysql</span></code></pre></div>
+            <p>InnoDB 的 <code>innodb_flush_method</code> 建议设为
+            <code>O_DIRECT</code>，绕过页缓存，避免双重缓冲。</p>
+            <h4 id="postgresql">PostgreSQL</h4>
+            <p>PostgreSQL 使用大量 8 KiB
+            的页文件，每个表和索引都对应一个或多个文件。</p>
+            <p>推荐配置：</p>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># mkfs 参数</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.xfs</span> <span class="at">-f</span> <span class="at">-d</span> su=64k,sw=4 /dev/sda1</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co"># mount 参数</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> noatime,logbsize=256k /dev/sda1 /mnt/pgdata</span></code></pre></div>
+            <p>PostgreSQL 的 <code>full_page_writes</code> 参数与 XFS
+            日志之间存在交互： XFS 的元数据日志不保护 PostgreSQL
+            的数据页，因此 <code>full_page_writes</code> 应保持为
+            <code>on</code>（默认值）。</p>
+            <h4 id="通用建议">通用建议</h4>
+            <ul>
+            <li>将 WAL 日志和数据文件放在不同的 XFS
+            文件系统上（如果使用不同的磁盘）；</li>
+            <li>使用 <code>nobarrier</code>
+            挂载选项时需要确认存储层有电池保护的写缓存（Battery-Backed
+            Write Cache，BBWC），否则会有数据丢失风险；</li>
+            <li>避免在数据库文件所在的文件系统上运行碎片整理。</li>
+            </ul>
+            <h3 id="io-调度器配合">9.4 I/O 调度器配合</h3>
+            <p>XFS 本身不涉及 I/O 调度，但正确选择 I/O 调度器（I/O
+            Scheduler）可以进一步提升性能。</p>
+            <p>对于 NVMe SSD，推荐使用
+            <code>none</code>（无调度器），因为 NVMe
+            设备有自己的硬件队列管理：</p>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> none <span class="op">&gt;</span> /sys/block/nvme0n1/queue/scheduler</span></code></pre></div>
+            <p>对于 HDD 或 SATA SSD，<code>mq-deadline</code>
+            通常是好的选择：</p>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> mq-deadline <span class="op">&gt;</span> /sys/block/sda/queue/scheduler</span></code></pre></div>
+            <h3 id="调优参数速查表">9.5 调优参数速查表</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>参数</th>
+            <th>作用</th>
+            <th>推荐值</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>mkfs -d su=X,sw=Y</code></td>
+            <td>RAID 条带对齐</td>
+            <td>与硬件一致</td>
+            <td>RAID 阵列</td>
+            </tr>
+            <tr>
+            <td><code>mkfs -l size=X</code></td>
+            <td>日志大小</td>
+            <td>128m-2g</td>
+            <td>写入密集</td>
+            </tr>
+            <tr>
+            <td><code>mkfs -i size=X</code></td>
+            <td>inode 大小</td>
+            <td>512（默认）</td>
+            <td>通常无需调整</td>
+            </tr>
+            <tr>
+            <td><code>mount -o noatime</code></td>
+            <td>禁用访问时间</td>
+            <td>启用</td>
+            <td>读密集</td>
+            </tr>
+            <tr>
+            <td><code>mount -o logbsize=X</code></td>
+            <td>日志缓冲区</td>
+            <td>256k</td>
+            <td>写入密集</td>
+            </tr>
+            <tr>
+            <td><code>mount -o allocsize=X</code></td>
+            <td>预分配上限</td>
+            <td>默认</td>
+            <td>大文件顺序写</td>
+            </tr>
+            <tr>
+            <td><code>mount -o inode64</code></td>
+            <td>64 位 inode</td>
+            <td>默认启用</td>
+            <td>大容量卷</td>
+            </tr>
+            </tbody>
+            </table>
+            <h2 id="十xfs-在生产环境">十、XFS 在生产环境</h2>
+            <h3 id="rhel-默认文件系统">10.1 RHEL 默认文件系统</h3>
+            <p>从 Red Hat Enterprise Linux 7 开始，XFS 取代 ext4
+            成为默认文件系统。 Red Hat
+            做出这一决定的理由在官方文档中有明确说明：</p>
+            <ul>
+            <li>XFS 在大容量卷和大文件场景下的性能和可扩展性优于
+            ext4；</li>
+            <li>XFS 在多核并发 I/O 场景下的表现更稳定；</li>
+            <li>Red Hat
+            的企业客户（数据库、虚拟化、大数据）更多地需要这些特性。</li>
+            </ul>
+            <p>RHEL 上的 XFS 最大支持卷大小为 500 TiB（受限于 Red Hat
+            的支持策略，而非文件系统本身的技术限制）。</p>
+            <p>SUSE Linux Enterprise Server（SLES）默认使用
+            Btrfs，但也完整支持 XFS。 Debian 和 Ubuntu 默认使用 ext4，但
+            XFS 在这些发行版上同样是一等公民。</p>
+            <h3 id="数据库工作负载">10.2 数据库工作负载</h3>
+            <p>XFS 是 MySQL、PostgreSQL、MongoDB、Cassandra
+            等主流数据库的推荐文件系统之一。</p>
+            <p>数据库工作负载对文件系统的核心需求包括：</p>
+            <ul>
+            <li><strong>大文件顺序
+            I/O</strong>：数据库的表空间文件通常在 GB 到 TB
+            级别，需要高效的顺序读写；</li>
+            <li><strong><code>fsync()</code>
+            延迟</strong>：事务提交的延迟直接取决于日志的
+            <code>fsync()</code> 延迟；</li>
+            <li><strong>并发写入</strong>：多个连接同时写入不同的表和索引；</li>
+            <li><strong>空间预分配</strong>：数据库倾向于提前分配表空间，避免运行时扩展文件的开销。</li>
+            </ul>
+            <p>XFS 在这四个维度上都有良好的表现。
+            特别是延迟分配和预分配机制，使得数据库文件的区段连续性通常优于
+            ext4。</p>
+            <h3 id="虚拟化与容器存储">10.3 虚拟化与容器存储</h3>
+            <p>在虚拟化环境中，XFS 的 reflink
+            能力为虚拟机镜像管理提供了有效支持。</p>
+            <p>典型用法：维护一个基础镜像（Golden Image），通过
+            <code>cp --reflink</code> 为每台虚拟机创建独立的磁盘文件。
+            这些文件在创建时几乎不占用额外空间，只有当虚拟机修改数据时才通过
+            CoW 分配新的物理块。</p>
+            <div class="sourceCode" id="cb47"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 基础镜像</span></span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a><span class="ex">/mnt/vm-pool/base-centos8.qcow2</span>   <span class="co"># 10 GiB</span></span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 为 50 台虚拟机创建 reflink 副本</span></span>
+<span id="cb47-5"><a href="#cb47-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 50<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb47-6"><a href="#cb47-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">cp</span> <span class="at">--reflink</span><span class="op">=</span>always base-centos8.qcow2 vm-<span class="va">${i}</span>.qcow2</span>
+<span id="cb47-7"><a href="#cb47-7" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+            <p>50 个 reflink 副本的元数据开销通常只有几
+            MiB，而普通复制需要 500 GiB 的磁盘空间。</p>
+            <p>在容器环境中，Podman 和 CRI-O 的 overlay
+            存储驱动（Overlay Storage Driver）在 XFS 上运行时可以利用
+            reflink 加速镜像层的复制操作。</p>
+            <h3 id="大规模部署经验">10.4 大规模部署经验</h3>
+            <h4 id="监控指标">监控指标</h4>
+            <p>在生产环境中运行 XFS 时，建议监控以下指标：</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co"># AG 级别的空闲空间统计</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_spaceman</span> <span class="at">-c</span> <span class="st">&quot;freesp -s&quot;</span> /mnt/data</span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 文件系统级别的计数器</span></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/xfs/sda1/stats/stats</span></code></pre></div>
+            <p><code>/sys/fs/xfs/&lt;device&gt;/stats/stats</code>
+            文件提供丰富的运行时统计信息，包括：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>指标</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>xs_write_calls</td>
+            <td>write 系统调用次数</td>
+            </tr>
+            <tr>
+            <td>xs_read_calls</td>
+            <td>read 系统调用次数</td>
+            </tr>
+            <tr>
+            <td>xs_log_writes</td>
+            <td>日志写入次数</td>
+            </tr>
+            <tr>
+            <td>xs_log_blocks</td>
+            <td>日志写入的块数</td>
+            </tr>
+            <tr>
+            <td>xs_iflush_count</td>
+            <td>inode 刷写次数</td>
+            </tr>
+            <tr>
+            <td>xs_abt_lookup</td>
+            <td>空闲空间 B+树 查找次数</td>
+            </tr>
+            <tr>
+            <td>xs_blk_alloc</td>
+            <td>块分配请求次数</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这些指标可以导入 Prometheus 或 Grafana 进行长期监控。</p>
+            <h4 id="容量规划">容量规划</h4>
+            <p>XFS 不支持在线缩容，因此容量规划需要前瞻性思考：</p>
+            <ul>
+            <li>预留至少 10-15%
+            的空闲空间，避免空间不足时的分配效率下降；</li>
+            <li>当使用率超过 85%
+            时，空闲区段的碎片化会加速，分配大段连续空间变得困难；</li>
+            <li>使用 <code>xfs_growfs</code>
+            可以在线扩容，前提是底层块设备支持扩容。</li>
+            </ul>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 在线扩容（底层设备已经扩容后）</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_growfs</span> /mnt/data</span></code></pre></div>
+            <h4 id="备份策略">备份策略</h4>
+            <p>XFS 提供专用的备份和恢复工具：</p>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 xfsdump 进行完整备份</span></span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfsdump</span> <span class="at">-l</span> 0 <span class="at">-f</span> /backup/full.dump /mnt/data</span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 xfsdump 进行增量备份（级别 1）</span></span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a><span class="ex">xfsdump</span> <span class="at">-l</span> 1 <span class="at">-f</span> /backup/incr.dump /mnt/data</span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 从备份恢复</span></span>
+<span id="cb50-8"><a href="#cb50-8" aria-hidden="true" tabindex="-1"></a><span class="ex">xfsrestore</span> <span class="at">-f</span> /backup/full.dump /mnt/restore</span></code></pre></div>
+            <p><code>xfsdump</code> 理解 XFS
+            的内部结构，能正确处理扩展属性、ACL 和多流数据叉。
+            相比通用的 <code>tar</code> 或
+            <code>rsync</code>，<code>xfsdump</code>
+            在备份和恢复大量文件时效率更高。</p>
+            <h3 id="xfs-与其他文件系统的选型">10.5 XFS
+            与其他文件系统的选型</h3>
+            <table>
+            <thead>
+            <tr>
+            <th>场景</th>
+            <th>推荐文件系统</th>
+            <th>理由</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>通用桌面</td>
+            <td>ext4</td>
+            <td>成熟稳定，工具链完善，支持在线缩容</td>
+            </tr>
+            <tr>
+            <td>大文件存储</td>
+            <td>XFS</td>
+            <td>大文件性能好，区段管理高效</td>
+            </tr>
+            <tr>
+            <td>数据库</td>
+            <td>XFS 或 ext4</td>
+            <td>两者都可以，XFS 在大文件和并发方面略优</td>
+            </tr>
+            <tr>
+            <td>需要文件级快照</td>
+            <td>XFS（reflink）</td>
+            <td>无需卷管理器，操作简单</td>
+            </tr>
+            <tr>
+            <td>需要数据校验和</td>
+            <td>Btrfs 或 ZFS</td>
+            <td>XFS 不提供数据校验和</td>
+            </tr>
+            <tr>
+            <td>需要在线缩容</td>
+            <td>ext4</td>
+            <td>XFS 不支持在线缩容</td>
+            </tr>
+            <tr>
+            <td>NFS 服务器</td>
+            <td>XFS</td>
+            <td>大容量、高并发场景下表现好</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="xfs-的演进方向">10.6 XFS 的演进方向</h3>
+            <p>XFS 社区在持续推进几个重要方向：</p>
+            <p><strong>在线修复</strong>（Online
+            Repair）。<code>xfs_scrub</code>
+            已经具备在线检查能力，社区正在开发在线修复功能，目标是在不卸载文件系统的情况下修复检测到的不一致。相关代码的主要维护者是
+            Darrick J. Wong。</p>
+            <p><strong>大区段计数</strong>（Large Extent
+            Counters）。传统 XFS inode 中的区段计数字段只有 31
+            位，限制了单个文件最多约 21 亿个区段。<code>nrext64</code>
+            特性将区段计数扩展到 64 位，消除了这一限制。该特性在内核
+            5.19 中合入。</p>
+            <p><strong>父指针</strong>（Parent Pointers）。为每个 inode
+            记录其父目录的信息，使 <code>xfs_repair</code>
+            能在不扫描整棵目录树的情况下重建目录结构。该特性在内核 6.7
+            中合入。</p>
+            <p><strong>原子文件交换</strong>（Atomic File
+            Swap）。支持两个文件的区段映射原子性交换，为应用程序提供安全的文件替换机制，避免数据丢失窗口。</p>
+            <h2 id="参考文献">参考文献</h2>
+            <h3 id="规范与设计文档">规范与设计文档</h3>
+            <ol type="1">
+            <li><p>XFS 官方文档，“XFS Filesystem Disk Structures”，<a
+            href="https://xfs.wiki.kernel.org/。XFS"
+            class="uri">https://xfs.wiki.kernel.org/。XFS</a>
+            磁盘格式的权威参考，详细描述了超级块、AG 结构、B+树
+            格式。</p></li>
+            <li><p>Linux 内核文档，“XFS Filesystem”，<a
+            href="https://docs.kernel.org/filesystems/xfs.html。包含挂载选项、sysfs"
+            class="uri">https://docs.kernel.org/filesystems/xfs.html。包含挂载选项、sysfs</a>
+            接口和管理操作的说明。</p></li>
+            <li><p>Adam Sweeney 等，“Scalability in the XFS File
+            System”，USENIX Annual Technical Conference，1996。XFS
+            的原始设计论文，阐述了 AG 并行设计和 B+树
+            元数据管理的动机与实现。</p></li>
+            </ol>
+            <h3 id="源码">源码</h3>
+            <ol start="4" type="1">
+            <li><p>Linux
+            内核源码，<code>fs/xfs/xfs_ialloc.c</code>：inode
+            分配器实现，包括 AG 选择逻辑。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_ialloc.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_ialloc.c</a>
+            查阅。</p></li>
+            <li><p>Linux 内核源码，<code>fs/xfs/xfs_iomap.c</code>：I/O
+            映射和预分配逻辑。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_iomap.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_iomap.c</a>
+            查阅。</p></li>
+            <li><p>Linux
+            内核源码，<code>fs/xfs/xfs_alloc.c</code>：空间分配器核心实现，包括
+            bnobt 和 cntbt 操作。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_alloc.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_alloc.c</a>
+            查阅。</p></li>
+            <li><p>Linux
+            内核源码，<code>fs/xfs/xfs_log.c</code>：日志子系统核心实现。可在
+            <a
+            href="https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_log.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_log.c</a>
+            查阅。</p></li>
+            <li><p>Linux
+            内核源码，<code>fs/xfs/xfs_reflink.c</code>：reflink 和 CoW
+            实现。可在 <a
+            href="https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_reflink.c"
+            class="uri">https://elixir.bootlin.com/linux/latest/source/fs/xfs/xfs_reflink.c</a>
+            查阅。</p></li>
+            </ol>
+            <h3 id="书籍与演讲">书籍与演讲</h3>
+            <ol start="9" type="1">
+            <li><p>Darrick J. Wong，“XFS: Recent and Future Adventures
+            in Filesystem Evolution”，Linux Plumbers
+            Conference，2019。介绍了 rmapbt、reflink
+            和在线修复的设计与进展。</p></li>
+            <li><p>Christoph Hellwig，“XFS: The Big Storage File System
+            for Linux”，Linux Foundation Collaboration
+            Summit，2012。概述了 XFS 在 Linux
+            上的架构和性能特性。</p></li>
+            <li><p>Red Hat，“Managing file systems”，RHEL 9
+            Documentation，<a
+            href="https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/managing_file_systems/。包含"
+            class="uri">https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/managing_file_systems/。包含</a>
+            XFS 的管理和调优建议。</p></li>
+            </ol>
+            <h3 id="工具">工具</h3>
+            <ol start="12" type="1">
+            <li><p>xfsprogs 项目，包含
+            <code>mkfs.xfs</code>、<code>xfs_info</code>、<code>xfs_db</code>、<code>xfs_repair</code>、<code>xfs_fsr</code>
+            等工具。源码仓库：<a
+            href="https://git.kernel.org/pub/scm/fs/xfs/xfsprogs-dev.git/"
+            class="uri">https://git.kernel.org/pub/scm/fs/xfs/xfsprogs-dev.git/</a></p></li>
+            <li><p>duperemove 项目，文件级去重工具，支持 XFS 和 Btrfs 的
+            reflink 去重。项目地址：<a
+            href="https://github.com/markfasheh/duperemove"
+            class="uri">https://github.com/markfasheh/duperemove</a></p></li>
+            <li><p>xfsdump 项目，XFS 专用的备份和恢复工具。源码仓库：<a
+            href="https://git.kernel.org/pub/scm/fs/xfs/xfsdump-dev.git/"
+            class="uri">https://git.kernel.org/pub/scm/fs/xfs/xfsdump-dev.git/</a></p></li>
+            </ol>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../14-ext4-architecture/ext4-architecture.html">ext4
+            架构与调优</a> <strong>下一篇</strong>: <a
+            href="../16-btrfs-cow/btrfs-cow.html">Btrfs：写时复制文件系统</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/75-small-file-problem/small-file-problem.html">【存储工程】小文件问题：为什么文件数量比文件大小更致命</a></h3>
+                    <p>系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-04-22 · storage</p>
+                    <h3><a href="/post/storage/index.html">存储工程索引</a></h3>
+                    <p>汇总本站存储工程系列文章，覆盖 HDD、SSD、NVMe、持久内存、索引结构、压缩、分布式存储与对象存储。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-28 · linux / storage</p>
+                    <h3><a href="/post/linux/fsync-error-truth/fsync-error-truth.html">fsync 失败的真相：当它返回错误，你的数据可能已经没了</a></h3>
+                    <p>fsync() 返回 EIO 后再调一次为什么会成功？为什么这反而是灾难？从 2018 fsyncgate 到 Linux errseq_t，再到本机内核 6.6 上用 dm-error 单块故障注入的实测，讲清 writeback 失败时脏页被标记 clean、数据静默丢失的真相，以及 PostgreSQL 为什么选择 PANIC。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/76-disk-full-behavior/disk-full-behavior.html">【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链</a></h3>
+                    <p>逐层拆解 ext4、XFS、Btrfs、ZFS 从 70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC 故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

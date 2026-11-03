@@ -1,0 +1,1218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】Buffer Manager：为什么 shared_buffers 不是越大越好 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL Buffer Manager
+的核心机制：shared_buffers 的内部组织（BufferDescriptors 数组、Buffer
+Table hash table、buffer pool）、Clock sweep
+替换算法的完整源码路径、buffer 四态状态机与 pin/unpin 协议、bgwriter
+的触发条件与脏页写入策略、BAS_BULKREAD/BAS_VACUUM ring buffer
+的缓存隔离机制。用 pg_buffercache 实验观察 buffer 分布和 clock sweep
+行为，解释为什么 shared_buffers 超过 8-10GB 后回报递减——double
+buffering、checkpoint IO 尖峰和 clock sweep 扫描延迟的三重反噬。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, buffer-manager, shared-buffers, clock-sweep, bgwriter, pg-buffercache, buffer-pool, ring-buffer, double-buffering, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/05-buffer-manager/05-buffer-manager.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】Buffer Manager：为什么 shared_buffers 不是越大越好" />
+    <meta property="og:description" content="拆解 PostgreSQL Buffer Manager 的核心机制：shared_buffers 的内部组织（BufferDescriptors 数组、Buffer Table hash table、buffer pool）、Clock sweep 替换算法的完整源码路径、buffer 四态状态机与 pin/unpin 协议、bgwriter 的触发条件与脏页写入策略、BAS_BULKREAD/BAS_VACUUM ring buffer 的缓存隔离机制。用 pg_buffercache 实验观察 buffer 分布和 clock sweep 行为，解释为什么 shared_buffers 超过 8-10GB 后回报递减——double buffering、checkpoint IO 尖峰和 clock sweep 扫描延迟的三重反噬。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/05-buffer-manager/05-buffer-manager.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="buffer-manager" />
+    <meta property="article:tag" content="shared-buffers" />
+    <meta property="article:tag" content="clock-sweep" />
+    <meta property="article:tag" content="bgwriter" />
+    <meta property="article:tag" content="pg-buffercache" />
+    <meta property="article:tag" content="buffer-pool" />
+    <meta property="article:tag" content="ring-buffer" />
+    <meta property="article:tag" content="double-buffering" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】Buffer Manager：为什么 shared_buffers 不是越大越好" />
+    <meta name="twitter:description" content="拆解 PostgreSQL Buffer Manager 的核心机制：shared_buffers 的内部组织（BufferDescriptors 数组、Buffer Table hash table、buffer pool）、Clock sweep 替换算法的完整源码路径、buffer 四态状态机与 pin/unpin 协议、bgwriter 的触发条件与脏页写入策略、BAS_BULKREAD/BAS_VACUUM ring buffer 的缓存隔离机制。用 pg_buffercache 实验观察 buffer 分布和 clock sweep 行为，解释为什么 shared_buffers 超过 8-10GB 后回报递减——double buffering、checkpoint IO 尖峰和 clock sweep 扫描延迟的三重反噬。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】Buffer Manager：为什么 shared_buffers 不是越大越好", "description": "拆解 PostgreSQL Buffer Manager 的核心机制：shared_buffers 的内部组织（BufferDescriptors 数组、Buffer Table hash table、buffer pool）、Clock sweep 替换算法的完整源码路径、buffer 四态状态机与 pin/unpin 协议、bgwriter 的触发条件与脏页写入策略、BAS_BULKREAD/BAS_VACUUM ring buffer 的缓存隔离机制。用 pg_buffercache 实验观察 buffer 分布和 clock sweep 行为，解释为什么 shared_buffers 超过 8-10GB 后回报递减——double buffering、checkpoint IO 尖峰和 clock sweep 扫描延迟的三重反噬。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/05-buffer-manager/05-buffer-manager.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "buffer-manager", "shared-buffers", "clock-sweep", "bgwriter", "pg-buffercache", "buffer-pool", "ring-buffer", "double-buffering"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】Buffer Manager：为什么 shared_buffers 不是越大越好</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#buffer-manager</span> <span>#shared-buffers</span> <span>#clock-sweep</span> <span>#bgwriter</span> <span>#pg-buffercache</span> <span>#buffer-pool</span> <span>#ring-buffer</span> <span>#double-buffering</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/buffer-manager.html">#buffer-manager</a><a class="chip-link" href="/tags/shared-buffers.html">#shared-buffers</a><a class="chip-link" href="/tags/clock-sweep.html">#clock-sweep</a><a class="chip-link" href="/tags/bgwriter.html">#bgwriter</a><a class="chip-link" href="/tags/pg-buffercache.html">#pg-buffercache</a><a class="chip-link" href="/tags/buffer-pool.html">#buffer-pool</a><a class="chip-link" href="/tags/ring-buffer.html">#ring-buffer</a><a class="chip-link" href="/tags/double-buffering.html">#double-buffering</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#buffer-manager为什么-shared_buffers-不是越大越好"
+                id="toc-buffer-manager为什么-shared_buffers-不是越大越好">Buffer
+                Manager：为什么 shared_buffers 不是越大越好</a>
+                <ul>
+                <li><a href="#一shared_buffers-的内部组织"
+                id="toc-一shared_buffers-的内部组织">一、shared_buffers
+                的内部组织</a>
+                <ul>
+                <li><a href="#三层结构" id="toc-三层结构">1.1
+                三层结构</a></li>
+                </ul></li>
+                <li><a href="#二buffer-访问协议readbuffer-的完整路径"
+                id="toc-二buffer-访问协议readbuffer-的完整路径">二、Buffer
+                访问协议：ReadBuffer 的完整路径</a>
+                <ul>
+                <li><a href="#核心接口" id="toc-核心接口">2.1
+                核心接口</a></li>
+                <li><a href="#buffer-content-lock"
+                id="toc-buffer-content-lock">2.4 Buffer Content
+                Lock</a></li>
+                </ul></li>
+                <li><a href="#三buffer-状态机"
+                id="toc-三buffer-状态机">三、Buffer 状态机</a>
+                <ul>
+                <li><a href="#关键监控指标" id="toc-关键监控指标">5.3
+                关键监控指标</a></li>
+                <li><a href="#ring-buffer-中的-clock-sweep"
+                id="toc-ring-buffer-中的-clock-sweep">6.3 Ring Buffer
+                中的 Clock Sweep</a></li>
+                <li><a href="#checkpoint-io-尖峰"
+                id="toc-checkpoint-io-尖峰">7.2 Checkpoint I/O
+                尖峰</a></li>
+                <li><a href="#clock-sweep-的扫描延迟"
+                id="toc-clock-sweep-的扫描延迟">7.3 Clock Sweep
+                的扫描延迟</a></li>
+                <li><a href="#调优原则" id="toc-调优原则">7.4
+                调优原则</a></li>
+                </ul></li>
+                <li><a href="#八实验用-pg_buffercache-观察-buffer-分布"
+                id="toc-八实验用-pg_buffercache-观察-buffer-分布">八、实验：用
+                pg_buffercache 观察 buffer 分布</a>
+                <ul>
+                <li><a href="#启用扩展" id="toc-启用扩展">8.1
+                启用扩展</a></li>
+                <li><a href="#观察-clock-sweep-行为"
+                id="toc-观察-clock-sweep-行为">8.4 观察 Clock Sweep
+                行为</a></li>
+                </ul></li>
+                <li><a href="#九运维要点与故障模式"
+                id="toc-九运维要点与故障模式">九、运维要点与故障模式</a>
+                <ul>
+                <li><a href="#bgwriter-跟不上脏页产生速度"
+                id="toc-bgwriter-跟不上脏页产生速度">9.1 bgwriter
+                跟不上脏页产生速度</a></li>
+                <li><a href="#大量-backend-等待-bufferpin"
+                id="toc-大量-backend-等待-bufferpin">9.2 大量 Backend
+                等待 BufferPin</a></li>
+                </ul></li>
+                <li><a href="#十关键要点"
+                id="toc-十关键要点">十、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#相关文章"
+                id="toc-相关文章">相关文章</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="buffer-manager为什么-shared_buffers-不是越大越好">Buffer
+            Manager：为什么 shared_buffers 不是越大越好</h1>
+            <p>你按照某篇博客的建议把 <code>shared_buffers</code> 从
+            128MB 调到了 32GB，重启之后
+            <code>EXPLAIN (ANALYZE, BUFFERS)</code> 里的
+            <code>shared hit</code> 确实多了——但 TPS
+            反而跌了，内存占满，OS 开始 swap。问题出在哪里？</p>
+            <p>答案是 <strong>double buffering</strong>：PG 的
+            <code>shared_buffers</code> 和 OS page cache
+            是两套独立的缓存系统，互不知道对方的存在。同一页 8KB
+            数据可能同时存在于 shared_buffers 和 OS page cache 中，占用
+            16KB 物理内存。当 shared_buffers 大到挤压 OS page cache
+            时，不仅浪费内存，还会因为 checkpoint 写脏页量增大、OS
+            预读效率下降而拖慢整体性能。</p>
+            <p>本文从源码路径拆解 Buffer Manager
+            的完整运作：shared_buffers 的三层组织结构、ReadBuffer
+            的访问协议和 pin/unpin 机制、Clock Sweep
+            替换算法的决策逻辑、bgwriter 的写入触发条件、以及批量扫描的
+            ring buffer 隔离策略。读完你就能用
+            <code>pg_buffercache</code> 观察 buffer 分布、理解
+            <code>EXPLAIN (BUFFERS)</code> 输出背后的 buffer
+            行为，为你的场景找到 shared_buffers 的合理取值。</p>
+            <hr />
+            <h2 id="一shared_buffers-的内部组织">一、shared_buffers
+            的内部组织</h2>
+            <h3 id="三层结构">1.1 三层结构</h3>
+            <p><code>shared_buffers</code> 在共享内存中被组织为三层，由
+            <code>InitBufferPool()</code>（<code>src/backend/storage/buffer/buf_init.c</code>）在
+            <code>CreateSharedMemoryAndSemaphores()</code>
+            中一次性分配：</p>
+            <pre class="text"><code>BufferDescriptors[N]     Buffer Pool (N x 8KB)      Buffer Strategy
+     ↓                         ↓                         ↓
+  [desc 0]  ──────────→  [page 0, 8KB]           StrategyControl
+  [desc 1]  ──────────→  [page 1, 8KB]           (nextVictimBuffer,
+  [desc 2]  ──────────→  [page 2, 8KB]             completePasses,
+   ...                                               统计字段)
+  [desc N-1] ──────────→ [page N-1, 8KB]
+```text
+
+其中 $N = \text{shared\_buffers} / 8\text{KB}$。如果你设了 1GB 的 shared_buffers，$N = 131072$ 个 slot。第 $i$ 个 descriptor 指向第 $i$ 个 8KB 数据块，两者一一对应。
+
+### 1.2 BufferDesc：一个 buffer 的完整元数据
+
+```c
+// src/include/storage/buf_internals.h
+typedef struct BufferDesc {
+    BufferTag       tag;                // buffer 中当前页面的标识
+    pg_atomic_uint32 state;             // 状态位（见 1.3 节）
+    int             buf_id;             // buffer 在数组中的索引 (0..N-1)
+    int             freeNext;           // 空闲链表指针（-1 表示不在链表中）
+    LWLock          content_lock;       // 页面内容的读写保护锁
+    int             wait_backend_pid;   // 正在等待该 buffer pin 的 Backend PID
+    int             refcount;           // 当前的 pin 数量
+    unsigned short  usage_count;        // Clock Sweep 使用的访问计数 (0-5)
+} BufferDesc;</code></pre>
+            <p><code>BufferTag</code> 是全局唯一页面标识：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/buf_internals.h</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> buftag <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    RelFileLocator  rlocator<span class="op">;</span>     <span class="co">// 表空间 OID + 数据库 OID + 关系 OID</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    ForkNumber      forkNum<span class="op">;</span>      <span class="co">// 哪个 fork：MAIN / FSM / VM / INIT</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    BlockNumber     blockNum<span class="op">;</span>     <span class="co">// 页面在文件中的块号</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> BufferTag<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>`ForkNumber` 区分同一个关系文件的不同分支：</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `MAIN_FORKNUM`：数据页</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `FSM_FORKNUM`：Free Space Map</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `VISIBILITYMAP_FORKNUM`：Visibility Map</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `INIT_FORKNUM`：unlogged 表的初始化 fork</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 1.3 state 字段的位域编码</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>`state` 字段用位域编码 buffer 的所有状态信息（`src<span class="op">/</span>include<span class="op">/</span>storage<span class="op">/</span>buf_internals<span class="op">.</span>h`）：</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 位域 <span class="op">|</span> 含义 <span class="op">|</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="op">|------|------|</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_LOCKED` <span class="op">|</span> buffer header 自旋锁，保护 tag 和 state 的修改 <span class="op">|</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_DIRTY` <span class="op">|</span> 页面已被修改，需要 bgwriter 或 checkpoint 写入磁盘 <span class="op">|</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_VALID` <span class="op">|</span> buffer 中包含有效数据（页面已从磁盘读出） <span class="op">|</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_TAG_VALID` <span class="op">|</span> tag 字段有效（buffer 已分配给某个页面） <span class="op">|</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_IO_IN_PROGRESS` <span class="op">|</span> 正在从磁盘读取该页面到 buffer 中 <span class="op">|</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_IO_ERROR` <span class="op">|</span> 上一次 I<span class="op">/</span>O 操作时发生错误 <span class="op">|</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_JUST_DIRTIED` <span class="op">|</span> 页面刚被标记为脏页，bgwriter 尚未注意到 <span class="op">|</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_PIN_COUNT_WAITER` <span class="op">|</span> 有其他 Backend 正在等待此 buffer 的 pin count 降到零 <span class="op">|</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_CHECKPOINT_NEEDED` <span class="op">|</span> 该 buffer 必须在下一个 checkpoint 写入磁盘 <span class="op">|</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> `BM_PERMANENT` <span class="op">|</span> buffer 不会被驱逐——用于 critical 操作 <span class="op">|</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>这些位域的组合构成了 buffer 的完整状态语义。例如 `BM_IO_IN_PROGRESS` 和 `BM_DIRTY` 在逻辑上互斥——一个正在从磁盘读入的页面不可能同时是脏页。状态转换通过原子 CAS 操作保护。</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 1.4 Buffer Table：从 BufferTag 到 buffer ID 的映射</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>Buffer Table 是一个共享内存中的 hash table（`src<span class="op">/</span>backend<span class="op">/</span>storage<span class="op">/</span>buffer<span class="op">/</span>buf_table<span class="op">.</span>c`），key 为 `BufferTag`，value 为 `buf_id`。它的存在让缓存查找变成 $O<span class="op">(</span><span class="dv">1</span><span class="op">)</span>$ 而非 $O<span class="op">(</span>N<span class="op">)</span>$：</span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a><span class="co">// 查找流程（简化）</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>BufferLookupEnt <span class="op">*</span>entry <span class="op">=</span> BufTableLookup<span class="op">(&amp;</span>tag<span class="op">,</span> <span class="op">&amp;</span>hashcode<span class="op">);</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>entry <span class="op">!=</span> NULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    buf_id <span class="op">=</span> entry<span class="op">-&gt;</span>id<span class="op">;</span>   <span class="co">// buffer 已在 shared_buffers 中</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// buffer 不在 shared_buffers 中，需要分配或替换一个 slot</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>为减少锁争用，Buffer Table
+            采用<strong>分区哈希</strong>：128 个 partition，每个
+            partition 有独立的 LWLock。查找时先计算 tag 的 hash、确定
+            partition、获取该 partition 的共享锁，再查 hash table。</p>
+            <hr />
+            <h2 id="二buffer-访问协议readbuffer-的完整路径">二、Buffer
+            访问协议：ReadBuffer 的完整路径</h2>
+            <h3 id="核心接口">2.1 核心接口</h3>
+            <p>所有对数据页的访问都经过一个核心接口：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/storage/bufmgr.h</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>Buffer ReadBuffer<span class="op">(</span>Relation reln<span class="op">,</span> BlockNumber blockNum<span class="op">);</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>Buffer ReadBufferExtended<span class="op">(</span>Relation reln<span class="op">,</span> ForkNumber forkNum<span class="op">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>                          BlockNumber blockNum<span class="op">,</span> ReadBufferMode mode<span class="op">,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>                          BufferAccessStrategy strategy<span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>`ReadBufferMode` 决定对目标页的预期操作：</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `RBM_NORMAL`：从磁盘读入（如不在 buffer pool 中），以 shared mode pin 住。</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `RBM_ZERO_AND_LOCK`：分配一个新页面，返回被 pin 且 content lock 为 exclusive 的 buffer——用于表文件扩展或索引分裂。</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `RBM_ZERO_AND_CLEANUP_LOCK`：类似上面，但使用 cleanup lock，用于 VACUUM 清除 dead tuples。</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>`strategy` 是可选的 `BufferAccessStrategy`，用于批量扫描的 ring buffer 保护（第六节）。</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 2.2 ReadBuffer 的完整调用链</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>ReadBuffer<span class="op">(</span>relation<span class="op">,</span> blockNum<span class="op">)</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>  → ReadBuffer_common<span class="op">(</span>relation<span class="op">,</span> MAIN_FORKNUM<span class="op">,</span> blockNum<span class="op">,</span> RBM_NORMAL<span class="op">,</span> NULL<span class="op">,</span> <span class="op">&amp;</span>hit<span class="op">)</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    → 构造 BufferTag <span class="op">(</span>rlocator<span class="op">,</span> forkNum<span class="op">,</span> blockNum<span class="op">)</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    → BufTableLookup<span class="op">(&amp;</span>tag<span class="op">)</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>      ├─ 找到 → PinBuffer<span class="op">(</span>buf<span class="op">,</span> strategy<span class="op">)</span> → 返回 Buffer</span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>      └─ 未找到 → BufferAlloc<span class="op">(</span>smgr<span class="op">,</span> <span class="op">...,</span> <span class="op">&amp;</span>tag<span class="op">,</span> strategy<span class="op">)</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>                    → StrategyGetBuffer<span class="op">(</span>strategy<span class="op">)</span>  <span class="co">// 执行 Clock Sweep</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>                    → 如果 buffer 脏 → FlushBuffer<span class="op">()</span> 写回</span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>                    → 设置 tag 为新页</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>                    → smgrread<span class="op">()</span> 从磁盘读入</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>                    → 清除 BM_IO_IN_PROGRESS，设置 BM_VALID</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>                    → PinBuffer<span class="op">()</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>                    → 返回 Buffer</span></code></pre></div>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/buffer/bufmgr.c, ReadBuffer_common()</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 核心逻辑（简化）</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> Buffer ReadBuffer_common<span class="op">(</span>SMgrRelation smgr<span class="op">,</span> <span class="op">...,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>                                BlockNumber blockNum<span class="op">,</span> ReadBufferMode mode<span class="op">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>                                BufferAccessStrategy strategy<span class="op">,</span> <span class="dt">bool</span> <span class="op">*</span>hit<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    BufferTag tag<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    InitBufferTag<span class="op">(&amp;</span>tag<span class="op">,</span> <span class="op">&amp;</span>smgr<span class="op">-&gt;</span>smgr_rlocator<span class="op">.</span>locator<span class="op">,</span> forkNum<span class="op">,</span> blockNum<span class="op">);</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    buf_id <span class="op">=</span> BufTableLookup<span class="op">(&amp;</span>tag<span class="op">,</span> <span class="op">&amp;</span>hashcode<span class="op">);</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>buf_id <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 命中：pin 并返回</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>hit <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        buf <span class="op">=</span> PinBuffer<span class="op">(</span>bufDesc<span class="op">,</span> strategy<span class="op">);</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> BufferDescriptorGetBuffer<span class="op">(</span>bufDesc<span class="op">);</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 未命中：分配新 slot</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>hit <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>    buf <span class="op">=</span> BufferAlloc<span class="op">(</span>smgr<span class="op">,</span> <span class="op">...,</span> <span class="op">&amp;</span>tag<span class="op">,</span> blockNum<span class="op">,</span> strategy<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> buf<span class="op">;</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>`Buffer` 类型实际是 `int`，值为 `buf_id <span class="op">+</span> <span class="dv">1</span>`。设计为 non<span class="op">-</span>zero 值避免与 `InvalidBuffer <span class="op">=</span> <span class="dv">0</span>` 混淆。</span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 2.3 Pin 和 Unpin</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>Pin 机制是 Buffer Manager 最基本的协议——标记<span class="st">&quot;有人在用这个 buffer&quot;</span>，禁止 Clock Sweep 偷走它：</span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/buffer/bufmgr.c</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a><span class="co">// Pin：增加 refcount</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> PinBuffer<span class="op">(</span>BufferDesc <span class="op">*</span>buf<span class="op">,</span> BufferAccessStrategy strategy<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">-&gt;</span>refcount<span class="op">++;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>strategy <span class="op">==</span> NULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 普通访问：递增 usage_count（上限 5）</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>buf<span class="op">-&gt;</span>usage_count <span class="op">&lt;</span> BM_MAX_USAGE_COUNT<span class="op">)</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>            buf<span class="op">-&gt;</span>usage_count<span class="op">++;</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 有 strategy 时走 ring buffer 逻辑（第六节）</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a><span class="co">// Unpin：减少 refcount</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> UnpinBuffer<span class="op">(</span>BufferDesc <span class="op">*</span>buf<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>    Assert<span class="op">(</span>buf<span class="op">-&gt;</span>refcount <span class="op">&gt;</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">-&gt;</span>refcount<span class="op">--;</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>buf<span class="op">-&gt;</span>refcount <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 如果有等待者（BM_PIN_COUNT_WAITER），唤醒之</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>pg_atomic_read_u32<span class="op">(&amp;</span>buf<span class="op">-&gt;</span>state<span class="op">)</span> <span class="op">&amp;</span> BM_PIN_COUNT_WAITER<span class="op">)</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>            SignalBufferWaiter<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p>关键规则：</p>
+            <ol type="1">
+            <li>每次 <code>ReadBuffer</code> 返回的 buffer 都有 refcount
+            = 1，用完必须调用 <code>ReleaseBuffer()</code>（内部调用
+            <code>UnpinBuffer</code>）。忘 unpin 的 buffer 永久占用
+            slot，最终导致
+            <code>ERROR: no unpinned buffers available</code>。</li>
+            <li>同一个 Backend 可以对同一 buffer 多次 pin（refcount
+            可大于 1），但必须等量的 unpin 才能释放。</li>
+            <li>refcount &gt; 0 的 buffer <strong>永远不被 Clock Sweep
+            选中</strong>——它被保护在 buffer pool 中。</li>
+            </ol>
+            <h3 id="buffer-content-lock">2.4 Buffer Content Lock</h3>
+            <p>Pin 表达”我正在使用”，不提供读写互斥。保护页面内容的是
+            <code>content_lock</code>（一个 LWLock）：</p>
+            <ul>
+            <li>读取页面：<code>LWLockAcquire(buf-&gt;content_lock, LW_SHARED)</code></li>
+            <li>修改页面：<code>LWLockAcquire(buf-&gt;content_lock, LW_EXCLUSIVE)</code></li>
+            </ul>
+            <p><code>ReadBuffer</code> 返回后，<code>content_lock</code>
+            以 shared 模式持有。调用者如需修改页面内容，需显式调用
+            <code>LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE)</code>
+            升级为独占锁。</p>
+            <hr />
+            <h2 id="三buffer-状态机">三、Buffer 状态机</h2>
+            <p>一个 buffer 在其生命周期中经历四种逻辑状态，由
+            <code>state</code> 字段的 flag 组合决定：</p>
+            <pre class="mermaid"><code>stateDiagram-v2
+    direction LR
+    [*] --&gt; Unused : 初始化
+    Unused --&gt; Pinned_Clean : ReadBuffer() 命中或载入
+    Pinned_Clean --&gt; Pinned_Dirty : 写入数据
+    Pinned_Dirty --&gt; Unpinned_Dirty : Unpin, refcount=0
+    Pinned_Clean --&gt; Unpinned_Clean : Unpin, refcount=0
+    Unpinned_Dirty --&gt; Pinned_Clean : bgwriter 刷盘后
+    Unpinned_Dirty --&gt; Pinned_Dirty : 再次 pin
+    Unpinned_Clean --&gt; Pinned_Clean : 再次 pin
+    Unpinned_Clean --&gt; Unused : Clock Sweep 回收 (无需刷盘)
+    Unpinned_Dirty --&gt; Unused : Clock Sweep 回收 (先刷盘)
+```text
+
+四种状态：
+
+| 状态 | refcount | BM_DIRTY | 含义 |
+|------|----------|----------|------|
+| **Unused** | 0 | 0 | 空 buffer，`BM_TAG_VALID` 未设置。初始状态或刚被回收 |
+| **Unpinned Clean** | 0 | 0 | 包含有效页面，与磁盘一致，无人在用。最便宜的回收目标 |
+| **Unpinned Dirty** | 0 | 1 | 包含有效页面，已被修改但未刷盘。回收前必先写盘 |
+| **Pinned (Clean/Dirty)** | $&gt;$ 0 | 0/1 | 有人正在使用，不可回收 |
+
+`BM_DIRTY` 的置位发生在 Backend 修改页面内容后、调用 `MarkBufferDirty()` 时。此时 PG 不会立刻写盘，而是等待 bgwriter 或 checkpoint 处理该页。
+
+---
+
+## 四、Clock Sweep 替换算法
+
+### 4.1 为什么是 Clock Sweep
+
+当 `ReadBuffer` 请求的页面不在 shared_buffers 中时，BufferAlloc 必须找一个可驱逐的 buffer slot。可驱逐意味着 refcount == 0 且 usage_count == 0。
+
+PG 选择 Clock Sweep 而非纯 LRU（双向链表），原因很具体：纯 LRU 每次访问都要移动链表节点，在高并发下锁争用严重。Clock Sweep 只需要递增一个全局指针和递减一个计数器，大部分扫描无需持锁——只在最终选中目标时才做一次 CAS。
+
+### 4.2 usage_count：页面的&quot;温度&quot;
+
+每个 buffer 有一个 `usage_count` 字段（0-5，`BM_MAX_USAGE_COUNT = 5`）。它的语义类似于操作系统的页面引用位：
+
+- 每当一个页面被 pin（被访问），`usage_count` 加 1（上限 5）。
+- 当 Clock Sweep 指针经过一个 buffer 时，`usage_count` 减 1——减到 0 表示这个 buffer 已经&quot;冷&quot;了，可被回收。
+
+注意：不是每次 unpin 都更新 usage_count。递增逻辑在 `PinBuffer()` 中，且如果调用者使用了 `BAS_BULKREAD` 策略，usage_count **不递增**（第六节解释原因）。
+
+### 4.3 StrategyControl 与 StrategyGetBuffer
+
+```c
+// src/backend/storage/buffer/freelist.c
+typedef struct {
+    int         nextVictimBuffer;    // 时钟指针——下一次扫描的起始 buffer ID
+    int         firstFreeBuffer;     // 空闲链表头（-1 表示链表为空）
+    int         lastFreeBuffer;      // 空闲链表尾
+    uint32      completePasses;      // 完成的完整扫描次数（统计用）
+    pg_atomic_uint32 numBufferAllocs; // 累计 buffer 分配次数
+} BufferStrategyControl;
+
+static BufferStrategyControl *StrategyControl;</code></pre>
+            <p><code>nextVictimBuffer</code> 是时钟指针——一个递增的
+            <code>int</code>，在 <code>[0, NBuffers-1]</code>
+            范围内循环：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/buffer/freelist.c, StrategyGetBuffer()</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Clock Sweep 的核心——寻找一个可回收的 buffer</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>BufferDesc <span class="op">*</span>StrategyGetBuffer<span class="op">(</span>BufferAccessStrategy strategy<span class="op">,</span> <span class="dt">int</span> <span class="op">*</span>buf_state<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 如果 strategy 有自己的 ring buffer，先尝试从那里获取</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>strategy <span class="op">!=</span> NULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>        buf <span class="op">=</span> GetBufferFromRing<span class="op">(</span>strategy<span class="op">);</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>buf <span class="op">!=</span> NULL<span class="op">)</span> <span class="cf">return</span> buf<span class="op">;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 尝试全局空闲链表</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    buf <span class="op">=</span> GetFreeBuffer<span class="op">();</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>buf <span class="op">!=</span> NULL<span class="op">)</span> <span class="cf">return</span> buf<span class="op">;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. Clock Sweep：从 nextVictimBuffer 开始扫描</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>        buf <span class="op">=</span> GetBufferDescriptor<span class="op">(</span>StrategyControl<span class="op">-&gt;</span>nextVictimBuffer<span class="op">);</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 推进时钟指针（到达末尾绕回 0）</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        StrategyControl<span class="op">-&gt;</span>nextVictimBuffer<span class="op">++;</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>StrategyControl<span class="op">-&gt;</span>nextVictimBuffer <span class="op">&gt;=</span> NBuffers<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>            StrategyControl<span class="op">-&gt;</span>nextVictimBuffer <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>            StrategyControl<span class="op">-&gt;</span>completePasses<span class="op">++;</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 检查是否可用</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>        state <span class="op">=</span> pg_atomic_read_u32<span class="op">(&amp;</span>buf<span class="op">-&gt;</span>state<span class="op">);</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">((</span>state <span class="op">&amp;</span> BM_LOCKED<span class="op">)</span> <span class="op">||</span> buf<span class="op">-&gt;</span>refcount <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span>  <span class="co">// 被锁或有人用——跳过</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>buf<span class="op">-&gt;</span>usage_count <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>            buf<span class="op">-&gt;</span>usage_count<span class="op">--;</span>   <span class="co">// 第二次机会——降温</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>        <span class="co">// usage_count == 0 且 refcount == 0：可以回收</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>pg_atomic_compare_exchange_u32<span class="op">(&amp;</span>buf<span class="op">-&gt;</span>state<span class="op">,</span> <span class="op">&amp;</span>state<span class="op">,</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>                                           state <span class="op">|</span> BM_LOCKED<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>buf_state <span class="op">=</span> state<span class="op">;</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> buf<span class="op">;</span>  <span class="co">// 找到一个可回收 buffer</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>        <span class="co">// CAS 失败——被其他 Backend 抢先了，继续扫描</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.4 性能特点</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> <span class="op">**</span>无锁扫描<span class="op">**</span>：大多数 buffer 在扫描时不会被锁——只有命中可回收 buffer 时才做 CAS 获取 `BM_LOCKED`。被锁或 refcount <span class="op">&gt;</span> <span class="dv">0</span> 的 buffer 直接跳过。</span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> <span class="op">**</span>摊销 $O<span class="op">(</span><span class="dv">1</span><span class="op">)</span>$<span class="op">**</span>：虽然单次 sweep 可能遍历多个 buffer，但指针不回溯。在正常负载下平均遍历十几个 buffer 就能找到目标。</span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> <span class="op">**</span>退化场景<span class="op">**</span>：当几乎所有 buffer 的 usage_count 都很高且 refcount <span class="op">&gt;</span> <span class="dv">0</span> 时（例如大量 Backend 同时 pin 了很多页），sweep 可能遍历大半圈。`completePasses` 的激增就是这个退化信号。</span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.5 与其他替换算法的对比</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 算法 <span class="op">|</span> 多进程友好度 <span class="op">|</span> 命中率 <span class="op">|</span> 实现复杂度 <span class="op">|</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a><span class="op">|------|-------------|--------|-----------|</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> <span class="op">**</span>Clock Sweep <span class="op">(</span>PG<span class="op">)**</span> <span class="op">|</span> 极好（无锁扫描） <span class="op">|</span> 接近 LRU <span class="op">|</span> 低 <span class="op">|</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 纯 LRU（双向链表） <span class="op">|</span> 差（每次访问需移链表节点） <span class="op">|</span> 理论最优 <span class="op">|</span> 中 <span class="op">|</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> LFU <span class="op">|</span> 中等 <span class="op">|</span> 对低频扫描友好 <span class="op">|</span> 中 <span class="op">|</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> ARC（自适应） <span class="op">|</span> 差（复杂状态机） <span class="op">|</span> 较好 <span class="op">|</span> 高 <span class="op">|</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>PG 选择 Clock Sweep 是在高并发环境下用<span class="st">&quot;略低于最优的命中率&quot;</span>换<span class="st">&quot;每次访问几乎零争用&quot;</span>。</span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 五、bgwriter：后台写入器</span></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 5.1 bgwriter 的角色</span></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a>bgwriter（Background Writer）是 PG 中唯一负责<span class="st">&quot;定期将 shared_buffers 脏页写到磁盘&quot;</span>的进程。它存在的原因很简单：<span class="op">**</span>Backend 的时间应该花在执行查询上，而不是做 `write<span class="op">()</span>`<span class="op">**</span>。</span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>当一个 Backend 修改了页面内容后，它只调用 `MarkBufferDirty<span class="op">()</span>` 设置 `BM_DIRTY` 位。实际的写入由两个进程分工：</span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>bgwriter<span class="op">**</span>：定期扫描 shared_buffers，将脏页写到 OS（`write<span class="op">()</span>`，不 `fsync<span class="op">()</span>`）。</span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>checkpointer<span class="op">**</span>：在 checkpoint 时确保所有在 checkpoint 开始前被标记为脏的页面已 `fsync<span class="op">()</span>` 到磁盘。</span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 5.2 触发条件与写入策略</span></span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a>bgwriter 的主循环在 `src<span class="op">/</span>backend<span class="op">/</span>postmaster<span class="op">/</span>bgwriter<span class="op">.</span>c` 的 `BackgroundWriterMain<span class="op">()</span>` 中，核心策略函数 `BgBufferSync<span class="op">()</span>` 在 `src<span class="op">/</span>backend<span class="op">/</span>storage<span class="op">/</span>buffer<span class="op">/</span>bufmgr<span class="op">.</span>c`：</span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a><span class="co">// BgBufferSync() 的简化逻辑</span></span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>recent_alloc <span class="op">=</span> 最近几轮平均每次分配的新 buffer 数量；</span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>scan_target  <span class="op">=</span> recent_alloc <span class="op">*</span> bgwriter_lru_multiplier<span class="op">;</span></span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>scan_target <span class="op">&gt;</span> bgwriter_lru_maxpages<span class="op">)</span></span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>    scan_target <span class="op">=</span> bgwriter_lru_maxpages<span class="op">;</span></span>
+<span id="cb6-85"><a href="#cb6-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-86"><a href="#cb6-86" aria-hidden="true" tabindex="-1"></a><span class="co">// 从 StrategyControl-&gt;nextVictimBuffer 开始扫描 scan_target 个 buffer</span></span>
+<span id="cb6-87"><a href="#cb6-87" aria-hidden="true" tabindex="-1"></a><span class="co">// 将遇到的脏页 (BM_DIRTY set) 刷入磁盘</span></span></code></pre></div>
+            <p>关键 GUC：</p>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 26%" />
+            <col style="width: 42%" />
+            <col style="width: 31%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>GUC</th>
+            <th>默认值</th>
+            <th>含义</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>bgwriter_delay</code></td>
+            <td>200ms</td>
+            <td>bgwriter 每轮扫描之间的休眠时间</td>
+            </tr>
+            <tr>
+            <td><code>bgwriter_lru_maxpages</code></td>
+            <td>100</td>
+            <td>每轮最多刷多少个脏页</td>
+            </tr>
+            <tr>
+            <td><code>bgwriter_lru_multiplier</code></td>
+            <td>2.0</td>
+            <td>根据最近分配 buffer 速率，决定本轮扫描强度</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>bgwriter 不是逐出算法——它只把脏页写盘，不改变 buffer 的
+            tag 或状态。buffer 的回收仍然由 Clock Sweep 负责。bgwriter
+            的作用是确保 Clock Sweep 在需要回收一个 dirty buffer
+            时不需要等待磁盘 I/O。</p>
+            <h3 id="关键监控指标">5.3 关键监控指标</h3>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> buffers_checkpoint,   <span class="co">-- checkpoint 期间写了多少个 buffer</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>       buffers_clean,         <span class="co">-- bgwriter 的增量写入量</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>       maxwritten_clean,      <span class="co">-- bgwriter 达到 maxpages 上限的次数</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>       buffers_backend,       <span class="co">-- Backend 被迫自己写脏页的次数</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>       buffers_backend_fsync, <span class="co">-- Backend 被迫自己 fsync 的次数</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>       buffers_alloc          <span class="co">-- 已分配 buffer 的累计次数</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_bgwriter;</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>`buffers_backend` 是最需要关注的指标——如果这个值持续增长，说明 bgwriter 跟不上 dirty buffer 产生速度，Backend 在 `BufferAlloc()` 中被迫自己写盘。这通常是 `bgwriter_lru_maxpages` 设太小或磁盘 I<span class="op">/</span>O 能力不足的信号。</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>## 六、Buffer <span class="kw">Access</span> Strategy：Ring Buffer 隔离</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>### <span class="fl">6.1</span> 问题：Seq <span class="kw">Scan</span> 污染 buffer pool</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>一个 `SELECT <span class="op">*</span> <span class="kw">FROM</span> big_table` 的顺序扫描会依次读取表中每一页。如果表是 <span class="dv">100</span>GB 而 shared_buffers 只有 <span class="dv">8</span>GB，一次全表扫描就能把所有热页驱逐出去，换上 big_table 的页面——这些页面读完之后很可能再也不会被用到。这就是 <span class="op">**</span>buffer pool 污染<span class="op">**</span>。</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>PG 的防御机制是 <span class="op">**</span>Buffer <span class="kw">Access</span> Strategy <span class="kw">with</span> Ring Buffer<span class="op">**</span>：为批量扫描操作分配一个小的环形缓冲区，限制它们能使用的 buffer slot 数量，隔离整个 buffer pool 不受影响。</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>### <span class="fl">6.2</span> 环形缓冲区的设计与三种策略</span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> src<span class="op">/</span>include<span class="op">/</span><span class="kw">storage</span><span class="op">/</span><span class="kw">freelist</span>.h</span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>typedef struct BufferAccessStrategyData {</span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    BufferAccessStrategyType btype;  <span class="op">//</span> 策略类型</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         ring_size;           <span class="op">//</span> 环形缓冲区大小（buffer 个数）</span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>         <span class="kw">current</span>;             <span class="op">//</span> 当前在环形缓冲区中的位置</span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    bool        current_was_in_ring;</span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    Buffer      buffers[FLEXIBLE_ARRAY_MEMBER];  <span class="op">//</span> 环形缓冲区中的 buffer</span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>} BufferAccessStrategyData;</span></code></pre></div>
+            <p>三种策略类型及其使用场景（<code>src/backend/storage/buffer/freelist.c</code>）：</p>
+            <table>
+            <colgroup>
+            <col style="width: 25%" />
+            <col style="width: 27%" />
+            <col style="width: 32%" />
+            <col style="width: 15%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>策略类型</th>
+            <th>ring_size</th>
+            <th>典型触发场景</th>
+            <th>效果</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>BAS_NORMAL</code></td>
+            <td>0（无 ring）</td>
+            <td>随机访问（索引扫描）</td>
+            <td>不限制</td>
+            </tr>
+            <tr>
+            <td><code>BAS_BULKREAD</code></td>
+            <td>256KB（32 页）</td>
+            <td><code>SELECT * FROM big</code> 的 Seq Scan</td>
+            <td>限制在 32 页小环内</td>
+            </tr>
+            <tr>
+            <td><code>BAS_BULKWRITE</code></td>
+            <td>16MB（2048 页）</td>
+            <td><code>COPY</code>、<code>CREATE INDEX</code></td>
+            <td>限制在 2048 页中环内</td>
+            </tr>
+            <tr>
+            <td><code>BAS_VACUUM</code></td>
+            <td>256KB（32 页）</td>
+            <td><code>VACUUM</code></td>
+            <td>限制在 32 页小环内，类似 BULKREAD</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>当 <code>BufferAlloc</code> 发生 cache miss
+            需要从磁盘读入新页面时，如果调用者提供了 ring strategy，先在
+            ring 内找可用 slot 或按 ring 内的简化 Clock Sweep
+            替换——<strong>ring 之外的 buffer 完全不受影响</strong>。</p>
+            <h3 id="ring-buffer-中的-clock-sweep">6.3 Ring Buffer 中的
+            Clock Sweep</h3>
+            <p>Ring buffer 内部有自己的简化版 Clock Sweep：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/storage/buffer/freelist.c, GetBufferFromRing()</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> BufferDesc <span class="op">*</span>GetBufferFromRing<span class="op">(</span>BufferAccessStrategy strategy<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>        buf <span class="op">=</span> strategy<span class="op">-&gt;</span>buffers<span class="op">[</span>strategy<span class="op">-&gt;</span>current<span class="op">];</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>        strategy<span class="op">-&gt;</span>current <span class="op">=</span> <span class="op">(</span>strategy<span class="op">-&gt;</span>current <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> strategy<span class="op">-&gt;</span>ring_size<span class="op">;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>buf <span class="op">==</span> NULL <span class="op">||</span> buf<span class="op">-&gt;</span>refcount <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> buf<span class="op">;</span>  <span class="co">// 找到可用 slot</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>Ring 内的 usage_count 被限制为 <span class="dv">1</span>（只有 <span class="dv">1</span> bit 的<span class="st">&quot;最近用过&quot;</span>标志），因为 ring 内的页面不应该占据太高的 usage_count 来抵御多轮全局 Clock Sweep。</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 6.4 对缓存命中率的实际影响</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>Ring buffer 解释了为什么 `pg_stat_bgwriter` 的统计要小心解读——一次全表扫描被限制在 ring 内，不影响其他查询的命中率。但如果你反复执行同一张表的全表扫描（比如监控脚本每 <span class="dv">30</span> 秒跑一次），ring 内的 <span class="dv">32</span> 个 slot 不断被替换，每次都是 miss——这就是 `EXPLAIN <span class="op">(</span>ANALYZE<span class="op">,</span> BUFFERS<span class="op">)</span>` 输出中 `shared read` 的来源。</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 七、为什么 shared_buffers 不是越大越好</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 7.1 Double Buffering：同一页占用两倍内存</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>PG 的 shared_buffers 和 OS page cache 是<span class="op">**</span>两套独立的缓存<span class="op">**</span>——PG 读文件使用 `read<span class="op">()</span>` 系统调用，OS 在文件系统层自动缓存读取的页面到 page cache。PG 并不知道 OS 也缓存了同样的数据，OS 也不知道 PG 在共享内存中已经有一份。</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>物理内存布局（double buffering 示意）</span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a><span class="op">+-----------------------------------+</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> shared_buffers <span class="op">(</span>e<span class="op">.</span>g<span class="op">.</span> <span class="dv">8</span><span class="er">GB</span><span class="op">)</span>         <span class="op">|</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> page A <span class="op">|</span> page B <span class="op">|</span> page C <span class="op">|</span> <span class="op">...</span>    <span class="op">|</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="op">+-----------------------------------+</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> OS page cache                     <span class="op">|</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> page A <span class="op">|</span> page B <span class="op">|</span> page C <span class="op">|</span> <span class="op">...</span>    <span class="op">|</span>  ← 相同的页面！</span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a><span class="op">+-----------------------------------+</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 剩余可用内存                       <span class="op">|</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a><span class="op">+-----------------------------------+</span></span></code></pre></div>
+            <p>当 shared_buffers 占物理内存的 25% 以下时（例如 128GB RAM
+            设 8GB shared_buffers），double buffering 的影响可控。但当
+            shared_buffers 超过约 40% 可用内存时，OS page cache
+            被严重挤压，不但浪费内存，还会影响 OS 对 WAL
+            文件、索引文件、PG 可执行文件本身的缓存能力。</p>
+            <h3 id="checkpoint-io-尖峰">7.2 Checkpoint I/O 尖峰</h3>
+            <p>shared_buffers 越大，checkpoint 时需要刷的脏页就越多。PG
+            的 checkpoint 必须在 <code>checkpoint_timeout</code>（默认 5
+            分钟）内完成。1GB shared_buffers 的 checkpoint 可能需要写
+            200MB 脏页（取决于工作负载），而 32GB 可能需要写 10GB+——这
+            10GB I/O 必须在短时间内完成，形成明显的 I/O
+            尖峰，拖慢所有正在执行的查询。</p>
+            <p><code>checkpoint_completion_target</code>（默认
+            0.9）可以把写脏页摊开到
+            <code>checkpoint_timeout * 0.9</code> 的时间里。但如果
+            shared_buffers
+            太大、脏页数量远超磁盘带宽，摊开也无济于事。</p>
+            <h3 id="clock-sweep-的扫描延迟">7.3 Clock Sweep
+            的扫描延迟</h3>
+            <p>当 shared_buffers 很大（比如 32GB = 4,194,304 个 8KB
+            buffer），且大量 buffer 的 usage_count 都大于 0 时，clock
+            sweep 找到空闲 buffer 的预期扫描距离变长。在大量 Backend
+            同时分配新 buffer 的场景下（如并发 seqscan 读冷数据），clock
+            sweep 的争用可能放大。</p>
+            <h3 id="调优原则">7.4 调优原则</h3>
+            <p>不要用经验公式（“shared_buffers = 25%
+            RAM”）。正确的方法是：</p>
+            <ol type="1">
+            <li>从保守值开始（1-4GB）。</li>
+            <li>用 <code>pg_buffercache</code> 观察 usage count
+            分布——如果大部分 buffer 的 usage count 集中在 0-1，说明
+            shared_buffers 已经超过实际工作集大小，可以适当减小。</li>
+            <li>用 <code>EXPLAIN (ANALYZE, BUFFERS)</code> 观察查询的
+            <code>shared hit</code> 和 <code>shared read</code>。</li>
+            <li>用 <code>pg_stat_bgwriter</code> 监控
+            <code>buffers_backend</code>——如果这个值持续增长，先调优
+            bgwriter
+            参数（<code>bgwriter_lru_maxpages</code>、<code>bgwriter_delay</code>）而非加大
+            shared_buffers。</li>
+            <li>逐步调大，用实际负载测试，找 TPS 的平台期。</li>
+            </ol>
+            <p>一条在无法实测时参考的经验规则：<strong>初始值不超过物理内存的
+            25%，且不超过 8-10GB</strong>。超过 10GB 的 shared_buffers
+            在大多数场景下不是最优选择。</p>
+            <hr />
+            <h2
+            id="八实验用-pg_buffercache-观察-buffer-分布">八、实验：用
+            pg_buffercache 观察 buffer 分布</h2>
+            <h3 id="启用扩展">8.1 启用扩展</h3>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION pg_buffercache;</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>### <span class="fl">8.2</span> 整体分布概览</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 按 usage_count 和 dirty 状态统计 buffer 分布</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    isdirty  <span class="kw">AS</span> dirty,</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    usagecount,</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> buffers</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_buffercache</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> isdirty, usagecount</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> isdirty, usagecount;</span></code></pre></div>
+            <p>典型的 OLTP 数据库输出：</p>
+            <pre class="text"><code> dirty | usagecount | buffers
+-------+------------+--------
+ f     | 0          |   3241   ← 易被回收的&quot;冷&quot;缓存
+ f     | 1          |   4512
+ f     | 2          |   2103
+ f     | 3          |   1500
+ f     | 4          |    900
+ f     | 5          |   1200   ← 最&quot;热&quot;的 clean 页
+ t     | 0          |     45   ← 脏页（等待 bgwriter 刷盘）
+ t     | 1          |     12
+```text
+
+`usagecount = 5` 的 buffer 需要经过 5 次 Clock Sweep 扫描才能被回收，是最受保护的热页。`usagecount = 0` 的 clean buffer 是最便宜的被回收目标。
+
+如果大部分 buffer 的 usage count 集中在 0-1，说明 shared_buffers 对当前工作集来说偏大——很多 slot 分配给了不常用的页面。
+
+### 8.3 按 relation 统计 buffer 占用
+
+```sql
+SELECT
+    c.relname,
+    COUNT(*) AS buffers,
+    pg_size_pretty(COUNT(*) * 8192) AS total_size
+FROM pg_buffercache b
+JOIN pg_class c ON b.relfilenode = pg_relation_filenode(c.oid)
+JOIN pg_database d ON b.reldatabase = d.oid
+WHERE d.datname = current_database()
+GROUP BY c.relname
+ORDER BY 2 DESC
+LIMIT 10;</code></pre>
+            <p>如果某个大表占用了大量 buffer
+            但查询并不频繁访问它，可能是被 Seq Scan
+            污染了——检查该查询是否走了 <code>BAS_BULKREAD</code>（32 页
+            ring 不应该导致大量占用）。</p>
+            <h3 id="观察-clock-sweep-行为">8.4 观察 Clock Sweep
+            行为</h3>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第一次快照</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> TEMP <span class="kw">TABLE</span> buf_snap_1 <span class="kw">AS</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> usagecount, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> cnt <span class="kw">FROM</span> pg_buffercache <span class="kw">GROUP</span> <span class="kw">BY</span> usagecount;</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 执行压力查询（如 pgbench 或实际业务查询）</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 等待约 30 秒</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第二次快照</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> TEMP <span class="kw">TABLE</span> buf_snap_2 <span class="kw">AS</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> usagecount, <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> cnt <span class="kw">FROM</span> pg_buffercache <span class="kw">GROUP</span> <span class="kw">BY</span> usagecount;</span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 对比</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>    s1.usagecount,</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>    s1.cnt <span class="kw">AS</span> before_cnt,</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>    s2.cnt <span class="kw">AS</span> after_cnt,</span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>    s2.cnt <span class="op">-</span> s1.cnt <span class="kw">AS</span> diff</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> buf_snap_1 s1</span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> buf_snap_2 s2 <span class="kw">ON</span> s1.usagecount <span class="op">=</span> s2.usagecount</span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> s1.usagecount;</span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>如果 `usagecount <span class="op">=</span> <span class="dv">0</span>` 的 <span class="fu">count</span> 在增大，说明 Clock Sweep 正在主动<span class="ot">&quot;降温&quot;</span>冷页——这是正常行为。如果 `usagecount <span class="op">=</span> <span class="dv">5</span>` 持续高位不降，说明有一批页面被频繁访问，被 Clock Sweep 完美保护在了池中。</span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>### <span class="fl">8.5</span> 构造 Seq <span class="kw">Scan</span> 观察 Ring Buffer 效果</span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建一个测试大表</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> test_big <span class="kw">AS</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> generate_series(<span class="dv">1</span>, <span class="dv">5000000</span>) <span class="kw">AS</span> <span class="kw">id</span>, repeat(<span class="st">&#39;x&#39;</span>, <span class="dv">200</span>) <span class="kw">AS</span> padding;</span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a><span class="co">-- 记录 seqscan 前该表在 shared_buffers 中的页数</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- （执行 seqscan 前先清空缓存或重启 PG）</span></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> pages_in_cache</span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_buffercache b</span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_class c <span class="kw">ON</span> b.relfilenode <span class="op">=</span> pg_relation_filenode(c.<span class="kw">oid</span>)</span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.relname <span class="op">=</span> <span class="st">&#39;test_big&#39;</span>;</span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a><span class="co">-- 执行 seqscan</span></span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">FROM</span> test_big;</span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a><span class="co">-- 再次查看该表在 shared_buffers 中的页数</span></span>
+<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> pages_in_cache</span>
+<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_buffercache b</span>
+<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_class c <span class="kw">ON</span> b.relfilenode <span class="op">=</span> pg_relation_filenode(c.<span class="kw">oid</span>)</span>
+<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.relname <span class="op">=</span> <span class="st">&#39;test_big&#39;</span>;</span></code></pre></div>
+            <p>你会观察到 seqscan 之后 <code>test_big</code> 在
+            shared_buffers 中的页面数不会等于表的总页面数——它被
+            <code>BAS_BULKREAD</code> ring buffer（32
+            页）限制住了，最多只占约 32 个 buffer，其余页面在 ring
+            循环中被挤出，usage count 保持为 0。</p>
+            <hr />
+            <h2 id="九运维要点与故障模式">九、运维要点与故障模式</h2>
+            <h3 id="bgwriter-跟不上脏页产生速度">9.1 bgwriter
+            跟不上脏页产生速度</h3>
+            <p><strong>症状</strong>：<code>pg_stat_bgwriter</code> 中
+            <code>buffers_backend</code>
+            持续增长，<code>buffers_backend / buffers_clean</code>
+            比率大于 10。</p>
+            <p><strong>根因</strong>：bgwriter 每轮最多写
+            <code>bgwriter_lru_maxpages</code>（默认
+            100）个页面，每轮间隔 <code>bgwriter_delay</code>（默认
+            200ms）。如果脏页产生速度超过
+            <code>100 pages / 0.2s = 500 pages/s = 4MB/s</code>，backend
+            被迫自己写脏页。</p>
+            <p><strong>修复</strong>：先降低
+            <code>bgwriter_delay</code>（如 50ms），再增大
+            <code>bgwriter_lru_maxpages</code>（如 500-1000）。同时检查
+            <code>max_wal_size</code> 是否太小——过频繁的 checkpoint
+            也会导致脏页集中写入。</p>
+            <h3 id="大量-backend-等待-bufferpin">9.2 大量 Backend 等待
+            BufferPin</h3>
+            <p><strong>症状</strong>：大量 Backend 的
+            <code>wait_event_type = 'BufferPin'</code>、<code>wait_event = 'BufferPin'</code>，<code>pg_stat_activity</code>
+            中该等待类型的连接数持续上升。</p>
+            <p><strong>根因</strong>：一个 Backend 持有某个 buffer 的
+            pin（且 buffer 正在 I/O 操作中），其他需要同一 buffer 的
+            Backend 在 <code>BufferPin</code> 上等待。如果持 pin 的
+            Backend
+            本身在等一个重量级锁（<code>Lock</code>），就形成锁等待链。</p>
+            <p><strong>排查</strong>：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, wait_event_type, wait_event, <span class="kw">query</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;BufferPin&#39;</span> <span class="kw">AND</span> state <span class="op">=</span> <span class="st">&#39;active&#39;</span>;</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>修复<span class="op">**</span>：定位持 pin 的 Backend，用 `pg_blocking_pids()` 追踪锁链。如果是因为磁盘 I<span class="op">/</span>O 慢导致的 buffer I<span class="op">/</span>O 时间过长，检查存储系统。</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>### <span class="fl">9.3</span> 忘 unpin 导致 buffer 泄漏</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>症状<span class="op">**</span>：`pg_stat_bgwriter` 的 `buffers_alloc` 增长但 TPS 下降，`pg_buffercache` 中大量 buffer 的 `pinning_backends <span class="op">&gt;</span> <span class="dv">0</span>` 且长时间不变。</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>根因<span class="op">**</span>：代码中没有正确配对的 `ReadBuffer` <span class="op">/</span> `ReleaseBuffer`。忘 unpin 的 buffer 永远不能被 Clock Sweep 回收。</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>排查<span class="op">**</span>：</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">COUNT</span>(<span class="op">*</span>) <span class="kw">AS</span> leaked_buffers</span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_buffercache</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pinning_backends <span class="op">&gt;</span> <span class="dv">0</span>;</span></code></pre></div>
+            <p>虽然有 <code>pinning_backends &gt; 0</code> 的 buffer
+            也可能是正在被正常使用的，但如果这个数值持续高位且不随查询完成而下降，就是泄漏信号。</p>
+            <p><strong>修复</strong>：通常不是 DBA
+            能修复的——需要定位是哪个扩展或自定义函数持有 buffer
+            不放。临时缓解手段是杀掉对应
+            Backend（<code>pg_terminate_backend()</code>），Postmaster
+            会在回收子进程时释放其所有 pin。</p>
+            <hr />
+            <h2 id="十关键要点">十、关键要点</h2>
+            <ol type="1">
+            <li><p><strong>shared_buffers
+            由三层结构组成</strong>：BufferDescriptors 数组（元数据） +
+            Buffer Pool（数据页） + StrategyControl（Clock Sweep
+            控制）。通过 Buffer Table 实现 <span
+            class="math inline">\(O(1)\)</span> 缓存查找。</p></li>
+            <li><p><strong>Buffer 访问协议是
+            pin/unpin</strong>：<code>ReadBuffer()</code> 返回 pin count
+            = 1 的 buffer，用完必须 <code>ReleaseBuffer()</code>
+            unpin。忘 unpin 等于永久占用一个 slot。</p></li>
+            <li><p><strong>Clock Sweep
+            是用并发性能换命中率的务实选择</strong>：无锁扫描、5 级
+            usage count 梯度降温、支持 ring buffer 的局部
+            sweep。<code>completePasses</code>
+            的增长速度是替换压力的直接信号。</p></li>
+            <li><p><strong>bgwriter
+            只负责提前写出脏页，不做逐出</strong>：它的作用是让 Clock
+            Sweep 在需要回收脏页时立即复用，无需等待磁盘
+            I/O。<code>buffers_backend</code> 是 bgwriter
+            跟不上的第一信号。</p></li>
+            <li><p><strong>Ring
+            Buffer（BufferAccessStrategy）防止批量扫描污染
+            pool</strong>：<code>BAS_BULKREAD</code> 和
+            <code>BAS_VACUUM</code> 限制在 32
+            页小环内，<code>BAS_BULKWRITE</code> 限制在 2048
+            页中环内。</p></li>
+            <li><p><strong>shared_buffers 超过 8-10GB
+            后回报递减</strong>，三个原因：double buffering
+            浪费内存、checkpoint I/O 尖峰加剧、clock sweep
+            扫描延迟增大。正确值需通过 <code>pg_buffercache</code>
+            和实际负载实测确定。</p></li>
+            </ol>
+            <p>上一章：<a
+            href="../04-wal-internals/04-wal-internals.html">WAL
+            内部机制</a> 下一章：<a
+            href="../06-lock-manager/06-lock-manager.html">锁管理器</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/storage/buffer/bufmgr.c</code>：ReadBuffer_common(),
+            BufferAlloc(), PinBuffer(), UnpinBuffer(),
+            MarkBufferDirty(), FlushBuffer(), BgBufferSync()</li>
+            <li><code>src/backend/storage/buffer/freelist.c</code>：StrategyGetBuffer(),
+            GetBufferFromRing(), GetAccessStrategy(),
+            FreeAccessStrategy(), StrategyInitialize()</li>
+            <li><code>src/backend/storage/buffer/buf_init.c</code>：InitBufferPool(),
+            分区哈希表初始化</li>
+            <li><code>src/backend/storage/buffer/buf_table.c</code>：BufTableLookup(),
+            BufTableInsert(), BufTableDelete()</li>
+            <li><code>src/include/storage/buf_internals.h</code>：BufferDesc,
+            BufferTag, BufMappingPartition 定义</li>
+            <li><code>src/include/storage/bufmgr.h</code>：ReadBuffer(),
+            ReleaseBuffer(), ReadBufferMode, BufferAccessStrategyType
+            接口定义</li>
+            <li><code>src/include/storage/freelist.h</code>：BufferAccessStrategyData
+            结构体定义</li>
+            <li><code>src/backend/postmaster/bgwriter.c</code>：BackgroundWriterMain()</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 19: Server
+            Configuration — <code>shared_buffers</code>,
+            <code>bgwriter_lru_maxpages</code>,
+            <code>bgwriter_lru_multiplier</code>,
+            <code>bgwriter_delay</code></li>
+            <li>PostgreSQL Documentation, Chapter 27: Monitoring
+            Database Activity — <code>pg_stat_bgwriter</code>,
+            <code>pg_buffercache</code></li>
+            <li>PostgreSQL Documentation, Appendix F: Additional
+            Supplied Modules — pg_buffercache 扩展手册</li>
+            <li>PostgreSQL Documentation, Chapter 68: Database Physical
+            Storage — 页面格式与 Buffer Manager 的关系</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Effelsberg, W. &amp; Haerder, T. <em>Principles of
+            Database Buffer Management</em>. ACM Transactions on
+            Database Systems, 1984. — Buffer 替换算法的经典论文，Clock
+            Sweep 的理论基础。</li>
+            <li>O’Neil, E. J., O’Neil, P. E. &amp; Weikum, G. <em>The
+            LRU-K Page Replacement Algorithm for Database Disk
+            Buffering</em>. SIGMOD 1993. — LRU-K 算法，PG usage_count
+            梯度设计的思想来源。</li>
+            <li>Johnson, T. &amp; Shasha, D. <em>2Q: A Low Overhead High
+            Performance Buffer Management Replacement Algorithm</em>.
+            VLDB 1994. — 2Q 算法，另一种”接近 LRU
+            但更低开销”的思路。</li>
+            </ul>
+            <h3 id="相关文章">相关文章</h3>
+            <ul>
+            <li>本站存储工程系列：<a
+            href="../../../storage/26-buffer-pool/buffer-pool.html">Buffer
+            Pool 设计</a> — 通用 Buffer Pool
+            原理，可作为本篇的前置背景阅读。</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/26-config-pitfalls/26-config-pitfalls.html">【PG 内核】配置陷阱与生产最佳实践：11 个最危险的 GUC 和它们的正确设置</a></h3>
+                    <p>逐一拆解 11 个最容易被误解和配错的 PostgreSQL GUC 参数：shared_buffers 的 double buffering 反噬、work_mem 作为&#x27;每个操作&#x27;而非&#x27;每个查询&#x27;的内存炸弹、effective_cache_size 和 random_page_cost 如何误导优化器走向灾难计划、fsync=off 和 synchronous_commit=off 的数据丢失边界、huge_pages 在容器中的静默退化、maintenance_work_mem 不足导致 VACUUM 瘫痪、idle_in_transaction_session_timeout 为什么必须设、log_lock_waits 与 deadlock_timeout 的联动、以及 log_min_duration_statement 与 auto_explain 的日志洪水叠加。每条配查验 SQL 和 shell 命令——不是&#x27;设成 X 就好了&#x27;，而是&#x27;通过什么视图和日志确认当前设置有问题&#x27;。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/02-page-tuple/02-page-tuple.html">【PG 内核】页面布局与元组格式：PG 如何把一行数据塞进 8KB</a></h3>
+                    <p>拆解 PostgreSQL 的物理存储层：Page 的 8KB 布局（PageHeaderData、ItemId 数组、special space）、HeapTupleHeaderData 的字段语义（xmin/xmax/ctid/t_infomask/t_infomask2）、TOAST 外存机制的压缩阈值与四种策略（PLAIN/EXTENDED/EXTERNAL/MAIN），以及用 pageinspect 扩展直接观察页面字节。理解页面格式是理解 VACUUM、Index Scan、MVCC 可见性判断的共同前提。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

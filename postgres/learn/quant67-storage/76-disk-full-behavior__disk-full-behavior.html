@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="逐层拆解 ext4、XFS、Btrfs、ZFS 从
+70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC
+故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="enospc, disk-full, capacity-planning, ext4, xfs, btrfs, zfs, monitoring, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/76-disk-full-behavior/disk-full-behavior.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链" />
+    <meta property="og:description" content="逐层拆解 ext4、XFS、Btrfs、ZFS 从 70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC 故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/76-disk-full-behavior/disk-full-behavior.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="enospc" />
+    <meta property="article:tag" content="disk-full" />
+    <meta property="article:tag" content="capacity-planning" />
+    <meta property="article:tag" content="ext4" />
+    <meta property="article:tag" content="xfs" />
+    <meta property="article:tag" content="btrfs" />
+    <meta property="article:tag" content="zfs" />
+    <meta property="article:tag" content="monitoring" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链" />
+    <meta name="twitter:description" content="逐层拆解 ext4、XFS、Btrfs、ZFS 从 70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC 故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链", "description": "逐层拆解 ext4、XFS、Btrfs、ZFS 从 70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC 故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/76-disk-full-behavior/disk-full-behavior.html"}, "datePublished": "2026-06-11T00:00:00+00:00", "dateModified": "2026-06-12T13:37:40+00:00", "keywords": ["enospc", "disk-full", "capacity-planning", "ext4", "xfs", "btrfs", "zfs", "monitoring"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-11</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#enospc</span> <span>#disk-full</span> <span>#capacity-planning</span> <span>#ext4</span> <span>#xfs</span> <span>#btrfs</span> <span>#zfs</span> <span>#monitoring</span></span>
+            </p>
+                    </header>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/75-small-file-problem/small-file-problem.html">上一篇：【存储工程】小文件问题：为什么文件数量比文件大小更致命</a><a class="post-series-nav__link" href="/post/storage/77-file-locking-pitfalls/file-locking-pitfalls.html">下一篇：【存储工程】POSIX 文件锁：flock、fcntl 与 NFS 锁的工程陷阱</a></div></section>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/enospc.html">#enospc</a><a class="chip-link" href="/tags/disk-full.html">#disk-full</a><a class="chip-link" href="/tags/capacity-planning.html">#capacity-planning</a><a class="chip-link" href="/tags/ext4.html">#ext4</a><a class="chip-link" href="/tags/xfs.html">#xfs</a><a class="chip-link" href="/tags/btrfs.html">#btrfs</a><a class="chip-link" href="/tags/zfs.html">#zfs</a><a class="chip-link" href="/tags/monitoring.html">#monitoring</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#一空间填充的行为分期"
+                id="toc-一空间填充的行为分期">一、空间填充的行为分期</a></li>
+                <li><a href="#二ext4多块分配退化和-root-reserve"
+                id="toc-二ext4多块分配退化和-root-reserve">二、ext4：多块分配退化和
+                root reserve</a>
+                <ul>
+                <li><a href="#块分配器的退化路径"
+                id="toc-块分配器的退化路径">2.1
+                块分配器的退化路径</a></li>
+                <li><a href="#root-reserve5-的救命稻草"
+                id="toc-root-reserve5-的救命稻草">2.2 root reserve：5%
+                的救命稻草</a></li>
+                <li><a href="#inode-耗尽另一种-enospc"
+                id="toc-inode-耗尽另一种-enospc">2.3 inode 耗尽：另一种
+                ENOSPC</a></li>
+                <li><a href="#ext4-容量红线" id="toc-ext4-容量红线">2.4
+                ext4 容量红线</a></li>
+                </ul></li>
+                <li><a href="#三xfsag-碎片化与分配组不均衡"
+                id="toc-三xfsag-碎片化与分配组不均衡">三、XFS：AG
+                碎片化与分配组不均衡</a>
+                <ul>
+                <li><a href="#xfs-的分配组机制"
+                id="toc-xfs-的分配组机制">3.1 XFS 的分配组机制</a></li>
+                <li><a href="#高填充率下的-ag-退化"
+                id="toc-高填充率下的-ag-退化">3.2 高填充率下的 AG
+                退化</a></li>
+                <li><a href="#xfs-容量红线" id="toc-xfs-容量红线">3.3
+                XFS 容量红线</a></li>
+                </ul></li>
+                <li><a href="#四btrfs元数据-enospc-的独立危机"
+                id="toc-四btrfs元数据-enospc-的独立危机">四、Btrfs：元数据
+                ENOSPC 的独立危机</a>
+                <ul>
+                <li><a href="#两套空间池数据-vs-元数据"
+                id="toc-两套空间池数据-vs-元数据">4.1 两套空间池：数据
+                vs 元数据</a></li>
+                <li><a href="#紧急恢复btrfs-元数据-enospc"
+                id="toc-紧急恢复btrfs-元数据-enospc">4.2 紧急恢复：Btrfs
+                元数据 ENOSPC</a></li>
+                <li><a href="#btrfs-容量红线"
+                id="toc-btrfs-容量红线">4.3 Btrfs 容量红线</a></li>
+                </ul></li>
+                <li><a href="#五zfs池空间与配额管理"
+                id="toc-五zfs池空间与配额管理">五、ZFS：池空间与配额管理</a>
+                <ul>
+                <li><a href="#zfs-的空间模型"
+                id="toc-zfs-的空间模型">5.1 ZFS 的空间模型</a></li>
+                <li><a href="#zfs-空间耗尽的特殊行为"
+                id="toc-zfs-空间耗尽的特殊行为">5.2 ZFS
+                空间耗尽的特殊行为</a></li>
+                <li><a href="#zfs-容量红线" id="toc-zfs-容量红线">5.3
+                ZFS 容量红线</a></li>
+                </ul></li>
+                <li><a href="#六文件系统容量红线对比"
+                id="toc-六文件系统容量红线对比">六、文件系统容量红线对比</a></li>
+                <li><a href="#七enospc-应急恢复"
+                id="toc-七enospc-应急恢复">七、ENOSPC 应急恢复</a>
+                <ul>
+                <li><a href="#快速诊断" id="toc-快速诊断">7.1
+                快速诊断</a></li>
+                <li><a href="#紧急空间回收" id="toc-紧急空间回收">7.2
+                紧急空间回收</a></li>
+                <li><a href="#为什么-rm-有时候也失败"
+                id="toc-为什么-rm-有时候也失败">7.3 为什么 rm
+                有时候也失败</a></li>
+                </ul></li>
+                <li><a href="#八应用层故障模式"
+                id="toc-八应用层故障模式">八、应用层故障模式</a>
+                <ul>
+                <li><a href="#数据库" id="toc-数据库">8.1
+                数据库</a></li>
+                <li><a href="#键值存储" id="toc-键值存储">8.2
+                键值存储</a></li>
+                <li><a href="#消息队列" id="toc-消息队列">8.3
+                消息队列</a></li>
+                </ul></li>
+                <li><a href="#九监控与自动化"
+                id="toc-九监控与自动化">九、监控与自动化</a>
+                <ul>
+                <li><a href="#监控维度" id="toc-监控维度">9.1
+                监控维度</a></li>
+                <li><a href="#自动化清理策略"
+                id="toc-自动化清理策略">9.2 自动化清理策略</a></li>
+                <li><a href="#lvm-自动扩展" id="toc-lvm-自动扩展">9.3
+                LVM 自动扩展</a></li>
+                </ul></li>
+                <li><a href="#十总结从红线到实践"
+                id="toc-十总结从红线到实践">十、总结：从红线到实践</a></li>
+                <li><a href="#参考资料"
+                id="toc-参考资料">参考资料</a></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <p>磁盘空间监控最常见的告警阈值是
+            80%——超过这个值发通知，超过 90% 紧急处理。但这个”80%
+            红线”对不同文件系统、不同工作负载的实际含义完全不同。对于某些场景，70%
+            已经是在刀尖上跳舞了；对于另一些场景，95%
+            还能平稳运行。盲目套用统一阈值，要么是狼来了式的告警轰炸，要么是真出事时的后知后觉。</p>
+            <p>本文从块分配器行为退化开始，逐一拆解 ext4、XFS、Btrfs 和
+            ZFS 在从 70% 到 100% 填充过程中的行为变化，然后讨论
+            ENOSPC（No Space Left on
+            Device）的恢复方法、应用层故障模式，最后落到监控阈值设计和自动应急方案。</p>
+            <blockquote>
+            <p><strong>测试环境说明</strong> ext4、XFS、Btrfs 的 ENOSPC
+            与分配器退化行为在 Linux 6.8 内核上验证，工具版本为
+            ext4（e2fsprogs 1.47）、XFS（xfsprogs
+            6.5）、Btrfs（btrfs-progs 6.6）。ZFS 章节依据 OpenZFS
+            官方文档与工程实践归纳，未在本文环境中实测。其他内核版本的行为可能有所不同——尤其
+            Btrfs 的 ENOSPC 处理在不同版本之间变化较大。</p>
+            </blockquote>
+            <hr />
+            <h2 id="一空间填充的行为分期">一、空间填充的行为分期</h2>
+            <p>文件系统”满”不是一瞬间发生的。从一个干净的文件系统到
+            ENOSPC，中间经历了多个行为退化阶段。每个阶段的退化表现因文件系统而异，但大致可以划分为以下区间：</p>
+            <pre class="text"><code>┌──────────┬──────────────────────────────────────────────┐
+│ 填充率    │ 典型行为                                       │
+├──────────┼──────────────────────────────────────────────┤
+│ 0–70%    │ 正常。块分配器有充足连续空间，性能稳定           │
+│ 70–85%   │ 块分配器开始需要更多搜索来找到连续空闲块         │
+│ 85–95%   │ 碎片化明显。分配延迟开始出现抖动，大块分配可能失败│
+│ 95–98%   │ 紧急状态。文件系统开始拒绝非必要分配，元数据操作  │
+│          │ 可能失败，部分文件系统进入降级模式               │
+│ 98–100%  │ 灾难状态。连删除文件都可能失败，需要人工介入      │
+│ 100%     │ ENOSPC。文件系统空间耗尽，写入彻底失败            │
+└──────────┴──────────────────────────────────────────────┘</code></pre>
+            <pre class="mermaid"><code>flowchart LR
+    subgraph fill[&quot;填充率与退化&quot;]
+        P0[&quot;0–70% 正常&quot;]
+        P1[&quot;70–85% 搜索加剧&quot;]
+        P2[&quot;85–95% 碎片化&quot;]
+        P3[&quot;95–98% 紧急&quot;]
+        P4[&quot;98–100% 灾难&quot;]
+        P5[&quot;100% ENOSPC&quot;]
+    end
+    P0 --&gt; P1 --&gt; P2 --&gt; P3 --&gt; P4 --&gt; P5</code></pre>
+            <p>这张表是整个讨论的框架。下面逐文件系统拆解每个阶段的具体行为。</p>
+            <hr />
+            <h2
+            id="二ext4多块分配退化和-root-reserve">二、ext4：多块分配退化和
+            root reserve</h2>
+            <h3 id="块分配器的退化路径">2.1 块分配器的退化路径</h3>
+            <p>ext4 使用多块分配器（Multiblock
+            Allocator，mballoc）来分配数据块。当文件系统有充足空闲空间时，mballoc
+            能一次分配几十到几百个连续块，形成大的
+            extent。随着空闲空间减少，mballoc 的行为逐步退化：</p>
+            <pre class="text"><code>mballoc 在不同填充率下的行为：
+
+0–70%：
+  从空闲 extent 缓存（buddy cache）中直接获取大的连续区域
+  预分配（preallocation）机制正常工作
+
+70–85%：
+  空闲 extent 缓存中的大块减少
+  mballoc 需要扫描块位图来找到连续区域
+  预分配开始经常失败，退化为按需分配
+
+85–95%：
+  连续空闲区域碎片化为小段
+  大的 extent 分配极少成功，文件碎片化加剧
+  mballoc 回退到逐个块分配（单块模式）
+
+95%+：
+  块位图扫描可能跨越多个块组（block group）
+  单次分配可能涉及数十次位图读取
+  分配延迟显著上升（高填充率下可达毫秒级，视碎片程度而定）</code></pre>
+            <p>mballoc
+            的退化路径可以在内核源码中追踪。<code>fs/ext4/mballoc.c</code>
+            中的 <code>ext4_mb_regular_allocator()</code>
+            函数在找不到合适连续区域时，会逐步降低要求（从
+            <code>goal</code> 长度降低到单块），最终调用
+            <code>ext4_mb_simple_scan()</code> 做逐块扫描。</p>
+            <h3 id="root-reserve5-的救命稻草">2.2 root reserve：5%
+            的救命稻草</h3>
+            <p>ext4 默认保留 5% 的块给 root
+            用户（<code>reserved_blocks</code>）。这意味着当普通用户的写入触发
+            ENOSPC 时，root
+            仍然可以写入——这是为了确保管理员有空间执行清理操作。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看保留块数量和百分比</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-l</span> /dev/sda1 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> <span class="st">&quot;reserved block&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Reserved block count:     1310720</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Percentage reserved:      5%</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整保留百分比（仅在有明确理由时修改）</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-m</span> 1 /dev/sda1   <span class="co"># 降为 1%（大容量文件系统上常用）</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="ex">tune2fs</span> <span class="at">-m</span> 0 /dev/sda1   <span class="co"># 完全取消（谨慎！可能导致无法恢复）</span></span></code></pre></div>
+            <p>大容量文件系统上，5% 是一个过大的数字。一个 10 TB ext4
+            文件系统，5% 是 500
+            GB——这么多保留空间对管理员来说完全过剩。常见的做法是：对于纯数据分区（无操作系统文件），降到
+            1%；对于系统分区（<code>/</code>, <code>/var</code>），保持
+            5% 或至少 2%。</p>
+            <p>但注意：root reserve 只在块分配层面工作。如果文件系统的
+            inode 耗尽了（而不是数据块），root reserve 帮不了你——root
+            同样无法创建新文件。</p>
+            <h3 id="inode-耗尽另一种-enospc">2.3 inode 耗尽：另一种
+            ENOSPC</h3>
+            <p>ext4 的 inode
+            数量在创建文件系统时固定（<code>mkfs.ext4 -i</code> 或
+            <code>-N</code> 参数决定）。当 inode
+            用完时，所有文件创建操作都会失败——即使 <code>df -h</code>
+            显示还有 50% 的可用空间。</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 inode 使用情况</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /mnt/data</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Filesystem     Inodes  IUsed   IFree IUse% Mounted on</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/sda1      6553600 6540000  13600   99% /mnt/data</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 即使 df -h 显示 40% 空闲，inode 耗尽也能让写入失败</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/data</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/sda1      100G   60G   40G  60% /mnt/data</span></span></code></pre></div>
+            <p>这就是为什么存储监控必须同时监控
+            <code>df -h</code>（块使用）和 <code>df -i</code>（inode
+            使用）。两个维度中的任何一个触线都会导致系统不可用。</p>
+            <h3 id="ext4-容量红线">2.4 ext4 容量红线</h3>
+            <pre class="text"><code>ext4 容量监控建议：
+
+70%  → 预警线。开始规划扩容或清理
+85%  → 严重警告。启动临时文件清理，暂停非核心写入
+90%  → 紧急线。mballoc 退化明显，碎片化加速
+95%  → 灾难线。仅 root 可写（如果保留 5%）
+100% → 普通用户 ENOSPC</code></pre>
+            <hr />
+            <h2 id="三xfsag-碎片化与分配组不均衡">三、XFS：AG
+            碎片化与分配组不均衡</h2>
+            <h3 id="xfs-的分配组机制">3.1 XFS 的分配组机制</h3>
+            <p>XFS 将卷划分为若干等大的分配组（Allocation
+            Group，AG）。每个 AG 有独立的空闲空间 B+tree、inode B+tree
+            和块分配器状态。<code>mkfs.xfs</code> 默认按卷容量自动计算
+            AG 大小（通常在 256 MiB 到 1 TiB 之间）和数量（通常 4
+            到数千个）。例如 1 TB 卷常见配置为 4 个 AG、每个约 250
+            GB——但这并非固定规则，应以 <code>xfs_info</code>
+            输出为准（详见本站 <a
+            href="../15-xfs-architecture/xfs-architecture.html">XFS
+            架构</a> §二）。</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 AG 数量与每个 AG 的块数</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">xfs_info</span> /dev/sda1</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 典型输出片段：agcount=4, agsize=65536 blks</span></span></code></pre></div>
+            <p>这个设计的优势是并行性——多个并发的分配操作可以在不同 AG
+            中独立进行。但这个设计也带来了一个陷阱：<strong>AG
+            之间的空间使用可能不均衡</strong>。</p>
+            <p>当某些 AG 的空间使用远高于其他 AG 时，即使整体利用率只有
+            75%，某些 AG 可能已经接近 100%。文件系统的块分配器在目标 AG
+            中选择空闲区域，但如果目标 AG 已满，分配器需要切换
+            AG——这增加了延迟和碎片。</p>
+            <h3 id="高填充率下的-ag-退化">3.2 高填充率下的 AG 退化</h3>
+            <pre class="text"><code>XFS 填充率      AG 层面行为
+────────────────────────────────────────────
+&lt; 70%          各 AG 空间充足，并行分配正常
+70–85%         AG 间开始出现不均衡，某些 AG 接近满
+85–95%         AG 内连续空闲区域碎片化严重
+               AG 切换频率增加，分配延迟上升
+               xfs_fsr（在线碎片整理）收益开始明显
+95%+           大多数 AG 接近满，大块分配几乎不可能
+               文件碎片化不可逆</code></pre>
+            <p>XFS 的一个特有问题是：即使整体空间还够，如果所有 AG
+            的连续空闲区域都小于请求的大小，分配可能失败。这不是真正的
+            ENOSPC，而是”没有足够大的连续块”——但在应用层，两者都表现为写入失败。</p>
+            <h3 id="xfs-容量红线">3.3 XFS 容量红线</h3>
+            <pre class="text"><code>XFS 容量监控建议：
+
+70%  → 预警线
+85%  → 严重警告。AG 碎片化开始加速
+90%  → 紧急线。分配延迟明显增加，大文件写入可能受影响
+95%  → 灾难线。碎片化几乎不可逆，需要 xfs_fsr 干预</code></pre>
+            <p>XFS 比 ext4 更能容忍高填充率（因为动态 inode 分配和 AG
+            并行），但在 85% 以上时碎片化问题比 ext4
+            更严重。对于写密集的大文件场景（如视频存储、数据库），XFS
+            的红线应该更靠前（75% 就该关注）。</p>
+            <hr />
+            <h2 id="四btrfs元数据-enospc-的独立危机">四、Btrfs：元数据
+            ENOSPC 的独立危机</h2>
+            <h3 id="两套空间池数据-vs-元数据">4.1 两套空间池：数据 vs
+            元数据</h3>
+            <p>Btrfs 的一个核心设计是数据和元数据使用独立的空间池（Block
+            Group）。一个 Btrfs 文件系统可能有以下 block group
+            类型：</p>
+            <pre class="text"><code>Btrfs Block Group 类型：
+  DATA       → 文件数据
+  METADATA   → inode、extent tree、checksum tree 等
+  SYSTEM     → chunk tree（极小，通常 8–32 MB）</code></pre>
+            <p>这意味着 Btrfs
+            可能出现一种独特的故障模式：<strong>元数据空间耗尽，而数据空间仍有余量。</strong></p>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 Btrfs 各类型的空间使用</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem usage /mnt/btrfs</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例（截断）：</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Overall:</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co">#     Device size:         500.00GiB</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="co">#     Device allocated:    450.00GiB</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co">#     Device unallocated:   50.00GiB</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Data,single: Size:400.00GiB, Used:395.00GiB</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="co">#    /dev/sda1     400.00GiB</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Metadata,single: Size:48.00GiB, Used:47.95GiB</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="co">#    /dev/sda1      48.00GiB</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="co">#    ← 元数据几乎满了！但数据还有 5 GiB 空闲</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="co">#</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="co"># System,single: Size:32.00MiB, Used:16.00KiB</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="co">#    /dev/sda1      32.00MiB</span></span></code></pre></div>
+            <p>当元数据空间耗尽时，所有涉及元数据变更的操作（创建文件、扩展已有文件、创建快照、删除文件——注意，删除文件也需要更新元数据）都会失败。用户会看到
+            ENOSPC，但 <code>df -h</code> 可能显示还有几十 GB
+            数据空间——这是 Btrfs 场景下最令人困惑的故障模式。</p>
+            <h3 id="紧急恢复btrfs-元数据-enospc">4.2 紧急恢复：Btrfs
+            元数据 ENOSPC</h3>
+            <p>当 Btrfs 元数据空间耗尽，标准的 <code>rm</code>
+            操作可能失败（需要更新目录项元数据）。恢复步骤：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 步骤 1：确认是元数据 ENOSPC</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem usage /mnt/btrfs <span class="kw">|</span> <span class="fu">grep</span> Metadata</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 如果 Metadata Used 接近 Metadata Size，确认为元数据耗尽</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 步骤 2：尝试添加新的元数据空间</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 在文件系统还有未分配空间时：</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> balance start <span class="at">-dusage</span><span class="op">=</span>0 /mnt/btrfs</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="co"># -dusage=0 表示只重写空闲数据块组，释放给元数据使用</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 步骤 3：如果 balance 也失败（需要元数据空间来记录 balance 操作）</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 最坏情况：只读挂载，复制数据，重建文件系统</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> remount,ro /mnt/btrfs</span></code></pre></div>
+            <p>从 Linux 5.4 开始，Btrfs 引入了全局保留（Global
+            Reserve）机制：一小部分元数据空间被预留，仅供紧急的元数据操作使用（包括
+            <code>rm</code>、<code>truncate</code>）。这大大降低了元数据
+            ENOSPC
+            的灾难性程度，但全局保留空间非常有限——如果文件系统上的操作量过大，这个保留仍然可能被耗尽。</p>
+            <h3 id="btrfs-容量红线">4.3 Btrfs 容量红线</h3>
+            <pre class="text"><code>Btrfs 容量监控建议：
+
+总体使用率（设备分配/设备总大小）：
+  70%  → 预警线
+  85%  → 严重警告。启动 balance，回收未使用 chunk
+  90%  → 紧急线
+
+元数据使用率（单独监控！）：
+  75%  → 预警线（如果分配了较多 metadata chunk）
+  90%  → 紧急线。立即执行 metadata balance
+  95%  → 灾难线。文件创建可能失败</code></pre>
+            <p>Btrfs
+            的独特之处：<strong>元数据使用率比总体使用率更重要。</strong>
+            一个数据空间只用 30% 但元数据空间用了 95% 的 Btrfs
+            文件系统，比一个数据空间用了 95% 但元数据空间只用了 50%
+            的系统更危险。</p>
+            <hr />
+            <h2
+            id="五zfs池空间与配额管理">五、ZFS：池空间与配额管理</h2>
+            <h3 id="zfs-的空间模型">5.1 ZFS 的空间模型</h3>
+            <p>ZFS
+            不使用独立的文件系统空间，所有数据集（dataset）共享同一个存储池（pool）的空间。这使得空间管理更灵活——不需要像
+            ext4/XFS
+            那样为每个分区预留空间——但也带来了新的故障模式。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看池空间使用</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> list tank</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="co"># NAME   SIZE  ALLOC   FREE  CAP  HEALTH</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="co"># tank   10T   8.5T   1.5T   85%  ONLINE</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看各数据集的配额和使用</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> list <span class="at">-o</span> name,used,available,quota,reservation</span></code></pre></div>
+            <h3 id="zfs-空间耗尽的特殊行为">5.2 ZFS
+            空间耗尽的特殊行为</h3>
+            <p>ZFS
+            使用写时复制（Copy-on-Write，COW）。每次”覆盖写”实际上是一次”写到新位置
+            + 更新块指针”。这意味着在空间紧张时，一次看起来是 “in-place
+            update” 的写操作实际上需要额外的空闲空间来完成
+            COW。如果池的空间不足，COW
+            写可能失败——即使这个写操作的目标是”覆盖”一个已有块。</p>
+            <p>更具体地说：ZFS 事务组（Transaction
+            Group）在提交时需要分配新的块。如果池的剩余空间小于一个事务组的典型空间需求，整个事务组可能提交失败。这比传统文件系统（ext4/XFS
+            的覆盖写不需要额外空间）更早触发故障。</p>
+            <div class="sourceCode" id="cb15"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># ZFS 在 95%+ 填充率下的性能退化</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="co"># COW 写放大效应：</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="co">#   填充率 50%: COW 通常写入相邻空闲区域 → 顺序写</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co">#   填充率 85%: COW 开始写入分散的空闲区域 → 随机写</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="co">#   填充率 95%: COW 可用空间极小，写放大多次重试 → 延迟飙升</span></span></code></pre></div>
+            <p>ZFS 文档建议池使用率不超过 80%，主要原因是 COW
+            的开销。这个数字不是硬性限制，但对于随机写密集的负载（如虚拟机磁盘镜像），超过
+            80% 确实会导致显著的尾延迟恶化。</p>
+            <h3 id="zfs-容量红线">5.3 ZFS 容量红线</h3>
+            <pre class="text"><code>ZFS 容量监控建议：
+
+80%  → 预警线。COW 性能开始退化
+90%  → 严重警告。写延迟明显增加
+95%  → 紧急线。大型事务组可能提交失败
+98%  → 灾难线。基本写操作可能失败</code></pre>
+            <p>ZFS 的红线比 ext4/XFS
+            更靠前，不是因为它”更脆弱”，而是因为它的 COW
+            机制在高填充率下的退化更剧烈。</p>
+            <hr />
+            <h2
+            id="六文件系统容量红线对比">六、文件系统容量红线对比</h2>
+            <table>
+            <colgroup>
+            <col style="width: 20%" />
+            <col style="width: 20%" />
+            <col style="width: 17%" />
+            <col style="width: 24%" />
+            <col style="width: 17%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>条件</th>
+            <th>ext4</th>
+            <th>XFS</th>
+            <th>Btrfs</th>
+            <th>ZFS</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>预警线</td>
+            <td>70%</td>
+            <td>70%</td>
+            <td>70%（数据）/ 75%（元数据）</td>
+            <td>80%</td>
+            </tr>
+            <tr>
+            <td>严重警告</td>
+            <td>85%</td>
+            <td>85%</td>
+            <td>85%（数据）/ 90%（元数据）</td>
+            <td>90%</td>
+            </tr>
+            <tr>
+            <td>紧急线</td>
+            <td>90%</td>
+            <td>90%</td>
+            <td>90%（数据）/ 95%（元数据）</td>
+            <td>95%</td>
+            </tr>
+            <tr>
+            <td>特殊风险</td>
+            <td>inode 耗尽</td>
+            <td>AG 碎片化</td>
+            <td>元数据 ENOSPC</td>
+            <td>COW 空间不足</td>
+            </tr>
+            <tr>
+            <td>恢复难度</td>
+            <td>低（rm 即可）</td>
+            <td>低（rm 即可）</td>
+            <td>中–高（可能需要 balance）</td>
+            <td>中（COW 依赖空闲空间）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>这四条”红线”应该成为存储监控系统的基础告警规则。每条线触发什么动作，取决于业务对存储的依赖程度和数据的重要程度。</p>
+            <hr />
+            <h2 id="七enospc-应急恢复">七、ENOSPC 应急恢复</h2>
+            <p>当 ENOSPC
+            真正发生时，以下步骤可以帮助恢复（假设你有足够的权限）。</p>
+            <h3 id="快速诊断">7.1 快速诊断</h3>
+            <div class="sourceCode" id="cb17"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 确认空间使用情况</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/data</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /mnt/data   <span class="co"># 别忘了 inode</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 如果是 Btrfs / ZFS，确认是哪种空间耗尽</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> filesystem usage /mnt/data   <span class="co"># Btrfs</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> list tank                     <span class="co"># ZFS</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 找到占用空间最大的目录</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="fu">du</span> <span class="at">-sh</span> /mnt/data/<span class="pp">*</span> <span class="kw">|</span> <span class="fu">sort</span> <span class="at">-rh</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-20</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 检查是否有被删除但未释放空间的文件</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a><span class="ex">lsof</span> +L1 <span class="kw">|</span> <span class="fu">grep</span> /mnt/data</span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 输出示例：</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a><span class="co"># COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NLINK NODE NAME</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a><span class="co"># java     1234 appuser  5w   REG  253,0 1073741824    0 56789 /mnt/data/app.log (deleted)</span></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a><span class="co"># ← 文件已被删除但进程仍持有 fd，空间未释放</span></span></code></pre></div>
+            <h3 id="紧急空间回收">7.2 紧急空间回收</h3>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法 1：截断仍然被进程打开的大文件</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 假设进程 PID 1234 持有 fd 5，对应一个 1GB 的已删除文件</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 通过 /proc 截断它（需要 root）</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="bu">:</span> <span class="op">&gt;</span> /proc/1234/fd/5          <span class="co"># 截断到 0 字节</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 或者</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="fu">truncate</span> <span class="at">-s</span> 0 /proc/1234/fd/5</span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法 2：清理系统日志和临时文件</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">--vacuum-size</span><span class="op">=</span>100M   <span class="co"># 限制 systemd journal 大小</span></span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> /tmp/<span class="pp">*</span>                    <span class="co"># 清理临时文件（谨慎）</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> /var/tmp/<span class="pp">*</span>                <span class="co"># 清理持久临时文件</span></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法 3：清理包管理缓存</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a><span class="ex">apt-get</span> clean                    <span class="co"># Ubuntu/Debian</span></span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a><span class="ex">yum</span> clean all                    <span class="co"># CentOS/RHEL</span></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a><span class="ex">dnf</span> clean all                    <span class="co"># Fedora</span></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法 4：清理 Docker（如果使用）</span></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> system prune <span class="at">-a</span> <span class="at">-f</span> <span class="at">--volumes</span></span>
+<span id="cb18-20"><a href="#cb18-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-21"><a href="#cb18-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 方法 5：删除旧的快照（Btrfs/ZFS）</span></span>
+<span id="cb18-22"><a href="#cb18-22" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> subvolume delete /mnt/data/.snapshots/old_snapshot</span>
+<span id="cb18-23"><a href="#cb18-23" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> destroy tank/data@old_snapshot</span></code></pre></div>
+            <h3 id="为什么-rm-有时候也失败">7.3 为什么 rm
+            有时候也失败</h3>
+            <p>一个反直觉的现象：当文件系统 100% 满时，<code>rm</code>
+            命令可能也失败。原因：</p>
+            <ol type="1">
+            <li><p><strong>ext4/XFS</strong>：删除文件需要写入日志（Journal）。如果日志空间也在同一个分区上（总是如此），日志写入本身可能因为没有空闲空间而失败。ext4
+            的日志模式（<code>data=journal</code> vs
+            <code>data=ordered</code> vs
+            <code>data=writeback</code>）影响这里的行为——<code>data=journal</code>
+            下日志写更多，更可能在 ENOSPC 时卡住。</p></li>
+            <li><p><strong>Btrfs</strong>：删除文件需要更新 extent tree
+            的元数据。如果元数据空间耗尽，删除操作无法记录，失败。</p></li>
+            <li><p><strong>ext4 的 inode 耗尽</strong>：如果 ENOSPC
+            是因为 inode 耗尽，而非数据块耗尽——<code>rm</code>
+            不需要创建新 inode，只需要释放旧的，所以 <code>rm</code>
+            通常能成功。这正是 inode
+            耗尽的”优势”——比数据块耗尽更容易手动恢复。</p></li>
+            </ol>
+            <p>紧急情况下优先使用 <code>truncate</code> 而非
+            <code>rm</code>：<code>truncate -s 0 &lt;file&gt;</code>
+            只更新文件大小元数据，不涉及目录项变更，比 <code>rm</code>
+            的操作量更小。</p>
+            <hr />
+            <h2 id="八应用层故障模式">八、应用层故障模式</h2>
+            <p>存储空间耗尽时，不同应用的故障行为大相径庭。了解这些行为有助于设计降级策略和监控告警。</p>
+            <h3 id="数据库">8.1 数据库</h3>
+            <p><strong>PostgreSQL</strong>：当 WAL 写入遇到 ENOSPC
+            时，PostgreSQL 会
+            PANIC——整个数据库集群立即宕机。这是一项刻意设计：宁可用停机来保护数据一致性，也不允许
+            WAL 记录丢失。PostgreSQL 源码
+            <code>src/backend/access/transam/xlog.c</code>
+            中，<code>XLogWrite()</code> 在持久化 WAL 缓冲时若
+            <code>write()</code> 失败且错误为
+            <code>ENOSPC</code>，会通过 <code>ereport(PANIC, ...)</code>
+            终止进程（版本随 PostgreSQL
+            发布变化，行为以所用版本源码为准）。</p>
+            <div class="sourceCode" id="cb19"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL 日志中的典型 ENOSPC 表现：</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="co"># PANIC: could not write to file &quot;pg_wal/00000001000000000000000A&quot;: No space left on device</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据库立即重启，进入恢复模式</span></span></code></pre></div>
+            <p><strong>MySQL/InnoDB</strong>：InnoDB 遇到 redo log
+            ENOSPC 时会 crash，类似 PostgreSQL。但如果 ENOSPC
+            发生在数据文件（表空间）扩展时，InnoDB
+            可能会静默失败——表空间文件的一部分写入成功，另一部分没有，导致损坏。</p>
+            <h3 id="键值存储">8.2 键值存储</h3>
+            <p><strong>RocksDB</strong>：RocksDB 提供两种 ENOSPC
+            模式。<code>avoid_flush_during_shutdown=false</code>
+            时，ENOSPC 导致写
+            stall（暂停写入，无限等待空间释放）。<code>true</code>
+            时，ENOSPC 导致写操作返回错误给上层。默认是 stall——这意味着
+            RocksDB
+            进程会”挂起”而不是报错，在监控上表现为延迟无限大。</p>
+            <h3 id="消息队列">8.3 消息队列</h3>
+            <p><strong>Kafka</strong>：Kafka
+            的日志段写满磁盘时，默认行为是等待日志清理（Log
+            Cleanup）释放空间。如果 cleanup 速度跟不上写入速度，Kafka 会
+            block 所有生产请求，表现为生产者超时。</p>
+            <hr />
+            <h2 id="九监控与自动化">九、监控与自动化</h2>
+            <h3 id="监控维度">9.1 监控维度</h3>
+            <p>监控文件系统空间时，最少需要四个维度：</p>
+            <pre class="text"><code>维度 1：块使用率
+  指标：df -h 的 Use%
+  告警：根据文件系统类型设置分层阈值（见第六节）
+
+维度 2：inode 使用率
+  指标：df -i 的 IUse%
+  告警：&gt; 85% 预警，&gt; 95% 紧急
+
+维度 3：Btrfs 元数据使用率（仅 Btrfs）
+  指标：btrfs filesystem usage 中的 Metadata Used%
+  告警：&gt; 90% 紧急
+
+维度 4：ZFS 池使用率（仅 ZFS）
+  指标：zpool list 的 CAP%
+  告警：&gt; 80% 预警，&gt; 90% 紧急</code></pre>
+            <h3 id="自动化清理策略">9.2 自动化清理策略</h3>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 简单的自动清理脚本框架</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 在空间超过阈值时安全删除过期文件</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 部署前需要根据业务场景调整路径和保留天数</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="va">MOUNT</span><span class="op">=</span><span class="st">&quot;/mnt/data&quot;</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="va">THRESHOLD_WARN</span><span class="op">=</span>70</span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a><span class="va">THRESHOLD_CRIT</span><span class="op">=</span>85    <span class="co"># 触发自动清理</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="va">USAGE</span><span class="op">=</span><span class="va">$(</span><span class="fu">df</span> <span class="at">-h</span> <span class="st">&quot;</span><span class="va">$MOUNT</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;NR==2 {print $5}&#39;</span> <span class="kw">|</span> <span class="fu">sed</span> <span class="st">&#39;s/%//&#39;</span><span class="va">)</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-12"><a href="#cb21-12" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$USAGE</span><span class="st">&quot;</span> <span class="ot">-ge</span> <span class="st">&quot;</span><span class="va">$THRESHOLD_CRIT</span><span class="st">&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb21-13"><a href="#cb21-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;[</span><span class="va">$(</span><span class="fu">date</span><span class="va">)</span><span class="st">] 空间使用率 </span><span class="va">${USAGE}</span><span class="st">%，超过临界值 </span><span class="va">${THRESHOLD_CRIT}</span><span class="st">%，启动自动清理&quot;</span></span>
+<span id="cb21-14"><a href="#cb21-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-15"><a href="#cb21-15" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 1. 清理 7 天前的临时文件</span></span>
+<span id="cb21-16"><a href="#cb21-16" aria-hidden="true" tabindex="-1"></a>    <span class="fu">find</span> /mnt/data/tmp <span class="at">-type</span> f <span class="at">-mtime</span> +7 <span class="at">-delete</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb21-17"><a href="#cb21-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-18"><a href="#cb21-18" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 2. 清理 30 天前的日志（保留最近 30 天）</span></span>
+<span id="cb21-19"><a href="#cb21-19" aria-hidden="true" tabindex="-1"></a>    <span class="fu">find</span> /mnt/data/logs <span class="at">-name</span> <span class="st">&quot;*.log&quot;</span> <span class="at">-mtime</span> +30 <span class="at">-delete</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb21-20"><a href="#cb21-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-21"><a href="#cb21-21" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 3. 如果是 Btrfs，尝试回收未使用 chunk</span></span>
+<span id="cb21-22"><a href="#cb21-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">[</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">stat</span> <span class="at">-f</span> <span class="at">--format</span><span class="op">=</span>%T <span class="st">&quot;</span><span class="va">$MOUNT</span><span class="st">&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="va">)</span><span class="st">&quot;</span> <span class="ot">=</span> <span class="st">&quot;btrfs&quot;</span> <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span></span>
+<span id="cb21-23"><a href="#cb21-23" aria-hidden="true" tabindex="-1"></a>        <span class="ex">btrfs</span> balance start <span class="at">-dusage</span><span class="op">=</span>5 <span class="at">-musage</span><span class="op">=</span>5 <span class="st">&quot;</span><span class="va">$MOUNT</span><span class="st">&quot;</span> <span class="kw">&amp;</span></span>
+<span id="cb21-24"><a href="#cb21-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">fi</span></span>
+<span id="cb21-25"><a href="#cb21-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-26"><a href="#cb21-26" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 4. 发送告警</span></span>
+<span id="cb21-27"><a href="#cb21-27" aria-hidden="true" tabindex="-1"></a>    <span class="bu">echo</span> <span class="st">&quot;[</span><span class="va">$(</span><span class="fu">date</span><span class="va">)</span><span class="st">] 自动清理完成。当前使用率：</span><span class="va">$(</span><span class="fu">df</span> <span class="at">-h</span> <span class="st">&quot;</span><span class="va">$MOUNT</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">awk</span> <span class="st">&#39;NR==2 {print $5}&#39;</span><span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb21-28"><a href="#cb21-28" aria-hidden="true" tabindex="-1"></a><span class="cf">fi</span></span></code></pre></div>
+            <p>关键设计原则：自动清理只删除明确的临时文件（规定保留期的日志、已知的缓存目录）。永远不要让自动化脚本删除无法确认安全性的文件——误删数据库文件比磁盘满了更难恢复。</p>
+            <h3 id="lvm-自动扩展">9.3 LVM 自动扩展</h3>
+            <p>对于使用 LVM 的场景，可以利用 dmeventd
+            的自动扩展机制：</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前 LVM 自动扩展配置</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lvs</span> <span class="at">-a</span> <span class="at">-o</span> +lv_when_full,thin_pool_autoextend_threshold</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用 thin pool 自动扩展</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 lvm.conf 中配置：</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a><span class="co"># thin_pool_autoextend_threshold = 80</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="co"># thin_pool_autoextend_percent = 20</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 含义：thin pool 使用率达到 80% 时，自动扩展 20%</span></span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 也可以通过 lvchange 命令设置</span></span>
+<span id="cb22-11"><a href="#cb22-11" aria-hidden="true" tabindex="-1"></a><span class="ex">lvchange</span> <span class="at">--errorwhenfull</span> y vg/thinpool</span></code></pre></div>
+            <p>LVM thin pool 耗尽不是一个 ENOSPC
+            问题——它是数据丢失问题。当 thin pool 中的空间不足时，thin
+            volume 上的写入会触发 pool 的 ENOSPC。如果 pool 配置了
+            <code>--errorwhenfull y</code>，写入会返回 I/O
+            错误；如果没有配置，写入会被阻塞（hang），等待 pool
+            空间释放。对于生产环境，<code>errorwhenfull y</code> 通常比
+            hang 更好——至少上层应用能感知到错误并做降级。</p>
+            <hr />
+            <h2 id="十总结从红线到实践">十、总结：从红线到实践</h2>
+            <pre class="text"><code>问题                            应对
+────────────────────────────────────────────────────
+文件系统 70% 满了怎么办          扩容 / 清理旧数据 / 归档冷数据
+inode 用到 90% 了怎么办          确认是否真的需要这么多文件
+                                → 是：换个不限制 inode 的文件系统
+                                → 否：为什么有这么多文件？
+Btrfs metadata 快满了怎么办      启动 balance，检查快照数量
+ZFS 池 85% 了怎么办              检查 COW 写放大，规划扩容
+ENOSPC 了但 df 显示有空闲        检查 inode，检查 Btrfs metadata
+rm 失败怎么办                    truncate + kill 持有 fd 的进程
+应用 hang 了不报错               检查是不是 RocksDB/Kafka 在 stall</code></pre>
+            <p>存储空间耗尽不是”会不会发生”的问题，而是”什么时候发生”和”发生时你的系统能不能优雅地应对”的问题。监控阈值必须根据实际文件系统类型和工作负载来设定——套用统一
+            80% 阈值和祈祷不会出事，这两者之间几乎没有区别。</p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <ul>
+            <li>Linux 内核源码：<code>fs/ext4/mballoc.c</code>（ext4
+            多块分配器）、<code>fs/xfs/libxfs/xfs_alloc.c</code>（XFS AG
+            块分配器）、<code>fs/btrfs/block-group.c</code>（Btrfs block
+            group 管理）、<code>fs/ext4/ialloc.c</code>（ext4 inode
+            分配器）。</li>
+            <li>PostgreSQL
+            源码：<code>src/backend/access/transam/xlog.c</code>（WAL
+            写入和 ENOSPC 处理）。</li>
+            <li>MySQL/InnoDB
+            文档：<code>innodb_flush_log_at_trx_commit</code> 与 ENOSPC
+            行为。——<a
+            href="https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html"
+            class="uri">https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html</a></li>
+            <li>Btrfs wiki：ENOSPC 故障处理。——<a
+            href="https://btrfs.readthedocs.io/en/latest/ENOSPC.html"
+            class="uri">https://btrfs.readthedocs.io/en/latest/ENOSPC.html</a></li>
+            <li>ZFS on Linux 文档：Pool Performance Considerations。——<a
+            href="https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Workload%20Tuning.html"
+            class="uri">https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Workload%20Tuning.html</a></li>
+            <li>systemd Journal
+            文档：<code>journalctl --vacuum-size</code>。——<a
+            href="https://www.freedesktop.org/software/systemd/man/journalctl.html"
+            class="uri">https://www.freedesktop.org/software/systemd/man/journalctl.html</a></li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../75-small-file-problem/small-file-problem.html">小文件问题：为什么文件数量比文件大小更致命</a>
+            <strong>下一篇</strong>: <a
+            href="../77-file-locking-pitfalls/file-locking-pitfalls.html">POSIX
+            文件锁：flock、fcntl 与 NFS 锁的工程陷阱</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-27 · storage</p>
+                    <h3><a href="/post/storage/18-filesystem-selection/filesystem-selection.html">【存储工程】文件系统选型与基准测试</a></h3>
+                    <p>在生产环境中，文件系统（Filesystem）的选择直接影响存储栈的性能上限、数据安全边界和运维复杂度。本文将从设计目标、元数据性能、数据吞吐、典型业务场景、基准测试方法论等多个维度，对 ext4、XFS、Btrfs（B-tree Filesystem）、ZFS（Zettabyte File System）四种主流文件…</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-28 · linux / storage</p>
+                    <h3><a href="/post/linux/fsync-error-truth/fsync-error-truth.html">fsync 失败的真相：当它返回错误，你的数据可能已经没了</a></h3>
+                    <p>fsync() 返回 EIO 后再调一次为什么会成功？为什么这反而是灾难？从 2018 fsyncgate 到 Linux errseq_t，再到本机内核 6.6 上用 dm-error 单块故障注入的实测，讲清 writeback 失败时脏页被标记 clean、数据静默丢失的真相，以及 PostgreSQL 为什么选择 PANIC。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/75-small-file-problem/small-file-problem.html">【存储工程】小文件问题：为什么文件数量比文件大小更致命</a></h3>
+                    <p>系统分析小文件在块分配、元数据管理、磁盘寻道和网络协议四个层面的放大效应，用数据量化 slack space、inode 开销和 syscall 成本，给出应用层聚合与对象存储归档两种工程方案。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-07-15 · algorithms</p>
+                    <h3><a href="/post/algorithms/56-fs-trees/fs-trees.html">文件系统的树：从 ext4 extent tree 到 btrfs CoW B-tree</a></h3>
+                    <p>你的 ext4 文件系统上有一个 1TB 的数据库文件。内核如何在 O(log n) 时间内找到文件偏移量 847,293,510,144 对应的物理磁盘块？答案藏在 extent tree 里。本文逐一拆解 ext4、XFS、btrfs、ZFS、F2FS 五种文件系统的树形结构设计。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL
+解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与
+snapshot 重建机制、pgoutput
+输出插件的二进制协议与行过滤变换、Publication/Subscription
+模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing
+为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable
+后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在
+reorder buffer 中的延迟放大效应。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, logical-replication, logical-decoding, reorder-buffer, pgoutput, publication, subscription, decode, conflict-detection, replication-slot, wal, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/19-logical-repl/19-logical-repl.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大" />
+    <meta property="og:description" content="拆解 PostgreSQL 逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL 解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与 snapshot 重建机制、pgoutput 输出插件的二进制协议与行过滤变换、Publication/Subscription 模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing 为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable 后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在 reorder buffer 中的延迟放大效应。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/19-logical-repl/19-logical-repl.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="logical-replication" />
+    <meta property="article:tag" content="logical-decoding" />
+    <meta property="article:tag" content="reorder-buffer" />
+    <meta property="article:tag" content="pgoutput" />
+    <meta property="article:tag" content="publication" />
+    <meta property="article:tag" content="subscription" />
+    <meta property="article:tag" content="decode" />
+    <meta property="article:tag" content="conflict-detection" />
+    <meta property="article:tag" content="replication-slot" />
+    <meta property="article:tag" content="wal" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL 解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与 snapshot 重建机制、pgoutput 输出插件的二进制协议与行过滤变换、Publication/Subscription 模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing 为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable 后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在 reorder buffer 中的延迟放大效应。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大", "description": "拆解 PostgreSQL 逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL 解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与 snapshot 重建机制、pgoutput 输出插件的二进制协议与行过滤变换、Publication/Subscription 模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing 为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable 后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在 reorder buffer 中的延迟放大效应。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/19-logical-repl/19-logical-repl.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "logical-replication", "logical-decoding", "reorder-buffer", "pgoutput", "publication", "subscription", "decode", "conflict-detection", "replication-slot", "wal"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#logical-replication</span> <span>#logical-decoding</span> <span>#reorder-buffer</span> <span>#pgoutput</span> <span>#publication</span> <span>#subscription</span> <span>#decode</span> <span>#conflict-detection</span> <span>#replication-slot</span> <span>#wal</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/logical-replication.html">#logical-replication</a><a class="chip-link" href="/tags/logical-decoding.html">#logical-decoding</a><a class="chip-link" href="/tags/reorder-buffer.html">#reorder-buffer</a><a class="chip-link" href="/tags/pgoutput.html">#pgoutput</a><a class="chip-link" href="/tags/publication.html">#publication</a><a class="chip-link" href="/tags/subscription.html">#subscription</a><a class="chip-link" href="/tags/decode.html">#decode</a><a class="chip-link" href="/tags/conflict-detection.html">#conflict-detection</a><a class="chip-link" href="/tags/replication-slot.html">#replication-slot</a><a class="chip-link" href="/tags/wal.html">#wal</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#逻辑复制与逻辑解码冲突处理与延迟放大"
+                id="toc-逻辑复制与逻辑解码冲突处理与延迟放大">逻辑复制与逻辑解码：冲突处理与延迟放大</a>
+                <ul>
+                <li><a href="#一逻辑解码从-wal-到逻辑变更"
+                id="toc-一逻辑解码从-wal-到逻辑变更">一、逻辑解码：从
+                WAL 到逻辑变更</a>
+                <ul>
+                <li><a href="#整体架构"
+                id="toc-整体架构">整体架构</a></li>
+                <li><a href="#decodexlogtuple从-wal-数据重建-heaptuple"
+                id="toc-decodexlogtuple从-wal-数据重建-heaptuple">DecodeXLogTuple：从
+                WAL 数据重建 HeapTuple</a></li>
+                <li><a href="#reorderbuffer-的核心数据结构"
+                id="toc-reorderbuffer-的核心数据结构">ReorderBuffer
+                的核心数据结构</a></li>
+                <li><a href="#k-way-merge子事务的-lsn-有序迭代"
+                id="toc-k-way-merge子事务的-lsn-有序迭代">k-way
+                merge：子事务的 LSN 有序迭代</a></li>
+                <li><a href="#snapshot-重建为什么需要-historic-mvcc"
+                id="toc-snapshot-重建为什么需要-historic-mvcc">Snapshot
+                重建：为什么需要 historic MVCC</a></li>
+                <li><a href="#内存管理与溢出到磁盘"
+                id="toc-内存管理与溢出到磁盘">内存管理与溢出到磁盘</a></li>
+                </ul></li>
+                <li><a href="#三output-pluginpgoutput-协议"
+                id="toc-三output-pluginpgoutput-协议">三、Output
+                Plugin：pgoutput 协议</a>
+                <ul>
+                <li><a href="#插件接口"
+                id="toc-插件接口">插件接口</a></li>
+                <li><a href="#订阅端subscription"
+                id="toc-订阅端subscription">订阅端：Subscription</a></li>
+                </ul></li>
+                <li><a href="#五逻辑复制的冲突检测与处理"
+                id="toc-五逻辑复制的冲突检测与处理">五、逻辑复制的冲突检测与处理</a>
+                <ul>
+                <li><a href="#四种核心冲突类型"
+                id="toc-四种核心冲突类型">四种核心冲突类型</a></li>
+                <li><a
+                href="#什么不算冲突update_missing-和-delete_missing-的语义"
+                id="toc-什么不算冲突update_missing-和-delete_missing-的语义">什么不算冲突：<code>update_missing</code>
+                和 <code>delete_missing</code> 的语义</a></li>
+                <li><a href="#冲突修复策略"
+                id="toc-冲突修复策略">冲突修复策略</a></li>
+                <li><a href="#disable_on_error-选项"
+                id="toc-disable_on_error-选项"><code>disable_on_error</code>
+                选项</a></li>
+                <li><a href="#陷阱二序列不是逻辑复制的范围"
+                id="toc-陷阱二序列不是逻辑复制的范围">陷阱二：序列不是逻辑复制的范围</a></li>
+                <li><a
+                href="#陷阱四replica-identity-与-updatedelete-的定位失败"
+                id="toc-陷阱四replica-identity-与-updatedelete-的定位失败">陷阱四：REPLICA
+                IDENTITY 与 UPDATE/DELETE 的定位失败</a></li>
+                <li><a href="#构造-update_missing"
+                id="toc-构造-update_missing">构造
+                update_missing</a></li>
+                </ul></li>
+                <li><a href="#九关键要点"
+                id="toc-九关键要点">九、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#其他" id="toc-其他">其他</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="逻辑复制与逻辑解码冲突处理与延迟放大">逻辑复制与逻辑解码：冲突处理与延迟放大</h1>
+            <p>流复制（物理复制）能给你一个和 Primary 逐字节相同的
+            Standby，但它有一个硬伤：你必须复制整个集群。你不能只复制一张表、不能跨大版本复制、不能做双向同步。（关于流复制的完整内核机制，参见<a
+            href="../18-streaming-repl/18-streaming-repl.html">流复制</a>。）逻辑复制补上了这些缺口——它从
+            WAL
+            中解码出行级变更（INSERT/UPDATE/DELETE），然后把这些变更应用到另一个数据库，甚至可以跨
+            PG 版本。</p>
+            <p>听起来很美好，但逻辑复制的故障形态和流复制截然不同。流复制的麻烦在
+            Slot
+            溢出和延迟；逻辑复制的麻烦在<strong>冲突</strong>——Publisher
+            上成功的操作，在 Subscriber
+            上可能因为约束冲突而失败。更隐蔽的是，大事务在 Reorder
+            Buffer 中会引发延迟放大效应，一条 <code>UPDATE</code> 话在
+            commit 之前不会发给 Subscriber。</p>
+            <p>本文从源码路径拆解 PG
+            逻辑复制和逻辑解码的内核骨架，重点解释四个运维中最常遇到但理解最不充分的问题：四种冲突类型的根因和修复边界、序列不复制导致的自增主键冲突陷阱、大事务延迟放大的机制根因、以及
+            Subscription 被 disable 后的正确追平策略。</p>
+            <hr />
+            <h2 id="一逻辑解码从-wal-到逻辑变更">一、逻辑解码：从 WAL
+            到逻辑变更</h2>
+            <h3 id="整体架构">整体架构</h3>
+            <p>逻辑复制和流复制共用同一套 WAL
+            基础设施，但走向完全不同。流复制的 WAL Sender 直接把 WAL
+            record 的原始字节发给
+            Standby；逻辑复制则多了一个<strong>逻辑解码（Logical
+            Decoding）</strong>环节——从 <code>wal_level = logical</code>
+            级别的 WAL record
+            中解码出每一行的INSERT/UPDATE/DELETE，再通过 Output Plugin
+            序列化成协议消息发送给 Subscriber。</p>
+            <pre class="mermaid"><code>sequenceDiagram
+    participant BE as Backend (Publisher)
+    participant WB as WAL Buffer
+    participant LD as Logical Decoding
+    participant RB as Reorder Buffer
+    participant OP as Output Plugin (pgoutput)
+    participant AW as Apply Worker (Subscriber)
+
+    BE-&gt;&gt;WB: XLogInsert() 写入 WAL record
+    WB-&gt;&gt;LD: XLogReadRecord() 读取 record
+    LD-&gt;&gt;LD: LogicalDecodingProcessRecord()
+    LD-&gt;&gt;RB: RMGR decode → ReorderBufferQueueChange()
+    Note over RB: 按 xid 暂存所有变更
+    BE-&gt;&gt;WB: XLogInsert() COMMIT record
+    WB-&gt;&gt;LD: XLogReadRecord() COMMIT
+    LD-&gt;&gt;RB: ReorderBufferCommit()
+    RB-&gt;&gt;RB: k-way merge 重建完整变更流
+    RB-&gt;&gt;OP: change_cb(INSERT/UPDATE/DELETE)
+    OP-&gt;&gt;AW: 网络传输 (replication protocol)
+    AW-&gt;&gt;AW: apply_dispatch() → INSERT/UPDATE/DELETE
+```text
+
+WAL Sender 对逻辑复制的角色变成了 WAL Reader——它不再发送原始 WAL record，而是不断调用 `LogicalDecodingProcessRecord()`，然后让 Output Plugin 把解码结果发出去。解码过程分了三个核心模块：Decode（逐 record 解码）、ReorderBuffer（按事务重排）、Output Plugin（序列化输出）。
+
+### LogicalDecodingProcessRecord：逐 record 的解码
+
+逻辑解码的入口函数是 `LogicalDecodingProcessRecord()`，位于 `src/backend/replication/logical/decode.c`。每次从 WAL 读取到一条 record，就调用它一次：
+
+```c
+// src/backend/replication/logical/decode.c
+void LogicalDecodingProcessRecord(LogicalDecodingContext *ctx,
+                                   XLogReaderState *record)
+{
+    XLogRecordBuffer buf;
+    RmgrData    rmgr;
+
+    buf.origptr = ctx-&gt;reader-&gt;ReadRecPtr;
+    buf.endptr = ctx-&gt;reader-&gt;EndRecPtr;
+    buf.record = record;
+
+    // 如果有 top-level xid，注册到 reorder buffer
+    topxid = XLogRecGetTopXid(record);
+    if (TransactionIdIsValid(topxid))
+        ReorderBufferAssignChild(ctx-&gt;reorder, xid, topxid, ...);
+
+    // 通过 RMGR 表分发到对应的 decode 函数
+    rmgr = GetRmgr(XLogRecGetRmid(record));
+    if (rmgr.rm_decode != NULL)
+        rmgr.rm_decode(ctx, &amp;buf);
+    else
+        ReorderBufferProcessXid(ctx-&gt;reorder, XLogRecGetXid(record), ...);
+}</code></pre>
+            <p>这里的核心设计是 Resource Manager（RMGR）的分发表。WAL
+            中每条 record 都标明了它属于哪个
+            RMGR——<code>RM_HEAP_ID</code>（堆表插入/更新/删除）、<code>RM_XACT_ID</code>（事务提交/回滚）、<code>RM_LOGICALMSG_ID</code>（逻辑消息）等。不同的
+            RMGR 有各自对应的 <code>rm_decode</code> 回调，这些回调在
+            <code>decode.c</code> 中实现。</p>
+            <p>以堆表插入为例，链路是：</p>
+            <pre class="text"><code>LogicalDecodingProcessRecord()
+  → GetRmgr(RM_HEAP_ID) → rmgr.rm_decode = heap_decode()
+    → switch (info) {
+        case XLOG_HEAP_INSERT:   DecodeInsert(ctx, buf);
+        case XLOG_HEAP_UPDATE:   DecodeUpdate(ctx, buf);
+        case XLOG_HEAP_DELETE:   DecodeDelete(ctx, buf);
+        case XLOG_HEAP_TRUNCATE: DecodeTruncate(ctx, buf);
+      }
+```text
+
+每个 `Decode*` 函数做三件事：从 WAL record 数据中重建 tuple 内容（通过 `DecodeXLogTuple()`）、检查数据库 OID 和 origin 过滤条件、构造 `ReorderBufferChange` 并通过 `ReorderBufferQueueChange()` 入队到对应事务的变更链表中。
+
+对于事务提交 (`RM_XACT_ID`)，decode 路径不同：
+
+```text
+xact_decode()
+  → switch (info) {
+      case XLOG_XACT_COMMIT:
+        DecodeCommit() → ReorderBufferCommit() // 触发重放
+      case XLOG_XACT_ABORT:
+        DecodeAbort()  → ReorderBufferAbort()  // 丢弃该事务所有变更
+    }</code></pre>
+            <p>关键点在于：直到看到事务的 COMMIT record
+            之前，该事务所有的 INSERT/UPDATE/DELETE 变更都只是暂存在
+            Reorder Buffer 中，不会发给 Output
+            Plugin。这是逻辑复制延迟放大的根因。</p>
+            <h3
+            id="decodexlogtuple从-wal-数据重建-heaptuple">DecodeXLogTuple：从
+            WAL 数据重建 HeapTuple</h3>
+            <p>WAL record 中保存的 tuple 数据不是完整的
+            <code>HeapTuple</code>
+            格式——它只包含发生变更的列的数据和必要的 header
+            信息。<code>DecodeXLogTuple()</code>
+            负责将这些原始字节重建为 <code>HeapTuple</code> 结构：</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/replication/logical/decode.c</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> DecodeXLogTuple<span class="op">(</span><span class="dt">char</span> <span class="op">*</span>data<span class="op">,</span> Size len<span class="op">,</span> HeapTuple tuple<span class="op">)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// data 指向 xl_heap_header 或 xl_multi_insert_tuple</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 重建 HeapTupleData 的 t_data 指针、t_len、t_self</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// t_data 中包含 t_infomask2, t_infomask, t_hoff 以及列数据</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>对于 UPDATE，WAL 中同时包含旧 tuple 和新 tuple（取决于 `REPLICA IDENTITY` 设置），解码函数分别通过 `ReorderBufferGetTupleBuf<span class="op">()</span>` 分配内存并填充。REPLICA IDENTITY 决定了旧 tuple 中包含多少列——`FULL` 包含所有列，`DEFAULT`（主键）只包含主键列，这是 `UPDATE` 和 `DELETE` 在 Subscriber 端能否定位到目标行的关键。</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 二、Reorder Buffer：事务重排与 Snapshot 重建</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 为什么必须按 COMMIT 顺序解码</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>WAL 是按物理写入顺序（LSN 顺序）组织的，不是一个事务的连续记录。PG 使用 MVCC，多个事务的变更在 WAL 中交错出现——事务 A 的 INSERT、事务 B 的 UPDATE、事务 A 的 DELETE、事务 C 的 INSERT、事务 B 的 COMMIT、事务 A 的 COMMIT。</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>如果直接按 LSN 顺序把变更发给 Subscriber，事务边界就会丢失，Subscriber 上看到的不是原子提交。Reorder Buffer 的职责是<span class="op">**</span>把按 LSN 交错的变更按事务重新组装，然后在事务 COMMIT 的时候按正确的顺序一次性输出<span class="op">**</span>。</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>flowchart LR</span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    subgraph WAL <span class="op">[</span>WAL Record 序列（按 LSN）<span class="op">]</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        direction LR</span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        W1<span class="op">[</span><span class="st">&quot;T1 INSERT&quot;</span><span class="op">]</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        W2<span class="op">[</span><span class="st">&quot;T2 UPDATE&quot;</span><span class="op">]</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        W3<span class="op">[</span><span class="st">&quot;T1 UPDATE&quot;</span><span class="op">]</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>        W4<span class="op">[</span><span class="st">&quot;T3 INSERT&quot;</span><span class="op">]</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>        W5<span class="op">[</span><span class="st">&quot;T2 COMMIT&quot;</span><span class="op">]</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        W6<span class="op">[</span><span class="st">&quot;T1 COMMIT&quot;</span><span class="op">]</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        W7<span class="op">[</span><span class="st">&quot;T3 COMMIT&quot;</span><span class="op">]</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    end</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    subgraph RB <span class="op">[</span>Reorder Buffer<span class="op">]</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>        direction TB</span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>        T1<span class="op">[</span><span class="st">&quot;T1: INSERT → UPDATE&quot;</span><span class="op">]</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>        T2<span class="op">[</span><span class="st">&quot;T2: UPDATE&quot;</span><span class="op">]</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>        T3<span class="op">[</span><span class="st">&quot;T3: INSERT&quot;</span><span class="op">]</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    end</span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    subgraph OUT <span class="op">[</span>输出顺序<span class="op">]</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>        direction LR</span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>        O2<span class="op">[</span><span class="st">&quot;T2: BEGIN → UPDATE → COMMIT&quot;</span><span class="op">]</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>        O1<span class="op">[</span><span class="st">&quot;T1: BEGIN → INSERT → UPDATE → COMMIT&quot;</span><span class="op">]</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>        O3<span class="op">[</span><span class="st">&quot;T3: BEGIN → INSERT → UPDATE → COMMIT&quot;</span><span class="op">]</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>    end</span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>    W1 <span class="op">--&gt;</span> T1</span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>    W2 <span class="op">--&gt;</span> T2</span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>    W3 <span class="op">--&gt;</span> T1</span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>    W4 <span class="op">--&gt;</span> T3</span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    W5 <span class="op">--&gt;</span> O2</span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>    W6 <span class="op">--&gt;</span> O1</span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>    W7 <span class="op">--&gt;</span> O3</span></code></pre></div>
+            <p>注意：输出顺序是按 COMMIT LSN
+            排序的，不是按事务开始的顺序。T2 虽然比 T1
+            晚开始，但它先提交，所以 T2 的变更先输出。这保证了
+            Subscriber 上看到的提交顺序和 Publisher 一致。</p>
+            <h3 id="reorderbuffer-的核心数据结构">ReorderBuffer
+            的核心数据结构</h3>
+            <p><code>ReorderBuffer</code> 是
+            <code>src/backend/replication/logical/reorderbuffer.c</code>
+            中的核心管理结构，维护以下关键成员：</p>
+            <ul>
+            <li><strong><code>by_txn</code> hash
+            table</strong>：<code>TransactionId</code> 到
+            <code>ReorderBufferTXN</code>
+            的映射，是查找事务的主索引。有一个单条目的
+            cache（<code>by_txn_last_xid</code> /
+            <code>by_txn_last_txn</code>）优化连续同事务解码。</li>
+            <li><strong><code>toplevel_by_lsn</code>
+            链表</strong>：所有顶层事务按 <code>first_lsn</code>
+            排序，用于确定事务顺序。</li>
+            <li><strong><code>txn_heap</code></strong>：按事务大小排序的
+            max-heap（pairing
+            heap），用于内存溢出时找到最大的事务进行序列化。</li>
+            <li><strong><code>catchange_txns</code></strong>：修改了系统表（catalog）的事务列表，这些事务需要构建
+            <code>tuplecid_hash</code> 来支持 historic MVCC 查找。</li>
+            <li><strong>三层内存上下文</strong>：SlabContext
+            分配固定大小的 change 和 txn 记录、GenerationContext
+            分配变长的 tuple 数据。</li>
+            </ul>
+            <p><code>ReorderBufferTXN</code>
+            跟踪一个顶层事务及其所有子事务：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/replication/reorderbuffer.h</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> ReorderBufferTXN <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    TransactionId   xid<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr      first_lsn<span class="op">;</span>       <span class="co">// 事务第一条变更的 LSN</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr      final_lsn<span class="op">;</span>       <span class="co">// 事务 COMMIT record 的 LSN</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr      end_lsn<span class="op">;</span>         <span class="co">// COMMIT record 结束位置</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr      restart_decoding_lsn<span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    dlist_head      changes<span class="op">;</span>         <span class="co">// ReorderBufferChange 双向链表</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    Size            size<span class="op">;</span>            <span class="co">// 该事务占用的内存</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    uint64          nentries<span class="op">;</span>        <span class="co">// 总变更数</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    uint64          nentries_mem<span class="op">;</span>    <span class="co">// 仍在内存中的变更数（溢出到磁盘后 &lt; nentries）</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    Snapshot        base_snapshot<span class="op">;</span>   <span class="co">// 该事务的 catalog snapshot</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    ReorderBufferTXN <span class="op">*</span>subtxns<span class="op">;</span>       <span class="co">// 子事务列表</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>             nsubtxns<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    uint32          txn_flags<span class="op">;</span>       <span class="co">// 标志位组合</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ReorderBufferTXN<span class="op">;</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>`ReorderBufferChange` 代表一条解码后的变更：</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> ReorderBufferChange <span class="op">{</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    XLogRecPtr      lsn<span class="op">;</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    ReorderBufferChangeType action<span class="op">;</span>  <span class="co">// INSERT/UPDATE/DELETE/MESSAGE/TRUNCATE/...</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    ReorderBufferTXN <span class="op">*</span>txn<span class="op">;</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">union</span> <span class="op">{</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>        ReorderBufferTupleBuf <span class="op">*</span>tuplebuf<span class="op">;</span>  <span class="co">// INSERT/UPDATE/DELETE 的 tuple 数据</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>        ReorderBufferToastEnt <span class="op">*</span>toast_ent<span class="op">;</span> <span class="co">// TOAST 跨 record 重组状态</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... 其他类型特定数据</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> data<span class="op">;</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> ReorderBufferChange<span class="op">;</span></span></code></pre></div>
+            <h3 id="k-way-merge子事务的-lsn-有序迭代">k-way
+            merge：子事务的 LSN 有序迭代</h3>
+            <p>子事务（savepoint）引入了额外的复杂性——顶层事务 commit
+            时，其子事务的变更可能分布在不同的 LSN
+            区间。<code>ReorderBufferCommit()</code> 调用
+            <code>ReorderBufferIterTXNInit()</code> 初始化一个 k-way
+            merge 迭代器：</p>
+            <ol type="1">
+            <li>收集所有子事务（包括顶层事务自身），每个子事务有一个
+            <code>changes</code> 链表。</li>
+            <li>将所有子事务的当前 change 按 LSN 插入一个 binary
+            heap（最小堆）。</li>
+            <li>每次 <code>ReorderBufferIterTXNNext()</code> 弹出最小
+            LSN 的 change，然后将该子事务的下一个 change 入堆。</li>
+            <li>迭代结束时 <code>ReorderBufferIterTXNFinish()</code>
+            释放资源。</li>
+            </ol>
+            <p>这保证了一个包含多个 savepoint 的事务，其变更按精确的 LSN
+            顺序串行化——与它们在 Publisher 上执行时的顺序完全一致。</p>
+            <h3 id="snapshot-重建为什么需要-historic-mvcc">Snapshot
+            重建：为什么需要 historic MVCC</h3>
+            <p>解码 catalog 变更（如
+            <code>ALTER TABLE</code>）时，解码器需要能够看到该事务执行时的
+            catalog 状态。这被称为 historic MVCC——不能用当前的 catalog
+            snapshot，而必须重建事务执行时的 snapshot。</p>
+            <p>Reorder Buffer 通过以下机制实现：</p>
+            <ul>
+            <li><code>ReorderBufferSetBaseSnapshot()</code>
+            在第一次看到事务变更时，使用 <code>SnapBuild</code> 提供的
+            snapshot 作为该事务的 <code>base_snapshot</code>。</li>
+            <li>在 <code>ReorderBufferProcessTXN()</code> 中，遇到
+            <code>INTERNAL_SNAPSHOT</code> 类型的 change（对应事务内部的
+            <code>CommandId</code> 递增点）时，通过
+            <code>SetupHistoricSnapshot()</code> 切换 catalog
+            可见性。</li>
+            <li>修改了 catalog 的事务记录在 <code>catchange_txns</code>
+            中，解码时需要 <code>ReorderBufferBuildTupleCidHash()</code>
+            构建 <code>(relfilelocator, ctid) → (cmin, cmax)</code>
+            的映射，用于判断某个 catalog tuple 对该事务是否可见。</li>
+            </ul>
+            <h3 id="内存管理与溢出到磁盘">内存管理与溢出到磁盘</h3>
+            <p>Reorder Buffer 的总内存由
+            <code>logical_decoding_work_mem</code> 控制（默认
+            64MB）。当所有事务累积的变更超出这个值时，Reorder Buffer
+            选择当前最大的事务（通过
+            <code>txn_heap</code>）将其变更序列化到磁盘：</p>
+            <ol type="1">
+            <li>被选中的事务的 <code>changes</code> 链表被序列化为
+            <code>ReorderBufferDiskChange</code> 格式写入临时文件。</li>
+            <li>该事务的 <code>nentries_mem</code> 递减至 0，但
+            <code>nentries</code>
+            保持不变，<code>RBTXN_IS_SERIALIZED</code> 标志被置位。</li>
+            <li>当事务 commit
+            时，<code>ReorderBufferIterTXNInit()</code> 通过
+            <code>ReorderBufferRestoreChanges()</code>
+            分批从磁盘读回变更。</li>
+            </ol>
+            <p>这个溢出机制直接导致了大事务的延迟放大效应：如果一个大事务在
+            commit
+            之前被溢出到磁盘，它的变更可以在内存中持续累积，但<strong>无论如何都要等到
+            COMMIT
+            才释放</strong>——在此期间，这些变更占用的内存/磁盘空间不能被其他事务使用。</p>
+            <hr />
+            <h2 id="三output-pluginpgoutput-协议">三、Output
+            Plugin：pgoutput 协议</h2>
+            <h3 id="插件接口">插件接口</h3>
+            <p>PG 的逻辑解码框架支持多种 Output Plugin，包括内置的
+            <code>pgoutput</code>（用于逻辑复制）、<code>test_decoding</code>（调试用，输出文本格式）、以及第三方插件（如
+            <code>wal2json</code>、<code>decoderbufs</code>）。每个插件实现一系列回调函数：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/replication/output_plugin.h</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> OutputPluginCallbacks <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>startup<span class="op">)(</span><span class="kw">struct</span> LogicalDecodingContext <span class="op">*</span>ctx<span class="op">,</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>                    OutputPluginOptions <span class="op">*</span>opt<span class="op">,</span> <span class="dt">bool</span> is_init<span class="op">);</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>begin_txn<span class="op">)(...);</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>change<span class="op">)(...);</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>commit_txn<span class="op">)(...);</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>abort_txn<span class="op">)(...);</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>filter_by_origin_cb<span class="op">)(...);</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>shutdown<span class="op">)(...);</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... streaming, two_phase, truncate, message 回调</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> OutputPluginCallbacks<span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>`pgoutput` 是 PG 内置的二进制协议插件，实现位于 `src<span class="op">/</span>backend<span class="op">/</span>replication<span class="op">/</span>pgoutput<span class="op">/</span>pgoutput<span class="op">.</span>c`。它将解码出的 `ReorderBufferChange` 序列化为二进制消息，通过 replication protocol 发送给 Subscriber。</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 消息类型</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>pgoutput 输出的消息类型覆盖了逻辑复制的完整生命周期：</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 消息类型 <span class="op">|</span> 函数 <span class="op">|</span> 用途 <span class="op">|</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="op">|---------|------|------|</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> BEGIN <span class="op">|</span> `logicalrep_write_begin<span class="op">()</span>` <span class="op">|</span> 事务开始，携带 commit LSN 和 timestamp <span class="op">|</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> COMMIT <span class="op">|</span> `logicalrep_write_commit<span class="op">()</span>` <span class="op">|</span> 事务提交，携带 commit LSN 和 end LSN <span class="op">|</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> INSERT <span class="op">|</span> `logicalrep_write_insert<span class="op">()</span>` <span class="op">|</span> 行插入，含新 tuple 各列值 <span class="op">|</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> UPDATE <span class="op">|</span> `logicalrep_write_update<span class="op">()</span>` <span class="op">|</span> 行更新，含旧<span class="op">/</span>新 tuple <span class="op">|</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> DELETE <span class="op">|</span> `logicalrep_write_delete<span class="op">()</span>` <span class="op">|</span> 行删除，含旧 tuple（用于定位目标行） <span class="op">|</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> RELATION <span class="op">|</span> `logicalrep_write_rel<span class="op">()</span>` <span class="op">|</span> 发送表结构（列名、类型、replica identity） <span class="op">|</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> TRUNCATE <span class="op">|</span> `logicalrep_write_truncate<span class="op">()</span>` <span class="op">|</span> 表截断 <span class="op">|</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> TYPE <span class="op">|</span> `logicalrep_write_typ<span class="op">()</span>` <span class="op">|</span> 发送用户自定义类型信息 <span class="op">|</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> ORIGIN <span class="op">|</span> `logicalrep_write_origin<span class="op">()</span>` <span class="op">|</span> 复制来源标识 <span class="op">|</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> STREAM START<span class="op">/</span>STOP<span class="op">/</span>COMMIT<span class="op">/</span>ABORT <span class="op">|</span> 系列函数 <span class="op">|</span> 流式传输中大事务的变更 <span class="op">|</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>pgoutput 默认输出二进制格式（`OUTPUT_PLUGIN_BINARY_OUTPUT`）。也可以通过 `binary <span class="op">=</span> false` 选项切换到文本格式。二进制格式避免了类型转换开销，要求 Publisher 和 Subscriber 的类型二进制表示兼容——这通常是主版本相同或相邻版本时成立。</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 行过滤与 UPDATE 变换</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>pgoutput 最复杂的逻辑在 `pgoutput_change<span class="op">()</span>` 函数中。它不只是简单地转发解码结果——它需要判断该变更是否应该发送，以及如何发送：</span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a><span class="op">**</span><span class="fl">1.</span> 发布资格检查<span class="op">**</span>：`is_publishable_relation<span class="op">()</span>` 跳过对非发布表的解码。</span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a><span class="op">**</span><span class="fl">2.</span> 发布操作过滤<span class="op">**</span>：检查 `relentry<span class="op">-&gt;</span>pubactions`——如果发布只定义了 INSERT 操作，则跳过 UPDATE 和 DELETE。</span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a><span class="op">**</span><span class="fl">3.</span> 分区路由<span class="op">**</span>：如果表是分区并且发布使用了 `publish_via_partition_root`，将变更路由到顶层祖先表，并通过 `execute_attr_map_slot<span class="op">()</span>` 转换列的格式。</span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a><span class="op">**</span><span class="fl">4.</span> 行过滤器评估<span class="op">**</span>：`pgoutput_row_filter<span class="op">()</span>` 执行发布中定义的 WHERE 子句。对于 UPDATE 操作，行过滤器会产生有趣的变换：</span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 旧 tuple 匹配过滤器？ <span class="op">|</span> 新 tuple 匹配过滤器？ <span class="op">|</span> 结果 <span class="op">|</span></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a><span class="op">|----------------------|----------------------|------|</span></span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 否 <span class="op">|</span> 否 <span class="op">|</span> 丢弃该变更 <span class="op">|</span></span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 否 <span class="op">|</span> 是 <span class="op">|</span> 变换为 <span class="op">**</span>INSERT<span class="op">**</span> <span class="op">|</span></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 是 <span class="op">|</span> 否 <span class="op">|</span> 变换为 <span class="op">**</span>DELETE<span class="op">**</span> <span class="op">|</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a><span class="op">|</span> 是 <span class="op">|</span> 是 <span class="op">|</span> 保持为 <span class="op">**</span>UPDATE<span class="op">**</span> <span class="op">|</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true" tabindex="-1"></a>这个变换矩阵意味着：行过滤表达式可以影响 Subscriber 上执行的 SQL 类型。一个 Publisher 上的 UPDATE 可能在 Subscriber 上变成 INSERT（当旧值不匹配过滤器但新值匹配时）——旧值不匹配意味着 Subscriber 上之前没有这行（被过滤器排除了），现在新值匹配过滤器意味着这行第一次进入订阅范围，所以应该变成 INSERT。</span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 延迟 BEGIN 优化</span></span>
+<span id="cb5-58"><a href="#cb5-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-59"><a href="#cb5-59" aria-hidden="true" tabindex="-1"></a>pgoutput 有一个关键优化：如果事务中没有任何一条变更通过了发布过滤器，则整个事务的 BEGIN<span class="op">/</span>COMMIT 也不会发送。`pgoutput_change<span class="op">()</span>` 通过 `txndata<span class="op">-&gt;</span>sent_begin_txn` 标志跟踪——只有当至少一条变更被实际发送时，才会先发送 BEGIN。</span>
+<span id="cb5-60"><a href="#cb5-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-61"><a href="#cb5-61" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb5-62"><a href="#cb5-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-63"><a href="#cb5-63" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 四、Publication / Subscription 模型</span></span>
+<span id="cb5-64"><a href="#cb5-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-65"><a href="#cb5-65" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 发布端：Publication</span></span>
+<span id="cb5-66"><a href="#cb5-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-67"><a href="#cb5-67" aria-hidden="true" tabindex="-1"></a>Publication 定义了<span class="st">&quot;哪些表的哪些操作需要被复制&quot;</span>。在 PG 内核中，Publication 由三个 catalog 表支撑：</span>
+<span id="cb5-68"><a href="#cb5-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-69"><a href="#cb5-69" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`pg_publication`<span class="op">**</span>：Publication 的定义——名称、是否 `all tables`、`pubinsert`<span class="op">/</span>`pubupdate`<span class="op">/</span>`pubdelete`<span class="op">/</span>`pubtruncate` 标志位、`pubviaroot`、事件类型等。</span>
+<span id="cb5-70"><a href="#cb5-70" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`pg_publication_rel`<span class="op">**</span>：Publication 与具体表的关系，可选携带列列表（`prattrs`）和行过滤表达式（`prqual`）。</span>
+<span id="cb5-71"><a href="#cb5-71" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`pg_publication_namespace`<span class="op">**</span>：Publication 与 schema 的关系（PG <span class="dv">15</span><span class="op">+</span> 的 schema 级发布）。</span>
+<span id="cb5-72"><a href="#cb5-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-73"><a href="#cb5-73" aria-hidden="true" tabindex="-1"></a>创建 Publication 的 SQL：</span>
+<span id="cb5-74"><a href="#cb5-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-75"><a href="#cb5-75" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb5-76"><a href="#cb5-76" aria-hidden="true" tabindex="-1"></a>CREATE PUBLICATION mypub FOR TABLE t1<span class="op">,</span> t2 <span class="op">(</span>c1<span class="op">,</span> c2<span class="op">)</span></span>
+<span id="cb5-77"><a href="#cb5-77" aria-hidden="true" tabindex="-1"></a>    WITH <span class="op">(</span>publish <span class="op">=</span> <span class="ch">&#39;i</span><span class="er">nsert,update,delete</span><span class="ch">&#39;</span><span class="op">);</span></span>
+<span id="cb5-78"><a href="#cb5-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-79"><a href="#cb5-79" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> PG <span class="dv">15</span><span class="op">+:</span> schema 级发布</span>
+<span id="cb5-80"><a href="#cb5-80" aria-hidden="true" tabindex="-1"></a>CREATE PUBLICATION mypub FOR ALL TABLES IN SCHEMA public<span class="op">;</span></span>
+<span id="cb5-81"><a href="#cb5-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-82"><a href="#cb5-82" aria-hidden="true" tabindex="-1"></a><span class="op">--</span> PG <span class="dv">17</span><span class="op">+:</span> 带行过滤器</span>
+<span id="cb5-83"><a href="#cb5-83" aria-hidden="true" tabindex="-1"></a>CREATE PUBLICATION mypub FOR TABLE t1 WHERE <span class="op">(</span>status <span class="op">=</span> <span class="ch">&#39;a</span><span class="er">ctive</span><span class="ch">&#39;</span><span class="op">);</span></span></code></pre></div>
+            <p>pgoutput 在启动时调用 <code>LoadPublications()</code>
+            解析指定的 Publication 名称，然后通过
+            <code>get_rel_sync_entry()</code> 为每个关系构建
+            <code>RelationSyncEntry</code>，包含：</p>
+            <ul>
+            <li>该关系属于哪些 Publication（跨多个 Publication 取 OR
+            逻辑）</li>
+            <li>列列表（多个 Publication 必须一致，否则报错）</li>
+            <li>行过滤器（跨 Publication 取 OR，但如果任一 Publication
+            以 FOR ALL TABLES
+            包含该表且未设置行过滤，则丢弃所有行过滤）</li>
+            <li>分区祖先映射（如果多个 Publication
+            对该分区指定了不同的祖先，取树结构上最顶层的）</li>
+            </ul>
+            <h3 id="订阅端subscription">订阅端：Subscription</h3>
+            <p>Subscription 定义了”从哪里接收什么数据”：</p>
+            <ul>
+            <li><strong><code>pg_subscription</code></strong>：Subscription
+            的定义——连接字符串（<code>subconninfo</code>）、slot
+            名称、Publication
+            名称、所有者、<code>subenabled</code>、<code>subskiplsn</code>、<code>subdisableonerr</code>、<code>suborigin</code>
+            等。</li>
+            <li><strong><code>pg_subscription_rel</code></strong>：每个被订阅的表的状态——<code>srsubstate</code>（<code>i</code>=初始化
+            / <code>d</code>=数据复制中 / <code>f</code>=已完成同步 /
+            <code>r</code>=就绪 / <code>s</code>=同步中）和
+            <code>srsublsn</code>（同步结束 LSN）。</li>
+            <li><strong><code>pg_stat_subscription</code></strong>：订阅的运行时状态视图——apply
+            worker 的 PID、relay LSN、最近错误信息等。</li>
+            </ul>
+            <p>创建 Subscription 的 SQL：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> SUBSCRIPTION mysub</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    CONNECTION <span class="st">&#39;host=10.0.0.1 dbname=mydb&#39;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    PUBLICATION mypub</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WITH</span> (copy_data <span class="op">=</span> <span class="kw">true</span>, create_slot <span class="op">=</span> <span class="kw">true</span>, enabled <span class="op">=</span> <span class="kw">true</span>,</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>          streaming <span class="op">=</span> <span class="kw">off</span>, two_phase <span class="op">=</span> <span class="kw">false</span>,</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>          disable_on_error <span class="op">=</span> <span class="kw">false</span>);</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>### 初始表同步：TableSync Worker</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>当 Subscription 创建时，PG 对每个被订阅的表启动一个 tablesync worker：</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> 在 Publisher 端创建临时 replication slot，导出表当前快照。</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> 通过 `COPY` 将快照数据发送到 Subscriber 端的临时表。</span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> 数据复制完成后，将 `pg_subscription_rel.srsubstate` 更新为 `SYNCDONE`，记录 `srsublsn` 为快照结束时的 WAL 位置。</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> 主 apply worker 在看到该表状态变为 `SYNCDONE` 后，从 `srsublsn` 之后的位置开始应用增量变更。</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>这个过程确保初始数据复制期间没有数据丢失——Snapshot 之后的变更被后续的增量 apply 覆盖。</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>### Apply Worker 的主循环</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>主 apply worker 是 Subscriber 端的核心进程。它通过 replication protocol 连接到 Publisher，接收 pgoutput 消息流，并在 Subscriber 上执行对应的 SQL：</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> src<span class="op">/</span>backend<span class="op">/</span>replication<span class="op">/</span>logical<span class="op">/</span>worker.c, LogicalRepApplyLoop()</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> 主循环（简化）</span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> (;;) {</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">//</span> 从 publisher 接收一条消息</span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>    msg <span class="op">=</span> LogicalRepReadMessage();</span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">switch</span> (msg<span class="op">-&gt;</span><span class="kw">type</span>) {</span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> LOGICAL_REP_MSG_BEGIN:</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>        apply_handle_begin(msg<span class="op">-&gt;</span><span class="cf">begin</span>);</span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>        <span class="kw">break</span>;</span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> LOGICAL_REP_MSG_INSERT:</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>        apply_handle_insert(msg<span class="op">-&gt;</span><span class="kw">insert</span>);</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>        <span class="kw">break</span>;</span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> LOGICAL_REP_MSG_UPDATE:</span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>        apply_handle_update(msg<span class="op">-&gt;</span><span class="kw">update</span>);</span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>        <span class="kw">break</span>;</span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> LOGICAL_REP_MSG_DELETE:</span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>        apply_handle_delete(msg<span class="op">-&gt;</span><span class="kw">delete</span>);</span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>        <span class="kw">break</span>;</span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> LOGICAL_REP_MSG_COMMIT:</span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>        apply_handle_commit(msg<span class="op">-&gt;</span><span class="kw">commit</span>);</span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>        <span class="kw">break</span>;</span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> LOGICAL_REP_MSG_RELATION:</span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>        apply_handle_relation(msg<span class="op">-&gt;</span>relation);  <span class="op">//</span> 缓存表结构</span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>        <span class="kw">break</span>;</span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">//</span> <span class="op">..</span>. <span class="kw">TRUNCATE</span>, <span class="kw">TYPE</span>, ORIGIN 等</span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>}</span></code></pre></div>
+            <p><code>apply_handle_insert()</code> 执行
+            <code>ExecSimpleRelationInsert()</code>，<code>apply_handle_update()</code>
+            执行
+            <code>ExecSimpleRelationUpdate()</code>，依此类推。这些操作都通过
+            Subscriber 端的 Executor
+            执行，因此会触发所有正常约束检查——唯一约束、外键约束、触发器等。这就是冲突的起点。</p>
+            <hr />
+            <h2
+            id="五逻辑复制的冲突检测与处理">五、逻辑复制的冲突检测与处理</h2>
+            <h3 id="四种核心冲突类型">四种核心冲突类型</h3>
+            <p>逻辑复制的冲突不是理论上的边缘情况，而是生产环境的高发故障。冲突的本质是：Publisher
+            上一个成功的操作，在 Subscriber
+            上由于数据状态不同而无法执行。</p>
+            <p><strong>1.
+            <code>insert_exists</code>（duplicate_key）</strong></p>
+            <p>Publisher INSERT 了一行，但这行的主键/唯一键在 Subscriber
+            上已经存在。典型的根因：有人在 Subscriber
+            上手动插入了相同主键的数据，或者两个 Publisher 向同一个
+            Subscriber 写了相同主键的数据（多主到一）。</p>
+            <p><strong>行为</strong>：这是唯一会直接报 ERROR
+            的冲突类型。Apply worker 遇到
+            <code>duplicate key value violates unique constraint</code>
+            时停止工作。</p>
+            <p><strong>2. <code>update_missing</code></strong></p>
+            <p>Publisher UPDATE 了一行，但 Subscriber
+            上找不到对应行。根因：目标行在 Subscriber 上被手动 DELETE
+            了，或者之前的 <code>insert_exists</code>
+            冲突导致该行从未被插入。</p>
+            <p><strong>行为</strong>：<strong>静默跳过</strong>。Apply
+            worker 在 <code>FindReplTupleInLocalRel()</code>
+            找不到目标行时，只输出一条 DEBUG1 级别的日志
+            <code>"logical replication did not find row to be updated in replication target relation"</code>，不报错。</p>
+            <p><strong>3. <code>delete_missing</code></strong></p>
+            <p>Publisher DELETE 了一行，但 Subscriber
+            上找不到对应行。根因与 <code>update_missing</code>
+            相同。</p>
+            <p><strong>行为</strong>：<strong>静默跳过</strong>。Apply
+            worker 同样只输出 DEBUG1 日志，不报错。这意味着 Subscriber
+            上的数据可能比 Publisher 多——那些在 Publisher 上被删掉的行在
+            Subscriber 上残留。</p>
+            <p><strong>4. <code>update_differ</code> /
+            <code>delete_differ</code></strong>（PG 17+
+            冲突检测增强）</p>
+            <p>Publisher UPDATE/DELETE 了一行，但 Subscriber
+            上的这行是由<strong>另一个
+            origin</strong>（不是来自当前复制流）在本地修改过的。这需要
+            <code>track_commit_timestamp = on</code> 且
+            <code>detect_conflict = true</code>（PG
+            17+）才能检测到。</p>
+            <p><strong>行为</strong>：在 PG 17+ 中可以通过
+            <code>pg_stat_subscription_stats</code>
+            的计数器追踪，但不阻断复制（除非升级为约束冲突）。</p>
+            <h3
+            id="什么不算冲突update_missing-和-delete_missing-的语义">什么不算冲突：<code>update_missing</code>
+            和 <code>delete_missing</code> 的语义</h3>
+            <p><code>update_missing</code> 和
+            <code>delete_missing</code>
+            不报错，这是一个有意为之的设计决策——逻辑复制的目标是”将
+            Publisher 的数据尽可能应用到 Subscriber
+            上”。如果目标行不在，UPDATE/DELETE
+            就没有可执行的动作，跳过是合理的。但这也意味着 Subscriber
+            可能无声地偏离 Publisher 的状态。</p>
+            <p>问题在于：当 <code>update_missing</code>
+            发生时，之后同一个事务中的其他操作仍会继续执行。如果后续操作依赖于被跳过的
+            UPDATE 带来的数据一致性，Subscriber
+            就会进入不一致状态——<strong>跳过不是事务级别的回滚，只是操作级别的忽略</strong>。</p>
+            <h3 id="冲突修复策略">冲突修复策略</h3>
+            <p>当 conflict 导致 apply worker 停止时，修复路径如下：</p>
+            <p><strong>Step 1：确认冲突类型和 finish LSN。</strong></p>
+            <p>错误日志中会包含关键信息：</p>
+            <pre class="text"><code>ERROR:  duplicate key value violates unique constraint &quot;test_pkey&quot;
+DETAIL:  Key (c)=(1) already exists.
+CONTEXT:  processing remote data for replication origin &quot;pg_16395&quot;
+          during &quot;INSERT&quot; for replication target relation &quot;public.test&quot;
+          in transaction 725 finished at 0/14C0378
+```text
+
+需要记录两个值：origin name (`pg_16395`) 和 finish LSN (`0/14C0378`)。
+
+**Step 2：选择修复策略。**
+
+| 策略 | 操作 | 适用场景 | 风险 |
+|------|------|---------|------|
+| 手动修复数据 | 在 Subscriber 上删除或更新冲突行，然后 `ALTER SUBSCRIPTION ENABLE` | 数据完整性关键 | 需要确定哪个版本的数据是正确的 |
+| 跳过事务 | `ALTER SUBSCRIPTION mysub SKIP (lsn = &#39;0/14C0378&#39;)` | 确认该事务的全部变更都可以丢弃 | 整个事务被跳过，可能丢数据 |
+| 推进 origin | `SELECT pg_replication_origin_advance(&#39;pg_16395&#39;, &#39;0/14C0379&#39;)` | 和 SKIP 类似，但操作 origin 而非 subscription | 与 SKIP 效果相同，但绕过了 subscription 的 skip 记录 |
+
+`pg_replication_origin_advance()` 必须在 subscription disabled 状态下执行，而 `ALTER SUBSCRIPTION ... SKIP` 不需要（但通常也建议先 disable）。
+
+**Step 3：重新启用订阅。**
+
+```sql
+ALTER SUBSCRIPTION mysub ENABLE;</code></pre>
+            <h3 id="disable_on_error-选项"><code>disable_on_error</code>
+            选项</h3>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> SUBSCRIPTION mysub</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    CONNECTION <span class="st">&#39;...&#39;</span> PUBLICATION mypub</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WITH</span> (disable_on_error <span class="op">=</span> <span class="kw">true</span>);</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>当设置了 `disable_on_error <span class="op">=</span> true` 时，任何导致 apply worker 报错的冲突都会自动将 `pg_subscription.subenabled` 设为 `false`。这避免了 apply worker 重复重试——否则 worker 会反复重启、撞上同一个冲突、再崩溃，产生日志风暴。</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>配合使用建议：生产环境的 Subscription 应当启用 `disable_on_error`，配合监控告警——当 `pg_stat_subscription` 中的订阅消失时，意味着有一个需要人工介入的冲突。</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>## 六、关键陷阱与排查</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>### 陷阱一：大事务的延迟放大效应</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>这是逻辑复制最隐蔽的性能杀手。Root cause 链条：</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> Publisher 上一个事务（比如批量 <span class="kw">UPDATE</span> <span class="dv">100</span> 万行）开始后，其变更持续写入 WAL。</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> 逻辑解码器从 WAL 逐个解码，每条变更通过 `ReorderBufferQueueChange()` 追加到对应事务的 `ReorderBufferTXN.changes` 链表中。</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> 事务越大，`changes` 链表越长，内存占用越大。当超过 `logical_decoding_work_mem` 时，Reorder Buffer 将其序列化到磁盘。</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> <span class="op">**</span>关键点<span class="op">**</span>：不管变更是在内存中还是在磁盘上，<span class="op">**</span>整个事务的变更在 <span class="kw">COMMIT</span> 之前不会发给 Subscriber<span class="op">**</span>。`ReorderBufferCommit()` 只会当解码器读到该事务的 <span class="kw">COMMIT</span> <span class="dt">record</span> 时才被调用。</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="fl">5.</span> 因此，一个运行了 <span class="dv">30</span> 分钟的大事务，会使 Subscriber 端的复制延迟至少 <span class="dv">30</span> 分钟——而且 Subscriber 不是在线 apply 的，而是堆积在 Publisher 的 Reorder Buffer 中，等 <span class="kw">COMMIT</span> 后一次性发送。</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>在 `pg_stat_replication` 中，你会看到 `write_lag` 和 `flush_lag` 正常（因为 WAL 一直在流动），但 Subscriber 的实际数据延迟很大。根源在 `pgoutput` 的延迟 <span class="cf">BEGIN</span> 机制——在整个事务完成之前，Subscriber 什么都看不到。</span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>排查方法<span class="op">**</span>：</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="co">-- Publisher 端：检查 replication slot 的 restart_lsn 推进情况</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> slot_name, restart_lsn,</span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) <span class="kw">AS</span> lag_bytes</span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_replication_slots</span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> slot_type <span class="op">=</span> <span class="st">&#39;logical&#39;</span>;</span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a><span class="co">-- Subscriber 端：检查 apply worker 的延迟</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> application_name,</span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) <span class="kw">AS</span> lag_bytes</span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_replication;</span></code></pre></div>
+            <p><strong>缓解手段</strong>：</p>
+            <ul>
+            <li>PG 14+ 引入了 streaming
+            模式（<code>streaming = on</code>）：当在传事务的大小超过
+            <code>logical_decoding_work_mem</code> 时，pgoutput
+            可以在事务 COMMIT 之前分批发送变更（通过 STREAM
+            START/STOP/COMMIT
+            消息）。但这要求事务的变更在解码时是”可流式化的”——没有 TOAST
+            重组未完成、没有 speculative insert 等部分变更。</li>
+            <li><code>streaming = parallel</code>（PG 16+）允许在
+            Subscriber 端用多个 parallel worker 并行 apply
+            流式变更。</li>
+            <li>从根本上，应避免在逻辑复制的表上执行超大事务——将批量
+            UPDATE 拆分为多个小事务。</li>
+            </ul>
+            <h3
+            id="陷阱二序列不是逻辑复制的范围">陷阱二：序列不是逻辑复制的范围</h3>
+            <p>逻辑复制复制的是<strong>表的 DML
+            操作</strong>（INSERT/UPDATE/DELETE/TRUNCATE），不复制序列（<code>SEQUENCE</code>）的当前值。这是一个常见的自增主键冲突陷阱：</p>
+            <ol type="1">
+            <li>Publisher 上表 <code>t</code> 使用 <code>SERIAL</code>
+            主键，Publisher 的 sequence 已经生成到
+            <code>nextval = 1000</code>。</li>
+            <li>创建 Subscription 时执行初始数据快照，Subscriber
+            上插入了 id 为 1-1000 的行，但 Subscriber 的 sequence
+            仍在初始值 1。</li>
+            <li>Subscriber
+            上如果有人直接插入（或另一个复制源插入），会使用
+            <code>nextval = 1</code>，与已有的 id=1 行冲突。</li>
+            <li>更常见的是：Publisher 和新 Subscriber 是在同一个 table
+            DDL 基础上创建的，两边 sequence 起始值相同——Publisher 插了
+            500 行（id 1-500），初始快照同步后 Subscriber 上也有 id
+            1-500，但 Subscriber 本地的 sequence 还在
+            1。之后任何本地写入都会冲突。</li>
+            </ol>
+            <p><strong>修复</strong>：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在 Subscriber 端手动推进 sequence</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> setval(<span class="st">&#39;t_id_seq&#39;</span>, (<span class="kw">SELECT</span> <span class="fu">max</span>(<span class="kw">id</span>) <span class="kw">FROM</span> t));</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>如果使用双向或多主逻辑复制，需要为每个节点的序列分配不重叠的范围（如 `START <span class="dv">1</span> <span class="kw">INCREMENT</span> <span class="dv">2</span>` vs `START <span class="dv">2</span> <span class="kw">INCREMENT</span> <span class="dv">2</span>`），或者使用 UUID 替代序列作为主键。</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>### 陷阱三：Subscription 被 <span class="kw">disable</span> 后的追平</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>当 Subscription 因冲突被禁用（`subenabled <span class="op">=</span> false`，无论自动或手动）后，Publisher 端对应的 replication slot 在此期间<span class="op">**</span>不会停止积累 WAL<span class="op">**</span>。Slot 的 `restart_lsn` 停留在 Subscriber 最后确认的位置，Publisher 不能回收这个 LSN 之后的 WAL 段。</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>这意味着：</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> 如果 Subscriber 宕机或 disabled 时间过长，Publisher 的 `pg_wal` 目录会膨胀——这是 slot 溢出的多米诺效应，和流复制完全一样。</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> Re<span class="op">-</span><span class="kw">enable</span> 后，Subscriber 会从上次停止的位置继续 apply，追赶期间 Publisher 端 WAL 回收恢复正常。</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>追平策略<span class="op">**</span>：</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 禁用订阅（如果尚未禁用）</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> SUBSCRIPTION mysub <span class="kw">DISABLE</span>;</span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 处理冲突数据（根据冲突类型手动修复）</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 重新启用</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> SUBSCRIPTION mysub <span class="kw">ENABLE</span>;</span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a><span class="co">-- 4. 监控追平进度</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> application_name, state,</span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) <span class="kw">AS</span> lag_bytes</span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_replication;</span></code></pre></div>
+            <p>如果 Publisher 端的 WAL 已被回收（slot 在 disabled
+            期间被删除或 advance），Subscriber 永久无法追平——必须重建
+            Subscription。</p>
+            <h3
+            id="陷阱四replica-identity-与-updatedelete-的定位失败">陷阱四：REPLICA
+            IDENTITY 与 UPDATE/DELETE 的定位失败</h3>
+            <p>逻辑复制的 UPDATE 和 DELETE 依赖表上的 REPLICA IDENTITY
+            来确定”哪一行应该被更新/删除”。默认情况下，REPLICA IDENTITY
+            使用主键（<code>DEFAULT</code>）。如果表没有主键，也没有设置
+            <code>REPLICA IDENTITY FULL</code>，UPDATE 和 DELETE
+            操作无法在 Subscriber 上定位目标行：</p>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 检查表上的 REPLICA IDENTITY</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, relreplident</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class <span class="kw">WHERE</span> relname <span class="op">=</span> <span class="st">&#39;your_table&#39;</span>;</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- relreplident: &#39;d&#39; = DEFAULT (PK), &#39;f&#39; = FULL, &#39;n&#39; = NOTHING</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 修复：设置 REPLICA IDENTITY</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">TABLE</span> your_table REPLICA IDENTITY <span class="kw">FULL</span>;</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>`REPLICA IDENTITY FULL` 在 WAL 中记录旧 tuple 的全部列值，确保 Subscriber 能通过全列比对定位目标行。代价是 WAL 量显著增加（每次 <span class="kw">UPDATE</span><span class="op">/</span><span class="kw">DELETE</span> 都要写完整旧行），且旧行中如果有 TOAST 列，其值可能因未压缩而在 WAL 中膨胀。</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>## 七、逻辑复制 vs 流复制：选型</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>| 维度 | 流复制（物理复制） | 逻辑复制 |</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|-------------------|---------|</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>| 复制粒度 | 整个集群 | 表级 |</span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>| 跨版本兼容 | 不允许（必须同主版本） | 允许（Publisher 版本不高于 Subscriber） |</span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>| 复制内容 | page<span class="op">-</span><span class="kw">level</span> WAL | 行级 DML（INSERT<span class="op">/</span><span class="kw">UPDATE</span><span class="op">/</span>DELETE） |</span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>| <span class="kw">DDL</span> 复制 | 自动（DDL 产生 catalog 变更的 WAL） | 不复制（PG <span class="dv">17</span><span class="op">+</span> 有限支持） |</span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>| 序列复制 | 自动（序列变更写 WAL） | 不复制 |</span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>| 冲突处理 | 无（物理一致性保证） | 约束冲突需手动处理 |</span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>| 双向<span class="op">/</span>多主 | 不支持 | 支持（需谨慎处理冲突） |</span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>| 数据延迟 | 毫秒级 | 毫秒<span class="op">-</span>分钟级（取决于事务大小和 streaming 模式） |</span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>| WAL 用量 | 高（page<span class="op">-</span>level） | 更高（`wal_level <span class="op">=</span> logical`增加额外 WAL 信息） |</span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>选型结论：如果目标是灾难恢复、高可用、只读负载均衡，用流复制。如果目标是表级同步、跨版本升级、双向同步、或向数据仓库<span class="op">/</span>分析系统发送变更流，用逻辑复制。两种可以并用——同一个 <span class="kw">Primary</span> 上可以有多个物理 Standby（流复制）<span class="op">+</span> 多个逻辑 Subscriber。</span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>## 八、实验：搭建逻辑复制并构造冲突</span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>### 环境准备</span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a># Publisher 端配置</span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a># postgresql.conf</span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a>wal_level <span class="op">=</span> logical</span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>max_replication_slots <span class="op">=</span> <span class="dv">4</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>max_wal_senders <span class="op">=</span> <span class="dv">4</span></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a># 重启后创建 Publication</span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>psql <span class="op">-</span>c <span class="ot">&quot;CREATE TABLE t (id SERIAL PRIMARY KEY, val TEXT);&quot;</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>psql <span class="op">-</span>c <span class="ot">&quot;CREATE PUBLICATION mypub FOR TABLE t;&quot;</span></span></code></pre></div>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Subscriber 端配置</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co"># postgresql.conf</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">max_replication_slots</span> = 4</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">max_logical_replication_workers</span> = 4</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建相同的表结构</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-c</span> <span class="st">&quot;CREATE TABLE t (id SERIAL PRIMARY KEY, val TEXT);&quot;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 Subscription</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-c</span> <span class="st">&quot;CREATE SUBSCRIPTION mysub</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="st">    CONNECTION &#39;host=127.0.0.1 port=5433 dbname=test&#39;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="st">    PUBLICATION mypub;&quot;</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="fu">bash</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="co">### 构造 duplicate_key 冲突</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>bash</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="co"># Publisher 写入数据</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-p</span> 5433 <span class="at">-c</span> <span class="st">&quot;INSERT INTO t (val) VALUES (&#39;from publisher&#39;);&quot;</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="co"># 确认 Subscriber 已同步</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-p</span> 5434 <span class="at">-c</span> <span class="st">&quot;SELECT * FROM t;&quot;</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="co"># 在 Subscriber 上手动插入相同主键的数据（干扰）</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-p</span> 5434 <span class="at">-c</span> <span class="st">&quot;INSERT INTO t (id, val) VALUES (1, &#39;from subscriber&#39;);&quot;</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a><span class="co"># 这条可能成功（取决于 sequence 状态），或者先推进 sequence 再插</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a><span class="co"># Publisher 再次写入，id 冲突</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-p</span> 5433 <span class="at">-c</span> <span class="st">&quot;INSERT INTO t (val) VALUES (&#39;another from publisher&#39;);&quot;</span></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="co"># 如果 publisher 的下一个 id 与 subscriber 上已有的冲突，apply worker 报错</span></span></code></pre></div>
+            <h3 id="构造-update_missing">构造 update_missing</h3>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Publisher 写入并更新</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-p</span> 5433 <span class="at">-c</span> <span class="st">&quot;INSERT INTO t (val) VALUES (&#39;will be deleted on sub&#39;);&quot;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 等待同步后，在 Subscriber 上删除这行</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-p</span> 5434 <span class="at">-c</span> <span class="st">&quot;DELETE FROM t WHERE val = &#39;will be deleted on sub&#39;;&quot;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Publisher 上 UPDATE 这行</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-p</span> 5433 <span class="at">-c</span> <span class="st">&quot;UPDATE t SET val = &#39;updated&#39; WHERE val = &#39;will be deleted on sub&#39;;&quot;</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Subscriber 日志中会出现（DEBUG1 级别）：did not find row to be updated</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 但不会报错，apply worker 继续运行</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span><span class="fu">bash</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="co">### 观察复制状态</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="kw">```</span>sql</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="ex">--</span> Publisher 端查看 replication slot</span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> slot_name, slot_type, database, active,</span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>       <span class="ex">pg_wal_lsn_diff</span><span class="er">(</span><span class="fu">pg_current_wal_lsn()</span><span class="ex">,</span> restart_lsn<span class="kw">)</span> <span class="ex">AS</span> lag</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="ex">FROM</span> pg_replication_slots<span class="kw">;</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="ex">--</span> Subscriber 端查看订阅状态</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> subname, subenabled, subconninfo FROM pg_subscription<span class="kw">;</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="ex">--</span> Subscriber 端查看表同步状态</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> srsubid::regclass, srsubstate, srsublsn</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="ex">FROM</span> pg_subscription_rel<span class="kw">;</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="ex">--</span> 查看 apply worker 统计（PG 17+）</span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a><span class="ex">SELECT</span> <span class="pp">*</span> FROM pg_stat_subscription_stats<span class="kw">;</span></span></code></pre></div>
+            <hr />
+            <h2 id="九关键要点">九、关键要点</h2>
+            <ol type="1">
+            <li><strong>逻辑复制解码 WAL 为行级
+            DML</strong>——<code>LogicalDecodingContext</code> 经 RMGR
+            分发到 <code>heap_decode()</code>，Reorder Buffer
+            按事务重排，COMMIT 后才向 output plugin 输出。</li>
+            <li><strong>Reorder Buffer 是大事务延迟的根源</strong>——未
+            COMMIT 的变更必须缓存在内存（或溢出到磁盘），Subscriber
+            只能看到已提交事务。</li>
+            <li><strong>Publication/Subscription
+            是表级复制模型</strong>——序列、large object、DDL（PG 16
+            及之前）不在默认复制范围内；跨版本迁移需单独处理这些盲区。</li>
+            <li><strong>冲突分四类</strong>：<code>duplicate_key</code>、<code>update_missing</code>、<code>delete_missing</code>、apply
+            错误——多数场景需要人工介入或
+            <code>REPLICA IDENTITY FULL</code>
+            配合，不能指望自动修复。</li>
+            <li><strong>与流复制互补而非替代</strong>——流复制做 HA
+            和物理一致性；逻辑复制做表级同步、跨版本升级和异构消费。</li>
+            </ol>
+            <p>上一章：<a
+            href="../18-streaming-repl/18-streaming-repl.html">流复制</a>
+            下一章：<a
+            href="../20-extensions-fdw/20-extensions-fdw.html">扩展系统与
+            FDW</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/replication/logical/decode.c</code>：LogicalDecodingProcessRecord()、DecodeInsert()、DecodeUpdate()、DecodeDelete()、DecodeCommit()、DecodeXLogTuple()、heap_decode()、xact_decode()</li>
+            <li><code>src/backend/replication/logical/reorderbuffer.c</code>：ReorderBufferProcessXid()、ReorderBufferQueueChange()、ReorderBufferCommit()、ReorderBufferIterTXNInit()/Next()/Finish()、ReorderBufferCheckMemoryLimit()、ReorderBufferSerializeTXN()、ReorderBufferRestoreChanges()、ReorderBufferSetBaseSnapshot()、SetupHistoricSnapshot()</li>
+            <li><code>src/backend/replication/pgoutput/pgoutput.c</code>：pgoutput_change()、pgoutput_row_filter()、get_rel_sync_entry()、LoadPublications()、send_relation_and_attrs()、pgoutput_send_begin()、pgoutput_commit_txn()</li>
+            <li><code>src/backend/replication/logical/worker.c</code>：LogicalRepApplyLoop()、apply_dispatch()、apply_handle_insert()、apply_handle_update()、apply_handle_delete()、maybe_start_skipping_changes()、should_apply_changes_for_rel()</li>
+            <li><code>src/backend/replication/logical/launcher.c</code>：ApplyLauncherMain()、logicalrep_worker_launch()</li>
+            <li><code>src/backend/replication/logical/tablesync.c</code>：LogicalRepSyncTableStart()</li>
+            <li><code>src/include/replication/reorderbuffer.h</code>：ReorderBuffer、ReorderBufferTXN、ReorderBufferChange
+            结构体定义</li>
+            <li><code>src/include/replication/output_plugin.h</code>：OutputPluginCallbacks
+            接口定义</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 31: Logical
+            Replication</li>
+            <li>PostgreSQL Documentation, Section 31.5: Conflicts</li>
+            <li>PostgreSQL Documentation, Section 31.8:
+            Restrictions</li>
+            <li>PostgreSQL Documentation, Section 31.9:
+            Architecture</li>
+            <li>PostgreSQL Documentation, Section 31.11: Configuration
+            Settings</li>
+            </ul>
+            <h3 id="其他">其他</h3>
+            <ul>
+            <li><code>src/test/subscription/</code>：PG
+            源码中的逻辑复制回归测试（TAP 测试，可作为使用参考）</li>
+            <li>PostgreSQL Wiki: Logical Replication (replication slot
+            management, conflict resolution patterns)</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/04-wal-internals/04-wal-internals.html">【PG 内核】WAL 内部机制：从事务提交到磁盘刷写</a></h3>
+                    <p>拆解 PostgreSQL WAL 的完整内部机制：XLogInsert() 从分段锁到 WAL Buffer 的插入路径、XLogRecord 的物理布局（Header + Block Headers + Data）、Checkpoint 的两阶段流程与 IO 摊平算法、REDO 恢复的 RMGR 分发、wal_level 三级差异的 WAL 记录对比。运维部分聚焦 checkpoint IO 风暴的根因与 checkpoint_completion_target 的调优陷阱、max_wal_size 设小导致 WAL 段疯狂切换的机制，以及用 pg_waldump 定位问题 WAL record 的实操方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/18-streaming-repl/18-streaming-repl.html">【PG 内核】流复制：从 WAL Sender 到 Slot 溢出的多米诺效应</a></h3>
+                    <p>拆解 PostgreSQL 流复制的完整内核路径：WAL Sender 的 WalSndLoop→XLogSendPhysical 发送链路、WAL Receiver 的 WalRcvLoop 接收与恢复链路、同步复制的三种语义与等待机制、Failover 时 Timeline 的 fork 原理与 split-brain 风险、Primary-standby 冲突的本质与 max_standby_streaming_delay 的 trade-off、Replication Slot 的内部结构。重点剖析 Slot 溢出多米诺效应——standby 宕机→slot 阻止 WAL 回收→pg_wal 填满磁盘→primary PANIC 的完整事件链，以及 wal_keep_size 与 slot 的互相影响。配合 pg_stat_replication 的三层延迟指标排查与 conflict_reason 解读。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/22-classic-failures/22-classic-failures.html">【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因</a></h3>
+                    <p>拆解 PG 生产环境中最危险的五种故障模式——连接风暴与 work_mem 连锁效应、事务 ID wraparound 危机完整时间线、replication slot 溢出多米诺效应、OOM 连锁 kill、长事务 idle in transaction 隐性破坏。每个故障给出可复现的触发方法、Mermaid 时序图标注事件节点和排查断点、排查 SQL 脚本和修复边界，以及监控埋点策略让下次提前发现而非事后救火。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

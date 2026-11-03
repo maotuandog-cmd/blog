@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】查询规划器 — Join 顺序与路径生成：优化器如何选中 Nested Loop | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PostgreSQL
+查询优化器的路径生成：make_one_rel() 从基表访问到 Join
+路径的完整流程、四种扫描路径
+(SeqScan/IndexScan/IndexOnlyScan/BitmapScan) 的创建条件、三种 Join 方式
+(NestLoop/HashJoin/MergeJoin) 的代价比较与选择逻辑、动态规划到 GEQO
+遗传算法的切换条件 (geqo_threshold)、并行路径的生成机制。配 EXPLAIN
+(ANALYZE, BUFFERS) 输出与 planner 内部决策的逐项对照实验。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, query-planner, join-order, nested-loop, hash-join, merge-join, geqo, dynamic-programming, seqscan, indexscan, bitmapscan, explain-analyze, allpaths, joinpath, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/11-join-paths/11-join-paths.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】查询规划器 — Join 顺序与路径生成：优化器如何选中 Nested Loop" />
+    <meta property="og:description" content="拆解 PostgreSQL 查询优化器的路径生成：make_one_rel() 从基表访问到 Join 路径的完整流程、四种扫描路径 (SeqScan/IndexScan/IndexOnlyScan/BitmapScan) 的创建条件、三种 Join 方式 (NestLoop/HashJoin/MergeJoin) 的代价比较与选择逻辑、动态规划到 GEQO 遗传算法的切换条件 (geqo_threshold)、并行路径的生成机制。配 EXPLAIN (ANALYZE, BUFFERS) 输出与 planner 内部决策的逐项对照实验。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/11-join-paths/11-join-paths.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="query-planner" />
+    <meta property="article:tag" content="join-order" />
+    <meta property="article:tag" content="nested-loop" />
+    <meta property="article:tag" content="hash-join" />
+    <meta property="article:tag" content="merge-join" />
+    <meta property="article:tag" content="geqo" />
+    <meta property="article:tag" content="dynamic-programming" />
+    <meta property="article:tag" content="seqscan" />
+    <meta property="article:tag" content="indexscan" />
+    <meta property="article:tag" content="bitmapscan" />
+    <meta property="article:tag" content="explain-analyze" />
+    <meta property="article:tag" content="allpaths" />
+    <meta property="article:tag" content="joinpath" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】查询规划器 — Join 顺序与路径生成：优化器如何选中 Nested Loop" />
+    <meta name="twitter:description" content="拆解 PostgreSQL 查询优化器的路径生成：make_one_rel() 从基表访问到 Join 路径的完整流程、四种扫描路径 (SeqScan/IndexScan/IndexOnlyScan/BitmapScan) 的创建条件、三种 Join 方式 (NestLoop/HashJoin/MergeJoin) 的代价比较与选择逻辑、动态规划到 GEQO 遗传算法的切换条件 (geqo_threshold)、并行路径的生成机制。配 EXPLAIN (ANALYZE, BUFFERS) 输出与 planner 内部决策的逐项对照实验。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】查询规划器 — Join 顺序与路径生成：优化器如何选中 Nested Loop", "description": "拆解 PostgreSQL 查询优化器的路径生成：make_one_rel() 从基表访问到 Join 路径的完整流程、四种扫描路径 (SeqScan/IndexScan/IndexOnlyScan/BitmapScan) 的创建条件、三种 Join 方式 (NestLoop/HashJoin/MergeJoin) 的代价比较与选择逻辑、动态规划到 GEQO 遗传算法的切换条件 (geqo_threshold)、并行路径的生成机制。配 EXPLAIN (ANALYZE, BUFFERS) 输出与 planner 内部决策的逐项对照实验。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/11-join-paths/11-join-paths.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "query-planner", "join-order", "nested-loop", "hash-join", "merge-join", "geqo", "dynamic-programming", "seqscan", "indexscan", "bitmapscan", "explain-analyze", "allpaths", "joinpath"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】查询规划器 — Join 顺序与路径生成：优化器如何选中 Nested Loop</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#query-planner</span> <span>#join-order</span> <span>#nested-loop</span> <span>#hash-join</span> <span>#merge-join</span> <span>#geqo</span> <span>#dynamic-programming</span> <span>#seqscan</span> <span>#indexscan</span> <span>#bitmapscan</span> <span>#explain-analyze</span> <span>#allpaths</span> <span>#joinpath</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/query-planner.html">#query-planner</a><a class="chip-link" href="/tags/join-order.html">#join-order</a><a class="chip-link" href="/tags/nested-loop.html">#nested-loop</a><a class="chip-link" href="/tags/hash-join.html">#hash-join</a><a class="chip-link" href="/tags/merge-join.html">#merge-join</a><a class="chip-link" href="/tags/geqo.html">#geqo</a><a class="chip-link" href="/tags/dynamic-programming.html">#dynamic-programming</a><a class="chip-link" href="/tags/seqscan.html">#seqscan</a><a class="chip-link" href="/tags/indexscan.html">#indexscan</a><a class="chip-link" href="/tags/bitmapscan.html">#bitmapscan</a><a class="chip-link" href="/tags/explain-analyze.html">#explain-analyze</a><a class="chip-link" href="/tags/allpaths.html">#allpaths</a><a class="chip-link" href="/tags/joinpath.html">#joinpath</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#查询规划器-join-顺序与路径生成优化器如何选中-nested-loop"
+                id="toc-查询规划器-join-顺序与路径生成优化器如何选中-nested-loop">查询规划器
+                — Join 顺序与路径生成：优化器如何选中 Nested Loop</a>
+                <ul>
+                <li><a
+                href="#一从-query-到-reloptinfomake_one_rel-的全景"
+                id="toc-一从-query-到-reloptinfomake_one_rel-的全景">一、从
+                Query 到 RelOptInfo：make_one_rel 的全景</a>
+                <ul>
+                <li><a href="#调用链" id="toc-调用链">调用链</a></li>
+                <li><a href="#make_one_rel-的内部阶段"
+                id="toc-make_one_rel-的内部阶段">make_one_rel()
+                的内部阶段</a></li>
+                <li><a href="#关键数据结构"
+                id="toc-关键数据结构">关键数据结构</a></li>
+                </ul></li>
+                <li><a href="#二基表访问路径四种扫描方式"
+                id="toc-二基表访问路径四种扫描方式">二、基表访问路径：四种扫描方式</a>
+                <ul>
+                <li><a href="#seqscan顺序扫描"
+                id="toc-seqscan顺序扫描">SeqScan（顺序扫描）</a></li>
+                <li><a href="#indexonlyscan仅索引扫描"
+                id="toc-indexonlyscan仅索引扫描">IndexOnlyScan（仅索引扫描）</a></li>
+                </ul></li>
+                <li><a
+                href="#三join-路径生成三种-join-方式的创建条件与代价"
+                id="toc-三join-路径生成三种-join-方式的创建条件与代价">三、Join
+                路径生成：三种 Join 方式的创建条件与代价</a>
+                <ul>
+                <li><a href="#hash-join哈希连接"
+                id="toc-hash-join哈希连接">Hash
+                Join（哈希连接）</a></li>
+                <li><a href="#三种-join-的选择对比"
+                id="toc-三种-join-的选择对比">三种 Join
+                的选择对比</a></li>
+                <li><a href="#geqogeqo_threshold-的切换"
+                id="toc-geqogeqo_threshold-的切换">GEQO：geqo_threshold
+                的切换</a></li>
+                <li><a
+                href="#join_collapse_limit-与-from_collapse_limit"
+                id="toc-join_collapse_limit-与-from_collapse_limit">join_collapse_limit
+                与 from_collapse_limit</a></li>
+                </ul></li>
+                <li><a href="#五并行路径生成"
+                id="toc-五并行路径生成">五、并行路径生成</a>
+                <ul>
+                <li><a href="#构造三表-join-和索引选择"
+                id="toc-构造三表-join-和索引选择">1. 构造三表 Join
+                和索引选择</a></li>
+                <li><a href="#强制观察-hash-join-和-merge-join"
+                id="toc-强制观察-hash-join-和-merge-join">3. 强制观察
+                Hash Join 和 Merge Join</a></li>
+                <li><a href="#观察并行查询" id="toc-观察并行查询">5.
+                观察并行查询</a></li>
+                <li><a href="#统计信息漂移导致-join-顺序错乱"
+                id="toc-统计信息漂移导致-join-顺序错乱">2.
+                统计信息漂移导致 Join 顺序错乱</a></li>
+                <li><a href="#多表-join-计划不稳定geqo-区"
+                id="toc-多表-join-计划不稳定geqo-区">4. 多表 Join
+                计划不稳定（GEQO 区）</a></li>
+                </ul></li>
+                <li><a href="#八关键要点"
+                id="toc-八关键要点">八、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码pg-17" id="toc-源码pg-17">源码（PG
+                17）</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="查询规划器-join-顺序与路径生成优化器如何选中-nested-loop">查询规划器
+            — Join 顺序与路径生成：优化器如何选中 Nested Loop</h1>
+            <p>你在 <code>EXPLAIN</code> 输出里见过无数次
+            <code>Nested Loop</code>、<code>Hash Join</code>、<code>Merge Join</code>，也见过
+            <code>Seq Scan</code>、<code>Index Scan</code>、<code>Bitmap Index Scan</code>。但
+            PG 的优化器到底是怎么决定用哪个的？为什么有时候一个三表 Join
+            的查询，明明建了索引却走了 Seq
+            Scan？为什么超过一定表数量后执行计划突然变差？</p>
+            <p>这些问题的答案都在 <code>make_one_rel()</code>
+            这个函数里。它是 PG
+            查询优化器的路径生成入口——从单表扫描方式的选择，到两表 Join
+            算法的决策，再到多表 Join 顺序的排列搜索，全在这里调度。</p>
+            <p>本文从 <code>make_one_rel()</code>
+            的调用链开始，拆解四种访问路径的创建条件、三种 Join
+            方式的代价对比、动态规划到 GEQO 的切换逻辑，最后用
+            <code>EXPLAIN (ANALYZE, BUFFERS)</code> 对照 planner
+            的内部决策。</p>
+            <hr />
+            <h2 id="一从-query-到-reloptinfomake_one_rel-的全景">一、从
+            Query 到 RelOptInfo：make_one_rel 的全景</h2>
+            <h3 id="调用链">调用链</h3>
+            <p>规划器的主入口在
+            <code>src/backend/optimizer/plan/planner.c</code> 的
+            <code>standard_planner()</code>。它调用
+            <code>subquery_planner()</code> 做子查询规划，后者调用
+            <code>grouping_planner()</code>，最终到达
+            <code>query_planner()</code>，而
+            <code>query_planner()</code> 的核心调用就是
+            <code>make_one_rel()</code>：</p>
+            <p>```<code>text standard_planner()   → subquery_planner()     → grouping_planner()       → query_planner()         → add_base_rels_to_query()    // 为 FROM 中每个表创建 RelOptInfo         → build_base_rel_tlists()     // 构建 target list         → deconstruct_jointree()      // 将 jointree 展平为 JoinExpr 列表         → make_one_rel()              // ★ 核心：生成所有 Join 路径</code>bash</p>
+            <h3 id="make_one_rel-的内部阶段">make_one_rel()
+            的内部阶段</h3>
+            <div class="sourceCode" id="cb1"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/allpaths.c</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>RelOptInfo <span class="op">*</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>make_one_rel<span class="op">(</span>PlannerInfo <span class="op">*</span>root<span class="op">,</span> List <span class="op">*</span>joinlist<span class="op">)</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    RelOptInfo <span class="op">*</span>rel<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 阶段 1：为每个基表生成访问路径（SeqScan, IndexScan 等）</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    set_base_rel_pathlists<span class="op">(</span>root<span class="op">);</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 阶段 2：为所有基表的 RelOptInfo 构造 joinrel</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">//         按 joinlist 顺序——先做 FROM/JOIN 子句，再做 WHERE</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    rel <span class="op">=</span> make_rel_from_joinlist<span class="op">(</span>root<span class="op">,</span> joinlist<span class="op">);</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rel<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+            <p><code>set_base_rel_pathlists()</code> 为 FROM
+            子句中的每个基表（<code>RelOptInfo</code>）生成所有可行的访问路径，加入
+            <code>rel-&gt;pathlist</code>。<code>make_rel_from_joinlist()</code>
+            按 joinlist 中指定的 Join 配对关系，递归地构造 joinrel（Join
+            关系的 <code>RelOptInfo</code>），并在每个级别上调用
+            <code>add_paths_to_joinrel()</code> 生成 Join 路径。</p>
+            <h3 id="关键数据结构">关键数据结构</h3>
+            <p><code>RelOptInfo</code> 是优化器内部对”一个关系”（基表或
+            Join 中间结果）的抽象，其路径信息记录在：</p>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/include/nodes/pathnodes.h</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> RelOptInfo <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    Relids      relids<span class="op">;</span>          <span class="co">// 该关系包含的 base rel OID 集合</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>pathlist<span class="op">;</span>        <span class="co">// 该关系当前最优路径的列表（Path 链表）</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>partial_pathlist<span class="op">;</span><span class="co">// 可并行化的部分路径</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>cheapest_startup_path<span class="op">;</span>   <span class="co">// 启动代价最低的路径</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>cheapest_total_path<span class="op">;</span>     <span class="co">// 总代价最低的路径</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    PathTarget <span class="op">*</span>reltarget<span class="op">;</span>       <span class="co">// 输出列</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... 大量其他字段（行数估算、宽度、索引信息等）</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> RelOptInfo<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>`Path` 是单一执行路径的抽象，核心字段：</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> Path <span class="op">{</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    NodeTag     type<span class="op">;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    RelOptInfo <span class="op">*</span>parent<span class="op">;</span>         <span class="co">// 所属的 RelOptInfo</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    Cost        startup_cost<span class="op">;</span>   <span class="co">// 启动代价（产生第一行之前的开销）</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    Cost        total_cost<span class="op">;</span>     <span class="co">// 总代价</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    List       <span class="op">*</span>pathkeys<span class="op">;</span>       <span class="co">// 输出行的排序顺序</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> Path<span class="op">;</span></span></code></pre></div>
+            <p>每种扫描方式和 Join 方式都是 <code>Path</code>
+            的子结构：<code>IndexPath</code>
+            包含索引选择信息（<code>indexclauses</code>、<code>indexorderbys</code>），<code>JoinPath</code>
+            包含内外表的路径指针和 Join 条件。</p>
+            <hr />
+            <h2
+            id="二基表访问路径四种扫描方式">二、基表访问路径：四种扫描方式</h2>
+            <p><code>set_base_rel_pathlists()</code>
+            为每个基表生成访问路径。最终进入
+            <code>rel-&gt;pathlist</code>
+            的路径类型取决于表上有什么索引、统计信息怎么说、GUC
+            怎么配。源码在
+            <code>src/backend/optimizer/path/allpaths.c</code>。</p>
+            <h3 id="seqscan顺序扫描">SeqScan（顺序扫描）</h3>
+            <p>顺序扫描是最朴素的路径——从表的第一个页面读到最后一个页面。创建条件是无条件：只要表存在，就有一条
+            SeqScan 路径。</p>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/allpaths.c, set_plain_rel_pathlist()</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 即使有其他路径可选，SeqScan 也永远被加入 pathlist</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>add_path<span class="op">(</span>rel<span class="op">,</span> create_seqscan_path<span class="op">(</span>root<span class="op">,</span> rel<span class="op">,</span> required_outer<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>代价计算在 `cost_seqscan<span class="op">()</span>` 中：基本公式是 `N_page <span class="op">*</span> seq_page_cost <span class="op">+</span> N_tuple <span class="op">*</span> cpu_tuple_cost`。`seq_page_cost` 默认 <span class="fl">1.0</span>，`cpu_tuple_cost` 默认 <span class="fl">0.01</span>。在 `random_page_cost` 远大于 `seq_page_cost` 的配置下（比如默认 <span class="fl">4.0</span> vs <span class="fl">1.0</span>），SeqScan 在规划器眼中对大表极为划算——这正是 NVMe 上 `random_page_cost<span class="op">=</span><span class="fl">4.0</span>` 导致优化器不选索引的原因。</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## IndexScan（索引扫描）</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>IndexScan 用索引定位符合条件的行，然后到 heap 取对应的 tuple。创建条件是存在索引且索引列与查询条件相关。</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/indxpath.c, create_index_paths()</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co">// 关键调用链：</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="co">//   get_index_paths()</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="co">//     → build_index_paths()</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="co">//       → create_index_path()</span></span></code></pre></div>
+            <p>生成 IndexPath 时最关键的两个决策： -
+            <strong>选择率估算</strong>：<code>clauselist_selectivity()</code>
+            根据 MCV/histogram
+            估算索引条件的过滤率。如果过滤率太高（比如返回超过表的
+            30%），IndexScan 的总代价可能高于 SeqScan。 -
+            <strong>排序利用</strong>：如果索引的排序与查询的
+            <code>ORDER BY</code> 一致，<code>pathkeys</code>
+            直接满足排序需求，省掉了显式 Sort 节点。</p>
+            <p>代价计算在 <code>cost_index()</code> 中：索引页面 I/O +
+            heap 页面 I/O（随机读，用 <code>random_page_cost</code>）+
+            CPU 开销。索引扫描的 heap 读取是随机的（按 <code>ctid</code>
+            跳页），这是它的主要劣势——如果几乎所有页面都被遍历到，SeqScan
+            反而更便宜。</p>
+            <h3
+            id="indexonlyscan仅索引扫描">IndexOnlyScan（仅索引扫描）</h3>
+            <p>IndexOnlyScan 不需要读取
+            heap——所有需要的列都在索引中。创建条件是查询的 target list
+            和 WHERE 条件中的所有列都被索引覆盖。</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// IndexOnlyScan 的额外条件（除 IndexScan 条件外）：</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 1. 索引包含所有需要的列（无论是作为 key column 还是 included column）</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. Visibility Map 标识对应 heap 页面为 all-visible</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">//    ——如果 VM 不认为页面 all-visible，必须回表查 heap 页面确认可见性</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>IndexOnlyScan 的代价中，heap I<span class="op">/</span>O 的部分乘以 `vm_all_visible_fraction`——即 VM 认为 all<span class="op">-</span>visible 的页面比例。如果 VM 陈旧（很久没有 VACUUM），IndexOnlyScan 的优势大幅缩水。</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## BitmapScan（位图索引扫描）</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>BitmapScan 分两步：先在内存中构建一个 bitmap（每个 heap 页面一位），然后按页面顺序扫描 heap。它可以合并多个索引的 bitmap（`BitmapAnd`、`BitmapOr`），并将随机 I<span class="op">/</span>O 转换为顺序 I<span class="op">/</span>O（bitmap 按页面号排序后批量读）。</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/indxpath.c</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="co">// 核心路径：create_index_paths() → generate_bitmap_or_paths()</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="co">// 为单个索引创建 BitmapPath：cost_index() + bitmap 代价</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="co">// 为 OR 条件创建 BitmapOrPath：合并多个 BitmapPath</span></span></code></pre></div>
+            <p>BitmapScan 的创建条件是任何 IndexScan
+            的条件。对多个索引的条件组合（<code>WHERE a = 1 OR b = 2</code>），优化器可能为每个索引生成
+            BitmapPath，然后用 <code>BitmapOr</code> 合并。</p>
+            <p>它的优势场景是：返回行数中等（太多 IndexScan
+            回表随机读太贵，太少 Bitmap 构建开销不值），尤其在有多个
+            <code>OR</code> 条件的查询中。</p>
+            <hr />
+            <h2
+            id="三join-路径生成三种-join-方式的创建条件与代价">三、Join
+            路径生成：三种 Join 方式的创建条件与代价</h2>
+            <p>从 <code>make_one_rel()</code> →
+            <code>make_rel_from_joinlist()</code> →
+            <code>standard_join_search()</code>，优化器逐级构建
+            joinrel——先两表 Join，再三表 Join。</p>
+            <p><code>add_paths_to_joinrel()</code> 是加入 Join
+            路径的核心函数，源码在
+            <code>src/backend/optimizer/path/joinpath.c</code>。对每一对内外表路径，它调用三个函数：</p>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/joinpath.c, add_paths_to_joinrel()</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>match_unsorted_outer<span class="op">();</span>   <span class="co">// 尝试 Nested Loop（外表不需要排序）</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>hash_inner_and_required<span class="op">();</span> <span class="co">// 尝试 Hash Join（内表需要 hashable）</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>match_unsorted_outer<span class="op">()</span> 中 → sort_inner_and_outer<span class="op">();</span> <span class="co">// 尝试 Merge Join（需要排序）</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## Nested Loop Join（嵌套循环连接）</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>Nested Loop（NL）是最通用的 Join 方式：对外表的每一行，扫描内表（或在内表上做索引查找）找到匹配行。</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/joinpath.c, match_unsorted_outer()</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="co">// 对每一对 (outerpath, innerpath)：</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co">//   1. 检查 join 条件是否能用作 inner scan key（参数化路径）</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="co">//   2. 如果能：创建 parameterized NestLoop（内表是 IndexScan，外表行值作为扫描键）</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="co">//   3. 如果不能：创建 plain NestLoop（内表重复全扫描）</span></span></code></pre></div>
+            <p>代价公式：<span class="math inline">\(C_{total} =
+            C_{outer} + N_{outer} \times C_{inner\_rescan}\)</span></p>
+            <ul>
+            <li>如果内表能用索引扫描（parameterized path），<span
+            class="math inline">\(C_{inner\_rescan}\)</span>
+            是索引查找的代价，很便宜。</li>
+            <li>如果内表只能全扫描（plain NestLoop），<span
+            class="math inline">\(C_{inner\_rescan} \approx
+            C_{inner}\)</span>，对大数据量极其昂贵。</li>
+            </ul>
+            <p><strong>Nested Loop
+            的选择条件</strong>：外表小（行数少）且内表有高效索引，或
+            Join 条件不是等值条件（Nested Loop 是唯一支持非等值 Join
+            的方式）。它也是 <code>LEFT JOIN</code>
+            中唯一保证驱动表每一行都输出的方式。</p>
+            <h3 id="hash-join哈希连接">Hash Join（哈希连接）</h3>
+            <p>Hash Join 为内表构建内存 hash 表，然后扫描外表，每一行
+            probe hash 表找匹配。</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/joinpath.c, hash_inner_and_required()</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 创建条件：</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co">//   1. Join 条件是等值条件（equality operator，必须有 hash 函数）</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co">//   2. 内表路径可哈希化</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>代价公式：$C_<span class="op">{</span>total<span class="op">}</span> <span class="op">=</span> C_<span class="op">{</span>outer<span class="op">}</span> <span class="op">+</span> C_<span class="op">{</span>inner<span class="op">}</span> <span class="op">+</span> N_<span class="op">{</span>outer<span class="op">}</span> \times cpu\_operator\_cost <span class="op">+</span> N_<span class="op">{</span>inner<span class="op">}</span> \times cpu\_operator\_cost$</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>Hash Join 的关键风险在内存：如果 hash 表放不进 `work_mem <span class="op">*</span> hash_mem_multiplier`（PG <span class="dv">15</span><span class="op">+</span> 的额外乘数），就会溢出到磁盘（分批 batch），代价骤增。`EXPLAIN <span class="op">(</span>ANALYZE<span class="op">,</span> BUFFERS<span class="op">)</span>` 输出中的 `Buckets<span class="op">:</span>`、`Batches<span class="op">:</span>` 和 `Memory Usage<span class="op">:</span>` 显示 hash 表的实际大小和溢出情况。</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>Hash Join 的选择条件<span class="op">**</span>：两个表都不算太小（否则 Nested Loop 用索引更快）、Join 条件是等值条件、内表能全部装入 work_mem 的 hash 表或溢出不太多。</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## Merge Join（归并连接）</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>Merge Join 要求两个表都按 Join 键排序，然后双指针同步扫描。</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/joinpath.c, sort_inner_and_outer()</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="co">// 创建条件：</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="co">//   1. Join 条件是 mergejoinable 的等值条件（有 btree opfamily）</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="co">//   2. 两个表的路径都按 Join 键排序——要么天然有排序（索引），要么加 Sort 节点</span></span></code></pre></div>
+            <p>代价公式：<span class="math inline">\(C_{total} =
+            C_{outer\_sorted} + C_{inner\_sorted} + (N_{outer} +
+            N_{inner}) \times cpu\_operator\_cost\)</span></p>
+            <p>其中 <span
+            class="math inline">\(C_{outer\_sorted}\)</span> 和 <span
+            class="math inline">\(C_{inner\_sorted}\)</span> 包含可能的
+            Sort 代价。如果表本身已经按 Join
+            键排序（例如来自索引扫描），Sort 代价为零。</p>
+            <p><strong>Merge Join
+            的选择条件</strong>：两个表都很大（Hash Join 的 hash
+            表装不下内存、Nested Loop 太贵），且至少一个表已经按 Join
+            键排序（或排序代价可接受）。Merge Join
+            还有一个附带好处——输出天然按 Join 键排序，如果
+            <code>ORDER BY</code> 与 Join 键一致，省掉最终的 Sort。</p>
+            <h3 id="三种-join-的选择对比">三种 Join 的选择对比</h3>
+            <p>``````text 条件：两表大小相当，都有索引，等值 Join</p>
+            <p>内表小，有高效索引？ → Nested
+            Loop（外表每行一次索引查找） 内表中等，Hash 表能装进
+            work_mem？ → Hash Join（一次构建 hash + 一次扫描外表）
+            两个表都大，排序开销可接受？ → Merge
+            Join（如果已排序则极快）</p>
+            <pre class="text"><code>
+---
+
+## 四、Join 顺序搜索：动态规划与 GEQO 的切换
+
+### 动态规划：standard_join_search()
+
+PG 对 Join 顺序的搜索使用自底向上的动态规划（DP）。源码在 `src/backend/optimizer/path/joinrels.c` 的 `standard_join_search()`。
+
+```c
+// 算法概要：
+// levels_needed = FROM 子句中的基表数
+for (lev = 2; lev &lt;= levels_needed; lev++) {
+    // 对每个 level（包含 k 个基表的 joinrel）：
+    //   生成所有包含 lev 个基表的 joinrel
+    //   对每个 joinrel 的每种拆分方式 (outer_rel, inner_rel)：
+    //     调用 add_paths_to_joinrel() 创建 joinpath
+    //     用 add_path() 加入 joinrel-&gt;pathlist（dominance check）
+    //   保留下来的 joinpath 进入下一级
+}</code></pre>
+            <p>DP 算法保证找到理论上的最优 Join
+            顺序（在代价模型正确的前提下），因为所有可能的拆分方式都被遍历。但搜索空间是
+            Catalan number 增长：n 个基表的 Join 顺序数量是 <span
+            class="math inline">\(C_{n-1} =
+            \frac{(2n-2)!}{n!(n-1)!}\)</span>，即 <span
+            class="math inline">\(n=5\)</span> 时 14 种、<span
+            class="math inline">\(n=10\)</span> 时 4862 种、<span
+            class="math inline">\(n=15\)</span> 时约 267 万种。</p>
+            <h3 id="geqogeqo_threshold-的切换">GEQO：geqo_threshold
+            的切换</h3>
+            <p>当 <code>levels_needed &gt;= geqo_threshold</code>（默认
+            12）时，PG 不再用 DP 做穷举搜索，而是切换到 GEQO（Genetic
+            Query Optimizer，遗传算法）。源码在
+            <code>src/backend/optimizer/geqo/geqo_main.c</code>。</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/allpaths.c</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 决策点：</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>levels_needed <span class="op">&lt;=</span> geqo_threshold<span class="op">)</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    rel <span class="op">=</span> standard_join_search<span class="op">(</span>root<span class="op">,</span> levels_needed<span class="op">,</span> joinlist<span class="op">);</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="cf">else</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    rel <span class="op">=</span> geqo<span class="op">(</span>root<span class="op">,</span> levels_needed<span class="op">,</span> joinlist<span class="op">);</span>  <span class="co">// 遗传算法</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>GEQO 的遗传算法流程（`geqo_main<span class="op">.</span>c`）：</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>``````text</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> 初始化种群：生成 NumberGenerations 个随机 join 顺序（默认 pool_size<span class="op">=</span><span class="dv">0</span> 时自适应）</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> 对每个个体（join 顺序）评估代价（fitness），保留 best_keep 个（默认 <span class="dv">2</span>）</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> 对每一代：</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>   a<span class="op">.</span> 选择（selection）：biased linear selection——代价低的个体更可能被选中</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>   b<span class="op">.</span> 交叉（crossover）：交换两个亲代的部分 join 顺序，生成子代</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>   c<span class="op">.</span> 变异（mutation）：随机交换子代中的两个位置</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> 重复直到 max_generations 代，选择最优个体</span></code></pre></div>
+            <p>GEQO
+            不保证最优解，但搜索时间是多项式级别而非指数级。<code>geqo_threshold</code>
+            的默认 12 是基于 1990 年代的硬件设定的——今天的 CPU 可以在 DP
+            下处理更多表。<code>geqo_effort</code>（默认 5，范围
+            1-10）控制种群大小和代数，但 GEQO
+            的结果天然不稳定——同一查询可能两次得到不同计划。</p>
+            <p><strong>关键运维事实</strong>：当查询涉及 12+
+            个表时，你看到的执行计划不一定是最优的，只是 GEQO
+            在有限代数内找到的较优解。如果 12
+            表查询的性能不稳定，考虑降低
+            <code>join_collapse_limit</code> 或将部分 Join
+            编码为子查询/CTE 来减少搜索空间。</p>
+            <h3
+            id="join_collapse_limit-与-from_collapse_limit">join_collapse_limit
+            与 from_collapse_limit</h3>
+            <p>这些 GUC 限制优化器重排 Join 顺序的范围。默认值（与
+            <code>geqo_threshold</code> 相同）让优化器自由重排所有显式
+            Join 和 FROM 列表中的表，但保留显式括号的语义。当这些值设为
+            1 时，优化器完全按照 SQL 中写的 Join
+            顺序执行——这是排查”优化器选错顺序”时的有用工具。</p>
+            <hr />
+            <h2 id="五并行路径生成">五、并行路径生成</h2>
+            <p>当查询涉及大表扫描或大 Join 时，PG
+            可以为路径生成并行版本。入口在
+            <code>set_plain_rel_pathlist()</code> 中：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/optimizer/path/allpaths.c, set_plain_rel_pathlist()</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>rel<span class="op">-&gt;</span>pages <span class="op">&gt;</span> parallel_threshold<span class="op">)</span> <span class="op">{</span>  <span class="co">// min_parallel_table_scan_size</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    create_plain_partial_paths<span class="op">(</span>root<span class="op">,</span> rel<span class="op">);</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>`create_plain_partial_paths<span class="op">()</span>` 生成 <span class="op">**</span>partial path<span class="op">**</span>（部分路径）——表示可以由一个并行 worker 执行的那部分扫描。这些路径被加入 `rel<span class="op">-&gt;</span>partial_pathlist`，然后在 Join 路径生成时，优化器可以将 partial path 与 `Gather`<span class="op">/</span>`Gather Merge` 节点组合，生成并行执行计划。</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>并行 Join 的三种方式：</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>Parallel Hash Join<span class="op">**</span>：多个 worker 共享一个 hash 表（`SharedHashInfo`），每个 worker 并行扫描外表并与共享 hash 表做 probe。</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>Parallel Merge Join<span class="op">**</span>：每个 worker 并行扫描外表的一部分（数据已排序并分区），与共享的内表扫描指针做 merge。</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>Parallel Nested Loop<span class="op">**</span>：外表被分区，每个 worker 扫描一个分区并独立执行内表索引查找。</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>`parallel_setup_cost` 和 `parallel_tuple_cost` 分别控制启动并行 worker 和 worker 间传递 tuple 的代价估算。</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="op">---</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er"># 六、实验：EXPLAIN 输出与 Planner 决策对照</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 实验环境</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="pp"># </span><span class="er">PG 17, shared_buffers=512MB, work_mem=4MB, random_page_cost=4.0</span></span></code></pre></div>
+            <h3 id="构造三表-join-和索引选择">1. 构造三表 Join
+            和索引选择</h3>
+            <div class="sourceCode" id="cb10"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> orders (</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    order_id   <span class="dt">INTEGER</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    customer_id <span class="dt">INTEGER</span>,</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    order_date <span class="dt">DATE</span>,</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    amount     <span class="dt">NUMERIC</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> customers (</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    customer_id <span class="dt">INTEGER</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    name        TEXT,</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    region      TEXT</span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> products (</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    product_id  <span class="dt">INTEGER</span> <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>    order_id    <span class="dt">INTEGER</span>,</span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>    product_name TEXT</span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- 灌入数据</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> orders <span class="kw">SELECT</span> g, (g % <span class="dv">1000</span>) <span class="op">+</span> <span class="dv">1</span>,</span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>    <span class="st">&#39;2025-01-01&#39;</span>:<span class="ch">:DATE</span> <span class="op">+</span> (g % <span class="dv">365</span>),</span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>    (<span class="kw">random</span>() <span class="op">*</span> <span class="dv">1000</span>):<span class="ch">:NUMERIC</span>(<span class="dv">10</span>,<span class="dv">2</span>)</span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">100000</span>) g;</span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> customers <span class="kw">SELECT</span> g, <span class="st">&#39;customer_&#39;</span> <span class="op">||</span> g,</span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">CASE</span> <span class="cf">WHEN</span> g % <span class="dv">4</span> <span class="op">=</span> <span class="dv">0</span> <span class="cf">THEN</span> <span class="st">&#39;East&#39;</span> <span class="cf">ELSE</span> <span class="st">&#39;West&#39;</span> <span class="cf">END</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">1000</span>) g;</span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> products <span class="kw">SELECT</span> g, (g % <span class="dv">100000</span>) <span class="op">+</span> <span class="dv">1</span>, <span class="st">&#39;product_&#39;</span> <span class="op">||</span> g</span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> generate_series(<span class="dv">1</span>, <span class="dv">200000</span>) g;</span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- 创建外键索引（products 表）</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> idx_products_order <span class="kw">ON</span> products(order_id);</span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a><span class="co">-- ANALYZE</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> orders;</span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> customers;</span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> products;</span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>### <span class="fl">2.</span> 观察三表 <span class="kw">Join</span> 的计划选择</span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS, TIMING)</span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> c.name, o.order_date, p.product_name</span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> customers c</span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> orders o <span class="kw">ON</span> c.customer_id <span class="op">=</span> o.customer_id</span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> products p <span class="kw">ON</span> o.order_id <span class="op">=</span> p.order_id</span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.region <span class="op">=</span> <span class="st">&#39;West&#39;</span>;</span></code></pre></div>
+            <p>输出解读：</p>
+            <p>```<code>text Nested Loop  (cost=0.29..8912.45 rows=1500 width=...) (actual time=0.045..18.234 rows=150000 loops=1)   Buffers: shared hit=4623   -&gt;  Seq Scan on customers c  (cost=0.00..19.00 rows=750 width=...) (actual time=0.012..0.284 rows=750 loops=1)         Filter: (region = 'West')         Buffers: shared hit=13   -&gt;  Nested Loop  (cost=0.29..11.82 rows=2 width=...) (actual time=0.008..0.022 rows=200 loops=750)         Buffers: shared hit=4610         -&gt;  Index Scan using orders_customer_id_idx on orders o               (cost=0.29..4.31 rows=1 width=...) (actual time=0.004..0.006 rows=100 loops=750)               Index Cond: (customer_id = c.customer_id)               Buffers: shared hit=1360         -&gt;  Index Scan using idx_products_order on products p               (cost=0.42..7.50 rows=2 width=...) (actual time=0.003..0.008 rows=200 loops=75000)               Index Cond: (order_id = o.order_id)               Buffers: shared hit=3250</code>text</p>
+            <p><strong>对照分析</strong>：</p>
+            <ol type="1">
+            <li><p><strong>最外层 Seq Scan on
+            customers</strong>——<code>customers</code> 表只有 1000
+            行，SEQSCAN 扫描 13 个 buffer（8KB × 13 ≈ 104KB），optimizer
+            认为选索引不如直接扫。<code>region = 'West'</code> 过滤掉
+            25%（750
+            行），优化器估算准确（<code>rows=750</code>）。</p></li>
+            <li><p><strong>内层 Nested Loop</strong>——外表
+            <code>customers</code> 的 750 行作为驱动表，每行触发一次
+            <code>orders_customer_id_idx</code>
+            索引扫描（<code>loops=750</code>）。每个
+            <code>customer_id</code> 平均匹配 100 个订单（因为 100000
+            orders / 1000 customers = 100），所以
+            <code>actual rows=100</code> per loop。</p></li>
+            <li><p><strong>最内层 Nested
+            Loop</strong>——上一步返回的每行订单（750 × 100 =
+            75000），再触发一次 <code>idx_products_order</code>
+            索引扫描。每个 <code>order_id</code> 平均匹配 2
+            个产品（200000 products / 100000 orders = 2），所以
+            <code>actual rows=200</code> per loop，总
+            <code>loops=75000</code>。</p></li>
+            <li><p><strong>优化器为什么选 Nested Loop 而不是 Hash
+            Join？</strong> 因为 <code>customers</code> 被
+            <code>WHERE region = 'West'</code> 过滤后只有 750
+            行（估算准确），作为驱动表很划算。内表的每次索引扫描代价很低。如果优化器错误估算
+            <code>customers</code> 的行数（比如统计信息过时导致认为只有
+            10 行），可能选 Hash Join 更优。</p></li>
+            </ol>
+            <h3 id="强制观察-hash-join-和-merge-join">3. 强制观察 Hash
+            Join 和 Merge Join</h3>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 强制禁用特定 join 方式来观察替代计划</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> enable_nestloop <span class="op">=</span> <span class="kw">off</span>;</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS)</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> c.name, o.order_date, p.product_name</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> customers c</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> orders o <span class="kw">ON</span> c.customer_id <span class="op">=</span> o.customer_id</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> products p <span class="kw">ON</span> o.order_id <span class="op">=</span> p.order_id</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.region <span class="op">=</span> <span class="st">&#39;West&#39;</span>;</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察计划是否变为 Hash Join</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 恢复</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> enable_nestloop <span class="op">=</span> <span class="kw">on</span>;</span></code></pre></div>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 有排序需求时观察 Merge Join</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS)</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> c.name, o.order_date, p.product_name</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> customers c</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> orders o <span class="kw">ON</span> c.customer_id <span class="op">=</span> o.customer_id</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> products p <span class="kw">ON</span> o.order_id <span class="op">=</span> p.order_id</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> c.customer_id, o.order_id;</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- customer_id 和 order_id 都有索引，Merge Join 可能直接利用排序</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>### <span class="fl">4.</span> 触发 GEQO</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前 geqo_threshold</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>SHOW geqo_threshold;  <span class="co">-- 默认 12</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 修改为较低值来触发 GEQO</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> geqo_threshold <span class="op">=</span> <span class="dv">3</span>;</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>  (<span class="kw">SELECT</span> generate_series(<span class="dv">1</span>,<span class="dv">100</span>) <span class="kw">AS</span> a) t1,</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>  (<span class="kw">SELECT</span> generate_series(<span class="dv">1</span>,<span class="dv">100</span>) <span class="kw">AS</span> b) t2,</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>  (<span class="kw">SELECT</span> generate_series(<span class="dv">1</span>,<span class="dv">100</span>) <span class="kw">AS</span> c) t3,</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>  (<span class="kw">SELECT</span> generate_series(<span class="dv">1</span>,<span class="dv">100</span>) <span class="kw">AS</span> d) t4</span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> t1.a <span class="op">=</span> t2.b <span class="kw">AND</span> t2.b <span class="op">=</span> t3.c <span class="kw">AND</span> t3.c <span class="op">=</span> t4.d;</span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 注意 EXPLAIN 输出中不再保证最优 Join 顺序</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="co">-- 恢复</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a><span class="kw">RESET</span> geqo_threshold;</span></code></pre></div>
+            <h3 id="观察并行查询">5. 观察并行查询</h3>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 确保并行查询已启用</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> max_parallel_workers_per_gather <span class="op">=</span> <span class="dv">4</span>;</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS)</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FROM</span> orders <span class="kw">WHERE</span> amount <span class="op">&gt;</span> <span class="dv">900</span>;</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 输出可能包含 Gather 节点：</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- Gather  (cost=1000.00..1500.00 rows=10000 width=8)</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="co">--   Workers Planned: 2</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="co">--   -&gt;  Partial Aggregate</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="co">--         -&gt;  Parallel Seq Scan on orders</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>## 七、运维：路径选择的常见问题与排查</span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>### <span class="fl">1.</span> 优化器不选索引：random_page_cost 过高</span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>现象<span class="op">**</span>：表上建了索引，`EXPLAIN` 仍然显示 Seq Scan。</span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>根因<span class="op">**</span>：`random_page_cost` 默认 <span class="fl">4.0</span>，意味着优化器假设一次随机页面读取的成本是一次顺序页面读取的 <span class="dv">4</span> 倍。在 NVMe SSD 上，这个假设严重高估了随机读的成本，导致优化器认为 SeqScan（全顺序读）比 IndexScan（随机读 <span class="op">+</span> 回表）更便宜。</span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>排查<span class="op">**</span>：</span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看当前配置</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>SHOW random_page_cost;</span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a><span class="co">-- 用 pg_test_fsync 实测磁盘随机 vs 顺序读的性能比</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a><span class="co">-- 然后按比例设置。NVMe 上通常 1.0-1.5 合理</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">SYSTEM</span> <span class="kw">SET</span> random_page_cost <span class="op">=</span> <span class="fl">1.5</span>;</span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_reload_conf();</span></code></pre></div>
+            <h3 id="统计信息漂移导致-join-顺序错乱">2. 统计信息漂移导致
+            Join 顺序错乱</h3>
+            <p><strong>现象</strong>：曾经很快的查询突然变慢，<code>EXPLAIN</code>
+            显示 Join 顺序变了或选错了 Join 方式。</p>
+            <p><strong>根因</strong>：大表频繁插入/删除后统计信息过期。<code>pg_stat_user_tables.n_mod_since_analyze</code>
+            过大，优化器对行数和选择率的估算严重偏离实际。</p>
+            <p><strong>排查</strong>：</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 查看统计信息的新鲜度</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> relname, n_live_tup, n_dead_tup, n_mod_since_analyze,</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>       last_analyze, last_autoanalyze</span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_user_tables</span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> relname <span class="kw">IN</span> (<span class="st">&#39;orders&#39;</span>, <span class="st">&#39;customers&#39;</span>, <span class="st">&#39;products&#39;</span>);</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 如果 n_mod_since_analyze 远大于 n_live_tup * autovacuum_analyze_scale_factor（默认 0.1）</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="co">-- 说明 auto-analyze 没有及时触发或阈值太高</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="kw">ANALYZE</span> orders;  <span class="co">-- 立即更新统计信息</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>### <span class="fl">3.</span> work_mem 与 <span class="kw">Hash</span> <span class="kw">Join</span> 溢出的互相影响</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>现象<span class="op">**</span>：`EXPLAIN (<span class="kw">ANALYZE</span>, BUFFERS)` 中 <span class="kw">Hash</span> <span class="kw">Join</span> 的 `Batches:` 大于 <span class="dv">1</span>，查询比预期慢很多。</span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>根因<span class="op">**</span>：`work_mem` 太小（或并发连接太多，每连接的实际可用内存远小于 `work_mem`），Hash <span class="kw">Join</span> 的 <span class="kw">hash</span> 表装不下内存，溢出到磁盘批次处理。每次溢出产生额外的磁盘 I<span class="op">/</span>O——内表数据被多次写入和读出临时文件。</span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>排查<span class="op">**</span>：</span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a><span class="kw">EXPLAIN</span> (<span class="kw">ANALYZE</span>, BUFFERS, SETTINGS)</span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="op">..</span>.;</span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a><span class="co">-- 观察 Hash Join 节点的输出：</span></span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a><span class="co">-- Hash Join  (cost=...) (actual time=...)</span></span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a><span class="co">--   Hash Cond: (...)</span></span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a><span class="co">--   Buckets: 16384  Batches: 8  Memory Usage: 2049kB</span></span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a><span class="co">--   ↑ Batches &gt; 1 表示发生了溢出</span></span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a><span class="co">-- 溢出时增加 work_mem：</span></span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a><span class="kw">SET</span> work_mem <span class="op">=</span> <span class="st">&#39;64MB&#39;</span>;  <span class="co">-- 仅当前 session</span></span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a><span class="co">-- 或全局：</span></span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a><span class="co">-- ALTER SYSTEM SET work_mem = &#39;64MB&#39;;</span></span></code></pre></div>
+            <p>注意 <code>work_mem</code> 的危险性：设太大的
+            <code>work_mem</code> + 高并发 =
+            后端内存爆炸。<code>hash_mem_multiplier</code>（PG 15+）给
+            hash
+            操作额外的乘数，<code>work_mem * hash_mem_multiplier</code>
+            才是 hash 操作能用的内存上限。</p>
+            <h3 id="多表-join-计划不稳定geqo-区">4. 多表 Join
+            计划不稳定（GEQO 区）</h3>
+            <p><strong>现象</strong>：12+ 表 Join 的查询，每次
+            <code>EXPLAIN</code>
+            输出可能不同，执行时间在几秒到几十秒之间波动。</p>
+            <p><strong>根因</strong>：<code>geqo_threshold</code> 默认为
+            12，超过此数量的表使用 GEQO 遗传算法搜索 Join
+            顺序——遗传算法不保证找到最优解，每次运行可能产生不同的计划。</p>
+            <p><strong>排查与缓解</strong>：</p>
+            <p>```sql – 方案 A：提高 geqo_threshold 让更多表走 DP SET
+            geqo_threshold = 15; – 小心：DP 的复杂度是 Catalan 数</p>
+            <p>– 方案 B：降低 join_collapse_limit 限制 DP 搜索空间 SET
+            join_collapse_limit = 8;</p>
+            <p>– 方案 C：将部分 Join 编码为子查询或 CTE WITH sub AS (
+            SELECT … FROM t1 JOIN t2 … WHERE … ) SELECT … FROM sub JOIN
+            t3 …;</p>
+            <p>– 方案 D：固定部分 Join 顺序（显式括号 +
+            join_collapse_limit=1） – 让优化器按 SQL 书写的顺序执行
+            ```text</p>
+            <hr />
+            <h2 id="八关键要点">八、关键要点</h2>
+            <ol type="1">
+            <li><p><strong><code>make_one_rel()</code> 是 Join
+            路径生成的调度中心</strong>。先为每个基表生成扫描路径（<code>set_base_rel_pathlists()</code>），然后按
+            joinlist 逐级构造 joinrel 并生成 Join
+            路径（<code>make_rel_from_joinlist()</code>）。</p></li>
+            <li><p><strong>四种扫描路径各有用武之地</strong>：SeqScan
+            无条件存在，IndexScan 依赖索引和选择率估算，IndexOnlyScan
+            需要索引覆盖且依赖 VM all-visible，BitmapScan
+            适合中等过滤率和多索引 OR 组合。</p></li>
+            <li><p><strong>三种 Join
+            方式的选择来自代价比较而非硬规则</strong>：Nested Loop
+            适合驱动表小 + 内表有索引；Hash Join 适合等值 Join +
+            内表能装进 <code>work_mem</code>；Merge Join
+            适合大表且至少一个表已排序。</p></li>
+            <li><p><strong>GEQO 在 <code>geqo_threshold</code>（默认
+            12）个表时接管</strong>——遗传算法不保证最优，可能导致计划不稳定。超出此阈值时排查计划波动是
+            GEQO 而非统计信息的问题。</p></li>
+            <li><p><strong><code>EXPLAIN (ANALYZE, BUFFERS)</code> 是
+            plan 决策的”事后解剖”</strong>：<code>actual rows</code> vs
+            <code>plan rows</code>
+            的差异暴露统计信息问题，<code>Batches &gt; 1</code> 暴露
+            Hash Join 内存溢出，<code>Buffers: read</code> 暴露磁盘
+            I/O。</p></li>
+            </ol>
+            <p>下一章：<a
+            href="../12-executor/12-executor.html">执行器与表达式求值</a>，拆解火山模型的
+            ExecProcNode 调度、EEO (Expression Evaluation) 的 opcode
+            编译和 TupleTableSlot 机制。</p>
+            <p>上一章：<a
+            href="../10-statistics-cost/10-statistics-cost.html">查询规划器
+            — 统计信息与代价模型</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码pg-17">源码（PG 17）</h3>
+            <ul>
+            <li><code>src/backend/optimizer/path/allpaths.c</code>：<code>make_one_rel()</code>,
+            <code>set_base_rel_pathlists()</code>,
+            <code>set_plain_rel_pathlist()</code>,
+            <code>create_plain_partial_paths()</code></li>
+            <li><code>src/backend/optimizer/path/joinpath.c</code>：<code>add_paths_to_joinrel()</code>,
+            <code>match_unsorted_outer()</code>,
+            <code>hash_inner_and_required()</code>,
+            <code>sort_inner_and_outer()</code></li>
+            <li><code>src/backend/optimizer/path/joinrels.c</code>：<code>make_rel_from_joinlist()</code>,
+            <code>standard_join_search()</code></li>
+            <li><code>src/backend/optimizer/path/costsize.c</code>：<code>cost_seqscan()</code>,
+            <code>cost_index()</code>, <code>cost_nestloop()</code>,
+            <code>cost_hashjoin()</code>,
+            <code>cost_mergejoin()</code></li>
+            <li><code>src/backend/optimizer/path/indxpath.c</code>：<code>create_index_paths()</code>,
+            <code>get_index_paths()</code>,
+            <code>build_index_paths()</code></li>
+            <li><code>src/backend/optimizer/geqo/geqo_main.c</code>：<code>geqo()</code>,
+            GEQO 遗传算法主循环</li>
+            <li><code>src/backend/optimizer/geqo/geqo_eval.c</code>：<code>geqo_eval()</code>，个体评估</li>
+            <li><code>src/backend/optimizer/geqo/geqo_selection.c</code>：选择算子</li>
+            <li><code>src/backend/optimizer/geqo/geqo_cx.c</code>、<code>geqo_ox.c</code>、<code>geqo_pmx.c</code>：交叉算子（cycle
+            / order / partially matched crossover）</li>
+            <li><code>src/include/nodes/pathnodes.h</code>：<code>RelOptInfo</code>,
+            <code>Path</code>, <code>IndexPath</code>,
+            <code>JoinPath</code>, <code>PlannerInfo</code> 结构体</li>
+            <li><code>src/backend/optimizer/util/pathnode.c</code>：<code>add_path()</code>
+            ——路径比较和 dominance check</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Chapter 60: Genetic Query
+            Optimizer</li>
+            <li>PostgreSQL Documentation, Section 20.7: Query
+            Planning（GUC 参数说明：<code>geqo_threshold</code>,
+            <code>geqo_effort</code>, <code>join_collapse_limit</code>,
+            <code>from_collapse_limit</code>）</li>
+            <li>PostgreSQL Documentation, Section 14.1-14.3: Using
+            EXPLAIN</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Selinger, P. G. et al. <em>Access Path Selection in a
+            Relational Database Management System</em>. SIGMOD 1979. —
+            System R 代价模型，PG 代价估算的学术原型。</li>
+            <li>Graefe, G. <em>The Cascades Framework for Query
+            Optimization</em>. IEEE Data Eng. Bull. 1995. —
+            查询优化器架构的通用框架，PG 的 DP
+            搜索遵循此框架的设计思路。</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/12-executor/12-executor.html">【PG 内核】执行器与表达式求值：从计划树到行数据的一趟流水</a></h3>
+                    <p>拆解 PostgreSQL 执行器的火山模型（ExecInitNode→ExecProcNode→ExecEndNode）、Hash Join 内存化实现、EEO 表达式求值的 opcode 编译与解释执行机制、TupleTableSlot 的三种数据承载方式（virtual/heap/minimal）。附带查询 hang 住的完整诊断路径：pg_stat_activity 的 wait_event + pg_blocking_pids() 追踪锁等待链 + EXPLAIN ANALYZE 计划行数与实际行数差异定位。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/10-statistics-cost/10-statistics-cost.html">【PG 内核】查询规划器 — 统计信息与代价模型：优化器为什么选错了索引</a></h3>
+                    <p>拆解 PostgreSQL 查询优化器的决策基础：pg_statistic 中 MCV/histogram/correlation 的存储结构、ANALYZE 的采样流程与精度边界、clauselist_selectivity 如何逐层估算选择率、seq_page_cost 等代价常量的物理意义与调优依据、CREATE STATISTICS 解决多列相关性问题、以及统计信息漂移的诊断 SQL 与排查路径。读完你能回答：优化器为什么选 Seq Scan 而不是你建的索引，以及怎么定位根因。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/index.html">【PG 内核】PostgreSQL 内核机制深度拆解</a></h3>
+                    <p>从进程模型到磁盘页面、从 MVCC 到流复制——对 PostgreSQL 内核做完整的源码级拆解。不止步于源码分析：26 篇中 6 篇是运维实战——经典故障的根因与排查路径、性能调查的五层工具链、配置陷阱与恢复边界。面向想读懂 PG 内核源码、在生产环境排查过问题、准备给 PG 贡献代码的工程师。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/01-process-shmem/01-process-shmem.html">【PG 内核】进程模型与共享内存：Postmaster 如何管理 100 个 Backend</a></h3>
+                    <p>拆解 PostgreSQL 多进程架构的核心：Postmaster 的启动与信号处理、Backend 进程的 fork()→InitPostgres→主循环生命周期、CreateSharedMemoryAndSemaphores() 的共享内存初始化流程、PGPROC/ProcArray/PGXACT 等关键共享内存结构的内存布局，以及 Background Worker 的注册与调度。理解了这个地基，才能理解 PG 为什么用进程而不是线程，以及 max_connections 为什么不能随便调大。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

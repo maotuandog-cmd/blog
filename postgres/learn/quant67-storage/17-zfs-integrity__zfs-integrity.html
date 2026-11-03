@@ -1,0 +1,2075 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【存储工程】ZFS：数据完整性优先的存储栈 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="ZFS 三层架构、Merkle
+端到端校验、CoW、ARC、RAID-Z 与运维；算法选型与 field study 口径见
+checksum / data-integrity 篇。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="zfs, data-integrity, arc, l2arc, zil, slog, dedup, zpool, storage" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/storage/17-zfs-integrity/zfs-integrity.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【存储工程】ZFS：数据完整性优先的存储栈" />
+    <meta property="og:description" content="ZFS 三层架构、Merkle 端到端校验、CoW、ARC、RAID-Z 与运维；算法选型与 field study 口径见 checksum / data-integrity 篇。" />
+    <meta property="og:url" content="https://quant67.com/post/storage/17-zfs-integrity/zfs-integrity.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="storage" />
+    <meta property="article:tag" content="zfs" />
+    <meta property="article:tag" content="data-integrity" />
+    <meta property="article:tag" content="arc" />
+    <meta property="article:tag" content="l2arc" />
+    <meta property="article:tag" content="zil" />
+    <meta property="article:tag" content="slog" />
+    <meta property="article:tag" content="dedup" />
+    <meta property="article:tag" content="zpool" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【存储工程】ZFS：数据完整性优先的存储栈" />
+    <meta name="twitter:description" content="ZFS 三层架构、Merkle 端到端校验、CoW、ARC、RAID-Z 与运维；算法选型与 field study 口径见 checksum / data-integrity 篇。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【存储工程】ZFS：数据完整性优先的存储栈", "description": "ZFS 三层架构、Merkle 端到端校验、CoW、ARC、RAID-Z 与运维；算法选型与 field study 口径见 checksum / data-integrity 篇。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/storage/17-zfs-integrity/zfs-integrity.html"}, "datePublished": "2025-08-26T00:00:00+00:00", "dateModified": "2026-07-25T06:26:02+00:00", "keywords": ["zfs", "data-integrity", "arc", "l2arc", "zil", "slog", "dedup", "zpool"], "about": ["storage"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【存储工程】ZFS：数据完整性优先的存储栈</h1>
+                        <p class="post-meta">
+                <span class="post-date">2025-08-26</span>
+                 · <span class="post-categories"><span>storage</span></span>
+                 · <span class="post-tags"><span>#zfs</span> <span>#data-integrity</span> <span>#arc</span> <span>#l2arc</span> <span>#zil</span> <span>#slog</span> <span>#dedup</span> <span>#zpool</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/storage.html">storage</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/zfs.html">#zfs</a><a class="chip-link" href="/tags/data-integrity.html">#data-integrity</a><a class="chip-link" href="/tags/arc.html">#arc</a><a class="chip-link" href="/tags/l2arc.html">#l2arc</a><a class="chip-link" href="/tags/zil.html">#zil</a><a class="chip-link" href="/tags/slog.html">#slog</a><a class="chip-link" href="/tags/dedup.html">#dedup</a><a class="chip-link" href="/tags/zpool.html">#zpool</a></div></div></section>
+<section class="post-series-nav"><h2>存储工程系列导航</h2><p>按系列顺序继续阅读，而不是停在单篇。</p><div class="post-series-nav__links"><a class="post-series-nav__link" href="/post/storage/index.html">系列目录</a><a class="post-series-nav__link" href="/post/storage/16-btrfs-cow/btrfs-cow.html">上一篇：【存储工程】Btrfs：写时复制文件系统</a><a class="post-series-nav__link" href="/post/storage/18-filesystem-selection/filesystem-selection.html">下一篇：【存储工程】文件系统选型与基准测试</a></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a href="#端到端校验谱系zfs-在链中的位置"
+                id="toc-端到端校验谱系zfs-在链中的位置">〇、端到端校验谱系（ZFS
+                在链中的位置）</a></li>
+                <li><a href="#一zfs-设计哲学"
+                id="toc-一zfs-设计哲学">一、ZFS 设计哲学</a>
+                <ul>
+                <li><a href="#起源sun-microsystems-的野心"
+                id="toc-起源sun-microsystems-的野心">1.1 起源：Sun
+                Microsystems 的野心</a></li>
+                <li><a href="#数据完整性优先"
+                id="toc-数据完整性优先">1.2 数据完整性优先</a></li>
+                <li><a href="#管理简洁性" id="toc-管理简洁性">1.3
+                管理简洁性</a></li>
+                <li><a href="#池化存储模型" id="toc-池化存储模型">1.4
+                池化存储模型</a></li>
+                </ul></li>
+                <li><a href="#二三层架构zpoolvdevdataset"
+                id="toc-二三层架构zpoolvdevdataset">二、三层架构：zpool、vdev、dataset</a>
+                <ul>
+                <li><a href="#架构总览" id="toc-架构总览">2.1
+                架构总览</a></li>
+                <li><a href="#zpool存储池" id="toc-zpool存储池">2.2
+                zpool：存储池</a></li>
+                <li><a href="#vdev虚拟设备" id="toc-vdev虚拟设备">2.3
+                vdev：虚拟设备</a></li>
+                <li><a href="#dataset-与-zvol"
+                id="toc-dataset-与-zvol">2.4 dataset 与 zvol</a></li>
+                <li><a href="#属性继承" id="toc-属性继承">2.5
+                属性继承</a></li>
+                </ul></li>
+                <li><a href="#三端到端校验和"
+                id="toc-三端到端校验和">三、端到端校验和</a>
+                <ul>
+                <li><a href="#为什么需要文件系统层面的校验"
+                id="toc-为什么需要文件系统层面的校验">3.1
+                为什么需要文件系统层面的校验</a></li>
+                <li><a href="#merkle-树结构" id="toc-merkle-树结构">3.2
+                Merkle 树结构</a></li>
+                <li><a href="#校验和算法" id="toc-校验和算法">3.3
+                校验和算法</a></li>
+                <li><a href="#自愈机制" id="toc-自愈机制">3.4
+                自愈机制</a></li>
+                <li><a href="#scrub主动数据完整性巡检"
+                id="toc-scrub主动数据完整性巡检">3.5
+                scrub：主动数据完整性巡检</a></li>
+                </ul></li>
+                <li><a href="#四cow-与事务组txg"
+                id="toc-四cow-与事务组txg">四、CoW 与事务组（TXG）</a>
+                <ul>
+                <li><a href="#写时复制cow" id="toc-写时复制cow">4.1
+                写时复制（CoW）</a></li>
+                <li><a href="#事务组txg" id="toc-事务组txg">4.2
+                事务组（TXG）</a></li>
+                <li><a href="#uberblock最终一致性锚点"
+                id="toc-uberblock最终一致性锚点">4.3
+                Uberblock：最终一致性锚点</a></li>
+                <li><a href="#cow-的代价" id="toc-cow-的代价">4.4 CoW
+                的代价</a></li>
+                </ul></li>
+                <li><a href="#五arc-缓存" id="toc-五arc-缓存">五、ARC
+                缓存</a>
+                <ul>
+                <li><a href="#为什么不使用-page-cache"
+                id="toc-为什么不使用-page-cache">5.1 为什么不使用 Page
+                Cache</a></li>
+                <li><a href="#arc-算法原理" id="toc-arc-算法原理">5.2
+                ARC 算法原理</a></li>
+                <li><a href="#l1arc-与-l2arc"
+                id="toc-l1arc-与-l2arc">5.3 L1ARC 与 L2ARC</a></li>
+                <li><a href="#arc-调优" id="toc-arc-调优">5.4 ARC
+                调优</a></li>
+                <li><a href="#预取机制" id="toc-预取机制">5.5
+                预取机制</a></li>
+                </ul></li>
+                <li><a href="#六zil-与-slog"
+                id="toc-六zil-与-slog">六、ZIL 与 SLOG</a>
+                <ul>
+                <li><a href="#同步写的问题" id="toc-同步写的问题">6.1
+                同步写的问题</a></li>
+                <li><a href="#zil-工作原理" id="toc-zil-工作原理">6.2
+                ZIL 工作原理</a></li>
+                <li><a href="#zil-写入模式" id="toc-zil-写入模式">6.3
+                ZIL 写入模式</a></li>
+                <li><a href="#slog独立日志设备"
+                id="toc-slog独立日志设备">6.4
+                SLOG：独立日志设备</a></li>
+                <li><a href="#slog-丢失的影响"
+                id="toc-slog-丢失的影响">6.5 SLOG 丢失的影响</a></li>
+                <li><a href="#同步写语义配置"
+                id="toc-同步写语义配置">6.6 同步写语义配置</a></li>
+                </ul></li>
+                <li><a href="#七压缩与去重"
+                id="toc-七压缩与去重">七、压缩与去重</a>
+                <ul>
+                <li><a href="#透明压缩" id="toc-透明压缩">7.1
+                透明压缩</a></li>
+                <li><a href="#压缩算法对比" id="toc-压缩算法对比">7.2
+                压缩算法对比</a></li>
+                <li><a href="#压缩实践建议" id="toc-压缩实践建议">7.3
+                压缩实践建议</a></li>
+                <li><a href="#去重deduplication"
+                id="toc-去重deduplication">7.4
+                去重（Deduplication）</a></li>
+                <li><a href="#去重的内存代价"
+                id="toc-去重的内存代价">7.5 去重的内存代价</a></li>
+                <li><a href="#去重使用建议" id="toc-去重使用建议">7.6
+                去重使用建议</a></li>
+                </ul></li>
+                <li><a href="#八raid-z" id="toc-八raid-z">八、RAID-Z</a>
+                <ul>
+                <li><a href="#传统-raid-的写洞问题"
+                id="toc-传统-raid-的写洞问题">8.1 传统 RAID
+                的写洞问题</a></li>
+                <li><a href="#raid-z-如何消除写洞"
+                id="toc-raid-z-如何消除写洞">8.2 RAID-Z
+                如何消除写洞</a></li>
+                <li><a href="#raid-z1z2z3" id="toc-raid-z1z2z3">8.3
+                RAID-Z1、Z2、Z3</a></li>
+                <li><a href="#draid分布式-raid-z"
+                id="toc-draid分布式-raid-z">8.4 dRAID：分布式
+                RAID-Z</a></li>
+                <li><a href="#mirror-与-raid-z-的选择"
+                id="toc-mirror-与-raid-z-的选择">8.5 mirror 与 RAID-Z
+                的选择</a></li>
+                </ul></li>
+                <li><a href="#九zfs-管理实战"
+                id="toc-九zfs-管理实战">九、ZFS 管理实战</a>
+                <ul>
+                <li><a href="#池管理基础" id="toc-池管理基础">9.1
+                池管理基础</a></li>
+                <li><a href="#数据集管理" id="toc-数据集管理">9.2
+                数据集管理</a></li>
+                <li><a href="#快照与克隆" id="toc-快照与克隆">9.3
+                快照与克隆</a></li>
+                <li><a href="#发送与接收" id="toc-发送与接收">9.4
+                发送与接收</a></li>
+                <li><a href="#scrub-与-resilver"
+                id="toc-scrub-与-resilver">9.5 scrub 与
+                resilver</a></li>
+                </ul></li>
+                <li><a href="#十zfs-性能调优"
+                id="toc-十zfs-性能调优">十、ZFS 性能调优</a>
+                <ul>
+                <li><a href="#recordsize-调优"
+                id="toc-recordsize-调优">10.1 recordsize 调优</a></li>
+                <li><a href="#ashift-配置" id="toc-ashift-配置">10.2
+                ashift 配置</a></li>
+                <li><a href="#压缩优化" id="toc-压缩优化">10.3
+                压缩优化</a></li>
+                <li><a href="#special-vdev" id="toc-special-vdev">10.4
+                special vdev</a></li>
+                <li><a href="#l2arc-调优" id="toc-l2arc-调优">10.5 L2ARC
+                调优</a></li>
+                <li><a href="#slog-设备选型" id="toc-slog-设备选型">10.6
+                SLOG 设备选型</a></li>
+                <li><a href="#其他调优参数" id="toc-其他调优参数">10.7
+                其他调优参数</a></li>
+                </ul></li>
+                <li><a href="#十一zfs-生产部署"
+                id="toc-十一zfs-生产部署">十一、ZFS 生产部署</a>
+                <ul>
+                <li><a href="#openzfs-项目" id="toc-openzfs-项目">11.1
+                OpenZFS 项目</a></li>
+                <li><a href="#freebsd-与-linux-的差异"
+                id="toc-freebsd-与-linux-的差异">11.2 FreeBSD 与 Linux
+                的差异</a></li>
+                <li><a href="#许可证问题" id="toc-许可证问题">11.3
+                许可证问题</a></li>
+                <li><a href="#生产部署检查清单"
+                id="toc-生产部署检查清单">11.4 生产部署检查清单</a></li>
+                <li><a href="#常见使用场景" id="toc-常见使用场景">11.5
+                常见使用场景</a></li>
+                <li><a href="#zfs-的局限" id="toc-zfs-的局限">11.6 ZFS
+                的局限</a></li>
+                </ul></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#规范与官方文档"
+                id="toc-规范与官方文档">规范与官方文档</a></li>
+                <li><a href="#论文" id="toc-论文">论文</a></li>
+                <li><a href="#书籍与工程博客"
+                id="toc-书籍与工程博客">书籍与工程博客</a></li>
+                <li><a href="#关联篇目"
+                id="toc-关联篇目">关联篇目</a></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <blockquote>
+            <p><strong>本篇分工（完整性三部曲）</strong></p>
+            <table>
+            <colgroup>
+            <col style="width: 50%" />
+            <col style="width: 50%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>文章</th>
+            <th>分工</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><a href="../12-data-integrity/data-integrity.html">12
+            数据完整性</a></td>
+            <td>fsync、写屏障、电源故障、RAID 与 SDC 来源</td>
+            </tr>
+            <tr>
+            <td><a href="../43-checksum/checksum.html">43
+            校验和与数据完整性</a></td>
+            <td>算法选型、端到端原则、Btrfs/RocksDB 等横向对比</td>
+            </tr>
+            <tr>
+            <td><strong>本文</strong></td>
+            <td>ZFS blkptr Merkle 链、CoW、scrub /
+            自愈、池管理与调优</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>端到端校验的学术谱系（Saltzer 1984 → Bonwick 2006 → FAST
+            2008 实证）在 <a href="../43-checksum/checksum.html">43
+            checksum §〇</a> 已串；本篇聚焦 OpenZFS
+            如何把该原则做成默认路径。</p>
+            </blockquote>
+            <p>在存储系统的世界里，大多数文件系统把”性能”放在第一位，把”完整性”当作锦上添花的特性。ZFS
+            的做法恰好相反——它把数据完整性视为最基本的不可协商的属性，然后在此基础上构建性能优化。这种设计哲学上的根本差异，使得
+            ZFS
+            在诞生近二十年后，仍然是数据保护领域无可替代的存储栈。</p>
+            <p>一个典型的场景：你的 RAID
+            控制器静默地翻转了一个比特，ext4
+            毫无感知地将损坏的数据交给应用程序；而 ZFS
+            不仅能检测到这个错误，还能从冗余副本自动修复它，整个过程对应用程序完全透明。这就是端到端数据完整性的力量。</p>
+            <p>本文将从 ZFS
+            的设计哲学出发，逐层剖析其三层存储架构、端到端校验和体系、写时复制事务模型、ARC
+            缓存机制、ZIL 日志加速、压缩与去重、RAID-Z
+            冗余方案，最后落地到管理实战与性能调优。目标是让读者不仅理解
+            ZFS
+            的”是什么”，更理解”为什么”——每一个设计决策背后的数据完整性考量。静默损坏的
+            field study 口径见 <a
+            href="../12-data-integrity/data-integrity.html">12
+            数据完整性 §6.3</a>，<strong>不在这里重复年化 SDC
+            率</strong>。</p>
+            <hr />
+            <h2
+            id="端到端校验谱系zfs-在链中的位置">〇、端到端校验谱系（ZFS
+            在链中的位置）</h2>
+            <table>
+            <colgroup>
+            <col style="width: 19%" />
+            <col style="width: 35%" />
+            <col style="width: 45%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>阶段</th>
+            <th>代表 work</th>
+            <th>ZFS 中的落点</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>端到端论证</td>
+            <td>Saltzer et al., ACM TOCS 1984</td>
+            <td>在 FS 层设「端点」：读路径必须验证后才返回用户态</td>
+            </tr>
+            <tr>
+            <td>ZFS 原设计</td>
+            <td>Bonwick &amp; Ahrens, StorageSS 2005</td>
+            <td>校验和写入<strong>父 block
+            pointer</strong>，与数据块分离</td>
+            </tr>
+            <tr>
+            <td>存储栈损坏实证</td>
+            <td>Bairavasundaram et al., FAST 2008</td>
+            <td>解释为何仅磁盘 ECC / RAID 不够——motivates scrub</td>
+            </tr>
+            <tr>
+            <td>ARC / 缓存</td>
+            <td>Megiddo &amp; Modha, FAST 2003</td>
+            <td>L1ARC 返回数据前仍走 checksum 验证（§5）</td>
+            </tr>
+            <tr>
+            <td>现代算法</td>
+            <td>OpenZFS 2.2+ BLAKE3</td>
+            <td>可选 <code>checksum=blake3</code>，与 dedup 的 SHA-256
+            路径并存</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>与 Btrfs 的分叉</strong>：Btrfs 用独立 checksum
+            树；ZFS 用 blkptr 树。FAST 2008 讨论的 misdirected write
+            场景下，两种结构对「数据和校验同时损坏」的概率模型不同——尚无
+            peer-reviewed 一方全面优于另一方的结论；工程上 ZFS
+            更强调<strong>自愈 + 冗余副本</strong>与 scrub
+            闭环（§3.4–3.5）。</p>
+            <p><strong>开放问题</strong>：</p>
+            <ol type="1">
+            <li><strong>dedup + 默认 Fletcher-4</strong>：dedup
+            需强哈希，日常检测用
+            Fletcher——双算法运维复杂度（§7.4–7.6）。</li>
+            <li><strong>RAID-Z 重建窗口</strong>：大盘 resilver
+            期间第二块盘故障 + 未 scrub 的 SDC 块——dRAID（OpenZFS
+            2.1）能否在可接受随机读 代价下缩短窗口？</li>
+            <li><strong>ZFS on Linux 许可证</strong>：CDDL vs GPL
+            长期是否阻碍主线集成，影响「默认 FS
+            即端到端」的部署面（§11.3）。</li>
+            <li><strong>L2ARC 持久化</strong>：OpenZFS 2.0+ 持久 L2ARC
+            与 checksum
+            验证路径在异常掉电下的边界——生产文档仍在演进。</li>
+            </ol>
+            <hr />
+            <h2 id="一zfs-设计哲学">一、ZFS 设计哲学</h2>
+            <h3 id="起源sun-microsystems-的野心">1.1 起源：Sun
+            Microsystems 的野心</h3>
+            <p>2001 年，Sun Microsystems（太阳微系统公司）的工程师 Jeff
+            Bonwick 和 Matt Ahrens
+            启动了一个雄心勃勃的项目：从零开始设计一个文件系统，彻底解决传统存储栈中积累了数十年的根本性问题。这个项目最终产生了
+            ZFS——Zettabyte File System（泽字节文件系统）。</p>
+            <p>Bonwick 在多次公开演讲中将 ZFS 称为”the last word in
+            filesystems”（文件系统的终极之作）。这个称号并非狂妄，而是反映了一个核心设计目标：构建一个不需要
+            fsck、不需要卷管理器、不会静默损坏数据的存储系统。</p>
+            <p>ZFS 在 2005 年作为 OpenSolaris
+            的一部分首次公开发布，随后被移植到 FreeBSD（2008
+            年）、Linux（ZFS on Linux，2013 年稳定版）以及 macOS。2013
+            年，OpenZFS 项目成立，统一了各平台的开发工作。</p>
+            <h3 id="数据完整性优先">1.2 数据完整性优先</h3>
+            <p>ZFS
+            的第一设计原则可以用一句话概括：<strong>永远不要向应用程序返回错误的数据</strong>。</p>
+            <p>传统文件系统如 ext4 和 XFS（扩展文件系统 4 和 X
+            文件系统）信任底层硬件：如果磁盘说数据写成功了，文件系统就认为数据是正确的。但现实中，硬件故障的形式远比”磁盘报错”复杂：</p>
+            <ul>
+            <li><strong>静默数据损坏（Silent Data
+            Corruption）</strong>：比特翻转发生在传输路径上，磁盘不报错，但数据已经错了。</li>
+            <li><strong>错位写入（Misdirected
+            Write）</strong>：数据被写到了错误的物理位置。</li>
+            <li><strong>幻影写入（Phantom
+            Write）</strong>：磁盘报告写入成功，但数据实际上并未持久化。</li>
+            <li><strong>固件缺陷（Firmware
+            Bug）</strong>：磁盘固件的逻辑错误导致数据损坏。</li>
+            </ul>
+            <p>ZFS
+            对这些问题的回答是：不信任任何底层组件，在文件系统层面实现端到端的数据校验。</p>
+            <h3 id="管理简洁性">1.3 管理简洁性</h3>
+            <p>ZFS 的第二个设计目标是消除存储管理的复杂性。在传统 Linux
+            存储栈中，管理员需要分别操作：</p>
+            <pre class="text"><code>物理磁盘 → 分区表 → mdadm/硬件 RAID → LVM → mkfs → mount</code></pre>
+            <p>每一层都有自己的工具、自己的配置、自己的故障模式。ZFS
+            将这些层合并成一个统一的栈：</p>
+            <pre class="text"><code>物理磁盘 → zpool（包含 RAID、卷管理、文件系统）</code></pre>
+            <p>一条命令创建存储池，一条命令创建文件系统，不需要
+            fdisk、不需要 mdadm、不需要
+            LVM。这种简洁性不仅降低了操作复杂度，更减少了人为配置错误的可能性——而人为错误是生产环境中数据丢失的最常见原因之一。</p>
+            <h3 id="池化存储模型">1.4 池化存储模型</h3>
+            <p>ZFS 引入了存储池（Storage
+            Pool）的概念，这在当时是革命性的。传统文件系统绑定到单个块设备——一个分区或一个逻辑卷——文件系统的大小和底层设备耦合。ZFS
+            的文件系统从存储池中动态分配空间，多个文件系统共享同一个池，不需要预先规划每个文件系统的大小。</p>
+            <p>这个设计带来了几个重要优势：</p>
+            <ul>
+            <li>消除了空间浪费：不再需要为每个文件系统预留空间。</li>
+            <li>简化了容量规划：只需关注池的总容量。</li>
+            <li>天然支持精简配置（Thin
+            Provisioning）：文件系统可以超额分配空间。</li>
+            </ul>
+            <hr />
+            <h2
+            id="二三层架构zpoolvdevdataset">二、三层架构：zpool、vdev、dataset</h2>
+            <h3 id="架构总览">2.1 架构总览</h3>
+            <p>ZFS 的存储架构分为三个层次，每一层负责不同的职责：</p>
+            <pre class="text"><code>┌─────────────────────────────────────────────┐
+│              dataset / zvol                 │  ← 文件系统 / 块设备
+│         （属性继承、快照、克隆）               │
+├─────────────────────────────────────────────┤
+│                  vdev                       │  ← 虚拟设备（冗余策略）
+│    （mirror、raidz1/z2/z3、spare、log、cache） │
+├─────────────────────────────────────────────┤
+│                  zpool                      │  ← 存储池（空间分配）
+│         （所有 I/O 的入口点）                 │
+└─────────────────────────────────────────────┘</code></pre>
+            <h3 id="zpool存储池">2.2 zpool：存储池</h3>
+            <p>存储池（Storage Pool）是 ZFS 存储的最顶层抽象。一个 zpool
+            由一个或多个虚拟设备（vdev，Virtual
+            Device）组成，所有的数据和元数据都存储在池中。</p>
+            <p>创建一个基本存储池：</p>
+            <div class="sourceCode" id="cb4"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用两块磁盘创建镜像池</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create tank mirror /dev/sda /dev/sdb</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看池状态</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> status tank</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>  pool: tank
+ state: ONLINE
+  scan: scrub repaired 0B in 00:12:34 with 0 errors on Sun Aug 24 03:00:01 2025
+config:
+
+        NAME        STATE     READ WRITE CKSUM
+        tank        ONLINE       0     0     0
+          mirror-0  ONLINE       0     0     0
+            sda     ONLINE       0     0     0
+            sdb     ONLINE       0     0     0
+
+errors: No known data errors</code></pre>
+            <p><code>zpool status</code>
+            输出中的三列计数器——READ、WRITE、CKSUM——是 ZFS
+            数据完整性监控的核心指标。CKSUM
+            列显示的是校验和（Checksum）错误的数量，即检测到的静默数据损坏次数。</p>
+            <h3 id="vdev虚拟设备">2.3 vdev：虚拟设备</h3>
+            <p>虚拟设备（Virtual Device，简称 vdev）是 ZFS
+            冗余策略的实施单元。每个 vdev 独立提供数据冗余，zpool
+            将数据条带化分布在多个 vdev 之间。</p>
+            <p>ZFS 支持以下 vdev 类型：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>vdev 类型</th>
+            <th>说明</th>
+            <th>冗余能力</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>disk</td>
+            <td>单磁盘，无冗余</td>
+            <td>无</td>
+            </tr>
+            <tr>
+            <td>mirror</td>
+            <td>镜像，N 路复制</td>
+            <td>可容忍 N-1 块磁盘故障</td>
+            </tr>
+            <tr>
+            <td>raidz1</td>
+            <td>单校验 RAID</td>
+            <td>可容忍 1 块磁盘故障</td>
+            </tr>
+            <tr>
+            <td>raidz2</td>
+            <td>双校验 RAID</td>
+            <td>可容忍 2 块磁盘故障</td>
+            </tr>
+            <tr>
+            <td>raidz3</td>
+            <td>三校验 RAID</td>
+            <td>可容忍 3 块磁盘故障</td>
+            </tr>
+            <tr>
+            <td>spare</td>
+            <td>热备盘</td>
+            <td>自动替换故障盘</td>
+            </tr>
+            <tr>
+            <td>log</td>
+            <td>ZIL 日志设备</td>
+            <td>加速同步写</td>
+            </tr>
+            <tr>
+            <td>cache</td>
+            <td>L2ARC 缓存设备</td>
+            <td>扩展读缓存</td>
+            </tr>
+            <tr>
+            <td>special</td>
+            <td>元数据加速设备</td>
+            <td>加速小块 I/O</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>一个生产环境的典型池配置：</p>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create production <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    raidz2 /dev/sd<span class="dt">{a</span><span class="op">,</span><span class="dt">b</span><span class="op">,</span><span class="dt">c</span><span class="op">,</span><span class="dt">d</span><span class="op">,</span><span class="dt">e</span><span class="op">,</span><span class="dt">f}</span> <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    raidz2 /dev/sd<span class="dt">{g</span><span class="op">,</span><span class="dt">h</span><span class="op">,</span><span class="dt">i</span><span class="op">,</span><span class="dt">j</span><span class="op">,</span><span class="dt">k</span><span class="op">,</span><span class="dt">l}</span> <span class="dt">\</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    log mirror /dev/nvme0n1 /dev/nvme1n1 <span class="dt">\</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    cache /dev/nvme2n1 <span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    special mirror /dev/nvme3n1 /dev/nvme4n1</span></code></pre></div>
+            <p>这个池包含两个 raidz2 数据 vdev（各 6 块盘）、一个镜像
+            SLOG 设备、一个 L2ARC 缓存设备和一个镜像 special vdev。</p>
+            <h3 id="dataset-与-zvol">2.4 dataset 与 zvol</h3>
+            <p>ZFS
+            数据集（Dataset）是文件系统层面的抽象，分为两种类型：</p>
+            <p><strong>文件系统（Filesystem）</strong>：提供 POSIX
+            文件系统接口，可以挂载到目录树。</p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建文件系统</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> create tank/home</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> create tank/home/alice</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置属性</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=lz4 tank/home</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set quota=100G tank/home/alice</span></code></pre></div>
+            <p><strong>卷（zvol）</strong>：提供块设备接口，用于 iSCSI
+            导出或虚拟机磁盘。</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 50G 的 zvol</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> create <span class="at">-V</span> 50G tank/vm-disks/vm01</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 生成的块设备</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-la</span> /dev/zvol/tank/vm-disks/vm01</span></code></pre></div>
+            <h3 id="属性继承">2.5 属性继承</h3>
+            <p>ZFS 数据集支持层次化的属性继承（Property
+            Inheritance）。父数据集设置的属性会自动传播到子数据集，除非子数据集显式覆盖：</p>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 在池级别设置压缩</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=lz4 tank</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 所有子数据集自动继承</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> get compression tank/home/alice</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="co"># NAME              PROPERTY     VALUE     SOURCE</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co"># tank/home/alice   compression  lz4       inherited from tank</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 子数据集可以覆盖</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=zstd tank/home/alice</span></code></pre></div>
+            <p>这种继承机制使得管理大量数据集变得极其简便——只需在合适的层次设置属性，所有下级自动生效。</p>
+            <hr />
+            <h2 id="三端到端校验和">三、端到端校验和</h2>
+            <h3 id="为什么需要文件系统层面的校验">3.1
+            为什么需要文件系统层面的校验</h3>
+            <p>传统存储栈中的每一层都有自己的错误检测机制：磁盘有
+            ECC（Error-Correcting Code，纠错码），SATA/SAS 有
+            CRC（Cyclic Redundancy Check，循环冗余校验），TCP/IP
+            有校验和。但这些机制存在一个致命的盲区：它们只保护相邻两层之间的传输，不保护端到端的数据完整性。</p>
+            <p>一个具体的场景：</p>
+            <pre class="text"><code>应用程序 → 内核 → 块设备层 → HBA → 线缆 → 磁盘控制器 → 介质
+                        ↑
+                   数据在此处被损坏
+                   （DMA 传输错误）</code></pre>
+            <p>磁盘的 ECC
+            校验通过了——因为存储到介质上的就是错误的数据。SATA CRC
+            校验也通过了——因为传输没有出错。只有在写入时记录了正确数据的校验和，并在读取时重新验证，才能发现这种损坏。</p>
+            <h3 id="merkle-树结构">3.2 Merkle 树结构</h3>
+            <p>ZFS 使用一种类似默克尔树（Merkle
+            Tree）的校验和树来保护所有数据和元数据。每一个数据块都有一个校验和，这个校验和不存储在数据块本身旁边，而是存储在<strong>父块的指针</strong>中。</p>
+            <pre class="text"><code>             Uberblock
+           （根校验和）
+                │
+         ┌──────┴──────┐
+         ▼             ▼
+    间接块 A        间接块 B
+  （含子块校验和）  （含子块校验和）
+    │    │          │    │
+    ▼    ▼          ▼    ▼
+  数据  数据      数据  数据</code></pre>
+            <p>这个设计的关键洞察是：<strong>校验和与数据分离存储</strong>。如果校验和存储在数据块旁边（像
+            Btrfs
+            的某些实现），那么当磁盘的某个区域损坏时，数据和校验和可能同时损坏，导致损坏无法被检测。ZFS
+            将校验和存储在父指针中，父指针位于完全不同的磁盘位置，大幅降低了同时损坏的概率。</p>
+            <h3 id="校验和算法">3.3 校验和算法</h3>
+            <p>ZFS 支持多种校验和算法，可以在数据集级别配置：</p>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前校验和算法</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> get checksum tank/home</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置校验和算法</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set checksum=sha256 tank/critical-data</span></code></pre></div>
+            <p>各算法的特点：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>算法</th>
+            <th>强度</th>
+            <th>性能</th>
+            <th>说明</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>on（默认）</td>
+            <td>中</td>
+            <td>高</td>
+            <td>等同于 fletcher4</td>
+            </tr>
+            <tr>
+            <td>fletcher2</td>
+            <td>低</td>
+            <td>极高</td>
+            <td>已弃用</td>
+            </tr>
+            <tr>
+            <td>fletcher4</td>
+            <td>中</td>
+            <td>高</td>
+            <td>默认算法，足够检测大多数硬件错误</td>
+            </tr>
+            <tr>
+            <td>sha256</td>
+            <td>极高</td>
+            <td>低</td>
+            <td>密码学强度，用于去重或高安全场景</td>
+            </tr>
+            <tr>
+            <td>skein</td>
+            <td>极高</td>
+            <td>中</td>
+            <td>密码学强度，比 SHA-256 快</td>
+            </tr>
+            <tr>
+            <td>edonr</td>
+            <td>极高</td>
+            <td>高</td>
+            <td>最快的密码学级校验和</td>
+            </tr>
+            <tr>
+            <td>blake3</td>
+            <td>极高</td>
+            <td>高</td>
+            <td>OpenZFS 2.2 引入，现代化密码学哈希</td>
+            </tr>
+            <tr>
+            <td>off</td>
+            <td>无</td>
+            <td>-</td>
+            <td>禁用校验和（强烈不建议）</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>Fletcher-4 是一种位置敏感的校验和算法（Position-Dependent
+            Checksum），它不仅检测数据内容的变化，还能检测数据顺序的变化。对于绝大多数场景，Fletcher-4
+            提供了足够的保护——检测到静默损坏的概率极高，而且几乎不消耗
+            CPU 资源。</p>
+            <p>SHA-256（安全哈希算法 256
+            位）提供密码学级别的碰撞抵抗，主要用于两个场景：去重（需要可靠判断两个块是否相同）和高安全性要求的环境。</p>
+            <h3 id="自愈机制">3.4 自愈机制</h3>
+            <p>当 ZFS 在冗余配置（mirror 或
+            raidz）中检测到校验和错误时，它不仅报告错误，还会<strong>自动修复</strong>。修复流程如下：</p>
+            <pre class="text"><code>1. 读取数据块
+2. 计算校验和，与父指针中存储的校验和对比
+3. 如果不匹配 → 校验和错误
+4. 从冗余副本读取同一数据块
+5. 验证冗余副本的校验和
+6. 如果冗余副本正确 → 用正确数据覆盖损坏副本
+7. 向上层返回正确数据</code></pre>
+            <p>这个过程对应用程序完全透明——应用程序拿到的永远是经过验证的正确数据。自愈事件会被记录，管理员可以通过
+            <code>zpool status</code> 看到修复计数。</p>
+            <h3 id="scrub主动数据完整性巡检">3.5
+            scrub：主动数据完整性巡检</h3>
+            <p>ZFS 的
+            <code>scrub</code>（数据擦洗）操作会读取池中的每一个数据块，验证校验和，并在冗余配置中自动修复发现的错误。这是一种主动的数据完整性检查，不同于被动等待读取时发现错误。</p>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启动 scrub</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> scrub tank</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 scrub 进度</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> status tank</span></code></pre></div>
+            <p>生产环境建议至少每月运行一次 scrub。对于大容量池，scrub
+            可能需要数小时甚至数天，但它使用低优先级
+            I/O，对前台负载影响有限。</p>
+            <p>scrub
+            的重要性在于<strong>降低数据丢失窗口</strong>。考虑一个
+            raidz1
+            池：如果一块磁盘上有一个静默损坏的块，而另一块磁盘发生故障，那么在重建（resilver）过程中，当需要从损坏的块所在磁盘读取数据时，重建会失败。定期
+            scrub
+            能在第二块磁盘故障之前发现并修复静默损坏，从而避免数据丢失。</p>
+            <hr />
+            <h2 id="四cow-与事务组txg">四、CoW 与事务组（TXG）</h2>
+            <h3 id="写时复制cow">4.1 写时复制（CoW）</h3>
+            <p>ZFS 使用写时复制（Copy-on-Write，简称
+            CoW）作为所有写操作的基本策略。当修改一个数据块时，ZFS
+            不会覆盖原始数据，而是：</p>
+            <ol type="1">
+            <li>在新的位置写入修改后的数据。</li>
+            <li>更新父指针，指向新数据的位置。</li>
+            <li>旧数据块成为空闲空间（或被快照引用）。</li>
+            </ol>
+            <pre class="text"><code>修改前：                     修改后：
+                             
+根指针 → 间接块 → 数据块A    根指针&#39; → 间接块&#39; → 数据块A&#39;（新）
+                                                  数据块B（不变）
+                              数据块A（旧，可回收）</code></pre>
+            <p>CoW 带来了几个关键优势：</p>
+            <ul>
+            <li><strong>原子性</strong>：写操作要么完全完成（根指针更新），要么完全没有发生（根指针仍指向旧数据）。不存在中间状态。</li>
+            <li><strong>不需要日志（Journal）</strong>：传统文件系统需要日志来保证崩溃一致性，ZFS
+            通过 CoW 天然实现了一致性。</li>
+            <li><strong>快照几乎免费</strong>：快照只是保留旧的根指针，不需要复制任何数据。</li>
+            </ul>
+            <h3 id="事务组txg">4.2 事务组（TXG）</h3>
+            <p>ZFS 将多个写操作聚合到事务组（Transaction Group，简称
+            TXG）中，批量提交到磁盘。每个 TXG
+            有一个单调递增的编号，并且原子性地生效。</p>
+            <p>在任意时刻，ZFS 中存在三个 TXG：</p>
+            <pre class="text"><code>TXG N-1：正在写入磁盘（syncing）
+TXG N  ：正在等待写入（quiescing）
+TXG N+1：正在接收新的写操作（open）</code></pre>
+            <p>TXG 的提交流程：</p>
+            <pre class="text"><code>1. open TXG 接收所有新写操作（默认最长 5 秒或 dirty 数据达到阈值）
+2. open TXG 进入 quiescing 状态，新的 open TXG 被创建
+3. quiescing TXG 等待前一个 syncing TXG 完成
+4. quiescing TXG 变为 syncing TXG，开始将数据写入磁盘
+5. syncing TXG 完成后，更新 Uberblock（超级块）
+6. Uberblock 更新是原子操作，标志着 TXG 正式提交</code></pre>
+            <p>关键参数：</p>
+            <div class="sourceCode" id="cb18"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># TXG 超时时间（默认 5 秒）</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 可通过模块参数调整</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 10 <span class="op">&gt;</span> /sys/module/zfs/parameters/zfs_txg_timeout</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看当前 TXG 状态</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/spl/kstat/zfs/tank/txgs</span></code></pre></div>
+            <h3 id="uberblock最终一致性锚点">4.3
+            Uberblock：最终一致性锚点</h3>
+            <p>超级块（Uberblock）是 ZFS 一致性的最终锚点。每个池有一个
+            Uberblock 数组（默认 128 个槽位），ZFS 以轮转方式写入新的
+            Uberblock。每个 Uberblock 包含：</p>
+            <ul>
+            <li>TXG 编号</li>
+            <li>根数据集对象的指针和校验和</li>
+            <li>时间戳</li>
+            </ul>
+            <p>系统崩溃后，ZFS 扫描所有 Uberblock 槽位，找到 TXG
+            编号最大且校验和验证通过的 Uberblock，从这个点恢复。由于 CoW
+            保证了每个 TXG 的原子性，恢复后的文件系统处于某个 TXG
+            完成后的一致状态——不需要 fsck，不需要日志回放。</p>
+            <h3 id="cow-的代价">4.4 CoW 的代价</h3>
+            <p>CoW
+            不是没有代价的。每次修改一个数据块，从该块到根指针路径上的所有间接块都需要重写。这被称为写放大（Write
+            Amplification）：</p>
+            <pre class="text"><code>修改一个 4KB 叶子块 → 重写间接块链 → 重写根指针
+实际写入量可能是 4KB + 16KB + 16KB + ... = 数倍于原始数据</code></pre>
+            <p>对于随机小写入密集型负载，CoW 的写放大问题尤为突出。ZFS
+            通过以下机制缓解：</p>
+            <ul>
+            <li><strong>TXG
+            聚合</strong>：将多次修改同一间接块的操作合并。</li>
+            <li><strong>ZIL</strong>：将同步写转换为顺序写。</li>
+            <li><strong>合理的
+            recordsize</strong>：减少间接块的层数。</li>
+            </ul>
+            <hr />
+            <h2 id="五arc-缓存">五、ARC 缓存</h2>
+            <h3 id="为什么不使用-page-cache">5.1 为什么不使用 Page
+            Cache</h3>
+            <p>大多数 Linux 文件系统使用内核的页缓存（Page
+            Cache）来缓存文件数据。ZFS
+            实现了自己的缓存机制——ARC（Adaptive Replacement
+            Cache，自适应替换缓存），原因在于：</p>
+            <ul>
+            <li>页缓存使用 LRU（Least Recently
+            Used，最近最少使用）算法，对扫描性负载（一次性读取大量数据）非常脆弱——一次全表扫描就能把整个缓存冲刷掉。</li>
+            <li>ZFS
+            需要缓存的不仅是文件数据，还有元数据（目录、属性、间接块），这些元数据在页缓存框架中难以高效管理。</li>
+            <li>ZFS
+            的校验和验证需要在缓存层面进行——数据从缓存返回时也要经过校验。</li>
+            </ul>
+            <h3 id="arc-算法原理">5.2 ARC 算法原理</h3>
+            <p>ARC 算法的核心思想来自 IBM 研究院 Nimrod Megiddo 和
+            Dharmendra Modha 2003 年发表的论文。它维护四个逻辑列表：</p>
+            <pre class="text"><code>┌──────────────────────────────────────────────────────────┐
+│                     ARC 缓存结构                          │
+├──────────┬──────────┬──────────┬─────────────────────────┤
+│  MFU     │  MRU     │  Ghost   │  Ghost MFU              │
+│ 频繁访问  │ 最近访问  │  MRU    │  （仅记录 key）           │
+│ 的数据   │ 的数据    │（仅key）│                          │
+├──────────┴──────────┼──────────┴─────────────────────────┤
+│   实际缓存数据       │   幽灵列表（不缓存数据）             │
+│   （占用内存）       │   （仅元数据，极少内存）             │
+└─────────────────────┴────────────────────────────────────┘</code></pre>
+            <p>四个列表的含义：</p>
+            <ul>
+            <li><strong>MRU（Most Recently
+            Used）</strong>：最近被访问的数据块，但只被访问过一次。</li>
+            <li><strong>MFU（Most Frequently
+            Used）</strong>：被多次访问的数据块。</li>
+            <li><strong>Ghost MRU</strong>：已从 MRU
+            中淘汰的块，只保留键（块的身份标识），不保留数据。</li>
+            <li><strong>Ghost MFU</strong>：已从 MFU
+            中淘汰的块，同样只保留键。</li>
+            </ul>
+            <p>ARC 的自适应机制在于：当一个新访问命中了 Ghost MRU
+            列表，说明”最近使用”的缓存太小了，ARC 会动态增大 MRU
+            的目标大小；反之，如果命中了 Ghost
+            MFU，说明”频繁使用”的缓存太小了，ARC 会增大 MFU
+            的目标大小。这种自适应调节使 ARC
+            在面对各种访问模式时都能保持良好的命中率。</p>
+            <h3 id="l1arc-与-l2arc">5.3 L1ARC 与 L2ARC</h3>
+            <p>ZFS 的缓存体系分为两级：</p>
+            <p><strong>L1ARC</strong>（一级
+            ARC）：驻留在主内存（RAM）中，是主要的读缓存。默认情况下，ZFS
+            会使用系统内存的很大一部分作为
+            ARC——在专用存储服务器上，通常配置为物理内存的 75% 到
+            80%。</p>
+            <div class="sourceCode" id="cb21"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 ARC 统计</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/spl/kstat/zfs/arcstats</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 关键指标</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="ex">arc_meta_used</span>    <span class="co"># 元数据缓存使用量</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="ex">arc_data_size</span>    <span class="co"># 数据缓存使用量</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="ex">hits</span>             <span class="co"># 缓存命中次数</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a><span class="ex">misses</span>           <span class="co"># 缓存未命中次数</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a><span class="ex">c</span>                <span class="co"># ARC 目标大小</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="ex">c_max</span>            <span class="co"># ARC 最大允许大小</span></span></code></pre></div>
+            <p><strong>L2ARC</strong>（二级
+            ARC）：驻留在快速存储设备（通常是 SSD 或 NVMe）上，作为
+            L1ARC 的扩展。当数据从 L1ARC 中淘汰时，会被写入 L2ARC。L2ARC
+            的读取虽然比内存慢，但仍然远快于从 HDD 读取。</p>
+            <div class="sourceCode" id="cb22"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加 L2ARC 设备</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> add tank cache /dev/nvme2n1</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 L2ARC 统计</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/spl/kstat/zfs/arcstats <span class="kw">|</span> <span class="fu">grep</span> l2</span></code></pre></div>
+            <p>L2ARC 的重要特性：</p>
+            <ul>
+            <li><strong>L2ARC 中的数据也有校验和保护</strong>——从 L2ARC
+            读取的数据同样要验证校验和。</li>
+            <li>L2ARC
+            设备丢失不会导致数据丢失——它只是缓存，原始数据在池中。</li>
+            <li>L2ARC 在重启后需要预热（OpenZFS 2.0 之前的版本会丢失
+            L2ARC 内容；2.0+ 支持持久化 L2ARC）。</li>
+            </ul>
+            <h3 id="arc-调优">5.4 ARC 调优</h3>
+            <p>ARC 大小调整是 ZFS 性能调优中最重要的环节之一：</p>
+            <div class="sourceCode" id="cb23"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置 ARC 最大大小（例如 64GB）</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 68719476736 <span class="op">&gt;</span> /sys/module/zfs/parameters/zfs_arc_max</span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置 ARC 最小大小（例如 8GB）</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 8589934592 <span class="op">&gt;</span> /sys/module/zfs/parameters/zfs_arc_min</span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 限制元数据在 ARC 中的占比</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 75 <span class="op">&gt;</span> /sys/module/zfs/parameters/zfs_arc_meta_limit_percent</span></code></pre></div>
+            <p>ARC 调优的关键原则：</p>
+            <ul>
+            <li><strong>专用存储服务器</strong>：ARC
+            尽量大，给其他应用留足够内存即可。</li>
+            <li><strong>混合用途服务器</strong>：ARC
+            需要受限，避免与应用争抢内存。Linux 上 ZFS 的 ARC
+            会在内存压力下自动收缩，但收缩速度可能不够快。</li>
+            <li><strong>元数据密集型负载</strong>（大量小文件）：增加
+            <code>zfs_arc_meta_limit_percent</code>，确保目录和 inode
+            信息常驻缓存。</li>
+            <li><strong>大文件顺序读取</strong>：ARC
+            用处有限，数据流过缓存后很少被再次访问。考虑限制 ARC
+            大小。</li>
+            </ul>
+            <h3 id="预取机制">5.5 预取机制</h3>
+            <p>ZFS 包含自己的预取（Prefetch）引擎，称为 zfetch。它独立于
+            Linux
+            内核的预读机制，能检测顺序和跨步（strided）的访问模式，并提前将数据读入
+            ARC：</p>
+            <div class="sourceCode" id="cb24"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看预取统计</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/spl/kstat/zfs/zfetchstats</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 关键指标</span></span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">hits</span>           <span class="co"># 预取命中（预取的数据确实被访问了）</span></span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a><span class="ex">misses</span>         <span class="co"># 预取未命中</span></span>
+<span id="cb24-7"><a href="#cb24-7" aria-hidden="true" tabindex="-1"></a><span class="ex">colinear_hits</span>  <span class="co"># 顺序预取命中</span></span>
+<span id="cb24-8"><a href="#cb24-8" aria-hidden="true" tabindex="-1"></a><span class="ex">stride_hits</span>    <span class="co"># 跨步预取命中</span></span></code></pre></div>
+            <hr />
+            <h2 id="六zil-与-slog">六、ZIL 与 SLOG</h2>
+            <h3 id="同步写的问题">6.1 同步写的问题</h3>
+            <p>当应用程序执行同步写操作（如 <code>fsync()</code> 或
+            <code>O_SYNC</code>），它期望在调用返回时，数据已经持久化到稳定存储。在
+            ZFS 的 TXG 模型中，数据要等到整个 TXG
+            提交后才真正写入磁盘——而 TXG 的提交间隔默认是 5 秒。让
+            <code>fsync()</code> 等待 5 秒是不可接受的。</p>
+            <p>ZIL（ZFS Intent Log，ZFS 意图日志）解决了这个问题。</p>
+            <h3 id="zil-工作原理">6.2 ZIL 工作原理</h3>
+            <p>ZIL 是一种预写日志（Write-Ahead
+            Log，WAL），专门用于加速同步写操作。当应用程序执行
+            <code>fsync()</code> 时，ZFS 将操作记录写入
+            ZIL，然后立即返回成功。数据最终会在 TXG
+            提交时写入正式位置，此时 ZIL 中的记录可以丢弃。</p>
+            <pre class="text"><code>同步写流程：
+
+1. 应用程序调用 write() + fsync()
+2. ZFS 将数据写入 TXG（内存中）
+3. ZFS 将操作记录写入 ZIL（磁盘上）
+4. fsync() 返回成功
+5. ... 最多 5 秒后 ...
+6. TXG 提交，数据写入正式位置
+7. ZIL 中的记录被标记为可回收</code></pre>
+            <p>如果在步骤 5 之前发生崩溃，ZFS 在恢复时会回放 ZIL
+            中的记录，将数据重新应用到文件系统中。</p>
+            <h3 id="zil-写入模式">6.3 ZIL 写入模式</h3>
+            <p>ZIL 有两种写入模式，取决于数据块的大小：</p>
+            <p><strong>日志写入（Log Write）</strong>：对于小于
+            <code>zfs_immediate_write_sz</code>（默认
+            32KB）的写操作，ZFS 将完整数据写入 ZIL。</p>
+            <p><strong>间接写入（Indirect
+            Write）</strong>：对于大数据块，ZFS
+            将数据直接写入池中的正式位置，在 ZIL
+            中只记录指针。这避免了大数据块的双重写入。</p>
+            <div class="sourceCode" id="cb26"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 ZIL 统计</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/spl/kstat/zfs/zil</span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb26-4"><a href="#cb26-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 关键指标</span></span>
+<span id="cb26-5"><a href="#cb26-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zil_commit_count</span>          <span class="co"># ZIL 提交次数</span></span>
+<span id="cb26-6"><a href="#cb26-6" aria-hidden="true" tabindex="-1"></a><span class="ex">zil_commit_writer_count</span>   <span class="co"># 实际写入次数（合并后）</span></span>
+<span id="cb26-7"><a href="#cb26-7" aria-hidden="true" tabindex="-1"></a><span class="ex">zil_itx_count</span>             <span class="co"># 事务总数</span></span>
+<span id="cb26-8"><a href="#cb26-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zil_itx_indirect_count</span>    <span class="co"># 间接写入次数</span></span>
+<span id="cb26-9"><a href="#cb26-9" aria-hidden="true" tabindex="-1"></a><span class="ex">zil_itx_copied_count</span>      <span class="co"># 直接写入（小块拷贝）次数</span></span></code></pre></div>
+            <h3 id="slog独立日志设备">6.4 SLOG：独立日志设备</h3>
+            <p>默认情况下，ZIL
+            记录写入到存储池的主数据磁盘上。对于同步写密集型负载（如数据库、NFS
+            服务器、虚拟化），这意味着 ZIL 写入和数据写入竞争相同的磁盘
+            I/O 带宽。</p>
+            <p>SLOG（Separate LOG，独立日志设备）是专门用于存放 ZIL
+            记录的快速设备，通常是高耐久性 NVMe SSD。</p>
+            <div class="sourceCode" id="cb27"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加镜像 SLOG 设备</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> add tank log mirror /dev/nvme0n1 /dev/nvme1n1</span></code></pre></div>
+            <p>SLOG 的关键要求：</p>
+            <ul>
+            <li><strong>低延迟</strong>：SLOG 的写入延迟直接影响
+            <code>fsync()</code> 的延迟。NVMe SSD 的 4K 随机写延迟通常在
+            20 到 100 微秒，远优于 HDD 的数毫秒。</li>
+            <li><strong>高耐久性</strong>：SLOG
+            上的数据写入频率极高。使用消费级 SSD
+            可能很快耗尽写入寿命。选择具有高 DWPD（Drive Writes Per
+            Day，每日全盘写入次数）的企业级 SSD。</li>
+            <li><strong>断电保护（PLP，Power Loss
+            Protection）</strong>：SLOG 设备必须具有断电保护能力。没有
+            PLP 的 SSD 在断电时可能丢失其写缓存中的数据，导致 ZIL
+            记录不完整。</li>
+            <li><strong>容量要求小</strong>：SLOG
+            只需要保存最近几秒（TXG 超时时间）的同步写数据。通常 8GB 到
+            32GB 就足够了。</li>
+            </ul>
+            <h3 id="slog-丢失的影响">6.5 SLOG 丢失的影响</h3>
+            <p>如果 SLOG
+            设备在系统正常运行时故障，不会导致数据丢失——因为 ZIL
+            中的记录只是数据的副本，正式数据在 TXG
+            提交时已写入池中。但如果 SLOG
+            在<strong>系统崩溃的同时</strong>也故障，那么尚未通过 TXG
+            提交的同步写数据会丢失。这就是为什么 SLOG
+            通常配置为镜像。</p>
+            <div class="sourceCode" id="cb28"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 SLOG 状态</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> status tank <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A</span> 3 log</span></code></pre></div>
+            <h3 id="同步写语义配置">6.6 同步写语义配置</h3>
+            <p>ZFS 允许在数据集级别配置同步写的语义：</p>
+            <div class="sourceCode" id="cb29"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 标准模式（默认）：fsync 写入 ZIL</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set sync=standard tank/data</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 总是同步：每次写操作都写入 ZIL（最安全但最慢）</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set sync=always tank/critical</span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 禁用同步写：fsync 不写入 ZIL（最快但不安全）</span></span>
+<span id="cb29-8"><a href="#cb29-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set sync=disabled tank/scratch</span></code></pre></div>
+            <p><code>sync=disabled</code>
+            意味着在系统崩溃时可能丢失最后一个 TXG 周期（默认 5
+            秒）的数据。这对于可重建的临时数据（如编译输出）是可接受的，但绝不应用于数据库或任何有持久性要求的数据。</p>
+            <hr />
+            <h2 id="七压缩与去重">七、压缩与去重</h2>
+            <h3 id="透明压缩">7.1 透明压缩</h3>
+            <p>ZFS 支持对数据进行透明压缩（Transparent
+            Compression）——数据在写入磁盘前自动压缩，读取时自动解压，对应用程序完全透明。</p>
+            <div class="sourceCode" id="cb30"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用 LZ4 压缩（推荐默认选择）</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=lz4 tank</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 ZSTD 压缩（更高压缩比）</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=zstd tank/archive</span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看压缩效果</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> get compressratio tank</span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a><span class="co"># NAME  PROPERTY       VALUE  SOURCE</span></span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="co"># tank  compressratio  2.35x  -</span></span></code></pre></div>
+            <h3 id="压缩算法对比">7.2 压缩算法对比</h3>
+            <p>ZFS 支持多种压缩算法：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>算法</th>
+            <th>压缩比</th>
+            <th>压缩速度</th>
+            <th>解压速度</th>
+            <th>适用场景</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>lz4</td>
+            <td>低-中</td>
+            <td>极高</td>
+            <td>极高</td>
+            <td>通用默认，几乎无性能损失</td>
+            </tr>
+            <tr>
+            <td>zstd</td>
+            <td>中-高</td>
+            <td>高</td>
+            <td>极高</td>
+            <td>需要更高压缩比的通用场景</td>
+            </tr>
+            <tr>
+            <td>zstd-fast</td>
+            <td>低-中</td>
+            <td>极高</td>
+            <td>极高</td>
+            <td>类似 lz4 但可调节</td>
+            </tr>
+            <tr>
+            <td>gzip-1 到 gzip-9</td>
+            <td>中-高</td>
+            <td>低</td>
+            <td>中</td>
+            <td>归档，不推荐一般使用</td>
+            </tr>
+            <tr>
+            <td>zle</td>
+            <td>极低</td>
+            <td>极高</td>
+            <td>极高</td>
+            <td>仅压缩零字节序列</td>
+            </tr>
+            <tr>
+            <td>lzjb</td>
+            <td>低</td>
+            <td>高</td>
+            <td>高</td>
+            <td>旧默认算法，已被 lz4 取代</td>
+            </tr>
+            </tbody>
+            </table>
+            <p><strong>LZ4</strong>
+            是目前推荐的默认压缩算法。它的解压速度接近内存带宽，这意味着在很多场景下，启用
+            LZ4
+            压缩反而<strong>提高</strong>了性能——因为从磁盘读取的数据量减少了，而解压的
+            CPU 开销几乎可以忽略。</p>
+            <p><strong>ZSTD（Zstandard）</strong> 在 OpenZFS 2.0
+            中引入，提供从 zstd-1（最快）到
+            zstd-19（最慢但压缩比最高）的多个级别。zstd-3 到 zstd-7
+            是一个良好的平衡点，压缩比明显优于 LZ4，性能损失有限。</p>
+            <div class="sourceCode" id="cb31"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用特定级别的 ZSTD</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=zstd-3 tank/data</span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用 zstd-fast 模式（类似 lz4）</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=zstd-fast tank/scratch</span></code></pre></div>
+            <h3 id="压缩实践建议">7.3 压缩实践建议</h3>
+            <p>在生产环境中，<strong>几乎总是应该启用压缩</strong>。理由如下：</p>
+            <ol type="1">
+            <li>减少磁盘写入量，延长 SSD 寿命。</li>
+            <li>减少磁盘读取量，在 I/O 密集型负载中提高性能。</li>
+            <li>增加有效存储容量。</li>
+            <li>LZ4 的 CPU 开销极低，几乎不影响系统性能。</li>
+            </ol>
+            <p>唯一不建议启用压缩的场景是数据本身已经是压缩格式（如视频、JPEG
+            图片、加密数据），此时压缩不仅无法减小数据量，反而消耗
+            CPU。可以对这类数据集设置 <code>compression=off</code>。</p>
+            <h3 id="去重deduplication">7.4 去重（Deduplication）</h3>
+            <p>ZFS 的去重（Deduplication，简称
+            dedup）功能在块级别识别相同的数据块，只存储一份，其他引用指向同一份数据。</p>
+            <div class="sourceCode" id="cb32"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用去重</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set dedup=on tank/vms</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看去重效果</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> get dedupratio tank</span></code></pre></div>
+            <p>去重使用去重表（DDT，Dedup
+            Table）来记录每个数据块的校验和到物理位置的映射。当写入一个新块时，ZFS
+            计算其校验和，在 DDT
+            中查找：如果找到匹配项，只增加引用计数，不写入数据；如果没找到，写入数据并创建新的
+            DDT 条目。</p>
+            <h3 id="去重的内存代价">7.5 去重的内存代价</h3>
+            <p>去重最大的问题是 DDT 对内存的需求。DDT
+            必须常驻内存才能高效工作——如果 DDT
+            需要从磁盘读取，每次写操作都会增加一次随机读，性能会崩溃。</p>
+            <p>DDT 内存需求的估算：</p>
+            <pre class="text"><code>每个 DDT 条目 ≈ 320 字节（核心表条目）
+每 TB 独立数据（recordsize=128K）≈ 约 800 万个块 ≈ 2.5 GB DDT 内存
+每 TB 独立数据（recordsize=4K）  ≈ 约 2.56 亿个块 ≈ 80 GB DDT 内存</code></pre>
+            <p>这意味着一个 100TB 的池使用 128K recordsize，仅 DDT
+            就需要约 250GB 内存。使用小 recordsize 时情况更糟。</p>
+            <h3 id="去重使用建议">7.6 去重使用建议</h3>
+            <p>在绝大多数场景下，<strong>不建议使用去重</strong>。原因包括：</p>
+            <ol type="1">
+            <li><strong>极高的内存需求</strong>：DDT
+            必须常驻内存，否则性能灾难性下降。</li>
+            <li><strong>写入性能影响</strong>：每次写入都需要查询
+            DDT。</li>
+            <li><strong>恢复复杂性</strong>：去重池的 scrub 和 resilver
+            更慢。</li>
+            <li><strong>有限的收益</strong>：大多数负载的去重比很低，不值得付出内存代价。</li>
+            </ol>
+            <p>去重真正有价值的场景非常有限：</p>
+            <ul>
+            <li>虚拟机镜像存储（大量相同操作系统的 VM）。</li>
+            <li>备份服务器（多台相似服务器的全量备份）。</li>
+            </ul>
+            <p>即使在这些场景中，也建议先用 <code>zdb -S</code>
+            命令模拟去重效果，评估去重比和内存需求后再做决定：</p>
+            <div class="sourceCode" id="cb34"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 模拟去重效果（不实际启用）</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zdb</span> <span class="at">-S</span> tank</span></code></pre></div>
+            <p>OpenZFS 2.2 引入了”快速去重”（Fast
+            Dedup），使用基于日志的 DDT
+            结构来降低内存需求和写放大，但这一特性仍在成熟中。</p>
+            <hr />
+            <h2 id="八raid-z">八、RAID-Z</h2>
+            <h3 id="传统-raid-的写洞问题">8.1 传统 RAID 的写洞问题</h3>
+            <p>传统硬件或软件 RAID 5/6 存在一个著名的问题——写洞（Write
+            Hole）。当一个条带（Stripe）的数据和校验需要同时更新时，如果在数据写完但校验尚未更新时发生断电，条带处于不一致状态。下次读取时，RAID
+            控制器可能用不一致的校验数据”修复”出错误的数据。</p>
+            <pre class="text"><code>传统 RAID 5 写洞：
+
+    磁盘1    磁盘2    磁盘3（校验）
+    ┌────┐  ┌────┐  ┌────┐
+    │ D1 │  │ D2 │  │ P  │   ← 原始状态
+    └────┘  └────┘  └────┘
+
+    修改 D1 → D1&#39;：
+    1. 读旧 D1 和 P
+    2. 写新 D1&#39;              ← 完成
+    3. 写新 P&#39; = D1&#39; XOR D2  ← 断电！P 仍是旧值
+
+    恢复后：D1&#39; + D2 + P（旧） → 不一致
+    如果磁盘2故障，用 P 和 D1&#39; 重建 → 得到错误的 D2</code></pre>
+            <h3 id="raid-z-如何消除写洞">8.2 RAID-Z 如何消除写洞</h3>
+            <p>ZFS 的 RAID-Z 通过两个机制消除了写洞：</p>
+            <ol type="1">
+            <li><strong>CoW</strong>：RAID-Z
+            条带总是写入到新位置，永远不会覆盖原有条带。旧条带保持完整，直到新条带的所有数据和校验都成功写入。</li>
+            <li><strong>变宽条带（Variable-Width
+            Stripes）</strong>：传统 RAID 使用固定大小的条带，RAID-Z
+            的条带大小随数据块大小变化。每个逻辑块精确占用一个条带，不存在部分条带更新的问题。</li>
+            </ol>
+            <pre class="text"><code>RAID-Z 变宽条带示意：
+
+传统 RAID 5（固定条带）：
+    D1  D2  P   D3  D4  P   D5  D6  P  ...
+    ←──条带1──→ ←──条带2──→ ←──条带3──→
+
+RAID-Z1（变宽条带）：
+    D1a D1b D1c P1   D2a D2b P2   D3a D3b D3c D3d P3 ...
+    ←──块1的条带──→  ←─块2条带─→  ←────块3的条带────→</code></pre>
+            <h3 id="raid-z1z2z3">8.3 RAID-Z1、Z2、Z3</h3>
+            <p>RAID-Z 有三个冗余级别：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>级别</th>
+            <th>校验块数</th>
+            <th>容错磁盘数</th>
+            <th>最少磁盘数</th>
+            <th>等效传统 RAID</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>RAID-Z1</td>
+            <td>1</td>
+            <td>1</td>
+            <td>2</td>
+            <td>RAID 5</td>
+            </tr>
+            <tr>
+            <td>RAID-Z2</td>
+            <td>2</td>
+            <td>2</td>
+            <td>3</td>
+            <td>RAID 6</td>
+            </tr>
+            <tr>
+            <td>RAID-Z3</td>
+            <td>3</td>
+            <td>3</td>
+            <td>4</td>
+            <td>无等效</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>RAID-Z2
+            是目前生产环境中最常见的选择——它能容忍两块磁盘同时故障，在大容量磁盘（8TB
+            以上）的重建周期越来越长的今天，单校验的 RAID-Z1
+            已经不够安全。</p>
+            <p>创建 RAID-Z vdev 的最佳磁盘数量遵循”2
+            的幂次加上校验块数”的公式：</p>
+            <pre class="text"><code>RAID-Z1：2+1=3、4+1=5、8+1=9 块磁盘
+RAID-Z2：2+2=4、4+2=6、8+2=10 块磁盘
+RAID-Z3：2+3=5、4+3=7、8+3=11 块磁盘</code></pre>
+            <p>这些配置能避免空间浪费（padding waste）。例如：</p>
+            <div class="sourceCode" id="cb38"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 推荐的 RAID-Z2 配置（6 磁盘 vdev，双路冗余）</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create tank raidz2 /dev/sd<span class="dt">{a</span><span class="op">,</span><span class="dt">b</span><span class="op">,</span><span class="dt">c</span><span class="op">,</span><span class="dt">d</span><span class="op">,</span><span class="dt">e</span><span class="op">,</span><span class="dt">f}</span></span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb38-4"><a href="#cb38-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 大型池：多个 vdev 提供更高的 IOPS</span></span>
+<span id="cb38-5"><a href="#cb38-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create bigpool <span class="dt">\</span></span>
+<span id="cb38-6"><a href="#cb38-6" aria-hidden="true" tabindex="-1"></a>    raidz2 /dev/sd<span class="dt">{a</span><span class="op">,</span><span class="dt">b</span><span class="op">,</span><span class="dt">c</span><span class="op">,</span><span class="dt">d</span><span class="op">,</span><span class="dt">e</span><span class="op">,</span><span class="dt">f}</span> <span class="dt">\</span></span>
+<span id="cb38-7"><a href="#cb38-7" aria-hidden="true" tabindex="-1"></a>    raidz2 /dev/sd<span class="dt">{g</span><span class="op">,</span><span class="dt">h</span><span class="op">,</span><span class="dt">i</span><span class="op">,</span><span class="dt">j</span><span class="op">,</span><span class="dt">k</span><span class="op">,</span><span class="dt">l}</span></span></code></pre></div>
+            <h3 id="draid分布式-raid-z">8.4 dRAID：分布式 RAID-Z</h3>
+            <p>dRAID（Distributed RAID）是 OpenZFS 2.1
+            引入的新特性，解决了传统 RAID-Z
+            在大型池中重建（resilver）速度慢的问题。</p>
+            <p>传统 RAID-Z
+            重建时，只有替换的新盘在写入数据，写带宽受限于单盘速度。在
+            10TB 磁盘上，传统 resilver 可能需要数天时间。</p>
+            <p>dRAID 将数据和校验分布在整个 vdev
+            的所有磁盘上，使用逻辑热备空间代替物理热备盘。当一块磁盘故障时，重建数据被分散写入<strong>所有</strong>其他磁盘的热备空间中，大幅提高了重建速度。</p>
+            <div class="sourceCode" id="cb39"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建 dRAID2 vdev（10 数据盘 + 2 校验 + 1 逻辑热备）</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create tank draid2:1s /dev/sd<span class="dt">{a</span><span class="op">,</span><span class="dt">b</span><span class="op">,</span><span class="dt">c</span><span class="op">,</span><span class="dt">d</span><span class="op">,</span><span class="dt">e</span><span class="op">,</span><span class="dt">f</span><span class="op">,</span><span class="dt">g</span><span class="op">,</span><span class="dt">h</span><span class="op">,</span><span class="dt">i</span><span class="op">,</span><span class="dt">j</span><span class="op">,</span><span class="dt">k</span><span class="op">,</span><span class="dt">l</span><span class="op">,</span><span class="dt">m}</span></span></code></pre></div>
+            <p>dRAID
+            的代价是降低了随机读性能（因为条带更宽）和灵活性（无法单独扩展
+            vdev）。它主要面向大规模存储部署（几十到数百块磁盘），对中小型部署不适用。</p>
+            <h3 id="mirror-与-raid-z-的选择">8.5 mirror 与 RAID-Z
+            的选择</h3>
+            <p>镜像（mirror）vdev 在某些场景下是比 RAID-Z
+            更好的选择：</p>
+            <table>
+            <colgroup>
+            <col style="width: 27%" />
+            <col style="width: 36%" />
+            <col style="width: 36%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>维度</th>
+            <th>mirror</th>
+            <th>RAID-Z</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>随机读 IOPS</td>
+            <td>高（N 路镜像可提供 N 倍读 IOPS）</td>
+            <td>低（需要读取整个条带）</td>
+            </tr>
+            <tr>
+            <td>容量效率</td>
+            <td>50%（双路镜像）</td>
+            <td>67%~90%（取决于磁盘数和级别）</td>
+            </tr>
+            <tr>
+            <td>重建速度</td>
+            <td>快（只需复制一块盘）</td>
+            <td>慢（需要读取整个 vdev）</td>
+            </tr>
+            <tr>
+            <td>扩展灵活性</td>
+            <td>高（可单独添加镜像 vdev）</td>
+            <td>低（无法向已有 vdev 添加磁盘）</td>
+            </tr>
+            <tr>
+            <td>适用场景</td>
+            <td>数据库、高 IOPS 需求</td>
+            <td>大容量存储、顺序 I/O</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>对于数据库等随机 I/O 密集型负载，镜像 vdev
+            通常是更好的选择。对于大容量归档、媒体存储等顺序 I/O
+            为主的负载，RAID-Z2 的容量效率更有吸引力。</p>
+            <hr />
+            <h2 id="九zfs-管理实战">九、ZFS 管理实战</h2>
+            <h3 id="池管理基础">9.1 池管理基础</h3>
+            <h4 id="创建池">创建池</h4>
+            <div class="sourceCode" id="cb40"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 最简单的镜像池</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create tank mirror /dev/sda /dev/sdb</span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用磁盘的 by-id 路径（推荐，避免设备名变化）</span></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create tank mirror <span class="dt">\</span></span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a>    /dev/disk/by-id/scsi-SATA_WDC_WD40EFRX-68N_WD-WCC7K0JL1234 <span class="dt">\</span></span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a>    /dev/disk/by-id/scsi-SATA_WDC_WD40EFRX-68N_WD-WCC7K0JL5678</span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-9"><a href="#cb40-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 指定 ashift（扇区大小的对数值）</span></span>
+<span id="cb40-10"><a href="#cb40-10" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create <span class="at">-o</span> ashift=12 tank mirror /dev/sda /dev/sdb</span>
+<span id="cb40-11"><a href="#cb40-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb40-12"><a href="#cb40-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建时设置挂载点</span></span>
+<span id="cb40-13"><a href="#cb40-13" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create <span class="at">-m</span> /data tank mirror /dev/sda /dev/sdb</span></code></pre></div>
+            <h4 id="查看池状态">查看池状态</h4>
+            <div class="sourceCode" id="cb41"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 基本状态</span></span>
+<span id="cb41-2"><a href="#cb41-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> status tank</span>
+<span id="cb41-3"><a href="#cb41-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-4"><a href="#cb41-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 详细状态（包含日志和缓存设备）</span></span>
+<span id="cb41-5"><a href="#cb41-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> status <span class="at">-v</span> tank</span>
+<span id="cb41-6"><a href="#cb41-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-7"><a href="#cb41-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 池列表和空间使用</span></span>
+<span id="cb41-8"><a href="#cb41-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> list <span class="at">-v</span> tank</span>
+<span id="cb41-9"><a href="#cb41-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb41-10"><a href="#cb41-10" aria-hidden="true" tabindex="-1"></a><span class="co"># I/O 统计（类似 iostat）</span></span>
+<span id="cb41-11"><a href="#cb41-11" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> iostat tank 5</span></code></pre></div>
+            <p><code>zpool iostat</code> 的输出示例：</p>
+            <pre class="text"><code>              capacity     operations     bandwidth
+pool        alloc   free   read  write   read  write
+----------  -----  -----  -----  -----  -----  -----
+tank        1.23T  2.77T    342    128  42.8M  16.0M
+  mirror    1.23T  2.77T    342    128  42.8M  16.0M
+    sda         -      -    189     64  23.6M  8.00M
+    sdb         -      -    153     64  19.1M  8.00M</code></pre>
+            <h4 id="扩展池">扩展池</h4>
+            <div class="sourceCode" id="cb43"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加新的镜像 vdev（扩展容量和 IOPS）</span></span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> add tank mirror /dev/sdc /dev/sdd</span>
+<span id="cb43-3"><a href="#cb43-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-4"><a href="#cb43-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 替换单个磁盘（升级到更大容量）</span></span>
+<span id="cb43-5"><a href="#cb43-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> replace tank /dev/sda /dev/sde</span>
+<span id="cb43-6"><a href="#cb43-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb43-7"><a href="#cb43-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 所有磁盘替换完毕后，扩展池使用新容量</span></span>
+<span id="cb43-8"><a href="#cb43-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> online <span class="at">-e</span> tank /dev/sde</span></code></pre></div>
+            <h4 id="移除和分离">移除和分离</h4>
+            <div class="sourceCode" id="cb44"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb44-1"><a href="#cb44-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 将磁盘标记为离线（计划维护）</span></span>
+<span id="cb44-2"><a href="#cb44-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> offline tank /dev/sda</span>
+<span id="cb44-3"><a href="#cb44-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-4"><a href="#cb44-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 恢复在线</span></span>
+<span id="cb44-5"><a href="#cb44-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> online tank /dev/sda</span>
+<span id="cb44-6"><a href="#cb44-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-7"><a href="#cb44-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 从镜像中分离一块磁盘</span></span>
+<span id="cb44-8"><a href="#cb44-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> detach tank /dev/sdb</span>
+<span id="cb44-9"><a href="#cb44-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb44-10"><a href="#cb44-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 移除 log 或 cache 设备</span></span>
+<span id="cb44-11"><a href="#cb44-11" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> remove tank /dev/nvme0n1</span></code></pre></div>
+            <h3 id="数据集管理">9.2 数据集管理</h3>
+            <h4 id="创建和配置">创建和配置</h4>
+            <div class="sourceCode" id="cb45"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建数据集</span></span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> create tank/data</span>
+<span id="cb45-3"><a href="#cb45-3" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> create tank/data/documents</span>
+<span id="cb45-4"><a href="#cb45-4" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> create tank/data/photos</span>
+<span id="cb45-5"><a href="#cb45-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb45-6"><a href="#cb45-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置属性</span></span>
+<span id="cb45-7"><a href="#cb45-7" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=lz4 tank/data</span>
+<span id="cb45-8"><a href="#cb45-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set atime=off tank/data</span>
+<span id="cb45-9"><a href="#cb45-9" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set recordsize=1M tank/data/photos</span>
+<span id="cb45-10"><a href="#cb45-10" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set quota=500G tank/data/documents</span>
+<span id="cb45-11"><a href="#cb45-11" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set reservation=100G tank/data/critical</span></code></pre></div>
+            <h4 id="查看属性">查看属性</h4>
+            <div class="sourceCode" id="cb46"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb46-1"><a href="#cb46-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 所有属性</span></span>
+<span id="cb46-2"><a href="#cb46-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> get all tank/data</span>
+<span id="cb46-3"><a href="#cb46-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-4"><a href="#cb46-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 特定属性</span></span>
+<span id="cb46-5"><a href="#cb46-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> get compression,compressratio,used,available tank/data</span>
+<span id="cb46-6"><a href="#cb46-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb46-7"><a href="#cb46-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 递归查看子数据集的空间使用</span></span>
+<span id="cb46-8"><a href="#cb46-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> list <span class="at">-r</span> tank/data</span></code></pre></div>
+            <p>输出示例：</p>
+            <pre class="text"><code>NAME                    USED  AVAIL     REFER  MOUNTPOINT
+tank/data               245G  2.55T      128K  /tank/data
+tank/data/documents      89G  411G      89.0G  /tank/data/documents
+tank/data/photos        156G  2.55T      156G  /tank/data/photos</code></pre>
+            <h3 id="快照与克隆">9.3 快照与克隆</h3>
+            <p>快照（Snapshot）是 ZFS 最强大的特性之一。由于 CoW
+            机制，创建快照几乎是瞬时的，不需要复制任何数据。</p>
+            <div class="sourceCode" id="cb48"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb48-1"><a href="#cb48-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建快照</span></span>
+<span id="cb48-2"><a href="#cb48-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> snapshot tank/data@2025-08-26</span>
+<span id="cb48-3"><a href="#cb48-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-4"><a href="#cb48-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 递归创建（包含所有子数据集）</span></span>
+<span id="cb48-5"><a href="#cb48-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> snapshot <span class="at">-r</span> tank/data@daily-20250826</span>
+<span id="cb48-6"><a href="#cb48-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-7"><a href="#cb48-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 列出快照</span></span>
+<span id="cb48-8"><a href="#cb48-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> list <span class="at">-t</span> snapshot <span class="at">-r</span> tank/data</span>
+<span id="cb48-9"><a href="#cb48-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-10"><a href="#cb48-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 回滚到快照</span></span>
+<span id="cb48-11"><a href="#cb48-11" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> rollback tank/data@2025-08-26</span>
+<span id="cb48-12"><a href="#cb48-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb48-13"><a href="#cb48-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 删除快照</span></span>
+<span id="cb48-14"><a href="#cb48-14" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> destroy tank/data@2025-08-26</span></code></pre></div>
+            <p>克隆（Clone）是基于快照创建的可写副本。克隆和快照共享相同的数据块，只有修改的部分占用额外空间：</p>
+            <div class="sourceCode" id="cb49"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 从快照创建克隆</span></span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> clone tank/data@2025-08-26 tank/data-test</span>
+<span id="cb49-3"><a href="#cb49-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-4"><a href="#cb49-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 克隆是一个完整的可写数据集</span></span>
+<span id="cb49-5"><a href="#cb49-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /tank/data-test/</span>
+<span id="cb49-6"><a href="#cb49-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb49-7"><a href="#cb49-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 完成后删除克隆</span></span>
+<span id="cb49-8"><a href="#cb49-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> destroy tank/data-test</span></code></pre></div>
+            <h3 id="发送与接收">9.4 发送与接收</h3>
+            <p>ZFS 的 send/receive
+            机制可以将数据集的快照序列化为字节流，传输到另一个池或远程系统：</p>
+            <div class="sourceCode" id="cb50"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb50-1"><a href="#cb50-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 完整发送</span></span>
+<span id="cb50-2"><a href="#cb50-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> send tank/data@snap1 <span class="kw">|</span> <span class="ex">zfs</span> receive backup/data</span>
+<span id="cb50-3"><a href="#cb50-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-4"><a href="#cb50-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 增量发送（只发送两个快照之间的差异）</span></span>
+<span id="cb50-5"><a href="#cb50-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> send <span class="at">-i</span> tank/data@snap1 tank/data@snap2 <span class="kw">|</span> <span class="ex">zfs</span> receive backup/data</span>
+<span id="cb50-6"><a href="#cb50-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-7"><a href="#cb50-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 通过 SSH 发送到远程系统</span></span>
+<span id="cb50-8"><a href="#cb50-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> send <span class="at">-i</span> tank/data@snap1 tank/data@snap2 <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb50-9"><a href="#cb50-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ssh</span> backup-server zfs receive backup/data</span>
+<span id="cb50-10"><a href="#cb50-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-11"><a href="#cb50-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 压缩传输</span></span>
+<span id="cb50-12"><a href="#cb50-12" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> send tank/data@snap1 <span class="kw">|</span> <span class="ex">zstd</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb50-13"><a href="#cb50-13" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ssh</span> backup-server <span class="st">&quot;zstd -d | zfs receive backup/data&quot;</span></span>
+<span id="cb50-14"><a href="#cb50-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb50-15"><a href="#cb50-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 使用原始模式发送（保留加密状态）</span></span>
+<span id="cb50-16"><a href="#cb50-16" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> send <span class="at">--raw</span> tank/data@snap1 <span class="kw">|</span> <span class="ex">zfs</span> receive backup/data</span></code></pre></div>
+            <p>增量 send/receive
+            是构建高效备份系统的基础。典型的备份策略：</p>
+            <div class="sourceCode" id="cb51"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/bin/bash</span></span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 简化的增量备份脚本</span></span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-4"><a href="#cb51-4" aria-hidden="true" tabindex="-1"></a><span class="va">DATASET</span><span class="op">=</span><span class="st">&quot;tank/data&quot;</span></span>
+<span id="cb51-5"><a href="#cb51-5" aria-hidden="true" tabindex="-1"></a><span class="va">REMOTE</span><span class="op">=</span><span class="st">&quot;backup-server&quot;</span></span>
+<span id="cb51-6"><a href="#cb51-6" aria-hidden="true" tabindex="-1"></a><span class="va">REMOTE_DATASET</span><span class="op">=</span><span class="st">&quot;backup/data&quot;</span></span>
+<span id="cb51-7"><a href="#cb51-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-8"><a href="#cb51-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 获取本地和远程的最新公共快照</span></span>
+<span id="cb51-9"><a href="#cb51-9" aria-hidden="true" tabindex="-1"></a><span class="va">LOCAL_SNAP</span><span class="op">=</span><span class="va">$(</span><span class="ex">zfs</span> list <span class="at">-H</span> <span class="at">-t</span> snapshot <span class="at">-o</span> name <span class="at">-S</span> creation <span class="st">&quot;</span><span class="va">${DATASET}</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-1</span><span class="va">)</span></span>
+<span id="cb51-10"><a href="#cb51-10" aria-hidden="true" tabindex="-1"></a><span class="va">REMOTE_SNAP</span><span class="op">=</span><span class="va">$(</span><span class="fu">ssh</span> <span class="st">&quot;</span><span class="va">${REMOTE}</span><span class="st">&quot;</span> zfs list <span class="at">-H</span> <span class="at">-t</span> snapshot <span class="at">-o</span> name <span class="at">-S</span> creation <span class="st">&quot;</span><span class="va">${REMOTE_DATASET}</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">head</span> <span class="at">-1</span><span class="va">)</span></span>
+<span id="cb51-11"><a href="#cb51-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-12"><a href="#cb51-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 创建新快照</span></span>
+<span id="cb51-13"><a href="#cb51-13" aria-hidden="true" tabindex="-1"></a><span class="va">NEW_SNAP</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${DATASET}</span><span class="st">@backup-</span><span class="va">$(</span><span class="fu">date</span> +%Y%m%d-%H%M%S<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb51-14"><a href="#cb51-14" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> snapshot <span class="st">&quot;</span><span class="va">${NEW_SNAP}</span><span class="st">&quot;</span></span>
+<span id="cb51-15"><a href="#cb51-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-16"><a href="#cb51-16" aria-hidden="true" tabindex="-1"></a><span class="co"># 获取公共快照名称</span></span>
+<span id="cb51-17"><a href="#cb51-17" aria-hidden="true" tabindex="-1"></a><span class="va">COMMON_BASE</span><span class="op">=</span><span class="va">$(</span><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">${REMOTE_SNAP}</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sed</span> <span class="st">&quot;s|</span><span class="va">${REMOTE_DATASET}</span><span class="st">|</span><span class="va">${DATASET}</span><span class="st">|&quot;</span><span class="va">)</span></span>
+<span id="cb51-18"><a href="#cb51-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb51-19"><a href="#cb51-19" aria-hidden="true" tabindex="-1"></a><span class="co"># 增量发送</span></span>
+<span id="cb51-20"><a href="#cb51-20" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> send <span class="at">-i</span> <span class="st">&quot;</span><span class="va">${COMMON_BASE}</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">${NEW_SNAP}</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb51-21"><a href="#cb51-21" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ssh</span> <span class="st">&quot;</span><span class="va">${REMOTE}</span><span class="st">&quot;</span> zfs receive <span class="at">-F</span> <span class="st">&quot;</span><span class="va">${REMOTE_DATASET}</span><span class="st">&quot;</span></span></code></pre></div>
+            <h3 id="scrub-与-resilver">9.5 scrub 与 resilver</h3>
+            <div class="sourceCode" id="cb52"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb52-1"><a href="#cb52-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 手动启动 scrub</span></span>
+<span id="cb52-2"><a href="#cb52-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> scrub tank</span>
+<span id="cb52-3"><a href="#cb52-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-4"><a href="#cb52-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 scrub 进度</span></span>
+<span id="cb52-5"><a href="#cb52-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> status tank <span class="kw">|</span> <span class="fu">grep</span> scan</span>
+<span id="cb52-6"><a href="#cb52-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-7"><a href="#cb52-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 停止 scrub（如果影响性能）</span></span>
+<span id="cb52-8"><a href="#cb52-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> scrub <span class="at">-s</span> tank</span>
+<span id="cb52-9"><a href="#cb52-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-10"><a href="#cb52-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置 scrub 速度限制</span></span>
+<span id="cb52-11"><a href="#cb52-11" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 104857600 <span class="op">&gt;</span> /sys/module/zfs/parameters/zfs_scrub_limit</span>
+<span id="cb52-12"><a href="#cb52-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb52-13"><a href="#cb52-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 配置定时 scrub（systemd timer）</span></span>
+<span id="cb52-14"><a href="#cb52-14" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/systemd/system/zfs-scrub@.timer</span></span></code></pre></div>
+            <p>resilver（重银化）是当磁盘被替换后，ZFS
+            重建数据到新磁盘的过程：</p>
+            <div class="sourceCode" id="cb53"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 替换故障磁盘，自动开始 resilver</span></span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> replace tank /dev/sda /dev/sde</span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 查看 resilver 进度</span></span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> status tank <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A</span> 2 scan</span></code></pre></div>
+            <hr />
+            <h2 id="十zfs-性能调优">十、ZFS 性能调优</h2>
+            <h3 id="recordsize-调优">10.1 recordsize 调优</h3>
+            <p>recordsize 是 ZFS 数据集中单个数据块的最大大小，默认
+            128KB。选择合适的 recordsize 对性能至关重要：</p>
+            <div class="sourceCode" id="cb54"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb54-1"><a href="#cb54-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 数据库（MySQL/PostgreSQL，通常使用 8K 或 16K 页）</span></span>
+<span id="cb54-2"><a href="#cb54-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set recordsize=16K tank/mysql</span>
+<span id="cb54-3"><a href="#cb54-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb54-4"><a href="#cb54-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 虚拟机磁盘</span></span>
+<span id="cb54-5"><a href="#cb54-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set recordsize=64K tank/vm-disks</span>
+<span id="cb54-6"><a href="#cb54-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb54-7"><a href="#cb54-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 大文件顺序 I/O（视频、备份）</span></span>
+<span id="cb54-8"><a href="#cb54-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set recordsize=1M tank/media</span>
+<span id="cb54-9"><a href="#cb54-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb54-10"><a href="#cb54-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 通用工作负载（默认值）</span></span>
+<span id="cb54-11"><a href="#cb54-11" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set recordsize=128K tank/general</span></code></pre></div>
+            <p>recordsize 的选择原则：</p>
+            <ul>
+            <li><strong>数据库</strong>：匹配数据库的页大小。PostgreSQL
+            默认 8K 页，MySQL InnoDB 默认 16K 页。使用过大的 recordsize
+            会导致写放大——修改 8K 数据需要读取整个 128K
+            块、修改、然后重新写入。</li>
+            <li><strong>大文件</strong>：使用大 recordsize（512K 到
+            1M）以减少元数据开销和提高压缩效率。</li>
+            <li><strong>小文件密集</strong>：默认 128K
+            通常合适。recordsize 是最大值，小于 recordsize
+            的文件不会被填充。</li>
+            </ul>
+            <h3 id="ashift-配置">10.2 ashift 配置</h3>
+            <p>ashift（Alignment Shift）定义了 ZFS 使用的最小 I/O
+            大小，以 2 的幂次表示。正确的 ashift
+            值必须匹配底层磁盘的物理扇区大小：</p>
+            <div class="sourceCode" id="cb55"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb55-1"><a href="#cb55-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 4K 扇区（Advanced Format 磁盘）→ ashift=12</span></span>
+<span id="cb55-2"><a href="#cb55-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create <span class="at">-o</span> ashift=12 tank mirror /dev/sda /dev/sdb</span>
+<span id="cb55-3"><a href="#cb55-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-4"><a href="#cb55-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 512 字节扇区（旧式磁盘）→ ashift=9</span></span>
+<span id="cb55-5"><a href="#cb55-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create <span class="at">-o</span> ashift=9 tank mirror /dev/sda /dev/sdb</span>
+<span id="cb55-6"><a href="#cb55-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb55-7"><a href="#cb55-7" aria-hidden="true" tabindex="-1"></a><span class="co"># NVMe SSD → ashift=12 或 ashift=13</span></span>
+<span id="cb55-8"><a href="#cb55-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> create <span class="at">-o</span> ashift=12 tank mirror /dev/nvme0n1 /dev/nvme1n1</span></code></pre></div>
+            <p><strong>ashift
+            只能在池创建时设置，之后无法更改</strong>。如果 ashift
+            设置过小（例如 4K 物理扇区的磁盘使用了 ashift=9），每次 4K
+            写入会导致磁盘执行读-修改-写循环，性能严重下降。</p>
+            <p>许多磁盘（尤其是 Advanced Format 硬盘）向操作系统报告 512
+            字节逻辑扇区但实际使用 4K 物理扇区。ZFS
+            自动检测可能会得到错误的值。<strong>始终显式设置
+            ashift=12</strong>，除非你确认磁盘确实是 512
+            字节物理扇区。</p>
+            <h3 id="压缩优化">10.3 压缩优化</h3>
+            <p>压缩不仅节省空间，在 I/O 瓶颈场景下还能提高性能：</p>
+            <div class="sourceCode" id="cb56"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb56-1"><a href="#cb56-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用 LZ4 压缩（推荐作为全局默认）</span></span>
+<span id="cb56-2"><a href="#cb56-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=lz4 tank</span>
+<span id="cb56-3"><a href="#cb56-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-4"><a href="#cb56-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 对压缩比敏感的数据使用 ZSTD</span></span>
+<span id="cb56-5"><a href="#cb56-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=zstd-3 tank/logs</span>
+<span id="cb56-6"><a href="#cb56-6" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=zstd-7 tank/archive</span>
+<span id="cb56-7"><a href="#cb56-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb56-8"><a href="#cb56-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 已压缩数据禁用压缩</span></span>
+<span id="cb56-9"><a href="#cb56-9" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set compression=off tank/media/videos</span></code></pre></div>
+            <p>可以使用 <code>zfs get compressratio</code>
+            评估压缩效果。如果 compressratio 低于
+            1.1x，说明数据不可压缩，可以考虑关闭压缩以减少 CPU
+            开销。</p>
+            <h3 id="special-vdev">10.4 special vdev</h3>
+            <p>特殊 vdev（Special vdev）是 OpenZFS
+            引入的一种加速机制，将元数据和可选的小文件存储在快速设备（如
+            NVMe SSD）上，而大数据块仍存储在 HDD 上：</p>
+            <div class="sourceCode" id="cb57"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb57-1"><a href="#cb57-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 添加镜像 special vdev</span></span>
+<span id="cb57-2"><a href="#cb57-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zpool</span> add tank special mirror /dev/nvme3n1 /dev/nvme4n1</span>
+<span id="cb57-3"><a href="#cb57-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb57-4"><a href="#cb57-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置小块阈值（小于此大小的块存储到 special vdev）</span></span>
+<span id="cb57-5"><a href="#cb57-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set special_small_blocks=32K tank</span></code></pre></div>
+            <p>special vdev
+            对元数据密集型负载的性能提升非常显著——文件查找、目录遍历、属性查询等操作都从
+            NVMe 速度中受益。</p>
+            <p><strong>注意</strong>：special vdev 必须配置为镜像（或
+            RAID-Z），因为它存储的是正式数据和元数据，丢失 special vdev
+            意味着丢失数据。</p>
+            <h3 id="l2arc-调优">10.5 L2ARC 调优</h3>
+            <p>L2ARC 的调优重点在于控制预热速度和选择合适的设备：</p>
+            <div class="sourceCode" id="cb58"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb58-1"><a href="#cb58-1" aria-hidden="true" tabindex="-1"></a><span class="co"># L2ARC 预热速度限制（字节/秒）</span></span>
+<span id="cb58-2"><a href="#cb58-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 268435456 <span class="op">&gt;</span> /sys/module/zfs/parameters/l2arc_write_max</span>
+<span id="cb58-3"><a href="#cb58-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 默认 8MB/s，可提高到 256MB/s 以加速预热</span></span>
+<span id="cb58-4"><a href="#cb58-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb58-5"><a href="#cb58-5" aria-hidden="true" tabindex="-1"></a><span class="co"># L2ARC 预热提升因子（启动初期的速度倍数）</span></span>
+<span id="cb58-6"><a href="#cb58-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 4 <span class="op">&gt;</span> /sys/module/zfs/parameters/l2arc_write_boost</span>
+<span id="cb58-7"><a href="#cb58-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb58-8"><a href="#cb58-8" aria-hidden="true" tabindex="-1"></a><span class="co"># L2ARC 头（元数据）大小限制</span></span>
+<span id="cb58-9"><a href="#cb58-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 67108864 <span class="op">&gt;</span> /sys/module/zfs/parameters/l2arc_headroom</span>
+<span id="cb58-10"><a href="#cb58-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb58-11"><a href="#cb58-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 启用 L2ARC 持久化（重启后保留 L2ARC 内容）</span></span>
+<span id="cb58-12"><a href="#cb58-12" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> /sys/module/zfs/parameters/l2arc_rebuild_enabled</span></code></pre></div>
+            <p>L2ARC 设备的选择建议：</p>
+            <ul>
+            <li>使用读取优化的
+            SSD（不需要高写入耐久性，因为写入量有限）。</li>
+            <li>容量通常为 L1ARC 的 5 到 10 倍。</li>
+            <li>避免使用与 SLOG 相同的设备——SLOG 需要极低延迟，而 L2ARC
+            的写入可能增加延迟。</li>
+            </ul>
+            <h3 id="slog-设备选型">10.6 SLOG 设备选型</h3>
+            <p>SLOG 设备的选择对同步写性能至关重要：</p>
+            <pre class="text"><code>SLOG 设备要求：
+┌──────────────────┬─────────────────────────────────────────┐
+│ 指标             │ 要求                                     │
+├──────────────────┼─────────────────────────────────────────┤
+│ 写入延迟         │ &lt;100μs（越低越好）                       │
+│ 断电保护（PLP）  │ 必须具备                                 │
+│ 写入耐久性       │ 高 DWPD（&gt;10 DWPD 最佳）                │
+│ 容量             │ 8GB-32GB 通常足够                        │
+│ 冗余             │ 强烈建议镜像配置                          │
+└──────────────────┴─────────────────────────────────────────┘</code></pre>
+            <p>适合做 SLOG 的设备：</p>
+            <ul>
+            <li>Intel Optane P1600X / P4801X（极低延迟，高耐久性）</li>
+            <li>企业级 NVMe SSD（如三星 PM9A3、西数 SN840）</li>
+            </ul>
+            <h3 id="其他调优参数">10.7 其他调优参数</h3>
+            <div class="sourceCode" id="cb60"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb60-1"><a href="#cb60-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 关闭 atime（文件访问时间记录），减少写入</span></span>
+<span id="cb60-2"><a href="#cb60-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set atime=off tank</span>
+<span id="cb60-3"><a href="#cb60-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb60-4"><a href="#cb60-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 关闭 relatime（如果 atime 已关闭则不需要）</span></span>
+<span id="cb60-5"><a href="#cb60-5" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set relatime=off tank</span>
+<span id="cb60-6"><a href="#cb60-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb60-7"><a href="#cb60-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置主缓存策略（控制哪些数据进入 ARC）</span></span>
+<span id="cb60-8"><a href="#cb60-8" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set primarycache=all tank          <span class="co"># 缓存数据和元数据（默认）</span></span>
+<span id="cb60-9"><a href="#cb60-9" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set primarycache=metadata tank/streaming  <span class="co"># 仅缓存元数据</span></span>
+<span id="cb60-10"><a href="#cb60-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb60-11"><a href="#cb60-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 设置二级缓存策略（控制哪些数据进入 L2ARC）</span></span>
+<span id="cb60-12"><a href="#cb60-12" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set secondarycache=all tank        <span class="co"># 缓存数据和元数据（默认）</span></span>
+<span id="cb60-13"><a href="#cb60-13" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> set secondarycache=metadata tank/streaming  <span class="co"># 仅缓存元数据</span></span>
+<span id="cb60-14"><a href="#cb60-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb60-15"><a href="#cb60-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 调整 TXG 超时时间</span></span>
+<span id="cb60-16"><a href="#cb60-16" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 10 <span class="op">&gt;</span> /sys/module/zfs/parameters/zfs_txg_timeout</span>
+<span id="cb60-17"><a href="#cb60-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb60-18"><a href="#cb60-18" aria-hidden="true" tabindex="-1"></a><span class="co"># 控制 dirty 数据上限（限制内存中待写入数据量）</span></span>
+<span id="cb60-19"><a href="#cb60-19" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 4294967296 <span class="op">&gt;</span> /sys/module/zfs/parameters/zfs_dirty_data_max</span></code></pre></div>
+            <hr />
+            <h2 id="十一zfs-生产部署">十一、ZFS 生产部署</h2>
+            <h3 id="openzfs-项目">11.1 OpenZFS 项目</h3>
+            <p>OpenZFS 是 ZFS 的开源社区驱动实现，统一了来自
+            Illumos、FreeBSD 和 Linux 的代码基。2013 年成立后，OpenZFS
+            成为 ZFS 发展的主要推动力。</p>
+            <p>OpenZFS 的主要里程碑：</p>
+            <table>
+            <thead>
+            <tr>
+            <th>版本</th>
+            <th>发布时间</th>
+            <th>重要特性</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>0.6.1</td>
+            <td>2013</td>
+            <td>ZFS on Linux 首个稳定版</td>
+            </tr>
+            <tr>
+            <td>0.8.0</td>
+            <td>2019</td>
+            <td>原生加密、设备移除、分配类</td>
+            </tr>
+            <tr>
+            <td>2.0.0</td>
+            <td>2020</td>
+            <td>FreeBSD 和 Linux 代码统一、ZSTD 压缩、持久化 L2ARC</td>
+            </tr>
+            <tr>
+            <td>2.1.0</td>
+            <td>2021</td>
+            <td>dRAID、兼容性属性</td>
+            </tr>
+            <tr>
+            <td>2.2.0</td>
+            <td>2023</td>
+            <td>快速去重、BLAKE3 校验和、直接 I/O</td>
+            </tr>
+            <tr>
+            <td>2.3.0</td>
+            <td>2024</td>
+            <td>RAIDZ 扩展、快速去重改进</td>
+            </tr>
+            </tbody>
+            </table>
+            <h3 id="freebsd-与-linux-的差异">11.2 FreeBSD 与 Linux
+            的差异</h3>
+            <p><strong>FreeBSD</strong>：ZFS 是一等公民（First-Class
+            Citizen）。FreeBSD 的安装程序原生支持在 ZFS
+            上安装根文件系统，ZFS
+            代码集成在内核源码树中，不存在许可证问题。FreeBSD 是 ZFS
+            最成熟的平台。</p>
+            <p><strong>Linux</strong>：ZFS 作为内核模块（DKMS
+            或预编译）运行。由于 CDDL（Common Development and
+            Distribution License，通用开发与分发许可证）与 GPL（GNU
+            General Public License，GNU
+            通用公共许可证）的许可证不兼容性，ZFS 无法合并到 Linux
+            主线内核。用户需要：</p>
+            <div class="sourceCode" id="cb61"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb61-1"><a href="#cb61-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 安装 ZFS on Linux（Ubuntu/Debian）</span></span>
+<span id="cb61-2"><a href="#cb61-2" aria-hidden="true" tabindex="-1"></a><span class="ex">apt</span> install zfsutils-linux</span>
+<span id="cb61-3"><a href="#cb61-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-4"><a href="#cb61-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 安装 ZFS on Linux（RHEL/CentOS）</span></span>
+<span id="cb61-5"><a href="#cb61-5" aria-hidden="true" tabindex="-1"></a><span class="ex">dnf</span> install epel-release</span>
+<span id="cb61-6"><a href="#cb61-6" aria-hidden="true" tabindex="-1"></a><span class="ex">dnf</span> install zfs</span>
+<span id="cb61-7"><a href="#cb61-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-8"><a href="#cb61-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 加载模块</span></span>
+<span id="cb61-9"><a href="#cb61-9" aria-hidden="true" tabindex="-1"></a><span class="ex">modprobe</span> zfs</span>
+<span id="cb61-10"><a href="#cb61-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb61-11"><a href="#cb61-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 确认版本</span></span>
+<span id="cb61-12"><a href="#cb61-12" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> version</span></code></pre></div>
+            <h3 id="许可证问题">11.3 许可证问题</h3>
+            <p>ZFS 使用 CDDL 许可证，而 Linux 内核使用 GPL
+            v2。关于这两个许可证是否兼容，法律界存在分歧：</p>
+            <ul>
+            <li><strong>CDDL 与 GPL 不兼容</strong>的立场认为：将 CDDL
+            代码以内核模块形式加载，构成了 GPL
+            所定义的”衍生作品”，违反了 GPL 的条款。</li>
+            <li><strong>兼容</strong>的立场认为：内核模块通过稳定的
+            ABI（应用程序二进制接口）与内核交互，不构成衍生作品。</li>
+            </ul>
+            <p>Canonical（Ubuntu 的母公司）从 2016 年起在 Ubuntu
+            中默认提供 ZFS 包，认为内核模块不违反
+            GPL。其他主要发行版采取更保守的态度，不在官方仓库中直接提供
+            ZFS。</p>
+            <p>从实用角度看，ZFS on Linux
+            在生产环境中被广泛使用，法律风险主要影响发行版的打包策略，对最终用户的影响有限。</p>
+            <h3 id="生产部署检查清单">11.4 生产部署检查清单</h3>
+            <p>部署 ZFS 存储系统的关键检查项：</p>
+            <pre class="text"><code>硬件层面：
+□ ECC 内存（ZFS 不严格要求，但强烈推荐）
+□ UPS 或 BBU（不间断电源或电池备用单元）
+□ 使用 HBA 直通模式，不使用硬件 RAID 控制器
+□ SLOG 设备具有断电保护（PLP）
+□ 所有磁盘使用 by-id 路径
+
+池配置：
+□ ashift=12（或更大）
+□ RAID-Z2 或镜像冗余
+□ SLOG 镜像配置
+□ special vdev 镜像配置
+□ 启用压缩（默认 LZ4）
+
+监控：
+□ 定期 scrub（每月至少一次）
+□ zpool status 健康检查（每日）
+□ ARC 命中率监控
+□ 磁盘 SMART 监控
+□ 空间使用率告警（80% 阈值）
+
+备份：
+□ 快照策略（每小时/每天/每周/每月）
+□ 异地 send/receive 备份
+□ 定期验证恢复流程</code></pre>
+            <h3 id="常见使用场景">11.5 常见使用场景</h3>
+            <p><strong>NAS（Network Attached
+            Storage，网络附加存储）</strong>：ZFS 是 TrueNAS（前
+            FreeNAS）的核心文件系统。家庭和企业 NAS 场景中，ZFS
+            提供数据完整性保护、快照备份和透明压缩。</p>
+            <p><strong>数据库存储后端</strong>：PostgreSQL、MySQL 在 ZFS
+            上运行良好。关键配置：</p>
+            <div class="sourceCode" id="cb63"><pre
+            class="sourceCode bash"><code class="sourceCode bash"><span id="cb63-1"><a href="#cb63-1" aria-hidden="true" tabindex="-1"></a><span class="co"># PostgreSQL on ZFS 最佳配置</span></span>
+<span id="cb63-2"><a href="#cb63-2" aria-hidden="true" tabindex="-1"></a><span class="ex">zfs</span> create <span class="at">-o</span> recordsize=16K <span class="dt">\</span></span>
+<span id="cb63-3"><a href="#cb63-3" aria-hidden="true" tabindex="-1"></a>           <span class="at">-o</span> compression=lz4 <span class="dt">\</span></span>
+<span id="cb63-4"><a href="#cb63-4" aria-hidden="true" tabindex="-1"></a>           <span class="at">-o</span> atime=off <span class="dt">\</span></span>
+<span id="cb63-5"><a href="#cb63-5" aria-hidden="true" tabindex="-1"></a>           <span class="at">-o</span> primarycache=all <span class="dt">\</span></span>
+<span id="cb63-6"><a href="#cb63-6" aria-hidden="true" tabindex="-1"></a>           <span class="at">-o</span> logbias=latency <span class="dt">\</span></span>
+<span id="cb63-7"><a href="#cb63-7" aria-hidden="true" tabindex="-1"></a>           tank/pgdata</span></code></pre></div>
+            <p><strong>虚拟化存储</strong>：ZFS
+            的快照和克隆机制非常适合虚拟机管理。创建 VM
+            快照瞬时完成，克隆一个 100GB
+            的虚拟机磁盘几乎不需要额外空间。Proxmox
+            VE（虚拟化环境）原生支持 ZFS 作为存储后端。</p>
+            <p><strong>备份目标</strong>：ZFS 的增量 send/receive
+            机制使其成为理想的备份目标。每次备份只传输变化的数据块，效率极高。</p>
+            <p><strong>容器存储驱动</strong>：Docker 和 LXC/LXD 都支持
+            ZFS 作为存储驱动。每个容器层可以作为独立的 ZFS 数据集，利用
+            CoW 实现高效的层共享。</p>
+            <h3 id="zfs-的局限">11.6 ZFS 的局限</h3>
+            <p>尽管 ZFS 功能强大，它也有明显的局限：</p>
+            <ol type="1">
+            <li><strong>内存需求高</strong>：ZFS 需要大量内存来维持 ARC
+            和元数据缓存。1TB 存储至少建议 1GB RAM（不含去重）。</li>
+            <li><strong>无法收缩 vdev</strong>：一旦磁盘加入
+            vdev，无法在不销毁池的情况下移除（2.0+ 支持移除顶级
+            vdev，但有限制）。</li>
+            <li><strong>RAID-Z 无法扩展</strong>：不能向现有 RAID-Z vdev
+            添加磁盘（2.3+ 的 RAIDZ expansion 开始解决此问题）。</li>
+            <li><strong>碎片化</strong>：长时间运行的 CoW
+            文件系统可能产生碎片，影响顺序读性能。</li>
+            <li><strong>Linux 内核兼容性</strong>：ZFS
+            模块可能在内核升级后需要重新编译，偶尔出现兼容性问题。</li>
+            <li><strong>许可证不确定性</strong>：CDDL 与 GPL
+            的兼容性问题始终是悬在 ZFS on Linux 上的一把剑。</li>
+            </ol>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="规范与官方文档">规范与官方文档</h3>
+            <ul>
+            <li>OpenZFS Documentation — <a
+            href="https://openzfs.github.io/openzfs-docs/"
+            class="uri">https://openzfs.github.io/openzfs-docs/</a></li>
+            <li>OpenZFS 源码 — <a href="https://github.com/openzfs/zfs"
+            class="uri">https://github.com/openzfs/zfs</a></li>
+            <li>OpenZFS Module Parameters / dRAID Howto</li>
+            </ul>
+            <h3 id="论文">论文</h3>
+            <ul>
+            <li>Bonwick &amp; Ahrens (2006). <em>The Zettabyte File
+            System.</em> StorageSS — blkptr 校验与池化模型。</li>
+            <li>Megiddo &amp; Modha (2003). <em>ARC.</em> FAST — §5
+            ARC。</li>
+            <li>Bairavasundaram et al. (2008). <em>Data Corruption in
+            the Storage Stack.</em> FAST — 完整性动机；详见 <a
+            href="../43-checksum/checksum.html">43 checksum</a>。</li>
+            </ul>
+            <h3 id="书籍与工程博客">书籍与工程博客</h3>
+            <ul>
+            <li>Jude &amp; Rodriguez (2015). <em>FreeBSD Mastery:
+            ZFS</em>；Lucas (2015). <em>Advanced ZFS</em>.</li>
+            <li>Delphix Engineering Blog — OpenZFS Performance
+            Tuning.</li>
+            </ul>
+            <h3 id="关联篇目">关联篇目</h3>
+            <ul>
+            <li><a href="../43-checksum/checksum.html">43
+            校验和与数据完整性</a></li>
+            <li><a href="../12-data-integrity/data-integrity.html">12
+            数据完整性：从 fsync 到端到端校验</a></li>
+            </ul>
+            <hr />
+            <p><strong>上一篇</strong>: <a
+            href="../16-btrfs-cow/btrfs-cow.html">Btrfs：写时复制文件系统</a>
+            <strong>下一篇</strong>: <a
+            href="../18-filesystem-selection/filesystem-selection.html">文件系统选型与基准测试</a></p>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-08-21 · storage</p>
+                    <h3><a href="/post/storage/12-data-integrity/data-integrity.html">【存储工程】数据完整性：从 fsync 到端到端校验</a></h3>
+                    <p>从 fsync 语义、写屏障与电源故障到静默损坏与端到端校验——建立存储栈各层丢失/损坏认知；算法选型见 checksum 篇，ZFS 实现见 zfs-integrity 篇。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-09-21 · storage</p>
+                    <h3><a href="/post/storage/43-checksum/checksum.html">【存储工程】校验和与数据完整性</a></h3>
+                    <p>深入分析存储系统中的数据完整性保障——CRC32C、xxHash、SHA-256 的性能对比，静默数据损坏的检测与防护，端到端校验架构设计</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-11 · storage</p>
+                    <h3><a href="/post/storage/76-disk-full-behavior/disk-full-behavior.html">【存储工程】磁盘空间耗尽：从 70% 到 ENOSPC 的行为退化链</a></h3>
+                    <p>逐层拆解 ext4、XFS、Btrfs、ZFS 从 70% 填充到 100% 耗尽过程中的块分配退化、碎片化加剧和 ENOSPC 故障模式，给出各文件系统的容量红线、监控阈值和应急恢复方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2025-10-14 · storage</p>
+                    <h3><a href="/post/storage/66-cache-engineering/cache-engineering.html">【存储工程】缓存工程：从 Page Cache 到应用层缓存</a></h3>
+                    <p>深入分析存储多级缓存架构——Page Cache、Buffer Pool、应用缓存的协同设计，缓存淘汰算法对比，缓存穿透/击穿/雪崩的防护策略</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>

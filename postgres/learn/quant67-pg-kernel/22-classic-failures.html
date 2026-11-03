@@ -1,0 +1,1293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因 | 土法炼钢 · 系统与基础设施</title>
+    <meta name="description" content="拆解 PG
+生产环境中最危险的五种故障模式——连接风暴与 work_mem 连锁效应、事务 ID
+wraparound 危机完整时间线、replication slot 溢出多米诺效应、OOM 连锁
+kill、长事务 idle in transaction
+隐性破坏。每个故障给出可复现的触发方法、Mermaid
+时序图标注事件节点和排查断点、排查 SQL
+脚本和修复边界，以及监控埋点策略让下次提前发现而非事后救火。" />
+    <link rel="stylesheet" href="/css/post.css" />
+    <link rel="stylesheet" href="/css/code-light.css" media="(prefers-color-scheme: light)" />
+    <link rel="stylesheet" href="/css/code-dark.css" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" />
+    <script src="/js/theme.js"></script>
+    <script defer src="/js/mermaid-init.js"></script>
+            <script type="text/javascript">
+    window.MathJax = {
+        tex: {
+            inlineMath: [['\u0024', '\u0024'], ['\\(', '\\)']],
+            displayMath: [['\u0024\u0024', '\u0024\u0024'], ['\\[', '\\]']],
+            processEscapes: true,
+            packages: { '[+]': ['textmacros'] }
+        },
+        options: {
+            skipHtmlTags: ['script','noscript','style','textarea','pre','code']
+        }
+    };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.min.js"></script>
+        <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) return;
+
+        const tocTitle = toc.querySelector('h2');
+        if (!tocTitle) return;
+
+        const minimizeBtn = document.createElement('button');
+        minimizeBtn.id = 'toc-minimize-btn';
+        minimizeBtn.innerHTML = '−';
+        minimizeBtn.title = '最小化目录';
+        minimizeBtn.setAttribute('aria-label', '最小化目录');
+
+        tocTitle.appendChild(minimizeBtn);
+
+        const isMinimized = localStorage.getItem('toc-minimized') === 'true';
+        if (isMinimized) {
+            toc.classList.add('minimized');
+            minimizeBtn.innerHTML = '+';
+            minimizeBtn.title = '展开目录';
+        }
+
+        minimizeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toc.classList.toggle('minimized');
+            const isMin = toc.classList.contains('minimized');
+            minimizeBtn.innerHTML = isMin ? '+' : '−';
+            minimizeBtn.title = isMin ? '展开目录' : '最小化目录';
+            localStorage.setItem('toc-minimized', isMin);
+        });
+    });
+    </script>
+
+    <meta name="keywords" content="postgresql, pg-kernel, troubleshooting, connection-storm, transaction-id-wraparound, replication-slot, oom, idle-in-transaction, failure-modes, pg-stat-activity, pg-locks, pg-replication-slots, database, kernel" />
+    <link rel="alternate" type="application/rss+xml" title="土法炼钢兴趣小组的算法知识备份" href="https://quant67.com/rss.xml" />
+    <link rel="canonical" href="https://quant67.com/post/db/postgresql-kernel/22-classic-failures/22-classic-failures.html" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因" />
+    <meta property="og:description" content="拆解 PG 生产环境中最危险的五种故障模式——连接风暴与 work_mem 连锁效应、事务 ID wraparound 危机完整时间线、replication slot 溢出多米诺效应、OOM 连锁 kill、长事务 idle in transaction 隐性破坏。每个故障给出可复现的触发方法、Mermaid 时序图标注事件节点和排查断点、排查 SQL 脚本和修复边界，以及监控埋点策略让下次提前发现而非事后救火。" />
+    <meta property="og:url" content="https://quant67.com/post/db/postgresql-kernel/22-classic-failures/22-classic-failures.html" />
+    <meta property="og:site_name" content="土法炼钢兴趣小组的算法知识备份" />
+    <meta property="article:section" content="database" />
+    <meta property="article:tag" content="postgresql" />
+    <meta property="article:tag" content="pg-kernel" />
+    <meta property="article:tag" content="troubleshooting" />
+    <meta property="article:tag" content="connection-storm" />
+    <meta property="article:tag" content="transaction-id-wraparound" />
+    <meta property="article:tag" content="replication-slot" />
+    <meta property="article:tag" content="oom" />
+    <meta property="article:tag" content="idle-in-transaction" />
+    <meta property="article:tag" content="failure-modes" />
+    <meta property="article:tag" content="pg-stat-activity" />
+    <meta property="article:tag" content="pg-locks" />
+    <meta property="article:tag" content="pg-replication-slots" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因" />
+    <meta name="twitter:description" content="拆解 PG 生产环境中最危险的五种故障模式——连接风暴与 work_mem 连锁效应、事务 ID wraparound 危机完整时间线、replication slot 溢出多米诺效应、OOM 连锁 kill、长事务 idle in transaction 隐性破坏。每个故障给出可复现的触发方法、Mermaid 时序图标注事件节点和排查断点、排查 SQL 脚本和修复边界，以及监控埋点策略让下次提前发现而非事后救火。" />
+
+    <script type="application/ld+json">{"@context": "https://schema.org", "@type": "Article", "headline": "【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因", "description": "拆解 PG 生产环境中最危险的五种故障模式——连接风暴与 work_mem 连锁效应、事务 ID wraparound 危机完整时间线、replication slot 溢出多米诺效应、OOM 连锁 kill、长事务 idle in transaction 隐性破坏。每个故障给出可复现的触发方法、Mermaid 时序图标注事件节点和排查断点、排查 SQL 脚本和修复边界，以及监控埋点策略让下次提前发现而非事后救火。", "inLanguage": "zh-CN", "author": {"@type": "Person", "name": "Liao Tonglang", "email": "liaotonglang@gmail.com"}, "mainEntityOfPage": {"@type": "WebPage", "@id": "https://quant67.com/post/db/postgresql-kernel/22-classic-failures/22-classic-failures.html"}, "datePublished": "2026-06-16T00:00:00+00:00", "dateModified": "2026-06-16T16:00:10+00:00", "keywords": ["postgresql", "pg-kernel", "troubleshooting", "connection-storm", "transaction-id-wraparound", "replication-slot", "oom", "idle-in-transaction", "failure-modes", "pg-stat-activity", "pg-locks", "pg-replication-slots"], "about": ["database", "kernel"], "publisher": {"@type": "Organization", "name": "土法炼钢兴趣小组", "url": "https://quant67.com"}}</script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7345802806644300"
+     crossorigin="anonymous"></script>
+
+    <script id="site-analytics-loader">
+(function () {
+    var hostname = window.location.hostname || "";
+
+    function isLocalPreviewHost(name) {
+        return !name
+            || name === "localhost"
+            || name === "127.0.0.1"
+            || name === "::1"
+            || name === "[::1]"
+            || /^127\./.test(name)
+            || /^10\./.test(name)
+            || /^192\.168\./.test(name)
+            || /^172\.(1[6-9]|2\d|3[0-1])\./.test(name)
+            || /\.local$/.test(name);
+    }
+
+    if (window.location.protocol === "file:"
+        || hostname === "localhost"
+        || isLocalPreviewHost(hostname)) {
+        return;
+    }
+
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?bf4c2a8d6ae620ec6d1c940e37d9c641";
+    hm.defer = true;
+
+    var anchor = document.getElementsByTagName("script")[0];
+    if (anchor && anchor.parentNode) {
+        anchor.parentNode.insertBefore(hm, anchor);
+        return;
+    }
+
+    document.head.appendChild(hm);
+})();
+</script>
+</head>
+<body>
+    <div id="content">
+        <header class="post-header">
+            <p class="site-title"><a href="/">土法炼钢兴趣小组的算法知识备份</a></p>
+            <h1 class="title">【PG 内核】经典故障模式与排查手册：五个真实事故的内核根因</h1>
+                        <p class="post-meta">
+                <span class="post-date">2026-06-16</span>
+                 · <span class="post-categories"><span>database</span> · <span>kernel</span></span>
+                 · <span class="post-tags"><span>#postgresql</span> <span>#pg-kernel</span> <span>#troubleshooting</span> <span>#connection-storm</span> <span>#transaction-id-wraparound</span> <span>#replication-slot</span> <span>#oom</span> <span>#idle-in-transaction</span> <span>#failure-modes</span> <span>#pg-stat-activity</span> <span>#pg-locks</span> <span>#pg-replication-slots</span></span>
+            </p>
+                    </header>
+<section class="post-discovery"><h2>文章导航</h2><div class="post-discovery__row"><span class="post-discovery__label">分类入口</span><div class="post-discovery__chips"><a class="chip-link" href="/categories/database.html">database</a><a class="chip-link" href="/categories/kernel.html">kernel</a></div></div><div class="post-discovery__row"><span class="post-discovery__label">标签入口</span><div class="post-discovery__chips"><a class="chip-link" href="/tags/postgresql.html">#postgresql</a><a class="chip-link" href="/tags/pg-kernel.html">#pg-kernel</a><a class="chip-link" href="/tags/troubleshooting.html">#troubleshooting</a><a class="chip-link" href="/tags/connection-storm.html">#connection-storm</a><a class="chip-link" href="/tags/transaction-id-wraparound.html">#transaction-id-wraparound</a><a class="chip-link" href="/tags/replication-slot.html">#replication-slot</a><a class="chip-link" href="/tags/oom.html">#oom</a><a class="chip-link" href="/tags/idle-in-transaction.html">#idle-in-transaction</a><a class="chip-link" href="/tags/failure-modes.html">#failure-modes</a><a class="chip-link" href="/tags/pg-stat-activity.html">#pg-stat-activity</a><a class="chip-link" href="/tags/pg-locks.html">#pg-locks</a><a class="chip-link" href="/tags/pg-replication-slots.html">#pg-replication-slots</a></div></div></section>
+
+                <div id="table-of-contents">
+            <h2>目录</h2>
+            <div id="text-table-of-contents">
+                <ul>
+                <li><a
+                href="#经典故障模式与排查手册五个真实事故的内核根因"
+                id="toc-经典故障模式与排查手册五个真实事故的内核根因">经典故障模式与排查手册：五个真实事故的内核根因</a>
+                <ul>
+                <li><a href="#一连接风暴及-work_mem-连锁效应"
+                id="toc-一连接风暴及-work_mem-连锁效应">一、连接风暴及
+                work_mem 连锁效应</a>
+                <ul>
+                <li><a href="#现象" id="toc-现象">1.1 现象</a></li>
+                <li><a href="#根因" id="toc-根因">1.2 根因</a></li>
+                <li><a href="#时序推演" id="toc-时序推演">1.3
+                时序推演</a></li>
+                <li><a href="#排查-sql" id="toc-排查-sql">1.4 排查
+                SQL</a></li>
+                <li><a href="#监控埋点" id="toc-监控埋点">1.6
+                监控埋点</a></li>
+                <li><a href="#排查-sql-1" id="toc-排查-sql-1">2.4 排查
+                SQL</a></li>
+                </ul></li>
+                <li><a href="#三replication-slot-溢出多米诺效应"
+                id="toc-三replication-slot-溢出多米诺效应">三、replication
+                slot 溢出多米诺效应</a>
+                <ul>
+                <li><a href="#现象-1" id="toc-现象-1">3.1 现象</a></li>
+                <li><a href="#根因-1" id="toc-根因-1">3.2 根因</a></li>
+                <li><a href="#排查-sql-2" id="toc-排查-sql-2">3.4 排查
+                SQL</a></li>
+                </ul></li>
+                <li><a href="#四oom-连锁-kill"
+                id="toc-四oom-连锁-kill">四、OOM 连锁 kill</a>
+                <ul>
+                <li><a href="#现象-2" id="toc-现象-2">4.1 现象</a></li>
+                <li><a href="#根因-2" id="toc-根因-2">4.2 根因</a></li>
+                <li><a href="#排查-sql-3" id="toc-排查-sql-3">4.4 排查
+                SQL</a></li>
+                <li><a href="#排查-sql-4" id="toc-排查-sql-4">5.4 排查
+                SQL</a></li>
+                </ul></li>
+                <li><a href="#六五个故障的内核关联"
+                id="toc-六五个故障的内核关联">六、五个故障的内核关联</a></li>
+                <li><a href="#七关键要点"
+                id="toc-七关键要点">七、关键要点</a></li>
+                <li><a href="#参考资料" id="toc-参考资料">参考资料</a>
+                <ul>
+                <li><a href="#源码路径"
+                id="toc-源码路径">源码路径</a></li>
+                <li><a href="#官方文档"
+                id="toc-官方文档">官方文档</a></li>
+                <li><a href="#事故复盘"
+                id="toc-事故复盘">事故复盘</a></li>
+                <li><a href="#实验工具"
+                id="toc-实验工具">实验工具</a></li>
+                </ul></li>
+                </ul></li>
+                </ul>
+            </div>
+        </div>
+        
+        <main class="post-body">
+            <h1
+            id="经典故障模式与排查手册五个真实事故的内核根因">经典故障模式与排查手册：五个真实事故的内核根因</h1>
+            <p>数据库生产事故有一个共同特征：早期信号在监控面板上存在了几天甚至几周，但没人注意到它们和最终爆炸之间的因果关系。</p>
+            <p>本文挑出 PG
+            生产环境中最危险的五种故障模式——“最危险”不意味着出现频率最高，而是指它们要么能直接让数据库进入只读状态（wraparound
+            / slot 溢出），要么是连锁反应的起点（连接风暴 / OOM
+            kill），要么是缓慢的破坏性积累直到某个 DDL 在凌晨 3 点 hang
+            住（长事务）。每个故障按「现象 → 内核根因 → 时序推演 → 排查
+            SQL → 修复边界 → 监控埋点」组织。</p>
+            <hr />
+            <h2 id="一连接风暴及-work_mem-连锁效应">一、连接风暴及
+            work_mem 连锁效应</h2>
+            <h3 id="现象">1.1 现象</h3>
+            <p>数据库突然无响应。<code>pg_stat_activity</code>
+            显示连接数接近
+            <code>max_connections</code>，但大部分连接状态是
+            <code>active</code> 而非
+            <code>idle</code>——不是应用忘了关连接，是真的都在干活。同时
+            OS 层 <code>dmesg</code> 可能出现 OOM kill 日志，PG 日志出现
+            <code>out of memory</code> 错误。</p>
+            <h3 id="根因">1.2 根因</h3>
+            <p>问题不在连接数本身，而在每个连接同时持有的
+            <code>work_mem</code> 配额之和。</p>
+            <p><code>work_mem</code>
+            的语义被广泛误解。它配置的不是”每个查询 4MB”或者”每个连接
+            4MB”，而是<strong>每个操作</strong>的内存上限——一个查询可能同时运行
+            hash join 的 build 阶段、一个 sort 节点、一个 materialize
+            节点，每个节点各自申请最多 <code>work_mem</code> 的内存。PG
+            15 引入的 <code>hash_mem_multiplier</code>（默认
+            2.0）进一步让 hash join 可以使用的内存 =
+            <code>work_mem × hash_mem_multiplier</code>。</p>
+            <p>假设
+            <code>max_connections = 200</code>，<code>work_mem = 4MB</code>（默认），<code>hash_mem_multiplier = 2.0</code>：</p>
+            <p><span class="math display">\[ \text{峰值内存} = 200
+            \times (4\text{MB}_{\text{sort}} + 8\text{MB}_{\text{hash}}
+            + 4\text{MB}_{\text{materialize}}) = 200 \times 16\text{MB}
+            = 3.2\text{GB} \]</span></p>
+            <p>这还没算 <code>shared_buffers</code>（通常 2-8GB）、每个
+            Backend 的私有内存（~5-10MB）、catalog cache 和 plan
+            cache。如果 200
+            个连接真的同时做复杂查询，实际内存需求可以轻松超过
+            10GB。问题不在于连接数——如果所有连接都在跑
+            <code>SELECT 1</code>，1000 个连接也不会有问题——而在于
+            <strong>work_mem
+            的乘法效应在没有流控的情况下被连接数放大</strong>。</p>
+            <p>更隐蔽的场景是连接风暴本身由上游服务扩容或故障切换触发：某服务重启后连接池初始化，瞬间创建
+            100 个连接，每个连接执行同一个业务查询（可能包含 hash join
+            或 ORDER BY），work_mem 的乘法效应在 1 秒内兑现。</p>
+            <h3 id="时序推演">1.3 时序推演</h3>
+            <pre class="mermaid"><code>sequenceDiagram
+    participant App as 应用层
+    participant Pool as 连接池
+    participant PM as Postmaster
+    participant BE as 100+ Backend
+    participant OS as OS 内核
+
+    App-&gt;&gt;Pool: 服务重启，初始化连接池
+    Pool-&gt;&gt;PM: 瞬间发起 100 个连接请求
+    PM-&gt;&gt;BE: fork() × 100（每个 ~8MB 私有内存）
+    Note over BE,OS: 100 Backend 各执行首条业务查询
+    BE-&gt;&gt;BE: 每个查询并行启动 hash join + sort
+    Note over BE: work_mem 4MB × 3 ops × 100 连接 = 1.2GB
+    BE-&gt;&gt;OS: 申请内存超过 OS 可用
+    OS--&gt;&gt;BE: OOM Killer 介入
+    OS-&gt;&gt;PM: 杀死 Postmaster 或若干 Backend
+    PM-&gt;&gt;PM: restart_after_crash=on → 触发 full restart
+    PM-&gt;&gt;BE: 断开所有现有连接，重新 fork
+    Note over App,OS: 应用重连 → 再次风暴 → 可能死循环
+```text
+
+关键断点：`restart_after_crash=on` 意味着 Postmaster 收到子进程异常退出信号（`SIGCHLD` → `reaper()`）后，会执行一次 full restart——**断开所有连接**，然后重新从 `postgresql.conf` 启动所有辅助进程。这会把&quot;一个 Backend 被 OOM kill&quot;变成&quot;所有 200 个用户连接全部断开&quot;。源码路径：
+
+```c
+// src/backend/postmaster/postmaster.c, reaper()
+// 当 HandleChildCrash 被调用时，标记所有 Backend 需要退出
+static void
+HandleChildCrash(int pid, int exitstatus, const char *procname) {
+    // 设置 FatalError = true
+    // 遍历 PMChildFlags，对每个 active process 设置退出信号
+    // SignalChildren(SIGQUIT) — 所有子进程收到 SIGQUIT
+}</code></pre>
+            <h3 id="排查-sql">1.4 排查 SQL</h3>
+            <div class="sourceCode" id="cb2"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1. 快速确认连接数和状态分布</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> state, <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> cnt</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> state <span class="kw">ORDER</span> <span class="kw">BY</span> cnt <span class="kw">DESC</span>;</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2. 定位可疑连接：同时 active 且运行时间异常</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, usename, application_name, state,</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>       wait_event_type, wait_event,</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> xact_start <span class="kw">AS</span> txn_duration,</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> query_start <span class="kw">AS</span> query_duration,</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>       <span class="kw">query</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;active&#39;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> now() <span class="op">-</span> query_start <span class="op">&gt;</span> <span class="dt">interval</span> <span class="st">&#39;10 seconds&#39;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> query_start;</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3. 如果有 pg_stat_statements，找出 memory 消耗最高的 query</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="co">-- 用 temp_bytes 做 proxies（需要 track_io_timing=on + PG 16+）：</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> queryid, calls,</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>       mean_exec_time:<span class="ch">:numeric</span>(<span class="dv">10</span>,<span class="dv">1</span>) <span class="kw">AS</span> avg_ms,</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>       (temp_blks_read <span class="op">+</span> temp_blks_written) <span class="op">*</span> <span class="dv">8192</span> <span class="op">/</span> calls <span class="kw">AS</span> avg_temp_bytes_per_call,</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>       <span class="kw">LEFT</span>(<span class="kw">query</span>, <span class="dv">200</span>) <span class="kw">AS</span> query_preview</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_statements</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> calls <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> (temp_blks_read <span class="op">+</span> temp_blks_written) <span class="op">*</span> <span class="dv">8192</span> <span class="op">/</span> calls <span class="kw">DESC</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">10</span>;</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 高 temp_bytes 意味着查询使用了磁盘临时文件（work_mem 不够）</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>### <span class="fl">1.5</span> 修复边界</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>| 操作 | 效果 | 边界 |</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|------|</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>| `ALTER <span class="kw">SYSTEM</span> <span class="kw">SET</span> work_mem <span class="op">=</span> <span class="st">&#39;2MB&#39;</span>` <span class="op">+</span> `pg_reload_conf()` | 降低单操作内存，给现有连接腾空间 | 对已在执行的查询不生效；太小会导致 <span class="kw">sort</span> 频繁写 temp <span class="kw">file</span> |</span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>| `SELECT pg_terminate_backend(pid)` | 杀掉特定 Backend | 被杀的连接无法重做未提交事务；如果所有连接都在执行同一条业务查询，杀完还会重来 |</span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>| `ALTER <span class="kw">SYSTEM</span> <span class="kw">SET</span> max_connections <span class="op">=</span> <span class="st">&#39;X&#39;</span>` <span class="op">+</span> restart | 限制连接数上限 | 需要重启；太小会导致连接排队，应用端必须设 `connect_timeout` |</span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>| `ALTER <span class="kw">DATABASE</span> db <span class="kw">SET</span> statement_timeout <span class="op">=</span> <span class="st">&#39;30s&#39;</span>` | 防止单个查询无限跑 | 只影响新连接 |</span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>| 应用层加连接池限流（`pgbouncer` <span class="kw">transaction</span> pooling） | 将 <span class="dv">200</span> 个应用连接映射到 <span class="dv">20</span> 个 PG 连接 | 需要部署 pgbouncer；`SET` 语句和 prepared statement 在 <span class="kw">transaction</span> pooling 下有约束 |</span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>将 `work_mem` 从默认 <span class="dv">4</span>MB 调到 <span class="dv">2</span>MB 并不是万能的——真正需要 <span class="dv">4</span>MB 的 <span class="kw">hash</span> <span class="kw">join</span> 会溢出到 temp file，造成新的 I<span class="op">/</span>O 瓶颈。正确做法是同时调整 `hash_mem_multiplier`：</span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a><span class="co">-- PG 15+: 降低 hash join 的额外内存权重</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">SYSTEM</span> <span class="kw">SET</span> hash_mem_multiplier <span class="op">=</span> <span class="fl">1.0</span>;</span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">SYSTEM</span> <span class="kw">SET</span> work_mem <span class="op">=</span> <span class="st">&#39;4MB&#39;</span>;</span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_reload_conf();</span></code></pre></div>
+            <h3 id="监控埋点">1.6 监控埋点</h3>
+            <div class="sourceCode" id="cb3"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 连接使用率（与 max_connections 的比值）</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">-- 告警阈值：&gt; 80%</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="op">*</span> <span class="fl">100.0</span> <span class="op">/</span> current_setting(<span class="st">&#39;max_connections&#39;</span>):<span class="ch">:int</span> <span class="kw">AS</span> pct_conn_used</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity;</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co">-- 有 temp_file 写入的查询占比</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 告警阈值：&gt; 10%</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">FILTER</span> (<span class="kw">WHERE</span> temp_blks_written <span class="op">&gt;</span> <span class="dv">0</span>) <span class="op">*</span> <span class="fl">100.0</span> <span class="op">/</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> pct_with_temp</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_statements <span class="kw">WHERE</span> calls <span class="op">&gt;</span> <span class="dv">0</span>;</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co">-- OS 内存水位</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 告警阈值：MemAvailable &lt; 10% 总内存</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co">-- 用 cron + grep /proc/meminfo，或 node_exporter + Prometheus</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>## 二、事务 <span class="kw">ID</span> wraparound 危机完整时间线</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>### <span class="fl">2.1</span> 现象</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>某天凌晨，所有写操作突然报错：</span></code></pre></div>
+            <p>ERROR: database is not accepting commands to avoid
+            wraparound data loss in database “mydb” HINT: Stop the
+            postmaster and vacuum that database in single-user mode.</p>
+            <pre class="text"><code>
+此时数据库进入**只读 shutdown 状态**——任何带写的 DML 和 DDL 都被拒绝，只有 `SELECT` 和少数 `VACUUM` 相关操作能执行。这是 PG 保护机制的最后一道防线：如果继续允许写入，已经 vacuum 过的死 tuple 的 xmin 会和新的 32 位事务 ID 发生回卷冲突，所有历史数据变成不可见。
+
+### 2.2 根因
+
+PG 的事务 ID（`TransactionId`，又名 `xid`）是 32 位无符号整数——只有 $2^{32} \approx 42$ 亿个值。PG 把 xid 空间视为一个圆环，规则是：**任何 xid 比当前 xid 早 $2^{31}$（约 20 亿）以上的事务，都被视为&quot;未来事务&quot;**。这意味着单库生命周期内，真实使用的事务 ID 不能跨越 20 亿的窗口。
+
+PG 通过 **freezing** 机制来对抗 wraparound：把一个 tuple 的 `xmin` 特殊标记为 `FrozenTransactionId`（值为 2），表示&quot;这个 tuple 的创建事务一定在 20 亿个 xid 之前，无需比较，直接视为过去&quot;。freezing 由 `VACUUM` 触发，按照 `vacuum_freeze_min_age` 和 `vacuum_freeze_table_age` 控制。
+
+`autovacuum_freeze_max_age`（默认 2 亿）是 PG 的内置安全网：当某个表的 `age(pg_class.relfrozenxid)` 超过这个阈值时，autovacuum 会对该表强制执行一次 **anti-wraparound VACUUM**——即使正常的 autovacuum 还没到触发阈值（即 `n_dead_tup` 不够多），也会启动 VACUUM 来冻结旧 xid。
+
+```c
+// src/backend/postmaster/autovacuum.c, relation_needs_vacanalyze()
+// 计算 age(relfrozenxid)，与 autovacuum_freeze_max_age 比较
+if (TransactionIdIsNormal(classForm-&gt;relfrozenxid)) {
+    xidForceLimit = recentXid - autovacuum_freeze_max_age;
+    if (TransactionIdPrecedes(classForm-&gt;relfrozenxid, xidForceLimit)) {
+        // 强制触发 anti-wraparound VACUUM
+        *dovacuum = true;
+    }
+}</code></pre>
+            <p>Wraparound 危机的完整因果链：</p>
+            <ol type="1">
+            <li>某张表的 <code>autovacuum_vacuum_cost_delay</code>
+            设太高（或 <code>autovacuum_vacuum_cost_limit</code>
+            设太低），导致 autovacuum 处理速度跟不上 UPDATE/DELETE 产生
+            dead tuple 的速度。</li>
+            <li>正常的 autovacuum 被不断触发但永远跑不完（或因为锁冲突被
+            cancel），<code>age(relfrozenxid)</code> 持续增长。</li>
+            <li>当 <code>age(relfrozenxid)</code> 超过
+            <code>autovacuum_freeze_max_age</code>（2 亿），PG 强制启动
+            anti-wraparound VACUUM。此时 <code>pg_stat_activity</code>
+            会看到
+            <code>autovacuum: VACUUM tablename (to prevent wraparound)</code>
+            的进程。</li>
+            <li>如果 anti-wraparound VACUUM 仍然跑不完（表太大、cost
+            delay 太高、被手动 cancel），<code>age(relfrozenxid)</code>
+            继续增长。</li>
+            <li>当 <code>age(relfrozenxid)</code> 达到
+            <code>ForceTransactionId</code> 的范围——源码中
+            <code>xidStopLimit</code>（从当前 xid 往前推 1000
+            万）先触发只写警告不阻塞，然后是
+            <code>xidWrapLimit</code>（往前推 100 万）触发只读
+            shutdown。</li>
+            </ol>
+            <div class="sourceCode" id="cb5"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/access/transam/varsup.c, SetTransactionIdLimit()</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define XID_WRAP_LIMIT     </span><span class="dv">1000000</span><span class="pp">  </span><span class="co">// 100 万，之后数据库进入只读</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define XID_STOP_LIMIT    </span><span class="dv">10000000</span><span class="pp">  </span><span class="co">// 1000 万，之后发出警告但允许写入</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> SetTransactionIdLimit<span class="op">(</span>TransactionId oldest_datfrozenxid<span class="op">,</span> Oid oldest_datoid<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// xidWrapLimit = oldest_datfrozenxid + (MaxTransactionId &gt;&gt; 1) - XID_WRAP_LIMIT</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// xidStopLimit = oldest_datfrozenxid + (MaxTransactionId &gt;&gt; 1) - XID_STOP_LIMIT</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 2.3 时序推演</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>sequenceDiagram</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    participant App as 应用写入</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    participant AV as Autovacuum Worker</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    participant Cat as pg_catalog</span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    participant Xid as XID 分配器</span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    participant Prot as Wraparound 保护</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>Prot<span class="op">:</span> T0<span class="op">:</span> 正常运作，age<span class="op">(</span>relfrozenxid<span class="op">)</span> 缓慢增长</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>    App<span class="op">-&gt;&gt;</span>Cat<span class="op">:</span> UPDATE<span class="op">/</span>DELETE 频繁</span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    Cat<span class="op">-&gt;&gt;</span>Cat<span class="op">:</span> dead tuple 堆积，age<span class="op">(</span>relfrozenxid<span class="op">)</span> 增加</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    AV<span class="op">-&gt;&gt;</span>Cat<span class="op">:</span> autovacuum 正常触发，但 cost_delay 太高</span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>    Note over AV<span class="op">:</span> VACUUM 跟不上 dead tuple 产生速度</span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>Prot<span class="op">:</span> T1<span class="op">:</span> 跨过 autovacuum_freeze_max_age <span class="op">(</span><span class="dv">2</span> 亿<span class="op">)</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>    AV<span class="op">-&gt;&gt;</span>Cat<span class="op">:</span> anti<span class="op">-</span>wraparound VACUUM 强制触发</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>    Note over AV<span class="op">:</span> pg_stat_activity<span class="op">:</span> <span class="st">&quot;VACUUM (to prevent wraparound)&quot;</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>    AV<span class="op">--&gt;&gt;</span>Cat<span class="op">:</span> 大表扫描 <span class="op">+</span> index cleanup 耗时数小时</span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>Prot<span class="op">:</span> T2<span class="op">:</span> anti<span class="op">-</span>wraparound VACUUM 被取消或卡住</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>    App<span class="op">-&gt;&gt;</span>Cat<span class="op">:</span> DDL 持锁 → autovacuum 等锁</span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    Note over AV<span class="op">:</span> autovacuum 多次被 lock_timeout 取消</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>    Xid<span class="op">-&gt;&gt;</span>Xid<span class="op">:</span> age<span class="op">(</span>relfrozenxid<span class="op">)</span> 继续增长</span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>Prot<span class="op">:</span> T3<span class="op">:</span> xidStopLimit 触发 <span class="op">(</span><span class="dv">1000</span> 万<span class="op">)</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>    Prot<span class="op">-&gt;&gt;</span>App<span class="op">:</span> WARNING<span class="op">:</span> database must be vacuumed within <span class="dv">10000000</span> transactions</span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>Prot<span class="op">:</span> T4<span class="op">:</span> xidWrapLimit 触发 <span class="op">(</span><span class="dv">100</span> 万<span class="op">)</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>    Prot<span class="op">-&gt;&gt;</span>App<span class="op">:</span> ERROR<span class="op">:</span> database is not accepting commands to avoid wraparound</span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">:</span> 数据库进入只读 shutdown 状态</span></code></pre></div>
+            <h3 id="排查-sql-1">2.4 排查 SQL</h3>
+            <div class="sourceCode" id="cb6"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第一步：查看全库最危险的 age</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> datname, age(datfrozenxid) <span class="kw">AS</span> age_xid,</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>       pg_size_pretty(pg_database_size(datname)) <span class="kw">AS</span> db_size</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_database</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> age(datfrozenxid) <span class="kw">DESC</span>;</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第二步：找出具体拖后腿的表和数据库</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> c.<span class="kw">oid</span>:<span class="ch">:regclass</span> <span class="kw">AS</span> table_name,</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>       age(c.relfrozenxid) <span class="kw">AS</span> age_xid,</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>       pg_size_pretty(pg_total_relation_size(c.<span class="kw">oid</span>)) <span class="kw">AS</span> table_size,</span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>       n.nspname <span class="kw">AS</span> <span class="kw">schema</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_class c</span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_namespace n <span class="kw">ON</span> c.relnamespace <span class="op">=</span> n.<span class="kw">oid</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> c.relkind <span class="kw">IN</span> (<span class="st">&#39;r&#39;</span>, <span class="st">&#39;t&#39;</span>, <span class="st">&#39;m&#39;</span>)  <span class="co">-- 普通表、toast 表、物化视图</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> age(c.relfrozenxid) <span class="op">&gt;</span> <span class="dv">100000000</span>  <span class="co">-- 1 亿，重点关注</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> age(c.relfrozenxid) <span class="kw">DESC</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>;</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第三步：检查 autovacuum 到底在干什么</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, datname, usename, backend_start,</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> backend_start <span class="kw">AS</span> running_for,</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>       <span class="kw">query</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> backend_type <span class="op">=</span> <span class="st">&#39;autovacuum worker&#39;</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> backend_start;</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第四步：看当前 anti-wraparound 的进度（PG 14+）</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> p.datname, p.relid:<span class="ch">:regclass</span>,</span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>       p.phase,</span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>       p.heap_blks_total, p.heap_blks_scanned,</span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>       <span class="cf">CASE</span> <span class="cf">WHEN</span> p.heap_blks_total <span class="op">&gt;</span> <span class="dv">0</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">THEN</span> <span class="fu">round</span>(<span class="fl">100.0</span> <span class="op">*</span> p.heap_blks_scanned <span class="op">/</span> p.heap_blks_total, <span class="dv">1</span>)</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>            <span class="cf">ELSE</span> <span class="dv">0</span> <span class="cf">END</span> <span class="kw">AS</span> pct_scanned,</span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>       p.index_vacuum_count, p.max_dead_tuple_bytes</span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_progress_vacuum p</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> p.phase <span class="kw">IS</span> <span class="kw">NOT</span> <span class="kw">NULL</span>;</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>### <span class="fl">2.5</span> 修复边界</span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>数据库已经进入只读 <span class="kw">shutdown</span> 时，只有两条路：</span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>路径 A：单用户模式 VACUUM（标准方案）<span class="op">**</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a># <span class="fl">1.</span> 停掉 PG</span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>pg_ctl <span class="kw">stop</span> <span class="op">-</span>D $PGDATA</span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a># <span class="fl">2.</span> 单用户模式启动（不启动 postmaster，不监听端口）</span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>postgres <span class="co">--single -D $PGDATA dbname</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a># <span class="fl">3.</span> 在 <span class="dt">single</span><span class="op">-</span><span class="fu">user</span> 提示符下执行</span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>VACUUM FREEZE;</span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a><span class="co">-- 或者针对特定表</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>VACUUM (FREEZE, VERBOSE) the_problem_table;</span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a># <span class="fl">4.</span> 退出（Ctrl<span class="op">+</span>D），正常启动</span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>pg_ctl <span class="kw">start</span> <span class="op">-</span>D $PGDATA</span></code></pre></div>
+            <ul>
+            <li><strong>适用</strong>：<code>pg_catalog</code> 表（如
+            <code>pg_authid</code>）的 age 过大——单用户模式唯一能处理
+            catalog 表 VACUUM 的场景。</li>
+            <li><strong>风险</strong>：单用户模式下没有并发控制，也没有
+            autovacuum。大库的 <code>VACUUM FREEZE</code>
+            可能跑数小时甚至数天。这期间业务完全不可用。</li>
+            </ul>
+            <p><strong>路径
+            B：放宽保护阈值（紧急方案，风险高）</strong></p>
+            <div class="sourceCode" id="cb7"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 在进入 shutdown 之前可以用，但已经 shutdown 了就无效</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">ALTER</span> <span class="kw">SYSTEM</span> <span class="kw">SET</span> autovacuum_freeze_max_age <span class="op">=</span> <span class="dv">2000000000</span>;  <span class="co">-- 20 亿</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_reload_conf();</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>风险巨大<span class="op">**</span>：如果 age 确实已经到了 <span class="dv">20</span> 亿附近，取消保护意味着 tuples 可能变成不可见——数据没有物理删除，但查询看不到。唯一恢复手段是单用户模式 VACUUM FREEZE。</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>适用<span class="op">**</span>：仅在 age 离真实 wraparound 还有很大差距、但保护阈值触发过早时作为临时放开手段。</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>路径 C：预防——永远别到这里<span class="op">**</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>确保以下检查在 age 到 <span class="dv">1</span> 亿之前就触发告警：</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="co">-- 监控查询：放在 cron 里每小时跑一次</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> datname, age(datfrozenxid),</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>       <span class="cf">CASE</span> <span class="cf">WHEN</span> age(datfrozenxid) <span class="op">&gt;</span> <span class="dv">150000000</span> <span class="cf">THEN</span> <span class="st">&#39;CRITICAL&#39;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>            <span class="cf">WHEN</span> age(datfrozenxid) <span class="op">&gt;</span> <span class="dv">100000000</span> <span class="cf">THEN</span> <span class="st">&#39;WARNING&#39;</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>            <span class="cf">ELSE</span> <span class="st">&#39;OK&#39;</span> <span class="cf">END</span> <span class="kw">AS</span> status</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_database;</span></code></pre></div>
+            <p>常见根因和对应措施：</p>
+            <table style="width:100%;">
+            <colgroup>
+            <col style="width: 28%" />
+            <col style="width: 42%" />
+            <col style="width: 28%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>根因</th>
+            <th>排查方式</th>
+            <th>修复</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td><code>autovacuum_vacuum_cost_delay</code> 太高</td>
+            <td><code>SHOW autovacuum_vacuum_cost_delay</code></td>
+            <td>调低到 2-5ms，或给大表单独设
+            <code>ALTER TABLE t SET (autovacuum_vacuum_cost_delay = 1)</code></td>
+            </tr>
+            <tr>
+            <td>autovacuum worker 不够</td>
+            <td><code>SHOW autovacuum_max_workers</code></td>
+            <td>增大到 5-10（注意
+            <code>maintenance_work_mem × worker 数</code>
+            的总内存）</td>
+            </tr>
+            <tr>
+            <td>长事务阻止 VACUUM 回收</td>
+            <td><code>SELECT pid, now()-xact_start FROM pg_stat_activity WHERE state='idle in transaction'</code></td>
+            <td><code>pg_terminate_backend()</code></td>
+            </tr>
+            <tr>
+            <td>DDL 持锁导致 autovacuum 等锁</td>
+            <td><code>SELECT * FROM pg_locks WHERE NOT granted</code></td>
+            <td>取消 DDL 或等它完成</td>
+            </tr>
+            </tbody>
+            </table>
+            <hr />
+            <h2 id="三replication-slot-溢出多米诺效应">三、replication
+            slot 溢出多米诺效应</h2>
+            <h3 id="现象-1">3.1 现象</h3>
+            <p>Standby 宕机几个小时后，Primary 也宕机了。检查发现
+            Primary 的磁盘被 <code>pg_wal</code> 目录占满——而
+            <code>wal_keep_size</code> 设的并不大。重启后 PG
+            无法启动，因为它需要写 WAL 但磁盘满了。</p>
+            <h3 id="根因-1">3.2 根因</h3>
+            <p>Replication slot 是 PG 流复制的核心机制：Primary 上的
+            slot 记录 standby 当前消费到哪个 WAL
+            LSN（<code>restart_lsn</code>），Primary 保证不会回收这个
+            LSN 之前的 WAL 段——这样即使 standby
+            短暂断开，重连后也能从上次读到的位置继续。</p>
+            <p>但 slot 的保护逻辑是<strong>无条件</strong>的：只要 slot
+            存在，<code>restart_lsn</code> 之前的 WAL
+            段就<strong>绝不回收</strong>，不管 standby
+            是否还活着、不管磁盘还有多少空间。</p>
+            <p>源码路径：</p>
+            <div class="sourceCode" id="cb8"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/replication/slot.c, GetOldestSafeRestartLSN()</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 遍历 pg_replication_slots，找到最老的 restart_lsn</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 这个 LSN 即为 WAL 回收的&quot;安全边界&quot;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 如果某个 slot 的 restart_lsn 非常老，所有 WAL 段都不能回收</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>```text</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>`wal_keep_size` 和 slot 的关系经常被误解：它们不是<span class="st">&quot;取最大值&quot;</span>，而是<span class="op">**</span>叠加<span class="op">**</span>。`wal_keep_size` 说<span class="st">&quot;至少保留 X MB 的 WAL&quot;</span>，slot 说<span class="st">&quot;不管 X 是多少，restart_lsn 之前的都要保留&quot;</span>。如果 slot 的 restart_lsn 比 `wal_keep_size` 覆盖的范围更老，slot 的约束生效，保留下来的 WAL 会远超 `wal_keep_size`。</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>多米诺效应：</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="fl">1.</span> Standby 因网络、磁盘或进程问题宕机。</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="fl">2.</span> Primary 上的 slot 状态变为 `active <span class="op">=</span> false`（因为 WAL Sender 进程断开），但 `restart_lsn` 停在上次 standby 确认的位置。</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="fl">3.</span> Primary 继续接受写入，WAL 持续产生，但因为 slot 不推进，旧 WAL 段无法回收。</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="fl">4.</span> `pg_wal` 目录开始膨胀。`wal_keep_size` 不限制 slot 保留的 WAL。</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="fl">5.</span> 磁盘满 → Primary 无法继续写 WAL → PANIC → crash。</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="fl">6.</span> 重启后磁盘仍满，PG 无法写 WAL 进入 recovery → 无法启动。</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 3.3 时序推演</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>sequenceDiagram</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    participant Primary as Primary</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>    participant Slot as Replication Slot</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>    participant WAL as pg_wal 目录</span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>    participant Disk as 磁盘</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>    participant Standby as Standby</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>    Note over Primary<span class="op">,</span>Standby<span class="op">:</span> T0<span class="op">:</span> 正常复制</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>    Standby<span class="op">-&gt;&gt;</span>Primary<span class="op">:</span> 确认消费到 LSN <span class="op">=</span> <span class="dv">0</span><span class="op">/</span><span class="dv">30000000</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>    Primary<span class="op">-&gt;&gt;</span>Slot<span class="op">:</span> 更新 restart_lsn <span class="op">=</span> <span class="dv">0</span><span class="op">/</span><span class="dv">30000000</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    Primary<span class="op">-&gt;&gt;</span>WAL<span class="op">:</span> 回收 <span class="dv">0</span><span class="op">/</span><span class="dv">30000000</span> 之前的 WAL 段</span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    Note over Primary<span class="op">,</span>Standby<span class="op">:</span> T1<span class="op">:</span> Standby 宕机</span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    Standby<span class="op">--</span>xPrimary<span class="op">:</span> 连接断开</span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>    Slot<span class="op">-&gt;&gt;</span>Slot<span class="op">:</span> active <span class="op">=</span> <span class="kw">false</span><span class="op">,</span> restart_lsn 冻结在 <span class="dv">0</span><span class="op">/</span><span class="dv">30000000</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>    Note over Primary<span class="op">,</span>Standby<span class="op">:</span> T2<span class="op">:</span> Primary 持续写入</span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    Primary<span class="op">-&gt;&gt;</span>WAL<span class="op">:</span> 新 WAL<span class="op">:</span> <span class="dv">0</span><span class="op">/</span><span class="dv">30000000</span> → <span class="dv">0</span><span class="op">/</span><span class="dv">50000000</span> → <span class="dv">0</span><span class="op">/</span>A0000000</span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    Primary<span class="op">--&gt;&gt;</span>WAL<span class="op">:</span> 尝试回收旧段 → 被 slot 阻止</span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>    Disk<span class="op">-&gt;&gt;</span>Disk<span class="op">:</span> pg_wal 持续增长<span class="op">:</span> <span class="dv">500</span><span class="er">MB</span> → <span class="dv">2</span><span class="er">GB</span> → <span class="dv">10</span><span class="er">GB</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>    Note over Primary<span class="op">,</span>Standby<span class="op">:</span> T3<span class="op">:</span> 磁盘满</span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    Primary<span class="op">-&gt;&gt;</span>WAL<span class="op">:</span> 申请新 WAL 段</span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>    WAL<span class="op">--&gt;&gt;</span>Primary<span class="op">:</span> 磁盘空间不足</span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>    Primary<span class="op">-&gt;&gt;</span>Primary<span class="op">:</span> PANIC<span class="op">:</span> could not write to WAL</span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>    Note over Primary<span class="op">:</span> 数据库 crash</span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>    Note over Primary<span class="op">,</span>Standby<span class="op">:</span> T4<span class="op">:</span> 尝试重启</span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>    Primary<span class="op">-&gt;&gt;</span>Primary<span class="op">:</span> 启动 → 需要写 WAL → 磁盘满 → 失败</span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>    Note over Primary<span class="op">:</span> 死锁：需要删文件腾空间，但删 WAL 可能丢掉未归档的数据</span></code></pre></div>
+            <h3 id="排查-sql-2">3.4 排查 SQL</h3>
+            <div class="sourceCode" id="cb9"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第一步：查看所有 slot 的状态，重点关注 active=f 且 restart_lsn 落后很多的</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> slot_name, slot_type, <span class="kw">database</span>, active,</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) <span class="kw">AS</span> behind,</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>       restart_lsn,</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>       <span class="cf">CASE</span> <span class="cf">WHEN</span> active <span class="op">=</span> <span class="kw">false</span> <span class="kw">AND</span> pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) <span class="op">&gt;</span> <span class="dv">1073741824</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>            <span class="cf">THEN</span> <span class="st">&#39;DANGER&#39;</span>  <span class="co">-- 落后 1GB 以上</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>            <span class="cf">WHEN</span> active <span class="op">=</span> <span class="kw">false</span> <span class="cf">THEN</span> <span class="st">&#39;WARNING&#39;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>            <span class="cf">ELSE</span> <span class="st">&#39;OK&#39;</span> <span class="cf">END</span> <span class="kw">AS</span> status</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_replication_slots</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) <span class="kw">DESC</span>;</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第二步：检查 pg_wal 目录的实际占用</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_size_pretty(<span class="fu">sum</span>(<span class="kw">size</span>)) <span class="kw">AS</span> pg_wal_size</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_ls_waldir();</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第三步：确认磁盘剩余空间</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="co">--（需要在 OS 层执行 df -h $PGDATA/pg_wal，或者用 pg_ls_dir 间接观察）</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>### <span class="fl">3.5</span> 修复边界</span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>| 场景 | 操作 | 后果 |</span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|------|</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>| <span class="kw">Standby</span> 可恢复（临时网络故障） | 修复网络<span class="op">/</span>重启 <span class="kw">standby</span> → 它会自动重连 → slot restart_lsn 推进 → WAL 自动回收 | 无需操作 |</span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>| <span class="kw">Standby</span> 永久性不可恢复（硬件损坏） | `SELECT pg_drop_replication_slot(<span class="st">&#39;slot_name&#39;</span>)` | 删除 slot。后果：必须重建 standby（重新 pg_basebackup），因为删掉的 WAL 可能包含 <span class="kw">standby</span> 需要的记录 |</span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>| 磁盘已满但还没 crash | 立即 `pg_drop_replication_slot()` → 等 <span class="kw">checkpoint</span> 回收 WAL | 如果 slot 是 sync <span class="kw">standby</span> 的，删除意味着放弃同步复制保护 |</span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>| 磁盘已满且已 crash | OS 层排查：确认 `pg_wal` 是否真的占满 → 如果有未归档 WAL，手动 `pg_waldump` 确认内容 → 决定是删 WAL 腾空间还是先 dd 到其他盘 | `pg_resetwal` 可以清空 WAL 重启，但代价极大（见第 <span class="dv">24</span> 章） |</span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>关键决策点<span class="op">**</span>：删除 replication slot 之前，必须确认 <span class="kw">standby</span> 是否还在用这个 slot。如果 <span class="kw">standby</span> 只是临时不可用但很快会恢复，删掉 slot 意味着必须重做 base backup——这是一个数小时的操作，取决于数据量。</span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>### <span class="fl">3.6</span> 监控埋点</span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a><span class="co">-- slot 落后 WAL 超过 1GB 的报警</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a><span class="co">-- 放在 cron 每分钟跑</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> slot_name,</span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a>       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) <span class="kw">AS</span> lag_bytes</span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_replication_slots</span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) <span class="op">&gt;</span> <span class="dv">1073741824</span>;</span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a><span class="co">-- pg_wal 磁盘占大盘百分比（需要 OS 层配合）</span></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a><span class="co">-- node_exporter + disk usage alert on $PGDATA/pg_wal</span></span></code></pre></div>
+            <hr />
+            <h2 id="四oom-连锁-kill">四、OOM 连锁 kill</h2>
+            <h3 id="现象-2">4.1 现象</h3>
+            <p>PG 运行正常，突然所有连接断开。应用日志显示
+            <code>connection reset by peer</code> 或
+            <code>server closed the connection unexpectedly</code>。PG
+            日志没有明显异常（因为 PG 进程被 OS
+            杀掉，来不及写日志），但几分钟后 PG 自己启动了（前提是
+            <code>restart_after_crash=on</code>）。用 <code>dmesg</code>
+            能看到：</p>
+            <pre class="text"><code>Out of memory: Killed process 12345 (postgres) total-vm:8388608kB, anon-rss:3145728kB</code></pre>
+            <h3 id="根因-2">4.2 根因</h3>
+            <p>Linux OOM Killer 在系统内存耗尽时，根据进程的
+            <code>oom_score</code> 选择并 kill 进程。PG 的 Backend
+            进程（尤其是正在执行大查询、持有大量 work_mem
+            的进程）通常是内存消耗大户，OOM Killer 很可能选中它们。</p>
+            <p>OOM Killer 杀掉单个 Backend 后，Postmaster 通过
+            <code>SIGCHLD</code> → <code>reaper()</code>
+            感知到子进程异常退出。如果
+            <code>restart_after_crash=on</code>（默认），Postmaster 执行
+            <strong>full restart</strong>：给每个子进程发
+            <code>SIGQUIT</code>，回收所有共享内存资源，然后重新初始化共享内存并重新
+            fork 所有辅助进程和 Backend。这意味着：</p>
+            <ol type="1">
+            <li>所有正在运行的事务全部回滚。</li>
+            <li>所有客户端连接全部断开。</li>
+            <li>所有 idle in transaction 的连接也断开。</li>
+            <li>如果应用立即重连，可能再次触发相同查询，再次 OOM——进入
+            kill-restart 循环。</li>
+            </ol>
+            <div class="sourceCode" id="cb11"><pre
+            class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/backend/postmaster/postmaster.c, HandleChildCrash()</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 关键逻辑：</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 1. 确定 pmdie 模式（是否正在 shutdown？如果 crash 发生在 shutdown 期间，不 restart）</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. 如果 restart_after_crash=on → FatalError = true → 进入 PM_RUN 重新初始化</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">// 3. FatalError = true 时，所有 Backend 在下一次 ReadCommand() 时检查并退出</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#</span><span class="er">## 4.3 时序推演</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>sequenceDiagram</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>    participant App as 应用</span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>    participant BE as Backend <span class="op">(</span>大查询<span class="op">)</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>    participant PM as Postmaster</span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>    participant OS as Linux OOM Killer</span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>OS<span class="op">:</span> 状态：<span class="dv">100</span> 个连接，其中 <span class="dv">1</span> 个执行复杂 hash join</span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>    BE<span class="op">-&gt;&gt;</span>BE<span class="op">:</span> hash join build 阶段申请 work_mem × hash_mem_multiplier</span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>    BE<span class="op">-&gt;&gt;</span>OS<span class="op">:</span> 多次 malloc，累计 <span class="dv">500</span><span class="er">MB</span><span class="op">+</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>    Note over OS<span class="op">:</span> 系统空闲内存不足</span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>    OS<span class="op">-&gt;&gt;</span>BE<span class="op">:</span> OOM Killer 选中此 Backend <span class="op">(</span>oom_score 高<span class="op">)</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>    OS<span class="op">-&gt;&gt;</span>BE<span class="op">:</span> SIGKILL</span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>    BE<span class="op">--</span>xPM<span class="op">:</span> 子进程异常退出</span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a>    PM<span class="op">-&gt;&gt;</span>PM<span class="op">:</span> SIGCHLD → reaper<span class="op">()</span> → HandleChildCrash<span class="op">()</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>    PM<span class="op">-&gt;&gt;</span>PM<span class="op">:</span> restart_after_crash<span class="op">=</span>on → 标记 FatalError<span class="op">=</span><span class="kw">true</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>    PM<span class="op">-&gt;&gt;</span>App<span class="op">:</span> 给所有剩余 Backend 发 SIGQUIT</span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>    App<span class="op">--</span>xPM<span class="op">:</span> <span class="dv">200</span> 个连接全部断开</span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>    PM<span class="op">-&gt;&gt;</span>PM<span class="op">:</span> 重新 InitPostgres → fork 辅助进程</span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>OS<span class="op">:</span> PG 重新可用，但所有连接需重建</span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a>    App<span class="op">-&gt;&gt;</span>PM<span class="op">:</span> 连接池自动重连</span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>    App<span class="op">-&gt;&gt;</span>BE<span class="op">:</span> 再次执行相同查询</span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a>    Note over App<span class="op">,</span>OS<span class="op">:</span> 如果 work_mem 配置没变 → 再次 OOM → 循环</span></code></pre></div>
+            <h3 id="排查-sql-3">4.4 排查 SQL</h3>
+            <div class="sourceCode" id="cb12"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第一步：确认 crash 后 PG 状态</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pg_postmaster_start_time();  <span class="co">-- 如果时间很近，说明刚 restart</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第二步（如果 PG 已恢复）：找出内存消耗大户</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co">-- 需要 pg_stat_statements 有足够历史</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> queryid,</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>       calls,</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>       mean_exec_time:<span class="ch">:numeric</span>(<span class="dv">10</span>,<span class="dv">1</span>) <span class="kw">AS</span> avg_ms,</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>       (shared_blks_dirtied <span class="op">+</span> local_blks_dirtied) <span class="op">*</span> <span class="dv">8192</span> <span class="op">/</span> calls <span class="kw">AS</span> avg_dirty_bytes_per_call,</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>       (temp_blks_read <span class="op">+</span> temp_blks_written) <span class="op">*</span> <span class="dv">8192</span> <span class="op">/</span> calls <span class="kw">AS</span> avg_temp_bytes_per_call,</span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>       <span class="kw">LEFT</span>(<span class="kw">query</span>, <span class="dv">150</span>)</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_statements</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> calls <span class="op">&gt;</span> <span class="dv">10</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> (temp_blks_read <span class="op">+</span> temp_blks_written) <span class="op">*</span> <span class="dv">8192</span> <span class="op">/</span> calls <span class="kw">DESC</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">10</span>;</span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第三步：确认当前配置</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>SHOW work_mem;</span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>SHOW hash_mem_multiplier;</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>SHOW maintenance_work_mem;</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>SHOW shared_buffers;</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>SHOW max_connections;</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第四步：事后查 OS 日志（在 shell 中执行）</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a><span class="co">-- dmesg | grep -i &quot;killed process&quot;</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="co">-- journalctl -u postgresql --since &quot;1 hour ago&quot;</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>### <span class="fl">4.5</span> 修复边界</span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a>| 操作 | 效果 | 边界 |</span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|------|</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a>| 降低 `work_mem` <span class="op">+</span> `hash_mem_multiplier` | 减少单个查询的峰值内存 | 可能导致 temp <span class="kw">file</span> 增多，I<span class="op">/</span>O 升高 |</span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a>| 降低 `max_connections` | 减少并发连接数，降低乘法效应 | 需要重启；太小导致连接排队 |</span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>| 增加物理内存 <span class="op">/</span> swap | 提高系统内存总量 | 硬件升级；swap 太慢不能替代真实内存 |</span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a>| 查询优化：替换 <span class="kw">hash</span> <span class="kw">join</span> 为 nestloop（对于小表） | 避免 <span class="kw">hash</span> <span class="kw">table</span> 的大内存分配 | 需要确认 nestloop 确实不慢；可能需要 hint 或 <span class="kw">session</span> 级 `SET enable_hashjoin <span class="op">=</span> off` |</span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a>| `ALTER <span class="fu">USER</span> app_user <span class="kw">SET</span> statement_timeout <span class="op">=</span> <span class="st">&#39;30s&#39;</span>` | 防止单个查询跑太久 | 也会超时 <span class="kw">kill</span> 正常的长报表查询 |</span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>| 部署 pgbouncer（transaction pooling） | 减少 PG 实际连接数 | 见第 <span class="dv">1</span> 节的边界 |</span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>关于 `restart_after_crash`<span class="op">**</span>：关了它（`ALTER <span class="kw">SYSTEM</span> <span class="kw">SET</span> restart_after_crash <span class="op">=</span> off`）可以防止 OOM <span class="kw">kill</span> 后的连锁 restart——但代价是：如果 PG crash 了，它不会自己起来，你需要手动启动。生产环境通常保留 `on`，但搭配进程监控（systemd `Restart<span class="op">=</span><span class="kw">on</span><span class="op">-</span>failure`）作为双重保险。</span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a>## 五、长事务（idle <span class="kw">in</span> transaction）的隐性破坏</span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a>### <span class="fl">5.1</span> 现象</span>
+<span id="cb12-47"><a href="#cb12-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-48"><a href="#cb12-48" aria-hidden="true" tabindex="-1"></a>症状分散、隐蔽，但共同指向一个根因：</span>
+<span id="cb12-49"><a href="#cb12-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-50"><a href="#cb12-50" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 凌晨 <span class="dv">3</span> 点跑 `ALTER <span class="kw">TABLE</span> <span class="op">..</span>. <span class="kw">ADD</span> COLUMN` 的 <span class="kw">DDL</span> hang 住，永远不返回。</span>
+<span id="cb12-51"><a href="#cb12-51" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> 表在膨胀——`pg_stat_user_tables.n_dead_tup` 持续增长，但 autovacuum 正常触发，VACUUM 也正常完成。</span>
+<span id="cb12-52"><a href="#cb12-52" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> `pg_stat_activity` 里有一个 `idle <span class="kw">in</span> transaction` 状态的连接，已经存在了 <span class="dv">8</span> 小时。</span>
+<span id="cb12-53"><a href="#cb12-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-54"><a href="#cb12-54" aria-hidden="true" tabindex="-1"></a>### <span class="fl">5.2</span> 根因</span>
+<span id="cb12-55"><a href="#cb12-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-56"><a href="#cb12-56" aria-hidden="true" tabindex="-1"></a>PG 的 `idle <span class="kw">in</span> transaction` 是一个很容易被忽略但破坏力极强的状态——它和 `idle`（正常空闲连接）不同：</span>
+<span id="cb12-57"><a href="#cb12-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-58"><a href="#cb12-58" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`idle`<span class="op">**</span>：连接在事务中没有执行任何 DML，或者事务已经提交。实际上连接完全空闲，不会阻塞 VACUUM。</span>
+<span id="cb12-59"><a href="#cb12-59" aria-hidden="true" tabindex="-1"></a><span class="op">-</span> <span class="op">**</span>`idle <span class="kw">in</span> transaction`<span class="op">**</span>：连接已经执行了至少一条 DML（例如 `SELECT <span class="op">*</span> <span class="kw">FROM</span> t <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">1</span>`），事务还没有 `COMMIT` 或 `ROLLBACK`。此时连接持有快照（snapshot），持有表级或行级锁。</span>
+<span id="cb12-60"><a href="#cb12-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-61"><a href="#cb12-61" aria-hidden="true" tabindex="-1"></a>长事务的两种破坏路径：</span>
+<span id="cb12-62"><a href="#cb12-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-63"><a href="#cb12-63" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>路径一：VACUUM 无法回收 dead tuple<span class="op">**</span></span>
+<span id="cb12-64"><a href="#cb12-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-65"><a href="#cb12-65" aria-hidden="true" tabindex="-1"></a>VACUUM 回收 dead tuple 的核心判断是：<span class="op">**</span>这个 dead tuple 对于所有现存事务是否都是不可见的？<span class="op">**</span> 如果连接 A 的事务开始于 <span class="dv">8</span> 小时前，它持有的快照只包含 <span class="dv">8</span> 小时前已提交的数据。那么这 <span class="dv">8</span> 小时内产生的所有 dead tuple——即使 `xmax` 的事务早已提交——对连接 A 的快照来说，仍然是应当可见的旧版本。VACUUM 必须保留它们。</span>
+<span id="cb12-66"><a href="#cb12-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-67"><a href="#cb12-67" aria-hidden="true" tabindex="-1"></a>```c</span>
+<span id="cb12-68"><a href="#cb12-68" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> src<span class="op">/</span>backend<span class="op">/</span><span class="kw">access</span><span class="op">/</span><span class="kw">heap</span><span class="op">/</span>vacuumlazy.c, lazy_scan_heap()</span>
+<span id="cb12-69"><a href="#cb12-69" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> 对所有 dead tuple 调用 HeapTupleSatisfiesVacuumHorizon()</span>
+<span id="cb12-70"><a href="#cb12-70" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> 如果 dead tuple 的 xmax 比任何现存事务的 xmin 更新，不能回收</span>
+<span id="cb12-71"><a href="#cb12-71" aria-hidden="true" tabindex="-1"></a><span class="op">//</span> OldestXmin <span class="op">=</span> 所有活跃事务 <span class="op">+</span> idle <span class="kw">in</span> <span class="kw">transaction</span> 的最小 xmin</span></code></pre></div>
+            <p>这意味着：一个 8 小时的长事务，相当于制造了一个 8
+            小时的”死 tuple 保护区”。在这 8 小时内产生的所有 dead
+            tuple，VACUUM 都不敢碰。表的膨胀和 <code>n_dead_tup</code>
+            的增长不会因为你配了激进的 autovacuum 而停止。</p>
+            <p><strong>路径二：持锁阻塞 DDL</strong></p>
+            <p><code>idle in transaction</code> 事务在执行第一条 DML
+            时，可能获取了各种锁——对表的
+            <code>AccessShareLock</code>（SELECT 获取）、对行的
+            <code>RowExclusiveLock</code>（UPDATE/DELETE
+            获取）、甚至是更高等级的锁。<code>ALTER TABLE</code> 需要
+            <code>AccessExclusiveLock</code>——它必须等所有持有该表任何级别锁的事务释放锁。</p>
+            <p>这就是凌晨 DDL 被阻塞的经典场景：有人白天在 psql 里
+            <code>BEGIN; SELECT * FROM big_table LIMIT 1;</code>，然后离开座位。这个事务持有一个
+            <code>AccessShareLock</code> on <code>big_table</code>。晚上
+            DBA 跑 <code>ALTER TABLE big_table ADD COLUMN ...</code>
+            需要
+            <code>AccessExclusiveLock</code>——它排在等锁队列里，而队列是
+            FIFO 的。在它被锁住期间，所有后续需要
+            <code>AccessShareLock</code>
+            的查询（即几乎所有读查询）也会被堵在等锁队列里。</p>
+            <div class="sourceCode" id="cb13"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 可以用这个查询直观看到锁等待链：</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> blocked.pid <span class="kw">AS</span> blocked_pid,</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>       blocked.<span class="kw">query</span> <span class="kw">AS</span> blocked_query,</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>       blocking.pid <span class="kw">AS</span> blocking_pid,</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>       blocking.<span class="kw">query</span> <span class="kw">AS</span> blocking_query,</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>       blocking.state <span class="kw">AS</span> blocking_state,</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> blocking.xact_start <span class="kw">AS</span> blocking_txn_age</span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity blocked</span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_locks blk_l <span class="kw">ON</span> blocked.pid <span class="op">=</span> blk_l.pid <span class="kw">AND</span> <span class="kw">NOT</span> blk_l.granted</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_locks blg_l <span class="kw">ON</span> blk_l.locktype <span class="op">=</span> blg_l.locktype</span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">AND</span> blk_l.<span class="kw">database</span> <span class="op">=</span> blg_l.<span class="kw">database</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">AND</span> blk_l.relation <span class="op">=</span> blg_l.relation</span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">AND</span> blg_l.granted</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity blocking <span class="kw">ON</span> blg_l.pid <span class="op">=</span> blocking.pid</span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> blocked.wait_event_type <span class="op">=</span> <span class="st">&#39;Lock&#39;</span>;</span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>### <span class="fl">5.3</span> 时序推演</span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>```mermaid</span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>sequenceDiagram</span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>    participant <span class="fu">User</span> <span class="kw">as</span> 用户 A</span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>    participant TXN <span class="kw">as</span> 长事务连接</span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>    participant App <span class="kw">as</span> 应用写入</span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>    participant VAC <span class="kw">as</span> Autovacuum</span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>    participant <span class="kw">DBA</span> <span class="kw">as</span> <span class="kw">DBA</span> (<span class="kw">DDL</span>)</span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> <span class="fu">User</span>,<span class="kw">DBA</span>: T0: 用户 A 在 psql 中开启事务并读取</span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>    <span class="fu">User</span><span class="op">-&gt;&gt;</span>TXN: <span class="cf">BEGIN</span>; <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> orders <span class="kw">LIMIT</span> <span class="dv">1</span>;</span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    TXN<span class="op">-&gt;&gt;</span>TXN: 获取 AccessShareLock <span class="kw">on</span> orders</span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>    TXN<span class="op">-&gt;&gt;</span>TXN: 创建 <span class="kw">snapshot</span> (xmin <span class="op">=</span> <span class="dv">1000000</span>)</span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> TXN: 用户离开座位，事务保持 <span class="ot">&quot;idle in transaction&quot;</span></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> <span class="fu">User</span>,<span class="kw">DBA</span>: T0<span class="op">+</span><span class="dv">1</span>h: 应用正常读写</span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a>    App<span class="op">-&gt;&gt;</span>TXN: <span class="kw">UPDATE</span> orders <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;shipped&#39;</span> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> <span class="dv">42</span></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a>    App<span class="op">-&gt;&gt;</span>App: COMMIT（生成 dead tuple）</span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a>    VAC<span class="op">-&gt;&gt;</span>TXN: autovacuum: 尝试回收 dead tuple</span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a>    TXN<span class="co">--&gt;&gt;VAC: OldestXmin = 1000000 (长事务的 xmin)</span></span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> VAC: 无法回收 xmin <span class="op">&gt;</span> <span class="dv">1000000</span> 之后的 dead tuple</span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> <span class="fu">User</span>,<span class="kw">DBA</span>: T0<span class="op">+</span><span class="dv">8</span>h: <span class="kw">DBA</span> 执行 <span class="kw">DDL</span></span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a>    <span class="kw">DBA</span><span class="op">-&gt;&gt;</span>TXN: <span class="kw">ALTER</span> <span class="kw">TABLE</span> orders <span class="kw">ADD</span> <span class="kw">COLUMN</span> note TEXT;</span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">DBA</span><span class="op">-&gt;&gt;</span><span class="kw">DBA</span>: 需要 AccessExclusiveLock</span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a>    <span class="kw">DBA</span><span class="co">--&gt;&gt;DBA: 排队等锁（长事务持有 AccessShareLock）</span></span>
+<span id="cb13-45"><a href="#cb13-45" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> <span class="kw">DBA</span>: <span class="kw">DDL</span> hang 住，后续读查询也排队</span>
+<span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> <span class="fu">User</span>,<span class="kw">DBA</span>: T0<span class="op">+</span><span class="dv">8</span>h<span class="op">+</span><span class="dv">5</span>min: 排查</span>
+<span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a>    <span class="kw">DBA</span><span class="op">-&gt;&gt;</span><span class="kw">DBA</span>: <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> pg_stat_activity <span class="kw">WHERE</span> state<span class="op">=</span><span class="st">&#39;idle in transaction&#39;</span></span>
+<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>    <span class="kw">DBA</span><span class="op">-&gt;&gt;</span><span class="kw">DBA</span>: <span class="kw">SELECT</span> pg_terminate_backend(长事务 pid)</span>
+<span id="cb13-50"><a href="#cb13-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-51"><a href="#cb13-51" aria-hidden="true" tabindex="-1"></a>    Note <span class="kw">over</span> VAC: VACUUM 可以继续、DDL 获得锁、膨胀开始修复</span></code></pre></div>
+            <h3 id="排查-sql-4">5.4 排查 SQL</h3>
+            <div class="sourceCode" id="cb14"><pre
+            class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第一步：找出所有 idle in transaction 状态且超过一定时长的连接</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, usename, application_name, client_addr,</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>       state, now() <span class="op">-</span> xact_start <span class="kw">AS</span> txn_age,</span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> state_change <span class="kw">AS</span> state_age,</span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>       wait_event_type, wait_event,</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>       <span class="kw">query</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;idle in transaction&#39;</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> now() <span class="op">-</span> xact_start <span class="op">&gt;</span> <span class="dt">interval</span> <span class="st">&#39;5 minutes&#39;</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> xact_start;</span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第二步：看长事务持有哪些锁</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> l.pid, l.locktype, l.<span class="kw">database</span>, l.relation:<span class="ch">:regclass</span> <span class="kw">AS</span> locked_table,</span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>       l.<span class="kw">mode</span>, l.granted,</span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>       a.state, now() <span class="op">-</span> a.xact_start <span class="kw">AS</span> txn_age,</span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a>       a.<span class="kw">query</span> <span class="kw">AS</span> last_query</span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_locks l</span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity a <span class="kw">ON</span> l.pid <span class="op">=</span> a.pid</span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> a.state <span class="op">=</span> <span class="st">&#39;idle in transaction&#39;</span></span>
+<span id="cb14-20"><a href="#cb14-20" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> now() <span class="op">-</span> a.xact_start <span class="op">&gt;</span> <span class="dt">interval</span> <span class="st">&#39;5 minutes&#39;</span></span>
+<span id="cb14-21"><a href="#cb14-21" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> a.xact_start, l.relation;</span>
+<span id="cb14-22"><a href="#cb14-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-23"><a href="#cb14-23" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第三步：看是否有 DDL 在等锁</span></span>
+<span id="cb14-24"><a href="#cb14-24" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> pid, usename, now() <span class="op">-</span> query_start <span class="kw">AS</span> waiting_for,</span>
+<span id="cb14-25"><a href="#cb14-25" aria-hidden="true" tabindex="-1"></a>       wait_event_type, wait_event,</span>
+<span id="cb14-26"><a href="#cb14-26" aria-hidden="true" tabindex="-1"></a>       <span class="kw">query</span></span>
+<span id="cb14-27"><a href="#cb14-27" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb14-28"><a href="#cb14-28" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;Lock&#39;</span></span>
+<span id="cb14-29"><a href="#cb14-29" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> wait_event <span class="op">=</span> <span class="st">&#39;relation&#39;</span></span>
+<span id="cb14-30"><a href="#cb14-30" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> query_start;</span>
+<span id="cb14-31"><a href="#cb14-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-32"><a href="#cb14-32" aria-hidden="true" tabindex="-1"></a><span class="co">-- 第四步：追踪完整的锁等待链</span></span>
+<span id="cb14-33"><a href="#cb14-33" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> blocked.pid <span class="kw">AS</span> blocked_pid,</span>
+<span id="cb14-34"><a href="#cb14-34" aria-hidden="true" tabindex="-1"></a>       blocked.<span class="kw">query</span> <span class="kw">AS</span> blocked_query,</span>
+<span id="cb14-35"><a href="#cb14-35" aria-hidden="true" tabindex="-1"></a>       blocking.pid <span class="kw">AS</span> blocking_pid,</span>
+<span id="cb14-36"><a href="#cb14-36" aria-hidden="true" tabindex="-1"></a>       blocking.<span class="kw">query</span> <span class="kw">AS</span> holding_query,</span>
+<span id="cb14-37"><a href="#cb14-37" aria-hidden="true" tabindex="-1"></a>       blocking.state <span class="kw">AS</span> holding_state,</span>
+<span id="cb14-38"><a href="#cb14-38" aria-hidden="true" tabindex="-1"></a>       now() <span class="op">-</span> blocking.xact_start <span class="kw">AS</span> holding_txn_age</span>
+<span id="cb14-39"><a href="#cb14-39" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity blocked</span>
+<span id="cb14-40"><a href="#cb14-40" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_locks blk_l <span class="kw">ON</span> blocked.pid <span class="op">=</span> blk_l.pid <span class="kw">AND</span> <span class="kw">NOT</span> blk_l.granted</span>
+<span id="cb14-41"><a href="#cb14-41" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_locks blg_l <span class="kw">ON</span> blk_l.locktype <span class="op">=</span> blg_l.locktype</span>
+<span id="cb14-42"><a href="#cb14-42" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">AND</span> blk_l.<span class="kw">database</span> <span class="op">=</span> blg_l.<span class="kw">database</span></span>
+<span id="cb14-43"><a href="#cb14-43" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">AND</span> blk_l.relation <span class="op">=</span> blg_l.relation</span>
+<span id="cb14-44"><a href="#cb14-44" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">AND</span> blg_l.granted</span>
+<span id="cb14-45"><a href="#cb14-45" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> pg_stat_activity blocking <span class="kw">ON</span> blg_l.pid <span class="op">=</span> blocking.pid;</span>
+<span id="cb14-46"><a href="#cb14-46" aria-hidden="true" tabindex="-1"></a>```bash</span>
+<span id="cb14-47"><a href="#cb14-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-48"><a href="#cb14-48" aria-hidden="true" tabindex="-1"></a>### <span class="fl">5.5</span> 修复边界</span>
+<span id="cb14-49"><a href="#cb14-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-50"><a href="#cb14-50" aria-hidden="true" tabindex="-1"></a>| 操作 | 效果 | 边界 |</span>
+<span id="cb14-51"><a href="#cb14-51" aria-hidden="true" tabindex="-1"></a>|<span class="co">------|------|------|</span></span>
+<span id="cb14-52"><a href="#cb14-52" aria-hidden="true" tabindex="-1"></a>| `SELECT pg_terminate_backend(pid)` | 立即终止长事务，释放锁和快照 | 事务回滚：该事务内所有未提交的 DML 丢失。如果 DML 已经持久化到磁盘但所在事务被回滚，这部分变更丢失 |</span>
+<span id="cb14-53"><a href="#cb14-53" aria-hidden="true" tabindex="-1"></a>| `ALTER <span class="kw">SYSTEM</span> <span class="kw">SET</span> idle_in_transaction_session_timeout <span class="op">=</span> <span class="st">&#39;10min&#39;</span>` | 超过 <span class="dv">10</span> 分钟的 idle <span class="kw">in</span> <span class="kw">transaction</span> 自动断开 | 只影响新连接。需要 `pg_reload_conf()` |</span>
+<span id="cb14-54"><a href="#cb14-54" aria-hidden="true" tabindex="-1"></a>| 应用程序端加事务超时 | 在应用层控制 `SET statement_timeout` 或使用连接池的事务超时 | 需要应用代码配合 |</span>
+<span id="cb14-55"><a href="#cb14-55" aria-hidden="true" tabindex="-1"></a>| 禁止在交互式 psql 中使用 `AUTOCOMMIT<span class="op">=</span>off` | 防止用户忘记 <span class="kw">commit</span> | 可能影响需要手动事务的工作流 |</span>
+<span id="cb14-56"><a href="#cb14-56" aria-hidden="true" tabindex="-1"></a>| 检查 ORM 框架的事务管理 | 很多 ORM 默认 `autocommit<span class="op">=</span>false` 且在异常路径中不 <span class="kw">rollback</span> | 需检查 Django <span class="op">/</span> SQLAlchemy <span class="op">/</span> Hibernate 等框架的配置 |</span>
+<span id="cb14-57"><a href="#cb14-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-58"><a href="#cb14-58" aria-hidden="true" tabindex="-1"></a><span class="op">**</span>关于 `pg_terminate_backend`<span class="op">**</span>：杀掉长事务后，VACUUM 可以马上回收之前被阻塞的 dead tuple，但已经积累的膨胀不会自动消失——VACUUM 回收空间但不收缩物理文件。如果需要回收磁盘空间到 OS，必须执行 `VACUUM FULL`（会锁表，阻塞读写）或 `pg_repack`（需要扩展，不锁表但需要额外磁盘空间）。</span>
+<span id="cb14-59"><a href="#cb14-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-60"><a href="#cb14-60" aria-hidden="true" tabindex="-1"></a>### <span class="fl">5.6</span> 监控埋点</span>
+<span id="cb14-61"><a href="#cb14-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-62"><a href="#cb14-62" aria-hidden="true" tabindex="-1"></a>```sql</span>
+<span id="cb14-63"><a href="#cb14-63" aria-hidden="true" tabindex="-1"></a><span class="co">-- idle in transaction 的持续时间和数量</span></span>
+<span id="cb14-64"><a href="#cb14-64" aria-hidden="true" tabindex="-1"></a><span class="co">-- 告警阈值：任何连接 &gt; 15 分钟，或数量 &gt; 5</span></span>
+<span id="cb14-65"><a href="#cb14-65" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> idle_in_txn_cnt,</span>
+<span id="cb14-66"><a href="#cb14-66" aria-hidden="true" tabindex="-1"></a>       <span class="fu">max</span>(now() <span class="op">-</span> xact_start) <span class="kw">AS</span> max_txn_age</span>
+<span id="cb14-67"><a href="#cb14-67" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb14-68"><a href="#cb14-68" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> state <span class="op">=</span> <span class="st">&#39;idle in transaction&#39;</span>;</span>
+<span id="cb14-69"><a href="#cb14-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-70"><a href="#cb14-70" aria-hidden="true" tabindex="-1"></a><span class="co">-- 锁等待超过 30 秒的查询</span></span>
+<span id="cb14-71"><a href="#cb14-71" aria-hidden="true" tabindex="-1"></a><span class="co">-- 告警阈值：&gt; 0</span></span>
+<span id="cb14-72"><a href="#cb14-72" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="fu">count</span>(<span class="op">*</span>) <span class="kw">AS</span> lock_waiting_cnt</span>
+<span id="cb14-73"><a href="#cb14-73" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> pg_stat_activity</span>
+<span id="cb14-74"><a href="#cb14-74" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> wait_event_type <span class="op">=</span> <span class="st">&#39;Lock&#39;</span></span>
+<span id="cb14-75"><a href="#cb14-75" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> now() <span class="op">-</span> query_start <span class="op">&gt;</span> <span class="dt">interval</span> <span class="st">&#39;30 seconds&#39;</span>;</span></code></pre></div>
+            <hr />
+            <h2 id="六五个故障的内核关联">六、五个故障的内核关联</h2>
+            <p>这五个故障不是孤立的。它们的交叉点构成了 PG
+            运维的”风险拓扑”：</p>
+            <table>
+            <colgroup>
+            <col style="width: 21%" />
+            <col style="width: 39%" />
+            <col style="width: 39%" />
+            </colgroup>
+            <thead>
+            <tr>
+            <th>故障</th>
+            <th>被什么触发</th>
+            <th>会触发什么</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+            <td>连接风暴</td>
+            <td>服务重启、流量尖峰、连接池配置错误</td>
+            <td>OOM kill（work_mem 乘法效应）</td>
+            </tr>
+            <tr>
+            <td>OOM kill</td>
+            <td>work_mem 过大、max_connections 过多、连接风暴</td>
+            <td>连锁 restart（<code>restart_after_crash=on</code>）→
+            连接风暴二次冲击</td>
+            </tr>
+            <tr>
+            <td>Wraparound</td>
+            <td>autovacuum 配置不当、长事务阻止 VACUUM</td>
+            <td>数据库只读</td>
+            </tr>
+            <tr>
+            <td>Replication slot 溢出</td>
+            <td>standby 宕机、slot 未清理</td>
+            <td>磁盘满 → Primary crash</td>
+            </tr>
+            <tr>
+            <td>长事务 (idle in transaction)</td>
+            <td>应用程序 bug、psql 交互式误操作</td>
+            <td>膨胀加速 × wraparound 风险上升 × DDL 阻塞</td>
+            </tr>
+            </tbody>
+            </table>
+            <p>一个不那么罕见的多故障耦合场景：Standby 宕机 → slot 保留
+            WAL 导致磁盘使用率上升到 90% → DBA 重启 Primary 想腾资源 →
+            重启后连接池瞬间重连 200 个连接 → 每个连接执行缓存的查询计划
+            → work_mem 乘法效应 → OOM kill → restart_after_crash → full
+            restart → 连接再次涌入 → OOM 循环。排查时看到的是
+            OOM，但根因是 replication slot
+            的磁盘压力触发了重启决策——这比五个故障各自独立出现更常见。</p>
+            <hr />
+            <h2 id="七关键要点">七、关键要点</h2>
+            <ol type="1">
+            <li><strong>连接风暴的根因常不是
+            <code>max_connections</code> 本身</strong>——而是 fork 后的
+            <code>work_mem</code> 乘法、连接池重连和缺少
+            <code>idle_in_transaction_session_timeout</code>
+            的叠加。</li>
+            <li><strong>Wraparound
+            有可见的预警链</strong>——<code>age(relfrozenxid)</code>、autovacuum
+            日志、写阻塞、只读 shutdown；监控阈值应设在 1 亿–1.5 亿
+            XID，而不是等到 2 亿。</li>
+            <li><strong>Replication slot
+            溢出是磁盘事故</strong>——inactive slot 阻止 WAL
+            回收；修复边界是删除 slot 或恢复 standby，不存在”保留 slot
+            又释放 WAL”的选项。</li>
+            <li><strong>OOM kill 触发 full restart</strong>——Postmaster
+            的 <code>restart_after_crash=on</code>
+            会断开所有连接；排查需同时看 <code>dmesg</code>
+            和内存大户查询。</li>
+            <li><strong>长事务是膨胀和 DDL
+            阻塞的隐形推手</strong>——<code>idle in transaction</code>
+            持有旧快照，VACUUM 无法回收其后 dead
+            tuple；<code>pg_terminate_backend()</code>
+            能止血但不收缩已膨胀的文件。</li>
+            </ol>
+            <p>上一章：<a
+            href="../21-monitoring/21-monitoring.html">监控体系与告警设计</a>
+            下一章：<a
+            href="../23-perf-investigation/23-perf-investigation.html">性能异常调查方法论</a></p>
+            <hr />
+            <h2 id="参考资料">参考资料</h2>
+            <h3 id="源码路径">源码路径</h3>
+            <ul>
+            <li><code>src/backend/postmaster/postmaster.c</code> —
+            <code>PostmasterMain()</code>, <code>ServerLoop()</code>,
+            <code>reaper()</code>, <code>HandleChildCrash()</code></li>
+            <li><code>src/backend/access/transam/varsup.c</code> —
+            <code>SetTransactionIdLimit()</code>,
+            <code>ForceTransactionId()</code>, <code>xidStopLimit</code>
+            / <code>xidWrapLimit</code></li>
+            <li><code>src/backend/postmaster/autovacuum.c</code> —
+            <code>relation_needs_vacanalyze()</code>,
+            <code>autovacuum_freeze_max_age</code> 的判断逻辑</li>
+            <li><code>src/backend/replication/slot.c</code> —
+            <code>CreateSlot()</code>, <code>SaveSlotToDisk()</code>,
+            WAL 回收的 LSN 边界计算</li>
+            <li><code>src/backend/storage/lmgr/lock.c</code> —
+            <code>LockAcquire()</code>, <code>LockReleaseAll()</code>,
+            锁等待队列</li>
+            <li><code>src/backend/access/heap/vacuumlazy.c</code> —
+            <code>lazy_scan_heap()</code>, <code>OldestXmin</code>
+            的计算与 dead tuple 回收判断</li>
+            <li><code>src/backend/utils/time/snapmgr.c</code> —
+            <code>GetSnapshotData()</code>, 快照的 xmin/xmax 计算</li>
+            </ul>
+            <h3 id="官方文档">官方文档</h3>
+            <ul>
+            <li>PostgreSQL Documentation, Section 24.1 — “Routine
+            Vacuuming”（事务 ID wraparound 的详细机制和预防）</li>
+            <li>PostgreSQL Documentation, Section 27.2 — “Write-Ahead
+            Log”（WAL 回收与 slot 的约束关系）</li>
+            <li>PostgreSQL Documentation, Section 27.2.4 — “Replication
+            Slots”（slot 的 restart_lsn 语义和 <code>active</code>
+            状态）</li>
+            <li>PostgreSQL Documentation, Section 19.4 — “Managing
+            Kernel Resources”（OOM Killer 和
+            <code>vm.overcommit_memory</code>）</li>
+            <li>PostgreSQL Documentation, Section 19.11 — “Client
+            Connection
+            Defaults”（<code>idle_in_transaction_session_timeout</code>）</li>
+            <li>PostgreSQL Documentation, Section 20.4 — “Lock
+            Management”（锁模式与锁等待队列）</li>
+            </ul>
+            <h3 id="事故复盘">事故复盘</h3>
+            <ul>
+            <li>“A Postgres outage: What we learned about replication
+            slots” — <code>pg_wal</code> 膨胀导致 primary crash
+            的真实案例</li>
+            <li>“Transaction ID wraparound in Postgres — a walk through
+            the nightmare” — 单用户模式 VACUUM 8 小时的实战记录</li>
+            <li>pgsql-hackers: “autovacuum_freeze_max_age default value
+            discussion” — 2 亿阈值为什么不是 1 亿或 4 亿</li>
+            </ul>
+            <h3 id="实验工具">实验工具</h3>
+            <ul>
+            <li><code>pg_stat_activity</code> —
+            进程级状态视图（<code>state</code>,
+            <code>wait_event_type</code>, <code>wait_event</code>,
+            <code>xact_start</code>, <code>query_start</code>）</li>
+            <li><code>pg_stat_user_tables</code> —
+            表级统计（<code>n_dead_tup</code>, <code>n_live_tup</code>,
+            <code>last_autovacuum</code>,
+            <code>last_autoanalyze</code>）</li>
+            <li><code>pg_stat_progress_vacuum</code> — VACUUM
+            进度视图（PG 14+，<code>phase</code>,
+            <code>heap_blks_scanned</code>）</li>
+            <li><code>pg_locks</code> — 锁视图（<code>locktype</code>,
+            <code>relation</code>, <code>mode</code>,
+            <code>granted</code>, <code>pid</code>）</li>
+            <li><code>pg_blocking_pids(pid)</code> —
+            找出谁在阻塞这个进程</li>
+            <li><code>pg_replication_slots</code> — slot 状态和 LSN
+            位置</li>
+            <li><code>pg_ls_waldir()</code> — <code>pg_wal</code>
+            目录文件列表和大小</li>
+            </ul>
+        <section class="post-recommendations"><h2>同主题继续阅读</h2><p>把当前热点继续串成多页阅读，而不是停在单篇消费。</p><div class="post-recommendations__grid">
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/21-monitoring/21-monitoring.html">【PG 内核】监控体系与告警设计：从内核机制出发定义该监控什么</a></h3>
+                    <p>不从 Grafana 模板照抄，而是从 PG 内核机制推导出必须监控的六个维度：连接与 wait_event、存储膨胀与 XID wraparound、WAL 与复制延迟、查询性能突变、锁等待链、以及 shared_buffers 命中率骗局。每个维度配具体 SQL 和指标解读，告警阈值给出内核依据而非拍脑袋数字，同时盘点 pg_stat_statements queryid 冲突、track_io_timing 开销、pg_stat_activity 自身代价等监控工具本身的陷阱。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/06-lock-manager/06-lock-manager.html">【PG 内核】锁管理器：从 SpinLock 到死锁检测的三层体系</a></h3>
+                    <p>拆解 PostgreSQL 锁管理器的完整架构：SpinLock 自旋锁的硬件原语与使用边界、LWLock 从 PG 9.4 前到 PG 16 LWLockWaitListLock 的三代演进、Heavyweight Lock 的 LockAcquire() 完整路径和锁表结构、死锁检测 DeadLockCheck() 的等待图 DFS 算法、行级锁 FOR UPDATE/FOR SHARE/FOR KEY SHARE 的 t_infomask 实现，以及用 pg_locks 和 pg_blocking_pids() 追踪生产锁等待链的诊断方法。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/18-streaming-repl/18-streaming-repl.html">【PG 内核】流复制：从 WAL Sender 到 Slot 溢出的多米诺效应</a></h3>
+                    <p>拆解 PostgreSQL 流复制的完整内核路径：WAL Sender 的 WalSndLoop→XLogSendPhysical 发送链路、WAL Receiver 的 WalRcvLoop 接收与恢复链路、同步复制的三种语义与等待机制、Failover 时 Timeline 的 fork 原理与 split-brain 风险、Primary-standby 冲突的本质与 max_standby_streaming_delay 的 trade-off、Replication Slot 的内部结构。重点剖析 Slot 溢出多米诺效应——standby 宕机→slot 阻止 WAL 回收→pg_wal 填满磁盘→primary PANIC 的完整事件链，以及 wal_keep_size 与 slot 的互相影响。配合 pg_stat_replication 的三层延迟指标排查与 conflict_reason 解读。</p>
+                </article>
+
+                <article class="post-recommendation-card">
+                    <p class="post-recommendation-card__meta">2026-06-16 · database / kernel</p>
+                    <h3><a href="/post/db/postgresql-kernel/19-logical-repl/19-logical-repl.html">【PG 内核】逻辑复制与逻辑解码：冲突处理与延迟放大</a></h3>
+                    <p>拆解 PostgreSQL 逻辑复制的完整内核路径：LogicalDecodingContext 从 WAL 解码出逻辑变更的内部流程、Reorder Buffer 按 COMMIT 顺序重排事务与 snapshot 重建机制、pgoutput 输出插件的二进制协议与行过滤变换、Publication/Subscription 模型的内核实现。重点剖析四种冲突类型的根因与修复边界——update_missing/delete_missing 为什么静默跳过而 duplicate_key 直接停摆、subscription 被 disable 后的数据追平策略、序列不在逻辑复制范围内的自增主键冲突陷阱、大事务在 reorder buffer 中的延迟放大效应。</p>
+                </article>
+</div></section>
+</main>
+    </div>
+
+    <div class="utterances-frame">
+        <script src="https://utteranc.es/client.js"
+            repo="zltl/bcomments"
+            issue-term="url"
+            theme="preferred-color-scheme"
+            crossorigin="anonymous"
+            async>
+        </script>
+    </div>
+    <hr />
+    <p>By <a href="https://github.com/zltl" rel="author">ltl</a>.</p>
+<script id="toc-toggle-script">
+    (function () {
+        const toc = document.getElementById('table-of-contents');
+        if (!toc) { return; }
+        const tocList = document.getElementById('text-table-of-contents');
+        if (!tocList) { return; }
+
+        let button = document.getElementById('toc-toggle');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'toc-toggle';
+            button.type = 'button';
+            button.setAttribute('aria-controls', 'table-of-contents');
+            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-label', '打开目录');
+            button.textContent = '目录';
+            document.body.appendChild(button);
+        }
+
+        const mql = window.matchMedia('(max-width: 900px)');
+        let isOpen = false;
+
+        const updateLabel = (expanded) => {
+            const label = expanded ? '收起目录' : '目录';
+            button.textContent = label;
+            button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            button.setAttribute('aria-label', expanded ? '收起目录' : '打开目录');
+            button.classList.toggle('is-active', expanded);
+        };
+
+        const focusFirstLink = () => {
+            const firstLink = toc.querySelector('a');
+            if (firstLink) {
+                try {
+                    firstLink.focus({ preventScroll: true });
+                } catch (err) {
+                    firstLink.focus();
+                }
+            }
+        };
+
+        const returnFocusToButton = () => {
+            window.requestAnimationFrame(() => {
+                try {
+                    button.focus({ preventScroll: true });
+                } catch (err) {
+                    button.focus();
+                }
+            });
+        };
+
+        const applyState = () => {
+            const expanded = Boolean(isOpen);
+            document.body.classList.toggle('toc-open', expanded);
+            updateLabel(expanded);
+            if (expanded && mql.matches) {
+                window.requestAnimationFrame(focusFirstLink);
+            } else if (!expanded && document.activeElement && toc.contains(document.activeElement)) {
+                returnFocusToButton();
+            }
+        };
+
+        const setState = (open) => {
+            isOpen = Boolean(open);
+            applyState();
+        };
+
+        const toggle = () => setState(!isOpen);
+
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggle();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!mql.matches || !isOpen) { return; }
+            if (toc.contains(event.target) || button.contains(event.target)) { return; }
+            setState(false);
+        }, { capture: true });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isOpen) {
+                setState(false);
+            }
+        });
+
+        toc.addEventListener('click', (event) => {
+            if (!mql.matches) { return; }
+            const target = event.target;
+            if (target && target.tagName && target.tagName.toLowerCase() == 'a') {
+                window.requestAnimationFrame(() => setState(false));
+            }
+        });
+
+        const syncForViewport = () => {
+            applyState();
+        };
+
+        if (typeof mql.addEventListener === 'function') {
+            mql.addEventListener('change', syncForViewport);
+        } else if (typeof mql.addListener === 'function') {
+            mql.addListener(syncForViewport);
+        }
+
+        document.body.classList.add('toc-ready');
+        syncForViewport();
+    })();
+</script>
+</body>
+</html>
